@@ -188,7 +188,7 @@ pub const FileStore = struct {
             .map = map,
             .header = undefined,
             .syncer = syncer,
-            .header_checksum_ok = undefined, // set by readHeader below
+            .header_checksum_ok = false, // set by readHeader below
         };
         try fs.readHeader();
         return fs;
@@ -225,7 +225,8 @@ pub const FileStore = struct {
         std.mem.writeInt(u32, self.map[off.page_size..][0..4], self.header.page_size, .little);
         self.map[off.endianness] = @intFromEnum(self.header.endianness);
         self.map[off.active_slot] = self.header.active_slot;
-        // [14..16] reserved -- leave as zero
+        // [14..16] reserved -- zero explicitly so the CRC is deterministic
+        @memset(self.map[14..16], 0);
         std.mem.writeInt(u64, self.map[off.logical_size..][0..8], self.header.logical_size, .little);
         // [24..28] reserved -- zero explicitly so the CRC is deterministic
         @memset(self.map[24..28], 0);
