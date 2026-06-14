@@ -14,7 +14,6 @@ const Arena = @import("arena.zig").Arena;
 const Allocation = @import("arena.zig").Allocation;
 const Ref = @import("ref.zig").Ref;
 const Slot = @import("slots.zig").Slot;
-const selectActive = @import("slots.zig").selectActive;
 
 const slot_a_off: usize = 64;
 const slot_b_off: usize = 128;
@@ -58,12 +57,21 @@ pub const Db = struct {
         var store = try FileStore.open(allocator, path, RealSyncer.any());
         errdefer store.deinit();
 
-        const slot_a = store.map[slot_a_off..][0..Slot.size];
-        const slot_b = store.map[slot_b_off..][0..Slot.size];
-        const choice = selectActive(slot_a, slot_b) orelse return error.Corrupt;
+        // The durable header.active_slot is the source of truth for which version is
+        // committed. selectActive's max-version heuristic would wrongly resurrect an
+        // aborted commit whose new slot was durably written in the data barrier but
+        // never published (i.e., header flush failed after the data barrier succeeded).
+        const primary_idx = store.header.active_slot;
+        const primary_off: usize = if (primary_idx == 0) slot_a_off else slot_b_off;
+        const other_off: usize = if (primary_idx == 0) slot_b_off else slot_a_off;
 
-        const active_bytes = if (choice.index == 0) slot_a else slot_b;
-        const active = try Slot.decode(active_bytes);
+        // Try the primary slot first (normal path and correct crash-recovery path).
+        // Fall back to the other slot only if the primary checksum is bad, which
+        // indicates a crash mid-slot-write into the primary region itself.
+        const active: Slot = Slot.decode(store.map[primary_off..][0..Slot.size]) catch blk: {
+            break :blk Slot.decode(store.map[other_off..][0..Slot.size]) catch
+                return error.Corrupt;
+        };
 
         // Resume arena just past the last committed byte.
         var arena = Arena.init(store.map, default_page_size);
@@ -193,6 +201,40 @@ fn tmpFilePath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const
     const path_len = try tmp.dir.realPath(testing.io, &path_buf);
     const dir_path = path_buf[0..path_len];
     return std.fs.path.join(allocator, &.{ dir_path, name });
+}
+
+test "recovery follows header active_slot pointer, not max version" {
+    // Regression test: after a crash where the data barrier (step 3 of commit) made
+    // the new slot durable but the header flush (step 5) never completed, Db.open must
+    // recover the version that header.active_slot points to, not the highest-version
+    // slot on disk.
+    //
+    // Setup: header.active_slot=0 (slot A, version 1). We manually write a valid
+    // higher-version slot (version 50) into slot B's byte range WITHOUT updating
+    // header.active_slot. This is exactly the dangerous on-disk state that a
+    // max-version heuristic would mishandle.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "recovery.airdb");
+    defer testing.allocator.free(path);
+
+    {
+        var db = try Db.create(testing.allocator, path);
+        defer db.deinit();
+        // Inject a plausible-but-aborted slot into slot B without touching the header.
+        const aborted = Slot{ .version = 50, .root_ref = 0, .logical_size = default_page_size };
+        aborted.encode(db.store.map[slot_b_off..][0..Slot.size]);
+        try db.store.syncer.flush(db.store.file);
+        // header.active_slot remains 0 (slot A, version 1).
+    }
+
+    // On reopen the correct recovery path must pick slot A (header.active_slot=0,
+    // version 1), not slot B (version 50).
+    {
+        var db = try Db.open(testing.allocator, path);
+        defer db.deinit();
+        try testing.expectEqual(@as(u64, 1), db.active_version);
+    }
 }
 
 test "commit then reopen sees the committed root" {
