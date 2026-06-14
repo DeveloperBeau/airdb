@@ -15,6 +15,7 @@ const Arena = @import("arena.zig").Arena;
 const Allocation = @import("arena.zig").Allocation;
 const Ref = @import("ref.zig").Ref;
 const Slot = @import("slots.zig").Slot;
+const FreeExtent = @import("freelist.zig").FreeExtent;
 
 const slot_a_off: usize = 64;
 const slot_b_off: usize = 128;
@@ -111,6 +112,7 @@ pub const Db = struct {
             .db = self,
             .new_root = self.active_root,
             .new_version = self.active_version + 1,
+            .in_flight_frees = .empty,
         };
     }
 };
@@ -140,6 +142,7 @@ pub const WriteTxn = struct {
     db: *Db,
     new_root: Ref,
     new_version: u64,
+    in_flight_frees: std.ArrayList(FreeExtent),
 
     pub fn alloc(self: *WriteTxn, size: usize) !Allocation {
         return self.db.arena.alloc(size);
@@ -147,6 +150,24 @@ pub const WriteTxn = struct {
 
     pub fn setRoot(self: *WriteTxn, ref: Ref) void {
         self.new_root = ref;
+    }
+
+    pub fn free(self: *WriteTxn, ref: Ref, len: usize) !void {
+        try self.in_flight_frees.append(self.db.store.allocator, .{
+            .offset = ref, .len = @intCast(len), .freed_version = self.new_version,
+        });
+    }
+
+    pub fn writableCopy(self: *WriteTxn, ref: Ref, len: usize) !Allocation {
+        const old = try self.db.arena.deref(ref, len);
+        const fresh = try self.alloc(len);
+        @memcpy(fresh.bytes, old);
+        try self.free(ref, len);
+        return fresh;
+    }
+
+    pub fn deinit(self: *WriteTxn) void {
+        self.in_flight_frees.deinit(self.db.store.allocator);
     }
 
     /// Two-slot atomic durable commit.
@@ -164,6 +185,8 @@ pub const WriteTxn = struct {
     ///      will see the old version.
     ///   5. Only after both flushes succeed: update active_version / active_root.
     pub fn commit(self: *WriteTxn) !u64 {
+        // Free in_flight_frees on every error path; explicit deinit covers success.
+        errdefer self.in_flight_frees.deinit(self.db.store.allocator);
         const db = self.db;
         const prev_active_slot = db.store.header.active_slot;
         const prev_logical_size = db.store.header.logical_size;
@@ -202,6 +225,7 @@ pub const WriteTxn = struct {
         // Step 5: publish the new version in memory only after both flushes succeed.
         db.active_version = self.new_version;
         db.active_root = self.new_root;
+        self.in_flight_frees.deinit(self.db.store.allocator);
         return self.new_version;
     }
 };
@@ -249,6 +273,25 @@ test "recovery follows header active_slot pointer, not max version" {
         defer db.deinit();
         try testing.expectEqual(@as(u64, 1), db.active_version);
     }
+}
+
+test "writableCopy allocates a new node, copies bytes, and records the old as freed" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "cow.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+
+    var w = try db.beginWrite();
+    const a = try w.alloc(8);
+    @memcpy(a.bytes, "ORIGINAL");
+    const copy = try w.writableCopy(a.ref, 8);
+    try testing.expect(copy.ref != a.ref);
+    try testing.expectEqualStrings("ORIGINAL", copy.bytes);
+    try testing.expectEqual(@as(usize, 1), w.in_flight_frees.items.len);
+    try testing.expectEqual(a.ref, w.in_flight_frees.items[0].offset);
+    w.deinit(); // releases the in-flight list without committing
 }
 
 test "commit then reopen sees the committed root" {
