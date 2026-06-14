@@ -8,6 +8,7 @@ pub const NodeHeader = struct {
     pub const size: usize = 5; // [kind:u8][element_count:u32 LE]
 
     pub fn encode(buf: []u8, h: NodeHeader) EncodeResult {
+        // Caller must provide >= size bytes. Under ReleaseSafe (this project's build mode) this assert is a safe trap, not UB.
         std.debug.assert(buf.len >= size);
         buf[0] = @intFromEnum(h.kind);
         std.mem.writeInt(u32, buf[1..5], h.element_count, .little);
@@ -40,15 +41,29 @@ pub const NodeView = struct {
 
 const testing = std.testing;
 
-test "encode then decode node header round-trips" {
-    var buf: [16]u8 = undefined;
-    const written = NodeHeader.encode(&buf, .{ .kind = .leaf_values, .element_count = 300 });
-    const view = try NodeView.parse(buf[0..written.total_len_with_payload(0)]);
-    try testing.expectEqual(NodeKind.leaf_values, view.header.kind);
-    try testing.expectEqual(@as(u32, 300), view.header.element_count);
+test "encode then decode node header round-trips for every kind" {
+    const cases = [_]struct { kind: NodeKind, count: u32 }{
+        .{ .kind = .leaf_values, .count = 0 },
+        .{ .kind = .inner_refs, .count = 300 },
+        .{ .kind = .raw_bytes, .count = 4294967295 },
+    };
+    for (cases) |c| {
+        var buf: [16]u8 = undefined;
+        const written = NodeHeader.encode(&buf, .{ .kind = c.kind, .element_count = c.count });
+        const view = try NodeView.parse(buf[0..written.total_len_with_payload(0)]);
+        try testing.expectEqual(c.kind, view.header.kind);
+        try testing.expectEqual(c.count, view.header.element_count);
+    }
 }
 
 test "parse rejects a truncated buffer" {
     const tiny = [_]u8{0x01};
     try testing.expectError(error.Corrupt, NodeView.parse(&tiny));
+}
+
+test "parse rejects an out-of-range kind byte" {
+    var buf: [NodeHeader.size]u8 = undefined;
+    buf[0] = 3; // one past raw_bytes (2)
+    std.mem.writeInt(u32, buf[1..5], 0, .little);
+    try testing.expectError(error.Corrupt, NodeView.parse(&buf));
 }
