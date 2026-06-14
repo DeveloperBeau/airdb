@@ -16,6 +16,7 @@ const Allocation = @import("arena.zig").Allocation;
 const Ref = @import("ref.zig").Ref;
 const Slot = @import("slots.zig").Slot;
 const FreeExtent = @import("freelist.zig").FreeExtent;
+const FreeList = @import("freelist.zig").FreeList;
 
 const slot_a_off: usize = 64;
 const slot_b_off: usize = 128;
@@ -133,6 +134,7 @@ pub const Db = struct {
             .new_root = self.active_root,
             .new_version = self.active_version + 1,
             .in_flight_frees = .empty,
+            .work_freelist = FreeList.init(self.store.allocator),
         };
     }
 };
@@ -171,9 +173,10 @@ pub const WriteTxn = struct {
     new_root: Ref,
     new_version: u64,
     in_flight_frees: std.ArrayList(FreeExtent),
+    work_freelist: FreeList,
 
     pub fn alloc(self: *WriteTxn, size: usize) !Allocation {
-        return self.db.arena.alloc(size);
+        return self.db.arena.allocReusing(size, &self.work_freelist, self.db.horizon());
     }
 
     pub fn setRoot(self: *WriteTxn, ref: Ref) void {
@@ -196,6 +199,7 @@ pub const WriteTxn = struct {
 
     pub fn deinit(self: *WriteTxn) void {
         self.in_flight_frees.deinit(self.db.store.allocator);
+        self.work_freelist.deinit();
     }
 
     /// Two-slot atomic durable commit.
@@ -213,8 +217,9 @@ pub const WriteTxn = struct {
     ///      will see the old version.
     ///   5. Only after both flushes succeed: update active_version / active_root.
     pub fn commit(self: *WriteTxn) !u64 {
-        // Free in_flight_frees on every error path; explicit deinit covers success.
+        // Free in_flight_frees and work_freelist on every error path; explicit deinits cover success.
         errdefer self.in_flight_frees.deinit(self.db.store.allocator);
+        errdefer self.work_freelist.deinit();
         const db = self.db;
         const prev_active_slot = db.store.header.active_slot;
         const prev_logical_size = db.store.header.logical_size;
@@ -254,6 +259,7 @@ pub const WriteTxn = struct {
         db.active_version = self.new_version;
         db.active_root = self.new_root;
         self.in_flight_frees.deinit(self.db.store.allocator);
+        self.work_freelist.deinit();
         return self.new_version;
     }
 };
