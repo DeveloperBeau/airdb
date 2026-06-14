@@ -73,6 +73,7 @@ pub const Db = struct {
         // aborted commit whose new slot was durably written in the data barrier but
         // never published (i.e., header flush failed after the data barrier succeeded).
         const primary_idx = store.header.active_slot;
+        if (primary_idx > 1) return error.Corrupt;
         const primary_off: usize = if (primary_idx == 0) slot_a_off else slot_b_off;
         const other_off: usize = if (primary_idx == 0) slot_b_off else slot_a_off;
 

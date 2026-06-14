@@ -32,7 +32,11 @@ test "data-barrier flush failure during commit leaves the prior version intact" 
         const b = try w.alloc(4);
         @memcpy(b.bytes, "v2!!");
         w.setRoot(b.ref);
+        const pre_version = db.active_version;
+        const pre_root = db.active_root;
         try testing.expectError(error.Durability, w.commit());
+        try testing.expectEqual(pre_version, db.active_version);
+        try testing.expectEqual(pre_root, db.active_root);
     }
     { // reopen with a real syncer: must still see v1
         var db = try airdb.Db.open(testing.allocator, path);
@@ -65,7 +69,11 @@ test "header-flush failure during commit does not publish v2" {
         const b = try w.alloc(4);
         @memcpy(b.bytes, "v2!!");
         w.setRoot(b.ref);
+        const pre_version = db.active_version;
+        const pre_root = db.active_root;
         try testing.expectError(error.Durability, w.commit());
+        try testing.expectEqual(pre_version, db.active_version);
+        try testing.expectEqual(pre_root, db.active_root);
     }
     {
         var db = try airdb.Db.open(testing.allocator, path);

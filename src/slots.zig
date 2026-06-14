@@ -29,24 +29,6 @@ pub const Slot = struct {
     }
 };
 
-pub const SlotChoice = struct { index: u8, version: u64 };
-
-/// Pick the higher-version slot whose checksum validates; fall back to the other;
-/// null if neither validates.
-pub fn selectActive(slot_a: []const u8, slot_b: []const u8) ?SlotChoice {
-    const da = Slot.decode(slot_a) catch null;
-    const db = Slot.decode(slot_b) catch null;
-    if (da != null and db != null) {
-        return if (db.?.version > da.?.version)
-            .{ .index = 1, .version = db.?.version }
-        else
-            .{ .index = 0, .version = da.?.version };
-    }
-    if (da != null) return .{ .index = 0, .version = da.?.version };
-    if (db != null) return .{ .index = 1, .version = db.?.version };
-    return null;
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -67,33 +49,4 @@ test "decode rejects a corrupted slot" {
     (Slot{ .version = 1, .root_ref = 4096, .logical_size = 8192 }).encode(&buf);
     buf[4] ^= 0xFF;
     try testing.expectError(error.BadChecksum, Slot.decode(&buf));
-}
-
-test "selectActive picks the higher valid version" {
-    var a: [Slot.size]u8 = undefined;
-    var b: [Slot.size]u8 = undefined;
-    (Slot{ .version = 3, .root_ref = 4096, .logical_size = 8192 }).encode(&a);
-    (Slot{ .version = 4, .root_ref = 8192, .logical_size = 12288 }).encode(&b);
-    const choice = selectActive(&a, &b);
-    try testing.expectEqual(SlotChoice{ .index = 1, .version = 4 }, choice.?);
-}
-
-test "selectActive falls back when the newest slot is corrupt" {
-    var a: [Slot.size]u8 = undefined;
-    var b: [Slot.size]u8 = undefined;
-    (Slot{ .version = 3, .root_ref = 4096, .logical_size = 8192 }).encode(&a);
-    (Slot{ .version = 4, .root_ref = 8192, .logical_size = 12288 }).encode(&b);
-    b[4] ^= 0xFF;
-    const choice = selectActive(&a, &b);
-    try testing.expectEqual(SlotChoice{ .index = 0, .version = 3 }, choice.?);
-}
-
-test "selectActive returns null when both slots are corrupt" {
-    var a: [Slot.size]u8 = undefined;
-    var b: [Slot.size]u8 = undefined;
-    (Slot{ .version = 3, .root_ref = 4096, .logical_size = 8192 }).encode(&a);
-    (Slot{ .version = 4, .root_ref = 8192, .logical_size = 12288 }).encode(&b);
-    a[0] ^= 0xFF;
-    b[0] ^= 0xFF;
-    try testing.expect(selectActive(&a, &b) == null);
 }
