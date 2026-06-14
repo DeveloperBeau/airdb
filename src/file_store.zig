@@ -73,7 +73,7 @@ pub const RealSyncer = struct {
 // ---------------------------------------------------------------------------
 
 pub const FileStore = struct {
-    allocator: std.mem.Allocator,
+    allocator: std.mem.Allocator, // reserved for future allocations (buffer pool, catalog pages)
     file: Io.File,
     map: []align(std.heap.page_size_min) u8,
     header: Header,
@@ -84,6 +84,7 @@ pub const FileStore = struct {
     /// Returns the blocking Io instance used for all file operations.
     /// This is always initialized (compile-time constant vtable), so it
     /// works in both test and production contexts without passing Io around.
+    // Phase 1 single-process/single-thread only. Phase 4 (multi-process/threaded) must replace this global Io.
     inline fn sysIo() Io {
         return std.Io.Threaded.global_single_threaded.io();
     }
@@ -144,6 +145,7 @@ pub const FileStore = struct {
         errdefer file.close(io);
 
         const file_len = try file.length(io);
+        if (file_len < default_page_size) return error.Corrupt;
 
         const map = try std.posix.mmap(
             null,
@@ -180,31 +182,39 @@ pub const FileStore = struct {
     //   [14..16] reserved
     //   [16..24] logical_size u64 LE
 
+    const off = struct {
+        const magic: usize = 0;
+        const page_size: usize = 8;
+        const endianness: usize = 12;
+        const active_slot: usize = 13;
+        const logical_size: usize = 16;
+    };
+
     fn writeHeader(self: *FileStore) void {
-        std.mem.writeInt(u64, self.map[0..8], self.header.magic, .little);
-        std.mem.writeInt(u32, self.map[8..12], self.header.page_size, .little);
-        self.map[12] = @intFromEnum(self.header.endianness);
-        self.map[13] = self.header.active_slot;
+        std.mem.writeInt(u64, self.map[off.magic..][0..8], self.header.magic, .little);
+        std.mem.writeInt(u32, self.map[off.page_size..][0..4], self.header.page_size, .little);
+        self.map[off.endianness] = @intFromEnum(self.header.endianness);
+        self.map[off.active_slot] = self.header.active_slot;
         // [14..16] reserved -- leave as zero
-        std.mem.writeInt(u64, self.map[16..24], self.header.logical_size, .little);
+        std.mem.writeInt(u64, self.map[off.logical_size..][0..8], self.header.logical_size, .little);
     }
 
     fn readHeader(self: *FileStore) !void {
         if (self.map.len < default_page_size) return error.Corrupt;
 
-        const magic = std.mem.readInt(u64, self.map[0..8], .little);
+        const magic = std.mem.readInt(u64, self.map[off.magic..][0..8], .little);
         if (magic != airdb_magic) return error.BadMagic;
 
-        const page_size = std.mem.readInt(u32, self.map[8..12], .little);
+        const page_size = std.mem.readInt(u32, self.map[off.page_size..][0..4], .little);
 
-        const endianness_byte = self.map[12];
+        const endianness_byte = self.map[off.endianness];
         // Zig 0.16: std.meta.intToEnum removed; use std.enums.fromInt instead.
         const endianness = std.enums.fromInt(Endianness, endianness_byte) orelse
             return error.UnsupportedEndianness;
         if (endianness != .little) return error.UnsupportedEndianness;
 
-        const active_slot = self.map[13];
-        const logical_size = std.mem.readInt(u64, self.map[16..24], .little);
+        const active_slot = self.map[off.active_slot];
+        const logical_size = std.mem.readInt(u64, self.map[off.logical_size..][0..8], .little);
 
         self.header = .{
             .magic = magic,
@@ -216,6 +226,7 @@ pub const FileStore = struct {
     }
 
     /// Re-encode header fields into the mmap'd page (does not flush).
+    // Writes the in-memory header into the mmap'd buffer. Durability requires a subsequent Syncer.flush.
     pub fn persistHeader(self: *FileStore) void {
         self.writeHeader();
     }
