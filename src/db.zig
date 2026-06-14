@@ -229,7 +229,9 @@ pub const WriteTxn = struct {
 
     pub fn free(self: *WriteTxn, ref: Ref, len: usize) !void {
         try self.in_flight_frees.append(self.db.store.allocator, .{
-            .offset = ref, .len = @intCast(len), .freed_version = self.new_version,
+            .offset = ref,
+            .len = @intCast(len),
+            .freed_version = self.new_version,
         });
     }
 
