@@ -135,3 +135,39 @@ test "second commit supersedes the first on reopen" {
         try testing.expectEqualStrings("v2!!", try r.deref(r.root(), 4));
     }
 }
+
+test "a reader pinned to an old version still reads its data after the writer reuses freed space" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "mvcc.airdb");
+    defer testing.allocator.free(path);
+    var db = try airdb.Db.create(testing.allocator, path);
+    defer db.deinit();
+
+    {
+        var w = try db.beginWrite();
+        const a = try w.alloc(8);
+        @memcpy(a.bytes, "AAAAAAAA");
+        w.setRoot(a.ref);
+        _ = try w.commit();
+    }
+
+    var reader = try db.beginRead();
+    try testing.expectEqualStrings("AAAAAAAA", try reader.deref(reader.root(), 8));
+
+    {
+        var w = try db.beginWrite();
+        const b = try w.alloc(8);
+        @memcpy(b.bytes, "BBBBBBBB");
+        try w.free(reader.root(), 8);
+        w.setRoot(b.ref);
+        _ = try w.commit();
+    }
+
+    try testing.expectEqualStrings("AAAAAAAA", try reader.deref(reader.root(), 8));
+    reader.end();
+
+    var r2 = try db.beginRead();
+    try testing.expectEqualStrings("BBBBBBBB", try r2.deref(r2.root(), 8));
+    r2.end();
+}
