@@ -557,7 +557,9 @@ test "verifyIntegrity passes on a freshly committed database" {
     var db = try Db.create(testing.allocator, path);
     defer db.deinit();
     var w = try db.beginWrite();
-    const a = try w.alloc(8); @memcpy(a.bytes, "INTEGER_"); w.setRoot(a.ref);
+    const a = try w.alloc(8);
+    @memcpy(a.bytes, "INTEGER_");
+    w.setRoot(a.ref);
     _ = try w.commit();
     try db.verifyIntegrity(); // void on clean db
 }
@@ -570,7 +572,9 @@ test "verifyIntegrity detects a root reference out of bounds" {
     var db = try Db.create(testing.allocator, path);
     defer db.deinit();
     var w = try db.beginWrite();
-    const a = try w.alloc(8); @memcpy(a.bytes, "INTEGER_"); w.setRoot(a.ref);
+    const a = try w.alloc(8);
+    @memcpy(a.bytes, "INTEGER_");
+    w.setRoot(a.ref);
     _ = try w.commit();
     db.active_root = db.store.map.len + 8; // point past the mapped region
     try testing.expectError(error.RootRefOutOfBounds, db.verifyIntegrity());

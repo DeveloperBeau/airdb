@@ -248,3 +248,71 @@ test "freed space is reused only after the pinning reader releases" {
         w.deinit();
     }
 }
+
+test "after a data-barrier flush failure, the reopened db passes verifyIntegrity and shows the prior version" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "cm1.airdb");
+    defer testing.allocator.free(path);
+    {
+        var db = try airdb.Db.create(testing.allocator, path);
+        defer db.deinit();
+        var w = try db.beginWrite();
+        const a = try w.alloc(8);
+        @memcpy(a.bytes, "BASELINE");
+        w.setRoot(a.ref);
+        _ = try w.commit();
+    }
+    {
+        var fsync = airdb.FailingSyncer{ .fail_on = 1 }; // fail the data barrier
+        var db = try airdb.Db.openWith(testing.allocator, path, fsync.any());
+        defer db.deinit();
+        var w = try db.beginWrite();
+        const b = try w.alloc(8);
+        @memcpy(b.bytes, "NEWERVAL");
+        w.setRoot(b.ref);
+        try testing.expectError(error.Durability, w.commit());
+    }
+    {
+        var db = try airdb.Db.open(testing.allocator, path);
+        defer db.deinit();
+        try db.verifyIntegrity();
+        var r = try db.beginRead();
+        try testing.expectEqualStrings("BASELINE", try r.deref(r.root(), 8));
+        r.end();
+    }
+}
+
+test "after a header-flush failure, the reopened db passes verifyIntegrity and shows the prior version" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "cm2.airdb");
+    defer testing.allocator.free(path);
+    {
+        var db = try airdb.Db.create(testing.allocator, path);
+        defer db.deinit();
+        var w = try db.beginWrite();
+        const a = try w.alloc(8);
+        @memcpy(a.bytes, "BASELINE");
+        w.setRoot(a.ref);
+        _ = try w.commit();
+    }
+    {
+        var fsync = airdb.FailingSyncer{ .fail_on = 2 }; // data barrier ok, header flush fails
+        var db = try airdb.Db.openWith(testing.allocator, path, fsync.any());
+        defer db.deinit();
+        var w = try db.beginWrite();
+        const b = try w.alloc(8);
+        @memcpy(b.bytes, "NEWERVAL");
+        w.setRoot(b.ref);
+        try testing.expectError(error.Durability, w.commit());
+    }
+    {
+        var db = try airdb.Db.open(testing.allocator, path);
+        defer db.deinit();
+        try db.verifyIntegrity();
+        var r = try db.beginRead();
+        try testing.expectEqualStrings("BASELINE", try r.deref(r.root(), 8));
+        r.end();
+    }
+}
