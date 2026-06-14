@@ -29,6 +29,7 @@ pub const Db = struct {
     arena: Arena,
     active_version: u64,
     active_root: Ref,
+    pins: std.AutoHashMap(u64, u32),
 
     /// Create a new database file at the given absolute path.
     pub fn create(allocator: std.mem.Allocator, path: []const u8) !Db {
@@ -57,6 +58,7 @@ pub const Db = struct {
             .arena = Arena.init(store.map, default_page_size),
             .active_version = 1,
             .active_root = 0,
+            .pins = std.AutoHashMap(u64, u32).init(allocator),
         };
     }
 
@@ -96,15 +98,33 @@ pub const Db = struct {
             .arena = arena,
             .active_version = active.version,
             .active_root = active.root_ref,
+            .pins = std.AutoHashMap(u64, u32).init(allocator),
         };
     }
 
     pub fn deinit(self: *Db) void {
+        self.pins.deinit();
         self.store.deinit();
     }
 
-    pub fn beginRead(self: *Db) ReadTxn {
-        return .{ .db = self, .root_ref = self.active_root };
+    pub fn beginRead(self: *Db) !ReadTxn {
+        const v = self.active_version;
+        if (self.pins.getPtr(v)) |ptr| {
+            ptr.* += 1;
+        } else {
+            try self.pins.put(v, 1);
+        }
+        return ReadTxn{ .db = self, .root_ref = self.active_root, .version = v };
+    }
+
+    pub fn horizon(self: *Db) u64 {
+        var min: ?u64 = null;
+        var it = self.pins.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.* == 0) continue;
+            if (min == null or entry.key_ptr.* < min.?) min = entry.key_ptr.*;
+        }
+        return min orelse self.active_version;
     }
 
     pub fn beginWrite(self: *Db) !WriteTxn {
@@ -124,6 +144,7 @@ pub const Db = struct {
 pub const ReadTxn = struct {
     db: *Db,
     root_ref: Ref,
+    version: u64,
 
     pub fn root(self: ReadTxn) Ref {
         return self.root_ref;
@@ -131,6 +152,13 @@ pub const ReadTxn = struct {
 
     pub fn deref(self: *ReadTxn, ref: Ref, len: usize) ![]const u8 {
         return self.db.arena.deref(ref, len);
+    }
+
+    pub fn end(self: *ReadTxn) void {
+        if (self.db.pins.getPtr(self.version)) |ptr| {
+            if (ptr.* > 0) ptr.* -= 1;
+            if (ptr.* == 0) _ = self.db.pins.remove(self.version);
+        }
     }
 };
 
@@ -312,10 +340,34 @@ test "commit then reopen sees the committed root" {
     {
         var db = try Db.open(testing.allocator, path);
         defer db.deinit();
-        var r = db.beginRead();
+        var r = try db.beginRead();
         const root_ref = r.root();
         try testing.expect(root_ref != 0);
         const bytes = try r.deref(root_ref, 8);
         try testing.expectEqualStrings("HELLOAID", bytes);
     }
+}
+
+test "version horizon tracks the oldest live reader" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "horizon.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+
+    try testing.expectEqual(db.active_version, db.horizon());
+
+    var r1 = try db.beginRead();
+    const v = db.active_version;
+    {
+        var w = try db.beginWrite();
+        const a = try w.alloc(8);
+        @memcpy(a.bytes, "NEWDATA_");
+        w.setRoot(a.ref);
+        _ = try w.commit();
+    }
+    try testing.expectEqual(v, db.horizon()); // r1 still pinned at v
+    r1.end();
+    try testing.expectEqual(db.active_version, db.horizon());
 }

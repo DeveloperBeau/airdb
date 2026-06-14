@@ -41,7 +41,7 @@ test "data-barrier flush failure during commit leaves the prior version intact" 
     { // reopen with a real syncer: must still see v1
         var db = try airdb.Db.open(testing.allocator, path);
         defer db.deinit();
-        var r = db.beginRead();
+        var r = try db.beginRead();
         try testing.expectEqualStrings("v1__", try r.deref(r.root(), 4));
     }
 }
@@ -78,7 +78,7 @@ test "header-flush failure during commit does not publish v2" {
     {
         var db = try airdb.Db.open(testing.allocator, path);
         defer db.deinit();
-        var r = db.beginRead();
+        var r = try db.beginRead();
         try testing.expectEqualStrings("v1__", try r.deref(r.root(), 4));
     }
 }
@@ -131,7 +131,7 @@ test "second commit supersedes the first on reopen" {
     {
         var db = try airdb.Db.open(testing.allocator, path);
         defer db.deinit();
-        var r = db.beginRead();
+        var r = try db.beginRead();
         try testing.expectEqualStrings("v2!!", try r.deref(r.root(), 4));
     }
 }
