@@ -9,6 +9,7 @@ const testing = std.testing;
 const Io = std.Io;
 const FileStore = @import("file_store.zig").FileStore;
 const RealSyncer = @import("file_store.zig").RealSyncer;
+const Syncer = @import("file_store.zig").Syncer;
 const default_page_size = @import("file_store.zig").default_page_size;
 const Arena = @import("arena.zig").Arena;
 const Allocation = @import("arena.zig").Allocation;
@@ -30,7 +31,12 @@ pub const Db = struct {
 
     /// Create a new database file at the given absolute path.
     pub fn create(allocator: std.mem.Allocator, path: []const u8) !Db {
-        var store = try FileStore.create(allocator, path, RealSyncer.any());
+        return createWith(allocator, path, RealSyncer.any());
+    }
+
+    /// Like create, but with an injectable Syncer (used for testing).
+    pub fn createWith(allocator: std.mem.Allocator, path: []const u8, syncer: Syncer) !Db {
+        var store = try FileStore.create(allocator, path, syncer);
         errdefer store.deinit();
 
         // Write version-1 into slot A; mark it active.
@@ -54,7 +60,12 @@ pub const Db = struct {
 
     /// Open an existing database file at the given absolute path.
     pub fn open(allocator: std.mem.Allocator, path: []const u8) !Db {
-        var store = try FileStore.open(allocator, path, RealSyncer.any());
+        return openWith(allocator, path, RealSyncer.any());
+    }
+
+    /// Like open, but with an injectable Syncer (used for testing).
+    pub fn openWith(allocator: std.mem.Allocator, path: []const u8, syncer: Syncer) !Db {
+        var store = try FileStore.open(allocator, path, syncer);
         errdefer store.deinit();
 
         // The durable header.active_slot is the source of truth for which version is

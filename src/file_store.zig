@@ -232,6 +232,24 @@ pub const FileStore = struct {
     }
 };
 
+/// Test syncer that fails the Nth flush call (1-based) to simulate a crash
+/// at a precise commit step. Non-failing calls perform the real sync.
+pub const FailingSyncer = struct {
+    count: usize = 0,
+    fail_on: usize,
+
+    pub fn flushImpl(ptr: *anyopaque, file: Io.File) anyerror!void {
+        const self: *FailingSyncer = @ptrCast(@alignCast(ptr));
+        self.count += 1;
+        if (self.count == self.fail_on) return error.SimulatedCrash;
+        try file.sync(std.Io.Threaded.global_single_threaded.io());
+    }
+
+    pub fn any(self: *FailingSyncer) Syncer {
+        return .{ .ptr = self, .flushFn = &FailingSyncer.flushImpl };
+    }
+};
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
