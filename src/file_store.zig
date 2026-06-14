@@ -97,6 +97,10 @@ pub const FileStore = struct {
     map: []align(std.heap.page_size_min) u8,
     header: Header,
     syncer: Syncer,
+    /// True when the header CRC32 matches the stored checksum at [28..32].
+    /// Set by readHeader (open path) or to true after writeHeader (create/persistHeader path).
+    /// Recovery in db.zig openWith reads this to decide whether to trust active_slot.
+    header_checksum_ok: bool,
 
     const initial_capacity: usize = default_page_size * 256;
 
@@ -146,8 +150,10 @@ pub const FileStore = struct {
                 .logical_size = default_page_size,
             },
             .syncer = syncer,
+            .header_checksum_ok = false, // set to true after writeHeader below
         };
         fs.writeHeader();
+        fs.header_checksum_ok = true;
         try fs.syncer.flush(fs.file);
         return fs;
     }
@@ -182,6 +188,7 @@ pub const FileStore = struct {
             .map = map,
             .header = undefined,
             .syncer = syncer,
+            .header_checksum_ok = undefined, // set by readHeader below
         };
         try fs.readHeader();
         return fs;
@@ -194,12 +201,14 @@ pub const FileStore = struct {
     }
 
     // Header byte layout (fixed):
-    //   [0..8]   magic       u64 LE
-    //   [8..12]  page_size   u32 LE
-    //   [12]     endianness  u8
-    //   [13]     active_slot u8
-    //   [14..16] reserved
+    //   [0..8]   magic        u64 LE
+    //   [8..12]  page_size    u32 LE
+    //   [12]     endianness   u8
+    //   [13]     active_slot  u8
+    //   [14..16] reserved     (zero)
     //   [16..24] logical_size u64 LE
+    //   [24..28] reserved     (zero, covered by checksum)
+    //   [28..32] checksum     CRC32 of [0..28], u32 LE
 
     const off = struct {
         const magic: usize = 0;
@@ -207,6 +216,8 @@ pub const FileStore = struct {
         const endianness: usize = 12;
         const active_slot: usize = 13;
         const logical_size: usize = 16;
+        // [24..28] reserved -- zeroed before hashing, covered by checksum
+        const checksum: usize = 28;
     };
 
     fn writeHeader(self: *FileStore) void {
@@ -216,6 +227,11 @@ pub const FileStore = struct {
         self.map[off.active_slot] = self.header.active_slot;
         // [14..16] reserved -- leave as zero
         std.mem.writeInt(u64, self.map[off.logical_size..][0..8], self.header.logical_size, .little);
+        // [24..28] reserved -- zero explicitly so the CRC is deterministic
+        @memset(self.map[24..28], 0);
+        // CRC32 over [0..28] written little-endian at [28..32]
+        const crc = std.hash.Crc32.hash(self.map[0..28]);
+        std.mem.writeInt(u32, self.map[off.checksum..][0..4], crc, .little);
     }
 
     fn readHeader(self: *FileStore) !void {
@@ -235,6 +251,13 @@ pub const FileStore = struct {
         const active_slot = self.map[off.active_slot];
         const logical_size = std.mem.readInt(u64, self.map[off.logical_size..][0..8], .little);
 
+        // Validate header CRC32: hash [0..28], compare to stored u32 at [28..32].
+        // A mismatch sets header_checksum_ok = false but does NOT hard-fail;
+        // db.zig openWith decides how to recover.
+        const stored_crc = std.mem.readInt(u32, self.map[off.checksum..][0..4], .little);
+        const computed_crc = std.hash.Crc32.hash(self.map[0..28]);
+        self.header_checksum_ok = (stored_crc == computed_crc);
+
         self.header = .{
             .magic = magic,
             .page_size = page_size,
@@ -248,6 +271,13 @@ pub const FileStore = struct {
     // Writes the in-memory header into the mmap'd buffer. Durability requires a subsequent Syncer.flush.
     pub fn persistHeader(self: *FileStore) void {
         self.writeHeader();
+        self.header_checksum_ok = true;
+    }
+
+    /// Test-only: re-parse the header from the current mmap contents.
+    /// Used to observe header_checksum_ok after in-place map tampering.
+    pub fn reReadHeaderForTest(self: *FileStore) !void {
+        try self.readHeader();
     }
 };
 
@@ -284,6 +314,28 @@ test "real syncer flush succeeds (exercises the platform durability path)" {
     var fs = try FileStore.create(testing.allocator, file_path, RealSyncer.any());
     defer fs.deinit();
     try fs.syncer.flush(fs.file); // explicit second flush must also succeed
+}
+
+test "header checksum validates on a clean file and fails when the header is tampered" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(testing.io, &path_buf);
+    const file_path = try std.fs.path.join(testing.allocator, &.{ path_buf[0..path_len], "hcrc.airdb" });
+    defer testing.allocator.free(file_path);
+    {
+        var fs = try FileStore.create(testing.allocator, file_path, RealSyncer.any());
+        defer fs.deinit();
+        try testing.expect(fs.header_checksum_ok);
+    }
+    {
+        var fs = try FileStore.open(testing.allocator, file_path, RealSyncer.any());
+        defer fs.deinit();
+        try testing.expect(fs.header_checksum_ok);
+        fs.map[13] ^= 0xFF; // scramble active_slot byte
+        try fs.reReadHeaderForTest();
+        try testing.expect(!fs.header_checksum_ok);
+    }
 }
 
 test "create writes a header that reopen reads back" {

@@ -82,21 +82,38 @@ pub const Db = struct {
         var store = try FileStore.open(allocator, path, syncer);
         errdefer store.deinit();
 
-        // The durable header.active_slot is the source of truth for which version is
-        // committed. selectActive's max-version heuristic would wrongly resurrect an
-        // aborted commit whose new slot was durably written in the data barrier but
-        // never published (i.e., header flush failed after the data barrier succeeded).
-        const primary_idx = store.header.active_slot;
-        if (primary_idx > 1) return error.Corrupt;
-        const primary_off: usize = if (primary_idx == 0) slot_a_off else slot_b_off;
-        const other_off: usize = if (primary_idx == 0) slot_b_off else slot_a_off;
+        const active: Slot = if (store.header_checksum_ok) active_blk: {
+            // The durable header.active_slot is the source of truth for which version is
+            // committed. The max-version heuristic would wrongly resurrect an aborted
+            // commit whose new slot was durably written in the data barrier but never
+            // published (i.e., header flush failed after the data barrier succeeded).
+            const primary_idx = store.header.active_slot;
+            if (primary_idx > 1) return error.Corrupt;
+            const primary_off: usize = if (primary_idx == 0) slot_a_off else slot_b_off;
+            const other_off: usize = if (primary_idx == 0) slot_b_off else slot_a_off;
 
-        // Try the primary slot first (normal path and correct crash-recovery path).
-        // Fall back to the other slot only if the primary checksum is bad, which
-        // indicates a crash mid-slot-write into the primary region itself.
-        const active: Slot = Slot.decode(store.map[primary_off..][0..Slot.size]) catch blk: {
-            break :blk Slot.decode(store.map[other_off..][0..Slot.size]) catch
+            // Try the primary slot first (normal path and correct crash-recovery path).
+            // Fall back to the other slot only if the primary checksum is bad, which
+            // indicates a crash mid-slot-write into the primary region itself.
+            break :active_blk Slot.decode(store.map[primary_off..][0..Slot.size]) catch fallback: {
+                break :fallback Slot.decode(store.map[other_off..][0..Slot.size]) catch
+                    return error.Corrupt;
+            };
+        } else active_blk: {
+            // Header checksum failed: the authoritative active_slot pointer is unreadable,
+            // so fall back to the highest valid-version slot. This last-resort heuristic is
+            // used ONLY when the header itself is corrupt.
+            const maybe_a: ?Slot = Slot.decode(store.map[slot_a_off..][0..Slot.size]) catch null;
+            const maybe_b: ?Slot = Slot.decode(store.map[slot_b_off..][0..Slot.size]) catch null;
+            if (maybe_a != null and maybe_b != null) {
+                break :active_blk if (maybe_a.?.version >= maybe_b.?.version) maybe_a.? else maybe_b.?;
+            } else if (maybe_a != null) {
+                break :active_blk maybe_a.?;
+            } else if (maybe_b != null) {
+                break :active_blk maybe_b.?;
+            } else {
                 return error.Corrupt;
+            }
         };
 
         // Resume arena just past the last committed byte.

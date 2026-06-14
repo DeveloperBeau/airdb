@@ -10,6 +10,37 @@ fn tmpFilePath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const
     return std.fs.path.join(allocator, &.{ dir_path, name });
 }
 
+test "recovery survives a corrupted header by falling back to the best valid slot" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "hdr.airdb");
+    defer testing.allocator.free(path);
+    {
+        var db = try airdb.Db.create(testing.allocator, path);
+        defer db.deinit();
+        var w = try db.beginWrite();
+        const a = try w.alloc(8);
+        @memcpy(a.bytes, "GOODDATA");
+        w.setRoot(a.ref);
+        _ = try w.commit();
+    }
+    { // scramble active_slot (offset 13) and the header crc (offset 28) on disk, leaving slots intact
+        const io = std.Io.Threaded.global_single_threaded.io();
+        var f = try std.Io.Dir.openFileAbsolute(io, path, .{ .mode = .read_write });
+        defer f.close(io);
+        try f.writePositionalAll(io, &[_]u8{0xAB}, 13);
+        try f.writePositionalAll(io, &[_]u8{ 0, 0, 0, 0 }, 28);
+        try f.sync(io);
+    }
+    {
+        var db = try airdb.Db.open(testing.allocator, path);
+        defer db.deinit();
+        var r = try db.beginRead();
+        try testing.expectEqualStrings("GOODDATA", try r.deref(r.root(), 8));
+        r.end();
+    }
+}
+
 test "data-barrier flush failure during commit leaves the prior version intact" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
