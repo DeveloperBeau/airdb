@@ -43,6 +43,7 @@ pub const Db = struct {
         const initial = Slot{
             .version = 1,
             .root_ref = 0,
+            .free_list_ref = 0,
             .logical_size = default_page_size,
         };
         initial.encode(store.map[slot_a_off..][0..Slot.size]);
@@ -175,6 +176,7 @@ pub const WriteTxn = struct {
         const new_slot = Slot{
             .version = self.new_version,
             .root_ref = self.new_root,
+            .free_list_ref = 0,
             .logical_size = @intCast(db.arena.top),
         };
         new_slot.encode(db.store.map[inactive_off..][0..Slot.size]);
@@ -234,7 +236,7 @@ test "recovery follows header active_slot pointer, not max version" {
         var db = try Db.create(testing.allocator, path);
         defer db.deinit();
         // Inject a plausible-but-aborted slot into slot B without touching the header.
-        const aborted = Slot{ .version = 50, .root_ref = 0, .logical_size = default_page_size };
+        const aborted = Slot{ .version = 50, .root_ref = 0, .free_list_ref = 0, .logical_size = default_page_size };
         aborted.encode(db.store.map[slot_b_off..][0..Slot.size]);
         try db.store.syncer.flush(db.store.file);
         // header.active_slot remains 0 (slot A, version 1).
