@@ -41,7 +41,7 @@ test "data-barrier flush failure during commit leaves the prior version intact" 
     { // reopen with a real syncer: must still see v1
         var db = try airdb.Db.open(testing.allocator, path);
         defer db.deinit();
-        var r = db.beginRead();
+        var r = try db.beginRead();
         try testing.expectEqualStrings("v1__", try r.deref(r.root(), 4));
     }
 }
@@ -78,7 +78,7 @@ test "header-flush failure during commit does not publish v2" {
     {
         var db = try airdb.Db.open(testing.allocator, path);
         defer db.deinit();
-        var r = db.beginRead();
+        var r = try db.beginRead();
         try testing.expectEqualStrings("v1__", try r.deref(r.root(), 4));
     }
 }
@@ -131,7 +131,89 @@ test "second commit supersedes the first on reopen" {
     {
         var db = try airdb.Db.open(testing.allocator, path);
         defer db.deinit();
-        var r = db.beginRead();
+        var r = try db.beginRead();
         try testing.expectEqualStrings("v2!!", try r.deref(r.root(), 4));
+    }
+}
+
+test "a reader pinned to an old version still reads its data after the writer reuses freed space" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "mvcc.airdb");
+    defer testing.allocator.free(path);
+    var db = try airdb.Db.create(testing.allocator, path);
+    defer db.deinit();
+
+    {
+        var w = try db.beginWrite();
+        const a = try w.alloc(8);
+        @memcpy(a.bytes, "AAAAAAAA");
+        w.setRoot(a.ref);
+        _ = try w.commit();
+    }
+
+    var reader = try db.beginRead();
+    try testing.expectEqualStrings("AAAAAAAA", try reader.deref(reader.root(), 8));
+
+    {
+        var w = try db.beginWrite();
+        const b = try w.alloc(8);
+        @memcpy(b.bytes, "BBBBBBBB");
+        try w.free(reader.root(), 8);
+        w.setRoot(b.ref);
+        _ = try w.commit();
+    }
+
+    try testing.expectEqualStrings("AAAAAAAA", try reader.deref(reader.root(), 8));
+    reader.end();
+
+    var r2 = try db.beginRead();
+    try testing.expectEqualStrings("BBBBBBBB", try r2.deref(r2.root(), 8));
+    r2.end();
+}
+
+test "freed space is reused only after the pinning reader releases" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "reclaim.airdb");
+    defer testing.allocator.free(path);
+    var db = try airdb.Db.create(testing.allocator, path);
+    defer db.deinit();
+
+    {
+        var w = try db.beginWrite();
+        const a = try w.alloc(8);
+        @memcpy(a.bytes, "AAAAAAAA");
+        w.setRoot(a.ref);
+        _ = try w.commit();
+    }
+    var reader = try db.beginRead();
+    const old_root = reader.root();
+
+    {
+        var w = try db.beginWrite();
+        const b = try w.alloc(8);
+        @memcpy(b.bytes, "BBBBBBBB");
+        try w.free(old_root, 8);
+        w.setRoot(b.ref);
+        _ = try w.commit();
+    }
+
+    // Reader still pinned: a fresh allocation must NOT land on old_root yet.
+    {
+        var w = try db.beginWrite();
+        const c = try w.alloc(8);
+        try testing.expect(c.ref != old_root);
+        w.deinit(); // abandon the probe (no commit)
+    }
+
+    reader.end(); // horizon advances past the freed version
+
+    // Now a fresh allocation may reuse old_root.
+    {
+        var w = try db.beginWrite();
+        const d = try w.alloc(8);
+        try testing.expectEqual(old_root, d.ref);
+        w.deinit();
     }
 }

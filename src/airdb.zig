@@ -1,3 +1,4 @@
+pub const freelist = @import("freelist.zig");
 pub const Ref = @import("ref.zig").Ref;
 pub const node = @import("node.zig");
 pub const file_store = @import("file_store.zig");

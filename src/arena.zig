@@ -1,5 +1,6 @@
 const std = @import("std");
 const Ref = @import("ref.zig").Ref;
+const FreeList = @import("freelist.zig").FreeList;
 
 pub const Allocation = struct { ref: Ref, bytes: []u8 };
 
@@ -19,6 +20,15 @@ pub const Arena = struct {
         const ref: Ref = @intCast(aligned);
         self.top = aligned + size;
         return .{ .ref = ref, .bytes = self.map[aligned .. aligned + size] };
+    }
+
+    pub fn allocReusing(self: *Arena, size: usize, fl: *FreeList, horizon: u64) error{OutOfSpace}!Allocation {
+        const aligned_size = std.mem.alignForward(usize, size, 8);
+        if (fl.reuse(aligned_size, horizon)) |off| {
+            const offu: usize = @intCast(off);
+            return .{ .ref = off, .bytes = self.map[offu .. offu + size] };
+        }
+        return self.alloc(size);
     }
 
     // The single bounds-checked chokepoint. All reads go through here.
@@ -52,6 +62,23 @@ test "deref rejects an out-of-range or misaligned or null ref" {
     try testing.expectError(error.BadRef, arena.deref(backing.len + 8, 8));
     try testing.expectError(error.BadRef, arena.deref(7, 8)); // misaligned
     try testing.expectError(error.BadRef, arena.deref(0, 8)); // null ref
+}
+
+test "allocReusing reuses a freed extent below the horizon, else bumps" {
+    const backing = try testing.allocator.alloc(u8, 4096 * 4);
+    defer testing.allocator.free(backing);
+    var arena = Arena.init(backing, 4096);
+
+    var fl = @import("freelist.zig").FreeList.init(testing.allocator);
+    defer fl.deinit();
+    try fl.add(.{ .offset = 4096, .len = 64, .freed_version = 2 });
+
+    const bumped = try arena.allocReusing(16, &fl, 1); // horizon 1 < freed 2: bump
+    try testing.expect(bumped.ref >= 4096);
+    try testing.expectEqual(@as(usize, 1), fl.extents.items.len);
+
+    const reused = try arena.allocReusing(16, &fl, 2); // horizon 2 >= freed 2: reuse
+    try testing.expectEqual(@as(u64, 4096), reused.ref);
 }
 
 test "alloc fails cleanly when the arena is full" {
