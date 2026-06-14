@@ -75,6 +75,29 @@ test "header-flush failure during commit does not publish v2" {
     }
 }
 
+test "opening a file with bad magic fails cleanly" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "bad.airdb");
+    defer testing.allocator.free(path);
+
+    // Create a real db, then corrupt the magic bytes on disk.
+    {
+        var db = try airdb.Db.create(testing.allocator, path);
+        db.deinit();
+    }
+    {
+        // Overwrite the first 8 bytes (the magic) with garbage using Zig 0.16
+        // positional writes (file.writePositionalAll), which map to pwrite syscall.
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const f = try std.Io.Dir.openFileAbsolute(io, path, .{ .mode = .read_write });
+        defer f.close(io);
+        try f.writePositionalAll(io, &[_]u8{ 0xDE, 0xAD, 0xBE, 0xEF, 0, 0, 0, 0 }, 0);
+        try f.sync(io);
+    }
+    try testing.expectError(error.BadMagic, airdb.Db.open(testing.allocator, path));
+}
+
 test "second commit supersedes the first on reopen" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
