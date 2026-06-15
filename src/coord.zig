@@ -106,6 +106,31 @@ pub const Coord = struct {
     pub fn latestVersion(self: *Coord) u64 {
         return @atomicLoad(u64, self.latestPtr(), .acquire);
     }
+
+    /// Block until this process/thread holds an exclusive flock on the coord file.
+    pub fn lockExclusive(self: *Coord) !void {
+        const rc = std.c.flock(self.file.handle, std.posix.LOCK.EX);
+        switch (std.c.errno(rc)) {
+            .SUCCESS => {},
+            else => |e| return std.posix.unexpectedErrno(e),
+        }
+    }
+
+    /// Non-blocking exclusive flock attempt.
+    /// Returns error.WouldBlock immediately if another holder holds the lock.
+    pub fn tryLockExclusive(self: *Coord) !void {
+        const rc = std.c.flock(self.file.handle, std.posix.LOCK.EX | std.posix.LOCK.NB);
+        switch (std.c.errno(rc)) {
+            .SUCCESS => {},
+            .AGAIN => return error.WouldBlock,
+            else => |e| return std.posix.unexpectedErrno(e),
+        }
+    }
+
+    /// Release the flock held by this file description.
+    pub fn unlock(self: *Coord) void {
+        _ = std.c.flock(self.file.handle, std.posix.LOCK.UN);
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -143,4 +168,24 @@ test "latest_version round-trips through the mapping" {
     defer c.deinit();
     c.setLatestVersion(42);
     try testing.expectEqual(@as(u64, 42), c.latestVersion());
+}
+
+test "exclusive lock blocks a second holder via the same coord file" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dlen = try tmp.dir.realPath(coordIo(), &path_buf);
+    const cpath = try std.fs.path.join(testing.allocator, &.{ path_buf[0..dlen], "z.coord" });
+    defer testing.allocator.free(cpath);
+
+    var a = try Coord.openOrCreate(cpath);
+    defer a.deinit();
+    var b = try Coord.openOrCreate(cpath); // separate open file description -> independent flock that contends
+    defer b.deinit();
+
+    try a.lockExclusive();
+    try testing.expectError(error.WouldBlock, b.tryLockExclusive());
+    a.unlock();
+    try b.tryLockExclusive();
+    b.unlock();
 }
