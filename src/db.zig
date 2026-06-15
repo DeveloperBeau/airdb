@@ -75,7 +75,10 @@ pub const Db = struct {
         const coord_path = try std.fmt.allocPrint(allocator, "{s}.coord", .{path});
         defer allocator.free(coord_path);
         var coord = try Coord.openOrCreate(coord_path);
-        errdefer { _ = coord.detach(); coord.deinit(); }
+        errdefer {
+            _ = coord.detach();
+            coord.deinit();
+        }
         _ = coord.attach();
 
         return Db{
@@ -131,7 +134,10 @@ pub const Db = struct {
         const coord_path = try std.fmt.allocPrint(allocator, "{s}.coord", .{path});
         defer allocator.free(coord_path);
         var coord = try Coord.openOrCreate(coord_path);
-        errdefer { _ = coord.detach(); coord.deinit(); }
+        errdefer {
+            _ = coord.detach();
+            coord.deinit();
+        }
         _ = coord.attach();
 
         db.coord = coord;
@@ -263,9 +269,11 @@ pub const Db = struct {
         return min orelse self.active_version;
     }
 
-    pub fn beginWrite(self: *Db) !WriteTxn {
-        // Refresh from the shared mapping before building the write transaction.
-        // Safe here because no write transaction is in progress when beginWrite is called.
+    /// Shared body for beginWrite and beginWriteTry. Caller must hold the coord
+    /// lock before calling; an errdefer in the caller releases the lock if this
+    /// function returns an error.
+    fn beginWriteLocked(self: *Db) !WriteTxn {
+        // Refresh under the lock so the writer sees the truly-latest committed version.
         try self.refreshToLatest();
         // Clone the committed free list into work_freelist so the transaction
         // can reuse extents from it. db.free_list is untouched during the txn;
@@ -282,6 +290,23 @@ pub const Db = struct {
             .in_flight_frees = .empty,
             .work_freelist = work_freelist,
         };
+    }
+
+    /// Begin a write transaction, blocking until the cross-process write lock is
+    /// acquired. The lock is released when the returned WriteTxn is committed or
+    /// abandoned via deinit.
+    pub fn beginWrite(self: *Db) !WriteTxn {
+        try self.coord.lockExclusive();
+        errdefer self.coord.unlock(); // release if refresh or setup fails
+        return self.beginWriteLocked();
+    }
+
+    /// Like beginWrite but returns error.WouldBlock immediately if another writer
+    /// currently holds the lock.
+    pub fn beginWriteTry(self: *Db) !WriteTxn {
+        try self.coord.tryLockExclusive();
+        errdefer self.coord.unlock(); // release if refresh or setup fails
+        return self.beginWriteLocked();
     }
 
     /// Test-only accessor: number of extents in the committed free list.
@@ -355,7 +380,12 @@ pub const WriteTxn = struct {
     work_freelist: FreeList,
 
     pub fn alloc(self: *WriteTxn, size: usize) !Allocation {
-        return self.db.arena.allocReusing(size, &self.work_freelist, self.db.horizon());
+        // When more than one instance/process is attached, disable reuse (bump-only)
+        // so a writer never overwrites space a reader in another process might still
+        // see. A horizon of 0 makes no freed extent (tagged with version >= 2) qualify
+        // for reuse.
+        const h: u64 = if (self.db.coord.attachCount() > 1) 0 else self.db.horizon();
+        return self.db.arena.allocReusing(size, &self.work_freelist, h);
     }
 
     pub fn setRoot(self: *WriteTxn, ref: Ref) void {
@@ -381,6 +411,7 @@ pub const WriteTxn = struct {
     pub fn deinit(self: *WriteTxn) void {
         self.in_flight_frees.deinit(self.db.store.allocator);
         self.work_freelist.deinit();
+        self.db.coord.unlock();
     }
 
     /// Two-slot atomic durable commit.
@@ -464,7 +495,10 @@ pub const WriteTxn = struct {
 
         // Step 3: flush new data + inactive slot to durable storage.
         // Failure here: old active slot is still valid; no in-memory state changed.
-        db.store.syncer.flush(db.store.file) catch return error.Durability;
+        db.store.syncer.flush(db.store.file) catch {
+            self.db.coord.unlock();
+            return error.Durability;
+        };
 
         // Step 4: flip the header commit pointer and flush (commit point).
         db.store.header.active_slot = inactive_idx;
@@ -477,6 +511,7 @@ pub const WriteTxn = struct {
             // Restore the mmap bytes to match the reverted header so subsequent
             // persistHeader calls (from the next commit attempt) write the right value.
             db.store.persistHeader();
+            self.db.coord.unlock();
             return error.Durability;
         };
 
@@ -492,6 +527,7 @@ pub const WriteTxn = struct {
         db.free_list_node_len = node_len;
         self.in_flight_frees.deinit(self.db.store.allocator);
         self.work_freelist.deinit();
+        self.db.coord.unlock();
         return self.new_version;
     }
 };
@@ -754,7 +790,9 @@ test "a second Db instance sees a commit made by the first after refresh-on-read
     defer b.deinit();
     {
         var w = try a.beginWrite();
-        const x = try w.alloc(8); @memcpy(x.bytes, "SHARED!!"); w.setRoot(x.ref);
+        const x = try w.alloc(8);
+        @memcpy(x.bytes, "SHARED!!");
+        w.setRoot(x.ref);
         _ = try w.commit();
     }
     var r = try b.beginRead();
@@ -771,7 +809,9 @@ test "refresh does not advance to a durable-but-unpublished (aborted) slot" {
     defer db.deinit();
     {
         var w = try db.beginWrite();
-        const a = try w.alloc(8); @memcpy(a.bytes, "PUBLISH_"); w.setRoot(a.ref);
+        const a = try w.alloc(8);
+        @memcpy(a.bytes, "PUBLISH_");
+        w.setRoot(a.ref);
         _ = try w.commit(); // publishes; coord.latest_version advances to this version
     }
     const published_version = db.active_version;
@@ -786,4 +826,62 @@ test "refresh does not advance to a durable-but-unpublished (aborted) slot" {
     // Refresh must NOT advance to the forged version (coord.latest_version unchanged).
     try db.refreshToLatest();
     try testing.expectEqual(published_version, db.active_version);
+}
+
+test "a second writer is excluded while the first holds the write lock" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "excl.airdb");
+    defer testing.allocator.free(path);
+    var a = try Db.create(testing.allocator, path);
+    defer a.deinit();
+    var b = try Db.open(testing.allocator, path);
+    defer b.deinit();
+    var wa = try a.beginWrite();
+    try testing.expectError(error.WouldBlock, b.beginWriteTry());
+    const x = try wa.alloc(8);
+    @memcpy(x.bytes, "FIRST!!!");
+    wa.setRoot(x.ref);
+    _ = try wa.commit();
+    var wb = try b.beginWriteTry();
+    wb.deinit();
+}
+
+test "reuse is disabled while more than one instance is attached" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "noreuse.airdb");
+    defer testing.allocator.free(path);
+    var a = try Db.create(testing.allocator, path);
+    {
+        var w = try a.beginWrite();
+        const x = try w.alloc(8);
+        @memcpy(x.bytes, "AAAAAAAA");
+        w.setRoot(x.ref);
+        _ = try w.commit();
+    }
+    const old_root = a.active_root;
+    {
+        var w = try a.beginWrite();
+        const y = try w.alloc(8);
+        @memcpy(y.bytes, "BBBBBBBB");
+        try w.free(old_root, 8);
+        w.setRoot(y.ref);
+        _ = try w.commit();
+    }
+    var b = try Db.open(testing.allocator, path); // attach_count == 2
+    {
+        var w = try a.beginWrite();
+        const c = try w.alloc(8);
+        try testing.expect(c.ref != old_root); // bump, not reuse
+        w.deinit();
+    }
+    b.deinit(); // back to 1
+    {
+        var w = try a.beginWrite();
+        const d = try w.alloc(8);
+        try testing.expectEqual(old_root, d.ref); // reuse resumes
+        w.deinit();
+    }
+    a.deinit();
 }
