@@ -199,26 +199,45 @@ pub const Db = struct {
         self.free_list_node_len = node_len;
     }
 
+    /// Select the highest-version slot that qualifies as published (version <= lv).
+    /// Decodes both slot A and slot B; among those that decode successfully and
+    /// have version <= lv, returns the one with the highest version. Returns null
+    /// if no qualifying slot exists. Slots with version > lv are in-flight or
+    /// aborted and must never be returned.
+    fn selectPublishedSlot(self: *Db, lv: u64) ?Slot {
+        const maybe_a: ?Slot = Slot.decode(self.store.map[slot_a_off..][0..Slot.size]) catch null;
+        const maybe_b: ?Slot = Slot.decode(self.store.map[slot_b_off..][0..Slot.size]) catch null;
+        var best: ?Slot = null;
+        for ([_]?Slot{ maybe_a, maybe_b }) |ms| {
+            const s = ms orelse continue;
+            if (s.version > lv) continue;
+            if (best == null or s.version > best.?.version) best = s;
+        }
+        return best;
+    }
+
     /// Refresh this instance's in-memory view from the shared memory mapping.
-    /// Re-reads the header and, if a newer committed version is present, updates
-    /// active_version, active_root, arena.top, and the free list.
+    /// Gates advancement on coord.latestVersion() so that a slot written by an
+    /// aborted commit (durable data barrier but failed header flush) is never
+    /// observed. Only a version <= the published latest_version may be adopted.
     ///
     /// Safety: must only be called when no write transaction is in progress.
     /// It is called at the start of beginRead and beginWrite (before any txn
     /// state is built), which is safe.
     fn refreshToLatest(self: *Db) !void {
-        try self.store.readHeader(); // re-parse header from the shared mapping
-        const active = try self.selectActiveSlot();
-        if (active.version <= self.active_version) return; // nothing newer
-        self.active_version = active.version;
-        self.active_root = active.root_ref;
-        self.arena.top = @intCast(active.logical_size);
-        // Reload the free list from the newer slot.
+        const lv = self.coord.latestVersion(); // acquire-load of the published version
+        if (lv <= self.active_version) return; // nothing newer has been published
+        try self.store.readHeader(); // refresh header_checksum_ok / mapping view (for integrity use elsewhere)
+        const published = self.selectPublishedSlot(lv) orelse return; // no qualifying published slot visible yet
+        if (published.version <= self.active_version) return;
+        self.active_version = published.version;
+        self.active_root = published.root_ref;
+        self.arena.top = @intCast(published.logical_size);
         self.free_list.deinit();
         self.free_list = FreeList.init(self.store.allocator);
         self.free_list_node_ref = 0;
         self.free_list_node_len = 0;
-        if (active.free_list_ref != 0) try self.loadFreeList(active.free_list_ref);
+        if (published.free_list_ref != 0) try self.loadFreeList(published.free_list_ref);
     }
 
     pub fn beginRead(self: *Db) !ReadTxn {
@@ -741,4 +760,30 @@ test "a second Db instance sees a commit made by the first after refresh-on-read
     var r = try b.beginRead();
     try testing.expectEqualStrings("SHARED!!", try r.deref(r.root(), 8));
     r.end();
+}
+
+test "refresh does not advance to a durable-but-unpublished (aborted) slot" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "unpub.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    {
+        var w = try db.beginWrite();
+        const a = try w.alloc(8); @memcpy(a.bytes, "PUBLISH_"); w.setRoot(a.ref);
+        _ = try w.commit(); // publishes; coord.latest_version advances to this version
+    }
+    const published_version = db.active_version;
+    // Forge a VALID slot with a much higher version into the inactive slot bytes,
+    // WITHOUT advancing coord.latest_version (simulates an aborted-but-durable commit).
+    const forged = Slot{ .version = published_version + 50, .root_ref = 0, .free_list_ref = 0, .logical_size = default_page_size };
+    var buf: [Slot.size]u8 = undefined;
+    forged.encode(&buf);
+    // Write it into whichever slot is currently inactive. The active slot is header.active_slot.
+    const inactive_off: usize = if (db.store.header.active_slot == 0) slot_b_off else slot_a_off;
+    @memcpy(db.store.map[inactive_off .. inactive_off + Slot.size], &buf);
+    // Refresh must NOT advance to the forged version (coord.latest_version unchanged).
+    try db.refreshToLatest();
+    try testing.expectEqual(published_version, db.active_version);
 }
