@@ -17,6 +17,7 @@ const Ref = @import("ref.zig").Ref;
 const Slot = @import("slots.zig").Slot;
 const FreeExtent = @import("freelist.zig").FreeExtent;
 const FreeList = @import("freelist.zig").FreeList;
+const Coord = @import("coord.zig").Coord;
 
 const slot_a_off: usize = 64;
 const slot_b_off: usize = 128;
@@ -45,6 +46,8 @@ pub const Db = struct {
     free_list_node_ref: Ref,
     /// Byte length of the live free-list node on disk (0 if none).
     free_list_node_len: usize,
+    /// Coordination file for multi-process attach count and latest-version signal.
+    coord: Coord,
 
     /// Create a new database file at the given absolute path.
     pub fn create(allocator: std.mem.Allocator, path: []const u8) !Db {
@@ -68,6 +71,13 @@ pub const Db = struct {
         store.persistHeader();
         try store.syncer.flush(store.file);
 
+        // Coord setup -- done last so the errdefer has no further try-s after it.
+        const coord_path = try std.fmt.allocPrint(allocator, "{s}.coord", .{path});
+        defer allocator.free(coord_path);
+        var coord = try Coord.openOrCreate(coord_path);
+        errdefer { _ = coord.detach(); coord.deinit(); }
+        _ = coord.attach();
+
         return Db{
             .store = store,
             .arena = Arena.init(store.map, default_page_size),
@@ -77,6 +87,7 @@ pub const Db = struct {
             .free_list = FreeList.init(allocator),
             .free_list_node_ref = 0,
             .free_list_node_len = 0,
+            .coord = coord,
         };
     }
 
@@ -146,6 +157,13 @@ pub const Db = struct {
             free_list_node_len = node_len;
         }
 
+        // Coord setup -- done last so the errdefer has no further try-s after it.
+        const coord_path = try std.fmt.allocPrint(allocator, "{s}.coord", .{path});
+        defer allocator.free(coord_path);
+        var coord = try Coord.openOrCreate(coord_path);
+        errdefer { _ = coord.detach(); coord.deinit(); }
+        _ = coord.attach();
+
         return Db{
             .store = store,
             .arena = arena,
@@ -155,10 +173,13 @@ pub const Db = struct {
             .free_list = free_list,
             .free_list_node_ref = free_list_node_ref,
             .free_list_node_len = free_list_node_len,
+            .coord = coord,
         };
     }
 
     pub fn deinit(self: *Db) void {
+        _ = self.coord.detach();
+        self.coord.deinit();
         self.free_list.deinit();
         self.pins.deinit();
         self.store.deinit();
@@ -401,6 +422,7 @@ pub const WriteTxn = struct {
         // Step 5: publish the new version in memory only after both flushes succeed.
         db.active_version = self.new_version;
         db.active_root = self.new_root;
+        db.coord.setLatestVersion(self.new_version);
         // Install the new free list. errdefer for new_fl will NOT fire here
         // because we are on the success return path (return self.new_version below).
         db.free_list.deinit();
@@ -646,4 +668,16 @@ test "verifyIntegrity detects a free extent out of bounds" {
     // Inject an extent whose offset is past the mapped region.
     try db.free_list.extents.append(db.store.allocator, .{ .offset = @intCast(db.store.map.len + 8), .len = 8, .freed_version = 1 });
     try testing.expectError(error.FreeExtentOutOfBounds, db.verifyIntegrity());
+}
+
+test "two Db instances on one file share a coordination attach count" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "share.airdb");
+    defer testing.allocator.free(path);
+    var a = try Db.create(testing.allocator, path);
+    defer a.deinit();
+    var b = try Db.open(testing.allocator, path);
+    defer b.deinit();
+    try testing.expectEqual(@as(u32, 2), a.coord.attachCount());
 }
