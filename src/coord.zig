@@ -38,6 +38,22 @@ fn currentPid() u32 {
     return @intCast(std.c.getpid());
 }
 
+/// Returns true if the process with the given pid is alive.
+/// pid==0 is always considered dead (free slot sentinel).
+/// Uses kill(pid, 0): success or EPERM means alive; ESRCH means dead.
+fn pidAlive(pid: u32) bool {
+    if (pid == 0) return false;
+    std.posix.kill(
+        @as(std.posix.pid_t, @intCast(pid)),
+        @as(std.posix.SIG, @enumFromInt(0)),
+    ) catch |e| switch (e) {
+        error.ProcessNotFound => return false, // ESRCH: no such process
+        error.PermissionDenied => return true, // EPERM: alive, not ours
+        else => return true, // conservative: treat unknown errors as alive
+    };
+    return true;
+}
+
 pub const Coord = struct {
     file: std.Io.File,
     map: []align(std.heap.page_size_min) u8,
@@ -186,6 +202,33 @@ pub const Coord = struct {
     pub fn slotPidForTest(self: *Coord, idx: usize) u32 {
         return @atomicLoad(u32, self.slotPidPtr(idx), .seq_cst);
     }
+
+    /// Compute the global reclaim horizon: the minimum min_pinned across all
+    /// live participant slots. Slots whose process no longer exists are
+    /// reclaimed (pid zeroed) in the same pass. Returns `fallback` if no
+    /// live slot publishes a pinned version below it.
+    pub fn globalHorizon(self: *Coord, fallback: u64) u64 {
+        var min_v: u64 = fallback;
+        var i: usize = 0;
+        while (i < participant_slots) : (i += 1) {
+            const pid = @atomicLoad(u32, self.slotPidPtr(i), .seq_cst);
+            if (pid == 0) continue;
+            if (!pidAlive(pid)) {
+                @atomicStore(u32, self.slotPidPtr(i), 0, .seq_cst); // reclaim dead slot
+                continue;
+            }
+            const mp = @atomicLoad(u64, self.slotMinPtr(i), .acquire);
+            if (mp < min_v) min_v = mp;
+        }
+        return min_v;
+    }
+
+    /// Test helper: write a slot directly without going through claimSlot.
+    /// Allows tests to simulate a slot owned by an arbitrary (possibly dead) pid.
+    pub fn forgeSlotForTest(self: *Coord, idx: usize, pid: u32, min_pinned: u64) void {
+        @atomicStore(u64, self.slotMinPtr(idx), min_pinned, .seq_cst);
+        @atomicStore(u32, self.slotPidPtr(idx), pid, .seq_cst);
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -275,4 +318,38 @@ test "two claims get distinct slots" {
     try testing.expect(a != b);
     c.releaseSlot(a);
     c.releaseSlot(b);
+}
+
+test "globalHorizon is the min of live slots min_pinned, clamped to fallback" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dlen = try tmp.dir.realPath(coordIo(), &path_buf);
+    const cpath = try std.fs.path.join(testing.allocator, &.{ path_buf[0..dlen], "gh.coord" });
+    defer testing.allocator.free(cpath);
+    var c = try Coord.openOrCreate(cpath);
+    defer c.deinit();
+    const a = (try c.claimSlot()).?;
+    c.publishMinPinned(a, 5);
+    try testing.expectEqual(@as(u64, 5), c.globalHorizon(100));
+    c.publishMinPinned(a, sentinel_max);
+    try testing.expectEqual(@as(u64, 100), c.globalHorizon(100));
+    c.releaseSlot(a);
+}
+
+test "globalHorizon ignores and reclaims a dead-pid slot" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dlen = try tmp.dir.realPath(coordIo(), &path_buf);
+    const cpath = try std.fs.path.join(testing.allocator, &.{ path_buf[0..dlen], "dead.coord" });
+    defer testing.allocator.free(cpath);
+    var c = try Coord.openOrCreate(cpath);
+    defer c.deinit();
+    const live = (try c.claimSlot()).?;
+    c.publishMinPinned(live, sentinel_max);
+    c.forgeSlotForTest(1, 0x7fffffff, 3); // an almost-certainly-dead pid with a low min_pinned
+    try testing.expectEqual(@as(u64, 50), c.globalHorizon(50));
+    try testing.expectEqual(@as(u32, 0), c.slotPidForTest(1)); // reclaimed
+    c.releaseSlot(live);
 }
