@@ -378,11 +378,38 @@ test "set on a multi-level column leaves the old root snapshot unchanged" {
     while (i < 1000) : (i += 1) root = try append(&w, root, i);
     const old_root = root;
     const new_root = try set(&w, root, 500, 999999);
-    try testing.expectEqual(@as(u64, 500), try get(&w, old_root, 500));     // old snapshot unchanged
-    try testing.expectEqual(@as(u64, 999999), try get(&w, new_root, 500));  // new root updated
+    try testing.expectEqual(@as(u64, 500), try get(&w, old_root, 500)); // old snapshot unchanged
+    try testing.expectEqual(@as(u64, 999999), try get(&w, new_root, 500)); // new root updated
     try testing.expectEqual(try len(&w, old_root), try len(&w, new_root));
     // a few other indices match between old and new (shared subtrees)
     try testing.expectEqual(try get(&w, old_root, 0), try get(&w, new_root, 0));
     try testing.expectEqual(try get(&w, old_root, 999), try get(&w, new_root, 999));
     w.deinit();
+}
+
+test "a column persisted as the root survives commit and reopen" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try colTmpPath(testing.allocator, &tmp, "col6.airdb");
+    defer testing.allocator.free(path);
+    {
+        var db = try Db.create(testing.allocator, path);
+        defer db.deinit();
+        var w = try db.beginWrite();
+        var root = try create(&w);
+        var i: u64 = 0;
+        while (i < 2000) : (i += 1) root = try append(&w, root, i * 3);
+        w.setRoot(root);
+        _ = try w.commit();
+    }
+    {
+        var db = try Db.open(testing.allocator, path);
+        defer db.deinit();
+        var r = try db.beginRead();
+        try testing.expectEqual(@as(u64, 2000), try len(&r, r.root()));
+        try testing.expectEqual(@as(u64, 1999 * 3), try get(&r, r.root(), 1999));
+        try testing.expectEqual(@as(u64, 0), try get(&r, r.root(), 0));
+        try testing.expectEqual(@as(u64, 1000 * 3), try get(&r, r.root(), 1000));
+        r.end();
+    }
 }
