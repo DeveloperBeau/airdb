@@ -10,6 +10,37 @@ fn tmpFilePath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const
     return std.fs.path.join(allocator, &.{ dir_path, name });
 }
 
+test "recovery survives a corrupted header by falling back to the best valid slot" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "hdr.airdb");
+    defer testing.allocator.free(path);
+    {
+        var db = try airdb.Db.create(testing.allocator, path);
+        defer db.deinit();
+        var w = try db.beginWrite();
+        const a = try w.alloc(8);
+        @memcpy(a.bytes, "GOODDATA");
+        w.setRoot(a.ref);
+        _ = try w.commit();
+    }
+    { // scramble active_slot (offset 13) and the header crc (offset 28) on disk, leaving slots intact
+        const io = std.Io.Threaded.global_single_threaded.io();
+        var f = try std.Io.Dir.openFileAbsolute(io, path, .{ .mode = .read_write });
+        defer f.close(io);
+        try f.writePositionalAll(io, &[_]u8{0xAB}, 13);
+        try f.writePositionalAll(io, &[_]u8{ 0, 0, 0, 0 }, 28);
+        try f.sync(io);
+    }
+    {
+        var db = try airdb.Db.open(testing.allocator, path);
+        defer db.deinit();
+        var r = try db.beginRead();
+        try testing.expectEqualStrings("GOODDATA", try r.deref(r.root(), 8));
+        r.end();
+    }
+}
+
 test "data-barrier flush failure during commit leaves the prior version intact" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -215,5 +246,73 @@ test "freed space is reused only after the pinning reader releases" {
         const d = try w.alloc(8);
         try testing.expectEqual(old_root, d.ref);
         w.deinit();
+    }
+}
+
+test "after a data-barrier flush failure, the reopened db passes verifyIntegrity and shows the prior version" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "cm1.airdb");
+    defer testing.allocator.free(path);
+    {
+        var db = try airdb.Db.create(testing.allocator, path);
+        defer db.deinit();
+        var w = try db.beginWrite();
+        const a = try w.alloc(8);
+        @memcpy(a.bytes, "BASELINE");
+        w.setRoot(a.ref);
+        _ = try w.commit();
+    }
+    {
+        var fsync = airdb.FailingSyncer{ .fail_on = 1 }; // fail the data barrier
+        var db = try airdb.Db.openWith(testing.allocator, path, fsync.any());
+        defer db.deinit();
+        var w = try db.beginWrite();
+        const b = try w.alloc(8);
+        @memcpy(b.bytes, "NEWERVAL");
+        w.setRoot(b.ref);
+        try testing.expectError(error.Durability, w.commit());
+    }
+    {
+        var db = try airdb.Db.open(testing.allocator, path);
+        defer db.deinit();
+        try db.verifyIntegrity();
+        var r = try db.beginRead();
+        try testing.expectEqualStrings("BASELINE", try r.deref(r.root(), 8));
+        r.end();
+    }
+}
+
+test "after a header-flush failure, the reopened db passes verifyIntegrity and shows the prior version" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "cm2.airdb");
+    defer testing.allocator.free(path);
+    {
+        var db = try airdb.Db.create(testing.allocator, path);
+        defer db.deinit();
+        var w = try db.beginWrite();
+        const a = try w.alloc(8);
+        @memcpy(a.bytes, "BASELINE");
+        w.setRoot(a.ref);
+        _ = try w.commit();
+    }
+    {
+        var fsync = airdb.FailingSyncer{ .fail_on = 2 }; // data barrier ok, header flush fails
+        var db = try airdb.Db.openWith(testing.allocator, path, fsync.any());
+        defer db.deinit();
+        var w = try db.beginWrite();
+        const b = try w.alloc(8);
+        @memcpy(b.bytes, "NEWERVAL");
+        w.setRoot(b.ref);
+        try testing.expectError(error.Durability, w.commit());
+    }
+    {
+        var db = try airdb.Db.open(testing.allocator, path);
+        defer db.deinit();
+        try db.verifyIntegrity();
+        var r = try db.beginRead();
+        try testing.expectEqualStrings("BASELINE", try r.deref(r.root(), 8));
+        r.end();
     }
 }

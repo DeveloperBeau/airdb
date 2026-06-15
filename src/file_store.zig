@@ -16,6 +16,7 @@
 //       (always initialized; works in both test and production contexts)
 
 const std = @import("std");
+const builtin = @import("builtin");
 const testing = std.testing;
 const Io = std.Io;
 
@@ -50,14 +51,32 @@ pub const Syncer = struct {
     }
 };
 
-/// Production syncer that calls fsync via the blocking Io vtable.
+/// Durability barrier: uses F_FULLFSYNC on Apple targets (forces drive write-cache flush),
+/// plain fsync everywhere else.
+///
+/// In Zig 0.16, std.posix.fcntl does not exist. We call std.c.fcntl (the libc extern)
+/// with std.c.F.FULLFSYNC (value 51, Darwin-only) and check the result via std.c.errno.
+/// The comptime isDarwin() guard ensures the Darwin branch is never compiled on other targets.
+fn fullSync(file: Io.File) !void {
+    if (comptime builtin.target.os.tag.isDarwin()) {
+        // F_FULLFSYNC (51) forces the drive's write cache to platter, unlike plain fsync.
+        // Fall back to file.sync if the underlying filesystem does not support it (e.g. tmpfs).
+        const rc = std.c.fcntl(file.handle, std.c.F.FULLFSYNC, @as(c_int, 0));
+        if (std.c.errno(rc) != .SUCCESS) {
+            try file.sync(std.Io.Threaded.global_single_threaded.io());
+        }
+    } else {
+        try file.sync(std.Io.Threaded.global_single_threaded.io());
+    }
+}
+
+/// Production syncer that calls the platform durability barrier.
 pub const RealSyncer = struct {
     var instance: RealSyncer = .{};
 
     fn flushImpl(ptr: *anyopaque, file: Io.File) anyerror!void {
         _ = ptr;
-        // TODO Phase 3: F_FULLFSYNC on Apple
-        try file.sync(std.Io.Threaded.global_single_threaded.io());
+        try fullSync(file);
     }
 
     pub fn any() Syncer {
@@ -78,6 +97,10 @@ pub const FileStore = struct {
     map: []align(std.heap.page_size_min) u8,
     header: Header,
     syncer: Syncer,
+    /// True when the header CRC32 matches the stored checksum at [28..32].
+    /// Set by readHeader (open path) or to true after writeHeader (create/persistHeader path).
+    /// Recovery in db.zig openWith reads this to decide whether to trust active_slot.
+    header_checksum_ok: bool,
 
     const initial_capacity: usize = default_page_size * 256;
 
@@ -127,8 +150,10 @@ pub const FileStore = struct {
                 .logical_size = default_page_size,
             },
             .syncer = syncer,
+            .header_checksum_ok = false, // set to true after writeHeader below
         };
         fs.writeHeader();
+        fs.header_checksum_ok = true;
         try fs.syncer.flush(fs.file);
         return fs;
     }
@@ -163,6 +188,7 @@ pub const FileStore = struct {
             .map = map,
             .header = undefined,
             .syncer = syncer,
+            .header_checksum_ok = false, // set by readHeader below
         };
         try fs.readHeader();
         return fs;
@@ -175,12 +201,14 @@ pub const FileStore = struct {
     }
 
     // Header byte layout (fixed):
-    //   [0..8]   magic       u64 LE
-    //   [8..12]  page_size   u32 LE
-    //   [12]     endianness  u8
-    //   [13]     active_slot u8
-    //   [14..16] reserved
+    //   [0..8]   magic        u64 LE
+    //   [8..12]  page_size    u32 LE
+    //   [12]     endianness   u8
+    //   [13]     active_slot  u8
+    //   [14..16] reserved     (zero)
     //   [16..24] logical_size u64 LE
+    //   [24..28] reserved     (zero, covered by checksum)
+    //   [28..32] checksum     CRC32 of [0..28], u32 LE
 
     const off = struct {
         const magic: usize = 0;
@@ -188,6 +216,8 @@ pub const FileStore = struct {
         const endianness: usize = 12;
         const active_slot: usize = 13;
         const logical_size: usize = 16;
+        // [24..28] reserved -- zeroed before hashing, covered by checksum
+        const checksum: usize = 28;
     };
 
     fn writeHeader(self: *FileStore) void {
@@ -195,8 +225,14 @@ pub const FileStore = struct {
         std.mem.writeInt(u32, self.map[off.page_size..][0..4], self.header.page_size, .little);
         self.map[off.endianness] = @intFromEnum(self.header.endianness);
         self.map[off.active_slot] = self.header.active_slot;
-        // [14..16] reserved -- leave as zero
+        // [14..16] reserved -- zero explicitly so the CRC is deterministic
+        @memset(self.map[14..16], 0);
         std.mem.writeInt(u64, self.map[off.logical_size..][0..8], self.header.logical_size, .little);
+        // [24..28] reserved -- zero explicitly so the CRC is deterministic
+        @memset(self.map[24..28], 0);
+        // CRC32 over [0..28] written little-endian at [28..32]
+        const crc = std.hash.Crc32.hash(self.map[0..28]);
+        std.mem.writeInt(u32, self.map[off.checksum..][0..4], crc, .little);
     }
 
     fn readHeader(self: *FileStore) !void {
@@ -216,6 +252,13 @@ pub const FileStore = struct {
         const active_slot = self.map[off.active_slot];
         const logical_size = std.mem.readInt(u64, self.map[off.logical_size..][0..8], .little);
 
+        // Validate header CRC32: hash [0..28], compare to stored u32 at [28..32].
+        // A mismatch sets header_checksum_ok = false but does NOT hard-fail;
+        // db.zig openWith decides how to recover.
+        const stored_crc = std.mem.readInt(u32, self.map[off.checksum..][0..4], .little);
+        const computed_crc = std.hash.Crc32.hash(self.map[0..28]);
+        self.header_checksum_ok = (stored_crc == computed_crc);
+
         self.header = .{
             .magic = magic,
             .page_size = page_size,
@@ -229,6 +272,13 @@ pub const FileStore = struct {
     // Writes the in-memory header into the mmap'd buffer. Durability requires a subsequent Syncer.flush.
     pub fn persistHeader(self: *FileStore) void {
         self.writeHeader();
+        self.header_checksum_ok = true;
+    }
+
+    /// Test-only: re-parse the header from the current mmap contents.
+    /// Used to observe header_checksum_ok after in-place map tampering.
+    pub fn reReadHeaderForTest(self: *FileStore) !void {
+        try self.readHeader();
     }
 };
 
@@ -242,7 +292,7 @@ pub const FailingSyncer = struct {
         const self: *FailingSyncer = @ptrCast(@alignCast(ptr));
         self.count += 1;
         if (self.count == self.fail_on) return error.SimulatedCrash;
-        try file.sync(std.Io.Threaded.global_single_threaded.io());
+        try fullSync(file);
     }
 
     pub fn any(self: *FailingSyncer) Syncer {
@@ -253,6 +303,41 @@ pub const FailingSyncer = struct {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+test "real syncer flush succeeds (exercises the platform durability path)" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(testing.io, &path_buf);
+    const dir_path = path_buf[0..path_len];
+    const file_path = try std.fs.path.join(testing.allocator, &.{ dir_path, "fsync.airdb" });
+    defer testing.allocator.free(file_path);
+    var fs = try FileStore.create(testing.allocator, file_path, RealSyncer.any());
+    defer fs.deinit();
+    try fs.syncer.flush(fs.file); // explicit second flush must also succeed
+}
+
+test "header checksum validates on a clean file and fails when the header is tampered" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(testing.io, &path_buf);
+    const file_path = try std.fs.path.join(testing.allocator, &.{ path_buf[0..path_len], "hcrc.airdb" });
+    defer testing.allocator.free(file_path);
+    {
+        var fs = try FileStore.create(testing.allocator, file_path, RealSyncer.any());
+        defer fs.deinit();
+        try testing.expect(fs.header_checksum_ok);
+    }
+    {
+        var fs = try FileStore.open(testing.allocator, file_path, RealSyncer.any());
+        defer fs.deinit();
+        try testing.expect(fs.header_checksum_ok);
+        fs.map[13] ^= 0xFF; // scramble active_slot byte
+        try fs.reReadHeaderForTest();
+        try testing.expect(!fs.header_checksum_ok);
+    }
+}
 
 test "create writes a header that reopen reads back" {
     var tmp = testing.tmpDir(.{});

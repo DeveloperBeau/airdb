@@ -25,6 +25,14 @@ const slot_b_off: usize = 128;
 // Db
 // ---------------------------------------------------------------------------
 
+pub const VerifyError = error{
+    HeaderCorrupt,
+    SlotCorrupt,
+    FreeListCorrupt,
+    FreeExtentOutOfBounds,
+    RootRefOutOfBounds,
+};
+
 pub const Db = struct {
     store: FileStore,
     arena: Arena,
@@ -82,21 +90,38 @@ pub const Db = struct {
         var store = try FileStore.open(allocator, path, syncer);
         errdefer store.deinit();
 
-        // The durable header.active_slot is the source of truth for which version is
-        // committed. selectActive's max-version heuristic would wrongly resurrect an
-        // aborted commit whose new slot was durably written in the data barrier but
-        // never published (i.e., header flush failed after the data barrier succeeded).
-        const primary_idx = store.header.active_slot;
-        if (primary_idx > 1) return error.Corrupt;
-        const primary_off: usize = if (primary_idx == 0) slot_a_off else slot_b_off;
-        const other_off: usize = if (primary_idx == 0) slot_b_off else slot_a_off;
+        const active: Slot = if (store.header_checksum_ok) active_blk: {
+            // The durable header.active_slot is the source of truth for which version is
+            // committed. The max-version heuristic would wrongly resurrect an aborted
+            // commit whose new slot was durably written in the data barrier but never
+            // published (i.e., header flush failed after the data barrier succeeded).
+            const primary_idx = store.header.active_slot;
+            if (primary_idx > 1) return error.Corrupt;
+            const primary_off: usize = if (primary_idx == 0) slot_a_off else slot_b_off;
+            const other_off: usize = if (primary_idx == 0) slot_b_off else slot_a_off;
 
-        // Try the primary slot first (normal path and correct crash-recovery path).
-        // Fall back to the other slot only if the primary checksum is bad, which
-        // indicates a crash mid-slot-write into the primary region itself.
-        const active: Slot = Slot.decode(store.map[primary_off..][0..Slot.size]) catch blk: {
-            break :blk Slot.decode(store.map[other_off..][0..Slot.size]) catch
+            // Try the primary slot first (normal path and correct crash-recovery path).
+            // Fall back to the other slot only if the primary checksum is bad, which
+            // indicates a crash mid-slot-write into the primary region itself.
+            break :active_blk Slot.decode(store.map[primary_off..][0..Slot.size]) catch fallback: {
+                break :fallback Slot.decode(store.map[other_off..][0..Slot.size]) catch
+                    return error.Corrupt;
+            };
+        } else active_blk: {
+            // Header checksum failed: the authoritative active_slot pointer is unreadable,
+            // so fall back to the highest valid-version slot. This last-resort heuristic is
+            // used ONLY when the header itself is corrupt.
+            const maybe_a: ?Slot = Slot.decode(store.map[slot_a_off..][0..Slot.size]) catch null;
+            const maybe_b: ?Slot = Slot.decode(store.map[slot_b_off..][0..Slot.size]) catch null;
+            if (maybe_a != null and maybe_b != null) {
+                break :active_blk if (maybe_a.?.version >= maybe_b.?.version) maybe_a.? else maybe_b.?;
+            } else if (maybe_a != null) {
+                break :active_blk maybe_a.?;
+            } else if (maybe_b != null) {
+                break :active_blk maybe_b.?;
+            } else {
                 return error.Corrupt;
+            }
         };
 
         // Resume arena just past the last committed byte.
@@ -180,6 +205,34 @@ pub const Db = struct {
     /// Test-only accessor: number of extents in the committed free list.
     pub fn freeListLenForTest(self: *Db) usize {
         return self.free_list.extents.items.len;
+    }
+
+    pub fn verifyIntegrity(self: *Db) VerifyError!void {
+        if (!self.store.header_checksum_ok) return error.HeaderCorrupt;
+
+        const a_ok = Slot.decode(self.store.map[slot_a_off .. slot_a_off + Slot.size]) catch null;
+        const b_ok = Slot.decode(self.store.map[slot_b_off .. slot_b_off + Slot.size]) catch null;
+        if (a_ok == null and b_ok == null) return error.SlotCorrupt;
+
+        const limit = self.store.map.len;
+
+        if (self.active_root != 0) {
+            const r: usize = @intCast(self.active_root);
+            if (r % 8 != 0 or r >= limit) return error.RootRefOutOfBounds;
+        }
+
+        if (self.free_list_node_ref != 0) {
+            const n: usize = @intCast(self.free_list_node_ref);
+            if (n % 8 != 0 or n + self.free_list_node_len > limit) return error.FreeListCorrupt;
+        }
+
+        for (self.free_list.extents.items) |e| {
+            const eoff: usize = @intCast(e.offset);
+            if (e.len == 0) return error.FreeExtentOutOfBounds;
+            if (eoff % 8 != 0) return error.FreeExtentOutOfBounds;
+            const elen: usize = @intCast(e.len);
+            if (eoff > limit or elen > limit - eoff) return error.FreeExtentOutOfBounds;
+        }
     }
 };
 
@@ -494,4 +547,103 @@ test "free list persists across commit and reopen" {
         defer db.deinit();
         try testing.expect(db.freeListLenForTest() >= 1);
     }
+}
+
+test "verifyIntegrity passes on a freshly committed database" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "vi.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    const a = try w.alloc(8);
+    @memcpy(a.bytes, "INTEGER_");
+    w.setRoot(a.ref);
+    _ = try w.commit();
+    try db.verifyIntegrity(); // void on clean db
+}
+
+test "verifyIntegrity detects a root reference out of bounds" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "vi2.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    const a = try w.alloc(8);
+    @memcpy(a.bytes, "INTEGER_");
+    w.setRoot(a.ref);
+    _ = try w.commit();
+    db.active_root = db.store.map.len + 8; // point past the mapped region
+    try testing.expectError(error.RootRefOutOfBounds, db.verifyIntegrity());
+}
+
+test "verifyIntegrity detects a corrupt header" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "vi_hdr.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    const a = try w.alloc(8);
+    @memcpy(a.bytes, "INTEGER_");
+    w.setRoot(a.ref);
+    _ = try w.commit();
+    db.store.header_checksum_ok = false; // simulate an unreadable header
+    try testing.expectError(error.HeaderCorrupt, db.verifyIntegrity());
+}
+
+test "verifyIntegrity detects both slots corrupt" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "vi_slot.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    const a = try w.alloc(8);
+    @memcpy(a.bytes, "INTEGER_");
+    w.setRoot(a.ref);
+    _ = try w.commit();
+    // Corrupt the checksum bytes of BOTH slot regions so neither decodes. Header stays valid.
+    db.store.map[slot_a_off + 4] ^= 0xFF;
+    db.store.map[slot_b_off + 4] ^= 0xFF;
+    try testing.expectError(error.SlotCorrupt, db.verifyIntegrity());
+}
+
+test "verifyIntegrity detects a free-list node reference out of bounds" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "vi_fln.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    const a = try w.alloc(8);
+    @memcpy(a.bytes, "INTEGER_");
+    w.setRoot(a.ref);
+    _ = try w.commit();
+    db.free_list_node_ref = @intCast(db.store.map.len + 8); // past the mapped region (8-aligned)
+    db.free_list_node_len = 16;
+    try testing.expectError(error.FreeListCorrupt, db.verifyIntegrity());
+}
+
+test "verifyIntegrity detects a free extent out of bounds" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "vi_ext.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    const a = try w.alloc(8);
+    @memcpy(a.bytes, "INTEGER_");
+    w.setRoot(a.ref);
+    _ = try w.commit();
+    // Inject an extent whose offset is past the mapped region.
+    try db.free_list.extents.append(db.store.allocator, .{ .offset = @intCast(db.store.map.len + 8), .len = 8, .freed_version = 1 });
+    try testing.expectError(error.FreeExtentOutOfBounds, db.verifyIntegrity());
 }
