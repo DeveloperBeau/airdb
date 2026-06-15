@@ -316,3 +316,97 @@ test "after a header-flush failure, the reopened db passes verifyIntegrity and s
         r.end();
     }
 }
+
+test "a writer does not reuse space a reader in another instance still pins" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "xpin.airdb");
+    defer testing.allocator.free(path);
+    var a = try airdb.Db.create(testing.allocator, path);
+    defer a.deinit();
+    {
+        var w = try a.beginWrite();
+        const x = try w.alloc(8);
+        @memcpy(x.bytes, "AAAAAAAA");
+        w.setRoot(x.ref);
+        _ = try w.commit();
+    }
+
+    var b = try airdb.Db.open(testing.allocator, path);
+    defer b.deinit();
+    var rb = try b.beginRead(); // b pins the current version in its participant slot
+    const pinned_root = rb.root();
+    try testing.expectEqualStrings("AAAAAAAA", try rb.deref(pinned_root, 8));
+
+    // a frees the old root at the new version and commits new data.
+    {
+        var w = try a.beginWrite();
+        const y = try w.alloc(8);
+        @memcpy(y.bytes, "BBBBBBBB");
+        try w.free(pinned_root, 8);
+        w.setRoot(y.ref);
+        _ = try w.commit();
+    }
+
+    // a tries another allocation: the freed extent must NOT be reused, because b still
+    // pins a version below the freeing-version (global horizon respects b's reader).
+    {
+        var w = try a.beginWrite();
+        const c = try w.alloc(8);
+        try testing.expect(c.ref != pinned_root);
+        w.deinit();
+    }
+
+    // b's data is intact (never overwritten).
+    try testing.expectEqualStrings("AAAAAAAA", try rb.deref(pinned_root, 8));
+    rb.end(); // b publishes the sentinel -> the freed extent becomes reclaimable
+
+    // Now a may reuse the freed extent.
+    {
+        var w = try a.beginWrite();
+        const d = try w.alloc(8);
+        try testing.expectEqual(pinned_root, d.ref);
+        w.deinit();
+    }
+}
+
+test "an abandoned writer releases the lock and never publishes" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "abandon.airdb");
+    defer testing.allocator.free(path);
+    var a = try airdb.Db.create(testing.allocator, path);
+    defer a.deinit();
+    var b = try airdb.Db.open(testing.allocator, path);
+    defer b.deinit();
+
+    { // baseline commit via a
+        var w = try a.beginWrite();
+        const x = try w.alloc(8);
+        @memcpy(x.bytes, "BASELINE");
+        w.setRoot(x.ref);
+        _ = try w.commit();
+    }
+
+    { // a begins a write but ABANDONS it (deinit without commit): releases lock, no publish
+        var w = try a.beginWrite();
+        const x = try w.alloc(8);
+        @memcpy(x.bytes, "DROPPED!");
+        w.setRoot(x.ref);
+        w.deinit();
+    }
+
+    // b can now acquire the write lock (proves the abandoned writer released it) and commit.
+    {
+        var w = try b.beginWrite();
+        const y = try w.alloc(8);
+        @memcpy(y.bytes, "SECONDWR");
+        w.setRoot(y.ref);
+        _ = try w.commit();
+    }
+
+    // a refreshes on read and sees SECONDWR, never the abandoned DROPPED! value.
+    var r = try a.beginRead();
+    try testing.expectEqualStrings("SECONDWR", try r.deref(r.root(), 8));
+    r.end();
+}

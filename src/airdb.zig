@@ -1,3 +1,4 @@
+pub const coord = @import("coord.zig");
 pub const freelist = @import("freelist.zig");
 pub const Ref = @import("ref.zig").Ref;
 pub const node = @import("node.zig");

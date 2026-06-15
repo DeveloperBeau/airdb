@@ -17,6 +17,8 @@ const Ref = @import("ref.zig").Ref;
 const Slot = @import("slots.zig").Slot;
 const FreeExtent = @import("freelist.zig").FreeExtent;
 const FreeList = @import("freelist.zig").FreeList;
+const Coord = @import("coord.zig").Coord;
+const coord_mod = @import("coord.zig");
 
 const slot_a_off: usize = 64;
 const slot_b_off: usize = 128;
@@ -45,6 +47,11 @@ pub const Db = struct {
     free_list_node_ref: Ref,
     /// Byte length of the live free-list node on disk (0 if none).
     free_list_node_len: usize,
+    /// Coordination file for multi-process attach count and latest-version signal.
+    coord: Coord,
+    /// Index into the coord participant slot array claimed by this Db instance, or null
+    /// if all 64 slots were occupied at open/create time.
+    participant_slot: ?usize,
 
     /// Create a new database file at the given absolute path.
     pub fn create(allocator: std.mem.Allocator, path: []const u8) !Db {
@@ -68,6 +75,19 @@ pub const Db = struct {
         store.persistHeader();
         try store.syncer.flush(store.file);
 
+        // Coord setup -- done last so the errdefer has no further try-s after it.
+        const coord_path = try std.fmt.allocPrint(allocator, "{s}.coord", .{path});
+        defer allocator.free(coord_path);
+        var coord = try Coord.openOrCreate(coord_path);
+        var slot: ?usize = null;
+        errdefer {
+            if (slot) |s| coord.releaseSlot(s);
+            _ = coord.detach();
+            coord.deinit();
+        }
+        _ = coord.attach();
+        slot = try coord.claimSlot();
+
         return Db{
             .store = store,
             .arena = Arena.init(store.map, default_page_size),
@@ -77,6 +97,8 @@ pub const Db = struct {
             .free_list = FreeList.init(allocator),
             .free_list_node_ref = 0,
             .free_list_node_len = 0,
+            .coord = coord,
+            .participant_slot = slot,
         };
     }
 
@@ -89,13 +111,71 @@ pub const Db = struct {
     pub fn openWith(allocator: std.mem.Allocator, path: []const u8, syncer: Syncer) !Db {
         var store = try FileStore.open(allocator, path, syncer);
         errdefer store.deinit();
+        // Capture the map slice before store is copied into the partial Db below.
+        const store_map = store.map;
 
-        const active: Slot = if (store.header_checksum_ok) active_blk: {
+        // Build a partial Db so we can call selectActiveSlot and loadFreeList.
+        // coord is left undefined; it is set at the very end.
+        // On any error path, errdefer store.deinit() (above) frees the file+mmap,
+        // and errdefer db.free_list.deinit() (below) frees any allocated extents.
+        // db.pins is always empty here (no allocation), so it is safe to drop.
+        var db: Db = .{
+            .store = store,
+            .arena = Arena.init(store_map, default_page_size),
+            .active_version = 0,
+            .active_root = 0,
+            .pins = std.AutoHashMap(u64, u32).init(allocator),
+            .free_list = FreeList.init(allocator),
+            .free_list_node_ref = 0,
+            .free_list_node_len = 0,
+            .coord = undefined,
+            .participant_slot = null,
+        };
+        errdefer db.free_list.deinit();
+
+        const active = try db.selectActiveSlot();
+        db.active_version = active.version;
+        db.active_root = active.root_ref;
+        db.arena.top = @intCast(active.logical_size);
+        if (active.free_list_ref != 0) try db.loadFreeList(active.free_list_ref);
+
+        // Coord setup -- done last so the errdefer has no further try-s after it.
+        const coord_path = try std.fmt.allocPrint(allocator, "{s}.coord", .{path});
+        defer allocator.free(coord_path);
+        var coord = try Coord.openOrCreate(coord_path);
+        var slot: ?usize = null;
+        errdefer {
+            if (slot) |s| coord.releaseSlot(s);
+            _ = coord.detach();
+            coord.deinit();
+        }
+        _ = coord.attach();
+        slot = try coord.claimSlot();
+
+        db.coord = coord;
+        db.participant_slot = slot;
+        return db;
+    }
+
+    pub fn deinit(self: *Db) void {
+        if (self.participant_slot) |idx| self.coord.releaseSlot(idx);
+        _ = self.coord.detach();
+        self.coord.deinit();
+        self.free_list.deinit();
+        self.pins.deinit();
+        self.store.deinit();
+    }
+
+    /// Select the active Slot from the shared mapping.
+    /// Reads self.store.header_checksum_ok and self.store.header.active_slot.
+    /// The caller must have called self.store.readHeader() before this when refreshing.
+    fn selectActiveSlot(self: *Db) !Slot {
+        if (self.store.header_checksum_ok) {
             // The durable header.active_slot is the source of truth for which version is
             // committed. The max-version heuristic would wrongly resurrect an aborted
             // commit whose new slot was durably written in the data barrier but never
             // published (i.e., header flush failed after the data barrier succeeded).
-            const primary_idx = store.header.active_slot;
+            const primary_idx = self.store.header.active_slot;
             if (primary_idx > 1) return error.Corrupt;
             const primary_off: usize = if (primary_idx == 0) slot_a_off else slot_b_off;
             const other_off: usize = if (primary_idx == 0) slot_b_off else slot_a_off;
@@ -103,74 +183,110 @@ pub const Db = struct {
             // Try the primary slot first (normal path and correct crash-recovery path).
             // Fall back to the other slot only if the primary checksum is bad, which
             // indicates a crash mid-slot-write into the primary region itself.
-            break :active_blk Slot.decode(store.map[primary_off..][0..Slot.size]) catch fallback: {
-                break :fallback Slot.decode(store.map[other_off..][0..Slot.size]) catch
-                    return error.Corrupt;
-            };
-        } else active_blk: {
+            return Slot.decode(self.store.map[primary_off..][0..Slot.size]) catch
+                Slot.decode(self.store.map[other_off..][0..Slot.size]) catch
+                return error.Corrupt;
+        } else {
             // Header checksum failed: the authoritative active_slot pointer is unreadable,
             // so fall back to the highest valid-version slot. This last-resort heuristic is
             // used ONLY when the header itself is corrupt.
-            const maybe_a: ?Slot = Slot.decode(store.map[slot_a_off..][0..Slot.size]) catch null;
-            const maybe_b: ?Slot = Slot.decode(store.map[slot_b_off..][0..Slot.size]) catch null;
+            const maybe_a: ?Slot = Slot.decode(self.store.map[slot_a_off..][0..Slot.size]) catch null;
+            const maybe_b: ?Slot = Slot.decode(self.store.map[slot_b_off..][0..Slot.size]) catch null;
             if (maybe_a != null and maybe_b != null) {
-                break :active_blk if (maybe_a.?.version >= maybe_b.?.version) maybe_a.? else maybe_b.?;
+                return if (maybe_a.?.version >= maybe_b.?.version) maybe_a.? else maybe_b.?;
             } else if (maybe_a != null) {
-                break :active_blk maybe_a.?;
+                return maybe_a.?;
             } else if (maybe_b != null) {
-                break :active_blk maybe_b.?;
+                return maybe_b.?;
             } else {
                 return error.Corrupt;
             }
-        };
-
-        // Resume arena just past the last committed byte.
-        var arena = Arena.init(store.map, default_page_size);
-        arena.top = @intCast(active.logical_size);
-
-        // Load the persisted free list if one was recorded in this slot.
-        var free_list = FreeList.init(allocator);
-        errdefer free_list.deinit();
-        var free_list_node_ref: Ref = 0;
-        var free_list_node_len: usize = 0;
-
-        if (active.free_list_ref != 0) {
-            // First read the 4-byte count prefix to know the full node size.
-            const count_bytes = try arena.deref(active.free_list_ref, 4);
-            const count = std.mem.readInt(u32, count_bytes[0..4], .little);
-            const node_len = 4 + @as(usize, count) * 24;
-            // Now read the full node and decode it.
-            const node_bytes = try arena.deref(active.free_list_ref, node_len);
-            try free_list.decode(node_bytes);
-            free_list_node_ref = active.free_list_ref;
-            free_list_node_len = node_len;
         }
-
-        return Db{
-            .store = store,
-            .arena = arena,
-            .active_version = active.version,
-            .active_root = active.root_ref,
-            .pins = std.AutoHashMap(u64, u32).init(allocator),
-            .free_list = free_list,
-            .free_list_node_ref = free_list_node_ref,
-            .free_list_node_len = free_list_node_len,
-        };
     }
 
-    pub fn deinit(self: *Db) void {
+    /// Decode the persisted free-list node at free_list_ref into self.free_list.
+    /// Sets self.free_list_node_ref and self.free_list_node_len.
+    /// self.free_list must already be initialized (possibly empty).
+    fn loadFreeList(self: *Db, free_list_ref: Ref) !void {
+        // First read the 4-byte count prefix to know the full node size.
+        const count_bytes = try self.arena.deref(free_list_ref, 4);
+        const count = std.mem.readInt(u32, count_bytes[0..4], .little);
+        const node_len = 4 + @as(usize, count) * 24;
+        // Now read the full node and decode it.
+        const node_bytes = try self.arena.deref(free_list_ref, node_len);
+        try self.free_list.decode(node_bytes);
+        self.free_list_node_ref = free_list_ref;
+        self.free_list_node_len = node_len;
+    }
+
+    /// Select the highest-version slot that qualifies as published (version <= lv).
+    /// Decodes both slot A and slot B; among those that decode successfully and
+    /// have version <= lv, returns the one with the highest version. Returns null
+    /// if no qualifying slot exists. Slots with version > lv are in-flight or
+    /// aborted and must never be returned.
+    fn selectPublishedSlot(self: *Db, lv: u64) ?Slot {
+        const maybe_a: ?Slot = Slot.decode(self.store.map[slot_a_off..][0..Slot.size]) catch null;
+        const maybe_b: ?Slot = Slot.decode(self.store.map[slot_b_off..][0..Slot.size]) catch null;
+        var best: ?Slot = null;
+        for ([_]?Slot{ maybe_a, maybe_b }) |ms| {
+            const s = ms orelse continue;
+            if (s.version > lv) continue;
+            if (best == null or s.version > best.?.version) best = s;
+        }
+        return best;
+    }
+
+    /// Refresh this instance's in-memory view from the shared memory mapping.
+    /// Gates advancement on coord.latestVersion() so that a slot written by an
+    /// aborted commit (durable data barrier but failed header flush) is never
+    /// observed. Only a version <= the published latest_version may be adopted.
+    ///
+    /// Safety: must only be called when no write transaction is in progress.
+    /// It is called at the start of beginRead and beginWrite (before any txn
+    /// state is built), which is safe.
+    fn refreshToLatest(self: *Db) !void {
+        const lv = self.coord.latestVersion(); // acquire-load of the published version
+        if (lv <= self.active_version) return; // nothing newer has been published
+        try self.store.readHeader(); // refresh header_checksum_ok / mapping view (for integrity use elsewhere)
+        const published = self.selectPublishedSlot(lv) orelse return; // no qualifying published slot visible yet
+        if (published.version <= self.active_version) return;
+        self.active_version = published.version;
+        self.active_root = published.root_ref;
+        self.arena.top = @intCast(published.logical_size);
         self.free_list.deinit();
-        self.pins.deinit();
-        self.store.deinit();
+        self.free_list = FreeList.init(self.store.allocator);
+        self.free_list_node_ref = 0;
+        self.free_list_node_len = 0;
+        if (published.free_list_ref != 0) try self.loadFreeList(published.free_list_ref);
+    }
+
+    /// Returns the minimum pinned version among all active readers, or sentinel_max if none.
+    fn localMinPinned(self: *Db) u64 {
+        var min: ?u64 = null;
+        var it = self.pins.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.* == 0) continue;
+            if (min == null or entry.key_ptr.* < min.?) min = entry.key_ptr.*;
+        }
+        return min orelse coord_mod.sentinel_max;
+    }
+
+    /// Publish the local minimum pinned version to our participant slot (if we have one).
+    fn publishPins(self: *Db) void {
+        if (self.participant_slot) |idx| self.coord.publishMinPinned(idx, self.localMinPinned());
     }
 
     pub fn beginRead(self: *Db) !ReadTxn {
+        // Refresh from the shared mapping before pinning. Safe here because no
+        // write transaction is in progress when beginRead is called.
+        try self.refreshToLatest();
         const v = self.active_version;
         if (self.pins.getPtr(v)) |ptr| {
             ptr.* += 1;
         } else {
             try self.pins.put(v, 1);
         }
+        self.publishPins();
         return ReadTxn{ .db = self, .root_ref = self.active_root, .version = v };
     }
 
@@ -184,7 +300,12 @@ pub const Db = struct {
         return min orelse self.active_version;
     }
 
-    pub fn beginWrite(self: *Db) !WriteTxn {
+    /// Shared body for beginWrite and beginWriteTry. Caller must hold the coord
+    /// lock before calling; an errdefer in the caller releases the lock if this
+    /// function returns an error.
+    fn beginWriteLocked(self: *Db) !WriteTxn {
+        // Refresh under the lock so the writer sees the truly-latest committed version.
+        try self.refreshToLatest();
         // Clone the committed free list into work_freelist so the transaction
         // can reuse extents from it. db.free_list is untouched during the txn;
         // work_freelist is the mutable clone that reuse() shrinks.
@@ -200,6 +321,23 @@ pub const Db = struct {
             .in_flight_frees = .empty,
             .work_freelist = work_freelist,
         };
+    }
+
+    /// Begin a write transaction, blocking until the cross-process write lock is
+    /// acquired. The lock is released when the returned WriteTxn is committed or
+    /// abandoned via deinit.
+    pub fn beginWrite(self: *Db) !WriteTxn {
+        try self.coord.lockExclusive();
+        errdefer self.coord.unlock(); // release if refresh or setup fails
+        return self.beginWriteLocked();
+    }
+
+    /// Like beginWrite but returns error.WouldBlock immediately if another writer
+    /// currently holds the lock.
+    pub fn beginWriteTry(self: *Db) !WriteTxn {
+        try self.coord.tryLockExclusive();
+        errdefer self.coord.unlock(); // release if refresh or setup fails
+        return self.beginWriteLocked();
     }
 
     /// Test-only accessor: number of extents in the committed free list.
@@ -258,6 +396,7 @@ pub const ReadTxn = struct {
             if (ptr.* > 0) ptr.* -= 1;
             if (ptr.* == 0) _ = self.db.pins.remove(self.version);
         }
+        self.db.publishPins();
     }
 };
 
@@ -273,7 +412,13 @@ pub const WriteTxn = struct {
     work_freelist: FreeList,
 
     pub fn alloc(self: *WriteTxn, size: usize) !Allocation {
-        return self.db.arena.allocReusing(size, &self.work_freelist, self.db.horizon());
+        // A freed extent is reusable only when no reader in ANY live process pins a version
+        // below its freeing-version. globalHorizon = min of live processes' min-pinned versions,
+        // clamped to this writer's active_version (the fallback when no reader constrains it).
+        // If this process could not claim a participant slot, it cannot advertise its own readers,
+        // so it stays conservative (horizon 0 = bump-only).
+        const h: u64 = if (self.db.participant_slot == null) 0 else self.db.coord.globalHorizon(self.db.active_version);
+        return self.db.arena.allocReusing(size, &self.work_freelist, h);
     }
 
     pub fn setRoot(self: *WriteTxn, ref: Ref) void {
@@ -299,6 +444,7 @@ pub const WriteTxn = struct {
     pub fn deinit(self: *WriteTxn) void {
         self.in_flight_frees.deinit(self.db.store.allocator);
         self.work_freelist.deinit();
+        self.db.coord.unlock();
     }
 
     /// Two-slot atomic durable commit.
@@ -382,7 +528,10 @@ pub const WriteTxn = struct {
 
         // Step 3: flush new data + inactive slot to durable storage.
         // Failure here: old active slot is still valid; no in-memory state changed.
-        db.store.syncer.flush(db.store.file) catch return error.Durability;
+        db.store.syncer.flush(db.store.file) catch {
+            self.db.coord.unlock();
+            return error.Durability;
+        };
 
         // Step 4: flip the header commit pointer and flush (commit point).
         db.store.header.active_slot = inactive_idx;
@@ -395,12 +544,14 @@ pub const WriteTxn = struct {
             // Restore the mmap bytes to match the reverted header so subsequent
             // persistHeader calls (from the next commit attempt) write the right value.
             db.store.persistHeader();
+            self.db.coord.unlock();
             return error.Durability;
         };
 
         // Step 5: publish the new version in memory only after both flushes succeed.
         db.active_version = self.new_version;
         db.active_root = self.new_root;
+        db.coord.setLatestVersion(self.new_version);
         // Install the new free list. errdefer for new_fl will NOT fire here
         // because we are on the success return path (return self.new_version below).
         db.free_list.deinit();
@@ -409,6 +560,7 @@ pub const WriteTxn = struct {
         db.free_list_node_len = node_len;
         self.in_flight_frees.deinit(self.db.store.allocator);
         self.work_freelist.deinit();
+        self.db.coord.unlock();
         return self.new_version;
     }
 };
@@ -646,4 +798,137 @@ test "verifyIntegrity detects a free extent out of bounds" {
     // Inject an extent whose offset is past the mapped region.
     try db.free_list.extents.append(db.store.allocator, .{ .offset = @intCast(db.store.map.len + 8), .len = 8, .freed_version = 1 });
     try testing.expectError(error.FreeExtentOutOfBounds, db.verifyIntegrity());
+}
+
+test "two Db instances on one file share a coordination attach count" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "share.airdb");
+    defer testing.allocator.free(path);
+    var a = try Db.create(testing.allocator, path);
+    defer a.deinit();
+    var b = try Db.open(testing.allocator, path);
+    defer b.deinit();
+    try testing.expectEqual(@as(u32, 2), a.coord.attachCount());
+}
+
+test "a second Db instance sees a commit made by the first after refresh-on-read" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "vis.airdb");
+    defer testing.allocator.free(path);
+    var a = try Db.create(testing.allocator, path);
+    defer a.deinit();
+    var b = try Db.open(testing.allocator, path);
+    defer b.deinit();
+    {
+        var w = try a.beginWrite();
+        const x = try w.alloc(8);
+        @memcpy(x.bytes, "SHARED!!");
+        w.setRoot(x.ref);
+        _ = try w.commit();
+    }
+    var r = try b.beginRead();
+    try testing.expectEqualStrings("SHARED!!", try r.deref(r.root(), 8));
+    r.end();
+}
+
+test "refresh does not advance to a durable-but-unpublished (aborted) slot" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "unpub.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    {
+        var w = try db.beginWrite();
+        const a = try w.alloc(8);
+        @memcpy(a.bytes, "PUBLISH_");
+        w.setRoot(a.ref);
+        _ = try w.commit(); // publishes; coord.latest_version advances to this version
+    }
+    const published_version = db.active_version;
+    // Forge a VALID slot with a much higher version into the inactive slot bytes,
+    // WITHOUT advancing coord.latest_version (simulates an aborted-but-durable commit).
+    const forged = Slot{ .version = published_version + 50, .root_ref = 0, .free_list_ref = 0, .logical_size = default_page_size };
+    var buf: [Slot.size]u8 = undefined;
+    forged.encode(&buf);
+    // Write it into whichever slot is currently inactive. The active slot is header.active_slot.
+    const inactive_off: usize = if (db.store.header.active_slot == 0) slot_b_off else slot_a_off;
+    @memcpy(db.store.map[inactive_off .. inactive_off + Slot.size], &buf);
+    // Refresh must NOT advance to the forged version (coord.latest_version unchanged).
+    try db.refreshToLatest();
+    try testing.expectEqual(published_version, db.active_version);
+}
+
+test "a second writer is excluded while the first holds the write lock" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "excl.airdb");
+    defer testing.allocator.free(path);
+    var a = try Db.create(testing.allocator, path);
+    defer a.deinit();
+    var b = try Db.open(testing.allocator, path);
+    defer b.deinit();
+    var wa = try a.beginWrite();
+    try testing.expectError(error.WouldBlock, b.beginWriteTry());
+    const x = try wa.alloc(8);
+    @memcpy(x.bytes, "FIRST!!!");
+    wa.setRoot(x.ref);
+    _ = try wa.commit();
+    var wb = try b.beginWriteTry();
+    wb.deinit();
+}
+
+test "single instance reuse works through the global horizon" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "ghreuse.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    {
+        var w = try db.beginWrite();
+        const a = try w.alloc(8);
+        @memcpy(a.bytes, "AAAAAAAA");
+        w.setRoot(a.ref);
+        _ = try w.commit();
+    }
+    const old_root = db.active_root;
+    {
+        var w = try db.beginWrite();
+        const b = try w.alloc(8);
+        @memcpy(b.bytes, "BBBBBBBB");
+        try w.free(old_root, 8);
+        w.setRoot(b.ref);
+        _ = try w.commit();
+    }
+    {
+        var w = try db.beginWrite();
+        const c = try w.alloc(8);
+        try testing.expectEqual(old_root, c.ref);
+        w.deinit();
+    }
+}
+
+test "Db publishes its minimum pinned version to its participant slot" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "pub.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    {
+        var w = try db.beginWrite();
+        const a = try w.alloc(8);
+        @memcpy(a.bytes, "VERSION2");
+        w.setRoot(a.ref);
+        _ = try w.commit();
+    }
+    // No readers: this process publishes the sentinel (imposes no horizon constraint).
+    try testing.expectEqual(coord_mod.sentinel_max, db.coord.slotMinPinnedForTest(db.participant_slot.?));
+    var r = try db.beginRead(); // pins the current version
+    try testing.expectEqual(db.active_version, db.coord.slotMinPinnedForTest(db.participant_slot.?));
+    r.end();
+    try testing.expectEqual(coord_mod.sentinel_max, db.coord.slotMinPinnedForTest(db.participant_slot.?));
 }
