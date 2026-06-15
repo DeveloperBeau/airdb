@@ -316,3 +316,44 @@ test "after a header-flush failure, the reopened db passes verifyIntegrity and s
         r.end();
     }
 }
+
+test "an abandoned writer releases the lock and never publishes" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "abandon.airdb");
+    defer testing.allocator.free(path);
+    var a = try airdb.Db.create(testing.allocator, path);
+    defer a.deinit();
+    var b = try airdb.Db.open(testing.allocator, path);
+    defer b.deinit();
+
+    { // baseline commit via a
+        var w = try a.beginWrite();
+        const x = try w.alloc(8);
+        @memcpy(x.bytes, "BASELINE");
+        w.setRoot(x.ref);
+        _ = try w.commit();
+    }
+
+    { // a begins a write but ABANDONS it (deinit without commit): releases lock, no publish
+        var w = try a.beginWrite();
+        const x = try w.alloc(8);
+        @memcpy(x.bytes, "DROPPED!");
+        w.setRoot(x.ref);
+        w.deinit();
+    }
+
+    // b can now acquire the write lock (proves the abandoned writer released it) and commit.
+    {
+        var w = try b.beginWrite();
+        const y = try w.alloc(8);
+        @memcpy(y.bytes, "SECONDWR");
+        w.setRoot(y.ref);
+        _ = try w.commit();
+    }
+
+    // a refreshes on read and sees SECONDWR, never the abandoned DROPPED! value.
+    var r = try a.beginRead();
+    try testing.expectEqualStrings("SECONDWR", try r.deref(r.root(), 8));
+    r.end();
+}
