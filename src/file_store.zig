@@ -106,9 +106,12 @@ pub const FileStore = struct {
     header_checksum_ok: bool,
 
     const initial_capacity: usize = default_page_size * 256;
-    /// 1 GiB virtual address reservation. Never backed by physical pages beyond
-    /// what the file covers. The base pointer never moves after creation.
-    const max_reserved: usize = 1 << 30;
+    /// Virtual address reservation, and so the per-open maximum file size. It is never
+    /// backed by physical pages beyond what the file actually covers (PROT_NONE reservation;
+    /// the file mapping is demand-paged), and the base pointer never moves after creation.
+    /// 64-bit hosts reserve 1 TiB (negligible against a ~128 TiB address space). 32-bit hosts
+    /// reserve 256 MiB to leave room in their ~4 GiB address space.
+    pub const max_reserved: usize = if (@bitSizeOf(usize) >= 64) (1 << 40) else (1 << 28);
 
     /// Returns the blocking Io instance used for all file operations.
     /// This is always initialized (compile-time constant vtable), so it
@@ -445,5 +448,6 @@ test "grow beyond the reservation fails cleanly" {
     defer testing.allocator.free(fpath);
     var fs = try FileStore.create(testing.allocator, fpath, RealSyncer.any());
     defer fs.deinit();
-    try testing.expectError(error.FileTooLarge, fs.grow((1 << 30) + 4096));
+    // The check rejects before any setLength, so no oversized file is created.
+    try testing.expectError(error.FileTooLarge, fs.grow(FileStore.max_reserved + default_page_size));
 }
