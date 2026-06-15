@@ -5,7 +5,10 @@
 //   [8..12]  attach_count u32     (atomic, 4-aligned)
 //   [12..16] reserved     (zero)
 //   [16..24] latest_ver   u64     (atomic, 8-aligned)
-//   [24..]   reserved     (zero)
+//   [24..64] reserved     (zero)
+//   [64..1088] participant slots  64 x 16 bytes each
+//              slot layout: [pid u32 @+0][reserved u32 @+4][min_pinned u64 @+8]
+//              pid==0 means slot is free; min_pinned==sentinel_max means "pins nothing"
 //
 // Zig 0.16 notes (same adaptations as file_store.zig):
 //   - File I/O via std.Io.File and std.Io.Dir.*Absolute(io, path, .{})
@@ -25,6 +28,15 @@ const coord_size: usize = 4096;
 const off_magic: usize = 0; // u64
 const off_attach: usize = 8; // u32 atomic, 4-aligned
 const off_latest: usize = 16; // u64 atomic, 8-aligned
+
+pub const sentinel_max: u64 = std.math.maxInt(u64);
+const participant_slots: usize = 64;
+const participants_off: usize = 64;
+const slot_stride: usize = 16;
+
+fn currentPid() u32 {
+    return @intCast(std.c.getpid());
+}
 
 pub const Coord = struct {
     file: std.Io.File,
@@ -131,6 +143,49 @@ pub const Coord = struct {
     pub fn unlock(self: *Coord) void {
         _ = std.c.flock(self.file.handle, std.posix.LOCK.UN);
     }
+
+    fn slotPidPtr(self: *Coord, idx: usize) *u32 {
+        return @ptrCast(@alignCast(&self.map[participants_off + idx * slot_stride]));
+    }
+
+    fn slotMinPtr(self: *Coord, idx: usize) *u64 {
+        return @ptrCast(@alignCast(&self.map[participants_off + idx * slot_stride + 8]));
+    }
+
+    /// Claim a free participant slot. Returns the slot index on success,
+    /// or null if all 64 slots are occupied. Uses CAS to avoid races.
+    pub fn claimSlot(self: *Coord) !?usize {
+        const my_pid: u32 = @intCast(currentPid());
+        var i: usize = 0;
+        while (i < participant_slots) : (i += 1) {
+            const p = self.slotPidPtr(i);
+            if (@cmpxchgStrong(u32, p, 0, my_pid, .seq_cst, .seq_cst) == null) {
+                @atomicStore(u64, self.slotMinPtr(i), sentinel_max, .seq_cst);
+                return i;
+            }
+        }
+        return null;
+    }
+
+    /// Release a previously claimed slot. Zeros the pid last so no reader
+    /// observes a stale min_pinned after the slot appears free.
+    pub fn releaseSlot(self: *Coord, idx: usize) void {
+        @atomicStore(u64, self.slotMinPtr(idx), sentinel_max, .seq_cst);
+        @atomicStore(u32, self.slotPidPtr(idx), 0, .seq_cst);
+    }
+
+    /// Publish the minimum pinned version for this slot (release ordering).
+    pub fn publishMinPinned(self: *Coord, idx: usize, v: u64) void {
+        @atomicStore(u64, self.slotMinPtr(idx), v, .release);
+    }
+
+    pub fn slotMinPinnedForTest(self: *Coord, idx: usize) u64 {
+        return @atomicLoad(u64, self.slotMinPtr(idx), .acquire);
+    }
+
+    pub fn slotPidForTest(self: *Coord, idx: usize) u32 {
+        return @atomicLoad(u32, self.slotPidPtr(idx), .seq_cst);
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -188,4 +243,36 @@ test "exclusive lock blocks a second holder via the same coord file" {
     a.unlock();
     try b.tryLockExclusive();
     b.unlock();
+}
+
+test "claim returns a slot index, publish and read back min_pinned, release frees it" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dlen = try tmp.dir.realPath(coordIo(), &path_buf);
+    const cpath = try std.fs.path.join(testing.allocator, &.{ path_buf[0..dlen], "p.coord" });
+    defer testing.allocator.free(cpath);
+    var c = try Coord.openOrCreate(cpath);
+    defer c.deinit();
+    const idx = (try c.claimSlot()).?;
+    c.publishMinPinned(idx, 7);
+    try testing.expectEqual(@as(u64, 7), c.slotMinPinnedForTest(idx));
+    c.releaseSlot(idx);
+    try testing.expectEqual(@as(u32, 0), c.slotPidForTest(idx));
+}
+
+test "two claims get distinct slots" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dlen = try tmp.dir.realPath(coordIo(), &path_buf);
+    const cpath = try std.fs.path.join(testing.allocator, &.{ path_buf[0..dlen], "p2.coord" });
+    defer testing.allocator.free(cpath);
+    var c = try Coord.openOrCreate(cpath);
+    defer c.deinit();
+    const a = (try c.claimSlot()).?;
+    const b = (try c.claimSlot()).?;
+    try testing.expect(a != b);
+    c.releaseSlot(a);
+    c.releaseSlot(b);
 }
