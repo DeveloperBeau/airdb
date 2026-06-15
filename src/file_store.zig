@@ -110,8 +110,8 @@ pub const FileStore = struct {
     /// backed by physical pages beyond what the file actually covers (PROT_NONE reservation;
     /// the file mapping is demand-paged), and the base pointer never moves after creation.
     /// 64-bit hosts reserve 1 TiB (negligible against a ~128 TiB address space). 32-bit hosts
-    /// reserve 256 MiB to leave room in their ~4 GiB address space.
-    pub const max_reserved: usize = if (@bitSizeOf(usize) >= 64) (1 << 40) else (1 << 28);
+    /// reserve 1 GiB (a quarter of their ~4 GiB address space).
+    pub const max_reserved: usize = if (@bitSizeOf(usize) >= 64) (1 << 40) else (1 << 30);
 
     /// Returns the blocking Io instance used for all file operations.
     /// This is always initialized (compile-time constant vtable), so it
