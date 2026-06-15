@@ -248,6 +248,13 @@ pub const Db = struct {
         const lv = self.coord.latestVersion(); // acquire-load of the published version
         if (lv <= self.active_version) return; // nothing newer has been published
         try self.store.readHeader(); // refresh header_checksum_ok / mapping view (for integrity use elsewhere)
+        // If another process extended the file, grow our mapping before dereferencing
+        // slot descriptors or free-list nodes that may live in the grown region.
+        const flen = try self.store.fileLen();
+        if (flen > self.store.map.len) {
+            try self.store.grow(flen);
+            self.arena.map = self.store.map;
+        }
         const published = self.selectPublishedSlot(lv) orelse return; // no qualifying published slot visible yet
         if (published.version <= self.active_version) return;
         self.active_version = published.version;
@@ -340,6 +347,18 @@ pub const Db = struct {
         return self.beginWriteLocked();
     }
 
+    /// Bump-allocate `size` bytes, growing the file if the arena is full.
+    /// After any grow, re-syncs arena.map to the new (larger) mapping slice.
+    fn bumpGrowing(self: *Db, size: usize) !Allocation {
+        return self.arena.alloc(size) catch {
+            const needed = self.arena.top + std.mem.alignForward(usize, size, 8);
+            const target = @max(needed, self.store.map.len * 2);
+            try self.store.grow(target);
+            self.arena.map = self.store.map;
+            return self.arena.alloc(size);
+        };
+    }
+
     /// Test-only accessor: number of extents in the committed free list.
     pub fn freeListLenForTest(self: *Db) usize {
         return self.free_list.extents.items.len;
@@ -418,7 +437,13 @@ pub const WriteTxn = struct {
         // If this process could not claim a participant slot, it cannot advertise its own readers,
         // so it stays conservative (horizon 0 = bump-only).
         const h: u64 = if (self.db.participant_slot == null) 0 else self.db.coord.globalHorizon(self.db.active_version);
-        return self.db.arena.allocReusing(size, &self.work_freelist, h);
+        return self.db.arena.allocReusing(size, &self.work_freelist, h) catch {
+            const needed = self.db.arena.top + std.mem.alignForward(usize, size, 8);
+            const target = @max(needed, self.db.store.map.len * 2);
+            try self.db.store.grow(target);
+            self.db.arena.map = self.db.store.map;
+            return self.db.arena.allocReusing(size, &self.work_freelist, h);
+        };
     }
 
     pub fn setRoot(self: *WriteTxn, ref: Ref) void {
@@ -505,8 +530,9 @@ pub const WriteTxn = struct {
 
         // 4. Encode the new free list onto the arena via a BUMP allocation (never
         //    reuse, to avoid recursion: the free-list node must not reference itself).
+        //    Use bumpGrowing so the file is extended if the arena is full.
         const node_len = new_fl.byteLen();
-        const node = try db.arena.alloc(node_len);
+        const node = try db.bumpGrowing(node_len);
         const written = new_fl.encode(node.bytes);
         std.debug.assert(written == node_len);
 
@@ -931,4 +957,34 @@ test "Db publishes its minimum pinned version to its participant slot" {
     try testing.expectEqual(db.active_version, db.coord.slotMinPinnedForTest(db.participant_slot.?));
     r.end();
     try testing.expectEqual(coord_mod.sentinel_max, db.coord.slotMinPinnedForTest(db.participant_slot.?));
+}
+
+test "allocations beyond the initial mapping grow the file and data survives reopen" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "biggrow.airdb");
+    defer testing.allocator.free(path);
+    var last_ref: Ref = 0;
+    {
+        var db = try Db.create(testing.allocator, path);
+        defer db.deinit();
+        var w = try db.beginWrite();
+        var i: usize = 0;
+        while (i < 400) : (i += 1) {
+            const a = try w.alloc(4096);
+            a.bytes[0] = @intCast(i & 0xff);
+            last_ref = a.ref;
+        }
+        w.setRoot(last_ref);
+        _ = try w.commit();
+        try testing.expect(db.store.map.len > 4096 * 256);
+    }
+    {
+        var db = try Db.open(testing.allocator, path);
+        defer db.deinit();
+        var r = try db.beginRead();
+        const got = try r.deref(r.root(), 4096);
+        try testing.expectEqual(@as(u8, @intCast(399 & 0xff)), got[0]);
+        r.end();
+    }
 }
