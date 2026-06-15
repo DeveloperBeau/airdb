@@ -208,17 +208,52 @@ pub fn append(txn: *WriteTxn, root: Ref, value: u64) !Ref {
     return a.ref;
 }
 
+/// Recursive copy-on-write set: copies only the nodes on the path from root to
+/// the target leaf. Sibling subtrees are shared by reference, so the old root
+/// remains a valid, unchanged snapshot after the call returns.
+fn setInto(txn: *WriteTxn, node_ref: Ref, index: u64, value: u64) !Ref {
+    const bytes = try derefNode(txn, node_ref);
+    if (bytes[0] == kind_leaf) {
+        const count = std.mem.readInt(u16, bytes[1..3], .little);
+        if (index >= count) return error.IndexOutOfBounds;
+        const a = try txn.writableCopy(node_ref, leaf_node_size);
+        const idx: usize = @intCast(index);
+        const off: usize = leaf_header + idx * 8;
+        std.mem.writeInt(u64, a.bytes[off..][0..8], value, .little);
+        return a.ref;
+    } else {
+        const view = try parseInner(bytes);
+        var idx = index;
+        var target_i: u16 = 0;
+        var local_index: u64 = 0;
+        var found = false;
+        var i: u16 = 0;
+        while (i < view.child_count) : (i += 1) {
+            const cc = view.childCount(i);
+            if (idx < cc) {
+                target_i = i;
+                local_index = idx;
+                found = true;
+                break;
+            }
+            idx -= cc;
+        }
+        if (!found) return error.IndexOutOfBounds;
+        // Capture the child ref before the recursive call (bytes may alias mmap).
+        const child_ref = view.childRef(target_i);
+        const new_child = try setInto(txn, child_ref, local_index, value);
+        // COW this inner node and patch only the updated child's ref (count unchanged).
+        const a = try txn.writableCopy(node_ref, inner_node_size);
+        const off: usize = inner_header + @as(usize, target_i) * 16;
+        std.mem.writeInt(u64, a.bytes[off..][0..8], new_child, .little);
+        return a.ref;
+    }
+}
+
 /// Overwrite the value at index. Returns the new root Ref (copy-on-write).
-/// Returns error.IndexOutOfBounds if out of range.
+/// Returns error.IndexOutOfBounds if out of range. Works on trees of any depth.
 pub fn set(txn: *WriteTxn, root: Ref, index: u64, value: u64) !Ref {
-    const hdr = try txn.deref(root, leaf_header);
-    const count = std.mem.readInt(u16, hdr[1..3], .little);
-    if (index >= count) return error.IndexOutOfBounds;
-    const a = try txn.writableCopy(root, leaf_node_size);
-    const idx: usize = @intCast(index);
-    const off: usize = leaf_header + idx * 8;
-    std.mem.writeInt(u64, a.bytes[off..][0..8], value, .little);
-    return a.ref;
+    return setInto(txn, root, index, value);
 }
 
 /// Test-only helper: allocate an inner node over the given children and return its Ref.
@@ -327,5 +362,27 @@ test "get and len traverse an inner node over two leaves" {
     try testing.expectEqual(@as(u64, 2), try get(&w, inner, 2));
     try testing.expectEqual(@as(u64, 3), try get(&w, inner, 3));
     try testing.expectError(error.IndexOutOfBounds, get(&w, inner, 4));
+    w.deinit();
+}
+
+test "set on a multi-level column leaves the old root snapshot unchanged" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try colTmpPath(testing.allocator, &tmp, "col5.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var root = try create(&w);
+    var i: u64 = 0;
+    while (i < 1000) : (i += 1) root = try append(&w, root, i);
+    const old_root = root;
+    const new_root = try set(&w, root, 500, 999999);
+    try testing.expectEqual(@as(u64, 500), try get(&w, old_root, 500));     // old snapshot unchanged
+    try testing.expectEqual(@as(u64, 999999), try get(&w, new_root, 500));  // new root updated
+    try testing.expectEqual(try len(&w, old_root), try len(&w, new_root));
+    // a few other indices match between old and new (shared subtrees)
+    try testing.expectEqual(try get(&w, old_root, 0), try get(&w, new_root, 0));
+    try testing.expectEqual(try get(&w, old_root, 999), try get(&w, new_root, 999));
     w.deinit();
 }
