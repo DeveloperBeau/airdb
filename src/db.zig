@@ -412,11 +412,12 @@ pub const WriteTxn = struct {
     work_freelist: FreeList,
 
     pub fn alloc(self: *WriteTxn, size: usize) !Allocation {
-        // When more than one instance/process is attached, disable reuse (bump-only)
-        // so a writer never overwrites space a reader in another process might still
-        // see. A horizon of 0 makes no freed extent (tagged with version >= 2) qualify
-        // for reuse.
-        const h: u64 = if (self.db.coord.attachCount() > 1) 0 else self.db.horizon();
+        // A freed extent is reusable only when no reader in ANY live process pins a version
+        // below its freeing-version. globalHorizon = min of live processes' min-pinned versions,
+        // clamped to this writer's active_version (the fallback when no reader constrains it).
+        // If this process could not claim a participant slot, it cannot advertise its own readers,
+        // so it stays conservative (horizon 0 = bump-only).
+        const h: u64 = if (self.db.participant_slot == null) 0 else self.db.coord.globalHorizon(self.db.active_version);
         return self.db.arena.allocReusing(size, &self.work_freelist, h);
     }
 
@@ -879,43 +880,35 @@ test "a second writer is excluded while the first holds the write lock" {
     wb.deinit();
 }
 
-test "reuse is disabled while more than one instance is attached" {
+test "single instance reuse works through the global horizon" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const path = try tmpFilePath(testing.allocator, &tmp, "noreuse.airdb");
+    const path = try tmpFilePath(testing.allocator, &tmp, "ghreuse.airdb");
     defer testing.allocator.free(path);
-    var a = try Db.create(testing.allocator, path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
     {
-        var w = try a.beginWrite();
-        const x = try w.alloc(8);
-        @memcpy(x.bytes, "AAAAAAAA");
-        w.setRoot(x.ref);
+        var w = try db.beginWrite();
+        const a = try w.alloc(8);
+        @memcpy(a.bytes, "AAAAAAAA");
+        w.setRoot(a.ref);
         _ = try w.commit();
     }
-    const old_root = a.active_root;
+    const old_root = db.active_root;
     {
-        var w = try a.beginWrite();
-        const y = try w.alloc(8);
-        @memcpy(y.bytes, "BBBBBBBB");
+        var w = try db.beginWrite();
+        const b = try w.alloc(8);
+        @memcpy(b.bytes, "BBBBBBBB");
         try w.free(old_root, 8);
-        w.setRoot(y.ref);
+        w.setRoot(b.ref);
         _ = try w.commit();
     }
-    var b = try Db.open(testing.allocator, path); // attach_count == 2
     {
-        var w = try a.beginWrite();
+        var w = try db.beginWrite();
         const c = try w.alloc(8);
-        try testing.expect(c.ref != old_root); // bump, not reuse
+        try testing.expectEqual(old_root, c.ref);
         w.deinit();
     }
-    b.deinit(); // back to 1
-    {
-        var w = try a.beginWrite();
-        const d = try w.alloc(8);
-        try testing.expectEqual(old_root, d.ref); // reuse resumes
-        w.deinit();
-    }
-    a.deinit();
 }
 
 test "Db publishes its minimum pinned version to its participant slot" {
