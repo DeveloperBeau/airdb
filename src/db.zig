@@ -18,6 +18,7 @@ const Slot = @import("slots.zig").Slot;
 const FreeExtent = @import("freelist.zig").FreeExtent;
 const FreeList = @import("freelist.zig").FreeList;
 const Coord = @import("coord.zig").Coord;
+const coord_mod = @import("coord.zig");
 
 const slot_a_off: usize = 64;
 const slot_b_off: usize = 128;
@@ -48,6 +49,9 @@ pub const Db = struct {
     free_list_node_len: usize,
     /// Coordination file for multi-process attach count and latest-version signal.
     coord: Coord,
+    /// Index into the coord participant slot array claimed by this Db instance, or null
+    /// if all 64 slots were occupied at open/create time.
+    participant_slot: ?usize,
 
     /// Create a new database file at the given absolute path.
     pub fn create(allocator: std.mem.Allocator, path: []const u8) !Db {
@@ -75,11 +79,14 @@ pub const Db = struct {
         const coord_path = try std.fmt.allocPrint(allocator, "{s}.coord", .{path});
         defer allocator.free(coord_path);
         var coord = try Coord.openOrCreate(coord_path);
+        var slot: ?usize = null;
         errdefer {
+            if (slot) |s| coord.releaseSlot(s);
             _ = coord.detach();
             coord.deinit();
         }
         _ = coord.attach();
+        slot = try coord.claimSlot();
 
         return Db{
             .store = store,
@@ -91,6 +98,7 @@ pub const Db = struct {
             .free_list_node_ref = 0,
             .free_list_node_len = 0,
             .coord = coord,
+            .participant_slot = slot,
         };
     }
 
@@ -121,6 +129,7 @@ pub const Db = struct {
             .free_list_node_ref = 0,
             .free_list_node_len = 0,
             .coord = undefined,
+            .participant_slot = null,
         };
         errdefer db.free_list.deinit();
 
@@ -134,17 +143,22 @@ pub const Db = struct {
         const coord_path = try std.fmt.allocPrint(allocator, "{s}.coord", .{path});
         defer allocator.free(coord_path);
         var coord = try Coord.openOrCreate(coord_path);
+        var slot: ?usize = null;
         errdefer {
+            if (slot) |s| coord.releaseSlot(s);
             _ = coord.detach();
             coord.deinit();
         }
         _ = coord.attach();
+        slot = try coord.claimSlot();
 
         db.coord = coord;
+        db.participant_slot = slot;
         return db;
     }
 
     pub fn deinit(self: *Db) void {
+        if (self.participant_slot) |idx| self.coord.releaseSlot(idx);
         _ = self.coord.detach();
         self.coord.deinit();
         self.free_list.deinit();
@@ -246,6 +260,22 @@ pub const Db = struct {
         if (published.free_list_ref != 0) try self.loadFreeList(published.free_list_ref);
     }
 
+    /// Returns the minimum pinned version among all active readers, or sentinel_max if none.
+    fn localMinPinned(self: *Db) u64 {
+        var min: ?u64 = null;
+        var it = self.pins.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.* == 0) continue;
+            if (min == null or entry.key_ptr.* < min.?) min = entry.key_ptr.*;
+        }
+        return min orelse coord_mod.sentinel_max;
+    }
+
+    /// Publish the local minimum pinned version to our participant slot (if we have one).
+    fn publishPins(self: *Db) void {
+        if (self.participant_slot) |idx| self.coord.publishMinPinned(idx, self.localMinPinned());
+    }
+
     pub fn beginRead(self: *Db) !ReadTxn {
         // Refresh from the shared mapping before pinning. Safe here because no
         // write transaction is in progress when beginRead is called.
@@ -256,6 +286,7 @@ pub const Db = struct {
         } else {
             try self.pins.put(v, 1);
         }
+        self.publishPins();
         return ReadTxn{ .db = self, .root_ref = self.active_root, .version = v };
     }
 
@@ -365,6 +396,7 @@ pub const ReadTxn = struct {
             if (ptr.* > 0) ptr.* -= 1;
             if (ptr.* == 0) _ = self.db.pins.remove(self.version);
         }
+        self.db.publishPins();
     }
 };
 
@@ -380,11 +412,12 @@ pub const WriteTxn = struct {
     work_freelist: FreeList,
 
     pub fn alloc(self: *WriteTxn, size: usize) !Allocation {
-        // When more than one instance/process is attached, disable reuse (bump-only)
-        // so a writer never overwrites space a reader in another process might still
-        // see. A horizon of 0 makes no freed extent (tagged with version >= 2) qualify
-        // for reuse.
-        const h: u64 = if (self.db.coord.attachCount() > 1) 0 else self.db.horizon();
+        // A freed extent is reusable only when no reader in ANY live process pins a version
+        // below its freeing-version. globalHorizon = min of live processes' min-pinned versions,
+        // clamped to this writer's active_version (the fallback when no reader constrains it).
+        // If this process could not claim a participant slot, it cannot advertise its own readers,
+        // so it stays conservative (horizon 0 = bump-only).
+        const h: u64 = if (self.db.participant_slot == null) 0 else self.db.coord.globalHorizon(self.db.active_version);
         return self.db.arena.allocReusing(size, &self.work_freelist, h);
     }
 
@@ -847,41 +880,55 @@ test "a second writer is excluded while the first holds the write lock" {
     wb.deinit();
 }
 
-test "reuse is disabled while more than one instance is attached" {
+test "single instance reuse works through the global horizon" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const path = try tmpFilePath(testing.allocator, &tmp, "noreuse.airdb");
+    const path = try tmpFilePath(testing.allocator, &tmp, "ghreuse.airdb");
     defer testing.allocator.free(path);
-    var a = try Db.create(testing.allocator, path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
     {
-        var w = try a.beginWrite();
-        const x = try w.alloc(8);
-        @memcpy(x.bytes, "AAAAAAAA");
-        w.setRoot(x.ref);
+        var w = try db.beginWrite();
+        const a = try w.alloc(8);
+        @memcpy(a.bytes, "AAAAAAAA");
+        w.setRoot(a.ref);
         _ = try w.commit();
     }
-    const old_root = a.active_root;
+    const old_root = db.active_root;
     {
-        var w = try a.beginWrite();
-        const y = try w.alloc(8);
-        @memcpy(y.bytes, "BBBBBBBB");
+        var w = try db.beginWrite();
+        const b = try w.alloc(8);
+        @memcpy(b.bytes, "BBBBBBBB");
         try w.free(old_root, 8);
-        w.setRoot(y.ref);
+        w.setRoot(b.ref);
         _ = try w.commit();
     }
-    var b = try Db.open(testing.allocator, path); // attach_count == 2
     {
-        var w = try a.beginWrite();
+        var w = try db.beginWrite();
         const c = try w.alloc(8);
-        try testing.expect(c.ref != old_root); // bump, not reuse
+        try testing.expectEqual(old_root, c.ref);
         w.deinit();
     }
-    b.deinit(); // back to 1
+}
+
+test "Db publishes its minimum pinned version to its participant slot" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "pub.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
     {
-        var w = try a.beginWrite();
-        const d = try w.alloc(8);
-        try testing.expectEqual(old_root, d.ref); // reuse resumes
-        w.deinit();
+        var w = try db.beginWrite();
+        const a = try w.alloc(8);
+        @memcpy(a.bytes, "VERSION2");
+        w.setRoot(a.ref);
+        _ = try w.commit();
     }
-    a.deinit();
+    // No readers: this process publishes the sentinel (imposes no horizon constraint).
+    try testing.expectEqual(coord_mod.sentinel_max, db.coord.slotMinPinnedForTest(db.participant_slot.?));
+    var r = try db.beginRead(); // pins the current version
+    try testing.expectEqual(db.active_version, db.coord.slotMinPinnedForTest(db.participant_slot.?));
+    r.end();
+    try testing.expectEqual(coord_mod.sentinel_max, db.coord.slotMinPinnedForTest(db.participant_slot.?));
 }
