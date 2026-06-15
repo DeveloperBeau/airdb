@@ -235,7 +235,7 @@ pub const FileStore = struct {
         std.mem.writeInt(u32, self.map[off.checksum..][0..4], crc, .little);
     }
 
-    fn readHeader(self: *FileStore) !void {
+    pub fn readHeader(self: *FileStore) !void {
         if (self.map.len < default_page_size) return error.Corrupt;
 
         const magic = std.mem.readInt(u64, self.map[off.magic..][0..8], .little);
