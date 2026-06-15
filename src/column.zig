@@ -11,6 +11,10 @@ const kind_inner: u8 = 1;
 pub const leaf_node_size: usize = 1 + 2 + @as(usize, LEAF_CAP) * 8;
 const leaf_header: usize = 3;
 
+// Inner layout: [kind u8][child_count u16 LE][child_count * (child_ref u64 LE, subtree_count u64 LE)]
+pub const inner_node_size: usize = 1 + 2 + @as(usize, FANOUT) * 16;
+const inner_header: usize = 3;
+
 pub fn encodeLeaf(buf: []u8, values: []const u64) usize {
     std.debug.assert(values.len <= LEAF_CAP);
     buf[0] = kind_leaf;
@@ -40,9 +44,44 @@ pub fn parseLeaf(bytes: []const u8) error{Corrupt}!LeafView {
     return .{ .bytes = bytes, .count = count };
 }
 
+pub fn encodeInner(buf: []u8, child_refs: []const u64, child_counts: []const u64) usize {
+    std.debug.assert(child_refs.len == child_counts.len);
+    std.debug.assert(child_refs.len <= FANOUT);
+    buf[0] = kind_inner;
+    std.mem.writeInt(u16, buf[1..3], @intCast(child_refs.len), .little);
+    var off: usize = inner_header;
+    for (child_refs, child_counts) |r, c| {
+        std.mem.writeInt(u64, buf[off..][0..8], r, .little);
+        off += 8;
+        std.mem.writeInt(u64, buf[off..][0..8], c, .little);
+        off += 8;
+    }
+    return off;
+}
+
+pub const InnerView = struct {
+    bytes: []const u8,
+    child_count: u16,
+    pub fn childRef(self: InnerView, i: usize) u64 {
+        return std.mem.readInt(u64, self.bytes[inner_header + i * 16 ..][0..8], .little);
+    }
+    pub fn childCount(self: InnerView, i: usize) u64 {
+        return std.mem.readInt(u64, self.bytes[inner_header + i * 16 + 8 ..][0..8], .little);
+    }
+};
+
+pub fn parseInner(bytes: []const u8) error{Corrupt}!InnerView {
+    if (bytes.len < inner_header) return error.Corrupt;
+    if (bytes[0] != kind_inner) return error.Corrupt;
+    const child_count = std.mem.readInt(u16, bytes[1..3], .little);
+    if (child_count > FANOUT) return error.Corrupt;
+    if (bytes.len < inner_header + @as(usize, child_count) * 16) return error.Corrupt;
+    return .{ .bytes = bytes, .child_count = child_count };
+}
+
 // ---------------------------------------------------------------------------
-// Single-leaf column operations (Task 2)
-// Task 3 will add inner-node dispatch; Task 4 will add leaf splitting.
+// Column operations (Tasks 2-3)
+// Task 4 will add leaf splitting.
 // ---------------------------------------------------------------------------
 
 /// Allocate an empty leaf column node and return its Ref.
@@ -52,28 +91,53 @@ pub fn create(txn: *WriteTxn) !Ref {
     return a.ref;
 }
 
-/// Return the kind byte for the node at ref (used by Task 3 for inner-node dispatch).
-fn nodeKind(txn: anytype, ref: Ref) !u8 {
-    const b = try txn.deref(ref, 1);
-    return b[0];
+/// Deref a node by first reading its kind byte, then dereffing the full node.
+fn derefNode(txn: anytype, ref: Ref) ![]const u8 {
+    const kind_buf = try txn.deref(ref, 1);
+    return switch (kind_buf[0]) {
+        kind_leaf => txn.deref(ref, leaf_node_size),
+        kind_inner => txn.deref(ref, inner_node_size),
+        else => error.Corrupt,
+    };
 }
 
 /// Return the number of values stored in the column rooted at root.
 pub fn len(txn: anytype, root: Ref) !u64 {
-    const hdr = try txn.deref(root, leaf_header);
-    const count = std.mem.readInt(u16, hdr[1..3], .little);
-    return count;
+    const bytes = try derefNode(txn, root);
+    if (bytes[0] == kind_leaf) {
+        const count = std.mem.readInt(u16, bytes[1..3], .little);
+        return count;
+    } else {
+        const view = try parseInner(bytes);
+        var total: u64 = 0;
+        var i: u16 = 0;
+        while (i < view.child_count) : (i += 1) {
+            total += view.childCount(i);
+        }
+        return total;
+    }
 }
 
 /// Return the value at index. Returns error.IndexOutOfBounds if out of range.
 pub fn get(txn: anytype, root: Ref, index: u64) !u64 {
-    const hdr = try txn.deref(root, leaf_header);
-    const count = std.mem.readInt(u16, hdr[1..3], .little);
-    if (index >= count) return error.IndexOutOfBounds;
-    const idx: usize = @intCast(index);
-    const off: usize = leaf_header + idx * 8;
-    const bytes = try txn.deref(root, off + 8);
-    return std.mem.readInt(u64, bytes[off..][0..8], .little);
+    const bytes = try derefNode(txn, root);
+    if (bytes[0] == kind_leaf) {
+        const count = std.mem.readInt(u16, bytes[1..3], .little);
+        if (index >= count) return error.IndexOutOfBounds;
+        const idx: usize = @intCast(index);
+        const off: usize = leaf_header + idx * 8;
+        return std.mem.readInt(u64, bytes[off..][0..8], .little);
+    } else {
+        const view = try parseInner(bytes);
+        var idx = index;
+        var i: u16 = 0;
+        while (i < view.child_count) : (i += 1) {
+            const cc = view.childCount(i);
+            if (idx < cc) return get(txn, view.childRef(i), idx);
+            idx -= cc;
+        }
+        return error.IndexOutOfBounds;
+    }
 }
 
 /// Append value to the column. Returns the new root Ref (copy-on-write).
@@ -99,6 +163,20 @@ pub fn set(txn: *WriteTxn, root: Ref, index: u64, value: u64) !Ref {
     const idx: usize = @intCast(index);
     const off: usize = leaf_header + idx * 8;
     std.mem.writeInt(u64, a.bytes[off..][0..8], value, .little);
+    return a.ref;
+}
+
+/// Test-only helper: allocate an inner node over the given children and return its Ref.
+pub fn makeInnerForTest(txn: *WriteTxn, children: []const struct { ref: u64, count: u64 }) !Ref {
+    std.debug.assert(children.len <= FANOUT);
+    var refs: [FANOUT]u64 = undefined;
+    var counts: [FANOUT]u64 = undefined;
+    for (children, 0..) |c, i| {
+        refs[i] = c.ref;
+        counts[i] = c.count;
+    }
+    const a = try txn.alloc(inner_node_size);
+    _ = encodeInner(a.bytes, refs[0..children.len], counts[0..children.len]);
     return a.ref;
 }
 
@@ -149,5 +227,28 @@ test "single-leaf column: create, append, get, len, set" {
     root = try set(&w, root, 1, 222);
     try testing.expectEqual(@as(u64, 222), try get(&w, root, 1));
     try testing.expectError(error.IndexOutOfBounds, get(&w, root, 3));
+    w.deinit();
+}
+
+test "get and len traverse an inner node over two leaves" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try colTmpPath(testing.allocator, &tmp, "col3.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var l0 = try create(&w);
+    l0 = try append(&w, l0, 0);
+    l0 = try append(&w, l0, 1);
+    var l1 = try create(&w);
+    l1 = try append(&w, l1, 2);
+    l1 = try append(&w, l1, 3);
+    const inner = try makeInnerForTest(&w, &.{ .{ .ref = l0, .count = 2 }, .{ .ref = l1, .count = 2 } });
+    try testing.expectEqual(@as(u64, 4), try len(&w, inner));
+    try testing.expectEqual(@as(u64, 0), try get(&w, inner, 0));
+    try testing.expectEqual(@as(u64, 2), try get(&w, inner, 2));
+    try testing.expectEqual(@as(u64, 3), try get(&w, inner, 3));
+    try testing.expectError(error.IndexOutOfBounds, get(&w, inner, 4));
     w.deinit();
 }
