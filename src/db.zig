@@ -579,3 +579,71 @@ test "verifyIntegrity detects a root reference out of bounds" {
     db.active_root = db.store.map.len + 8; // point past the mapped region
     try testing.expectError(error.RootRefOutOfBounds, db.verifyIntegrity());
 }
+
+test "verifyIntegrity detects a corrupt header" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "vi_hdr.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    const a = try w.alloc(8);
+    @memcpy(a.bytes, "INTEGER_");
+    w.setRoot(a.ref);
+    _ = try w.commit();
+    db.store.header_checksum_ok = false; // simulate an unreadable header
+    try testing.expectError(error.HeaderCorrupt, db.verifyIntegrity());
+}
+
+test "verifyIntegrity detects both slots corrupt" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "vi_slot.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    const a = try w.alloc(8);
+    @memcpy(a.bytes, "INTEGER_");
+    w.setRoot(a.ref);
+    _ = try w.commit();
+    // Corrupt the checksum bytes of BOTH slot regions so neither decodes. Header stays valid.
+    db.store.map[slot_a_off + 4] ^= 0xFF;
+    db.store.map[slot_b_off + 4] ^= 0xFF;
+    try testing.expectError(error.SlotCorrupt, db.verifyIntegrity());
+}
+
+test "verifyIntegrity detects a free-list node reference out of bounds" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "vi_fln.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    const a = try w.alloc(8);
+    @memcpy(a.bytes, "INTEGER_");
+    w.setRoot(a.ref);
+    _ = try w.commit();
+    db.free_list_node_ref = @intCast(db.store.map.len + 8); // past the mapped region (8-aligned)
+    db.free_list_node_len = 16;
+    try testing.expectError(error.FreeListCorrupt, db.verifyIntegrity());
+}
+
+test "verifyIntegrity detects a free extent out of bounds" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "vi_ext.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    const a = try w.alloc(8);
+    @memcpy(a.bytes, "INTEGER_");
+    w.setRoot(a.ref);
+    _ = try w.commit();
+    // Inject an extent whose offset is past the mapped region.
+    try db.free_list.extents.append(db.store.allocator, .{ .offset = @intCast(db.store.map.len + 8), .len = 8, .freed_version = 1 });
+    try testing.expectError(error.FreeExtentOutOfBounds, db.verifyIntegrity());
+}
