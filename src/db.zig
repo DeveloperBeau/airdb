@@ -364,6 +364,26 @@ pub const Db = struct {
         return self.free_list.extents.items.len;
     }
 
+    pub const Metrics = struct {
+        mapped_len: u64,
+        latest_version: u64,
+        oldest_pinned_version: u64,
+        free_extent_count: usize,
+        reclaimable_bytes: u64,
+    };
+
+    pub fn metrics(self: *Db) Metrics {
+        var reclaimable: u64 = 0;
+        for (self.free_list.extents.items) |e| reclaimable += e.len;
+        return .{
+            .mapped_len = @intCast(self.store.map.len),
+            .latest_version = self.active_version,
+            .oldest_pinned_version = self.horizon(),
+            .free_extent_count = self.free_list.extents.items.len,
+            .reclaimable_bytes = reclaimable,
+        };
+    }
+
     pub fn verifyIntegrity(self: *Db) VerifyError!void {
         if (!self.store.header_checksum_ok) return error.HeaderCorrupt;
 
@@ -987,4 +1007,36 @@ test "allocations beyond the initial mapping grow the file and data survives reo
         try testing.expectEqual(@as(u8, @intCast(399 & 0xff)), got[0]);
         r.end();
     }
+}
+
+test "metrics report mapped length, versions, and reclaimable bytes" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "metrics.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    {
+        var w = try db.beginWrite();
+        const a = try w.alloc(8);
+        @memcpy(a.bytes, "AAAAAAAA");
+        w.setRoot(a.ref);
+        _ = try w.commit();
+    }
+    const old_root = db.active_root;
+    {
+        var w = try db.beginWrite();
+        const b = try w.alloc(8);
+        @memcpy(b.bytes, "BBBBBBBB");
+        try w.free(old_root, 8);
+        w.setRoot(b.ref);
+        _ = try w.commit();
+    }
+
+    const m = db.metrics();
+    try testing.expect(m.mapped_len >= 4096 * 256);
+    try testing.expectEqual(db.active_version, m.latest_version);
+    try testing.expect(m.free_extent_count >= 1);
+    try testing.expect(m.reclaimable_bytes >= 8);
+    try testing.expectEqual(db.active_version, m.oldest_pinned_version); // no readers
 }
