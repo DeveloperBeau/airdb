@@ -140,16 +140,71 @@ pub fn get(txn: anytype, root: Ref, index: u64) !u64 {
     }
 }
 
+const AppendResult = struct { ref: Ref, count: u64, split: ?Ref, split_count: u64 };
+
+fn appendInto(txn: *WriteTxn, node_ref: Ref, value: u64) !AppendResult {
+    const bytes = try derefNode(txn, node_ref);
+    if (bytes[0] == kind_leaf) {
+        const count = std.mem.readInt(u16, bytes[1..3], .little);
+        if (count < LEAF_CAP) {
+            const a = try txn.writableCopy(node_ref, leaf_node_size);
+            std.mem.writeInt(u16, a.bytes[1..3], count + 1, .little);
+            const off: usize = leaf_header + @as(usize, count) * 8;
+            std.mem.writeInt(u64, a.bytes[off..][0..8], value, .little);
+            return .{ .ref = a.ref, .count = @as(u64, count) + 1, .split = null, .split_count = 0 };
+        } else {
+            // Full leaf: allocate a new leaf for the new value; leave the old leaf untouched.
+            const a = try txn.alloc(leaf_node_size);
+            _ = encodeLeaf(a.bytes, &.{value});
+            return .{ .ref = node_ref, .count = LEAF_CAP, .split = a.ref, .split_count = 1 };
+        }
+    } else {
+        const view = try parseInner(bytes);
+        const child_count = view.child_count;
+        const last_idx: usize = @as(usize, child_count) - 1;
+        const last_ref = view.childRef(last_idx);
+        // Capture old totals before recursion (bytes stay valid: mmap grows in place).
+        var old_total: u64 = 0;
+        {
+            var i: usize = 0;
+            while (i < child_count) : (i += 1) old_total += view.childCount(i);
+        }
+        const old_last_count = view.childCount(last_idx);
+        const r = try appendInto(txn, last_ref, value);
+        // COW the inner node and update the last child entry.
+        const a = try txn.writableCopy(node_ref, inner_node_size);
+        const last_off: usize = inner_header + last_idx * 16;
+        std.mem.writeInt(u64, a.bytes[last_off..][0..8], r.ref, .little);
+        std.mem.writeInt(u64, a.bytes[last_off + 8 ..][0..8], r.count, .little);
+        if (r.split == null) {
+            return .{ .ref = a.ref, .count = old_total - old_last_count + r.count, .split = null, .split_count = 0 };
+        } else if (child_count < FANOUT) {
+            // Room in this inner: append the new child.
+            const new_off: usize = inner_header + @as(usize, child_count) * 16;
+            std.mem.writeInt(u16, a.bytes[1..3], child_count + 1, .little);
+            const split_ref = r.split.?;
+            std.mem.writeInt(u64, a.bytes[new_off..][0..8], split_ref, .little);
+            std.mem.writeInt(u64, a.bytes[new_off + 8 ..][0..8], r.split_count, .little);
+            return .{ .ref = a.ref, .count = old_total - old_last_count + r.count + r.split_count, .split = null, .split_count = 0 };
+        } else {
+            // Inner full: create a new right inner holding just the split child.
+            const new_inner = try txn.alloc(inner_node_size);
+            const split_ref = r.split.?;
+            _ = encodeInner(new_inner.bytes, &.{split_ref}, &.{r.split_count});
+            return .{ .ref = a.ref, .count = old_total - old_last_count + r.count, .split = new_inner.ref, .split_count = r.split_count };
+        }
+    }
+}
+
 /// Append value to the column. Returns the new root Ref (copy-on-write).
-/// Returns error.LeafFull when the leaf is at capacity; Task 4 handles splitting.
+/// Grows the tree through leaf splits and height increases as needed.
 pub fn append(txn: *WriteTxn, root: Ref, value: u64) !Ref {
-    const hdr = try txn.deref(root, leaf_header);
-    const count = std.mem.readInt(u16, hdr[1..3], .little);
-    if (count >= LEAF_CAP) return error.LeafFull;
-    const a = try txn.writableCopy(root, leaf_node_size);
-    std.mem.writeInt(u16, a.bytes[1..3], count + 1, .little);
-    const off: usize = leaf_header + @as(usize, count) * 8;
-    std.mem.writeInt(u64, a.bytes[off..][0..8], value, .little);
+    const r = try appendInto(txn, root, value);
+    if (r.split == null) return r.ref;
+    // Split propagated to the root: grow height by one.
+    const a = try txn.alloc(inner_node_size);
+    const split_ref = r.split.?;
+    _ = encodeInner(a.bytes, &.{ r.ref, split_ref }, &.{ r.count, r.split_count });
     return a.ref;
 }
 
@@ -227,6 +282,28 @@ test "single-leaf column: create, append, get, len, set" {
     root = try set(&w, root, 1, 222);
     try testing.expectEqual(@as(u64, 222), try get(&w, root, 1));
     try testing.expectError(error.IndexOutOfBounds, get(&w, root, 3));
+    w.deinit();
+}
+
+test "append grows the tree across many leaves and reads back correctly" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try colTmpPath(testing.allocator, &tmp, "col4.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var root = try create(&w);
+    const N: u64 = 5000; // > LEAF_CAP and > LEAF_CAP*FANOUT (4096): forces >= 3 levels
+    var i: u64 = 0;
+    while (i < N) : (i += 1) root = try append(&w, root, i * 7);
+    try testing.expectEqual(N, try len(&w, root));
+    try testing.expectEqual(@as(u64, 0), try get(&w, root, 0));
+    try testing.expectEqual(@as(u64, 4999 * 7), try get(&w, root, 4999));
+    try testing.expectEqual(@as(u64, 2500 * 7), try get(&w, root, 2500));
+    // spot-check several indices
+    var k: u64 = 0;
+    while (k < N) : (k += 137) try testing.expectEqual(k * 7, try get(&w, root, k));
     w.deinit();
 }
 
