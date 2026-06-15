@@ -410,3 +410,33 @@ test "an abandoned writer releases the lock and never publishes" {
     try testing.expectEqualStrings("SECONDWR", try r.deref(r.root(), 8));
     r.end();
 }
+
+test "a database grown well past the initial size reopens and verifies" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "large.airdb");
+    defer testing.allocator.free(path);
+    {
+        var db = try airdb.Db.create(testing.allocator, path);
+        defer db.deinit();
+        var w = try db.beginWrite();
+        var i: usize = 0;
+        var root: u64 = 0;
+        while (i < 600) : (i += 1) { // ~2.4 MiB of 4 KiB nodes, forces multiple grows past 1 MiB
+            const a = try w.alloc(4096);
+            @memset(a.bytes, @intCast(i & 0xff));
+            root = a.ref;
+        }
+        w.setRoot(root);
+        _ = try w.commit();
+    }
+    {
+        var db = try airdb.Db.open(testing.allocator, path);
+        defer db.deinit();
+        try db.verifyIntegrity();
+        var r = try db.beginRead();
+        const got = try r.deref(r.root(), 4096);
+        try testing.expectEqual(@as(u8, @intCast(599 & 0xff)), got[0]);
+        r.end();
+    }
+}
