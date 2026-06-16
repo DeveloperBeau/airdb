@@ -327,6 +327,8 @@ pub const Db = struct {
             .new_version = self.active_version + 1,
             .in_flight_frees = .empty,
             .work_freelist = work_freelist,
+            .txn_reuse = FreeList.init(self.store.allocator),
+            .txn_start_top = self.arena.top,
         };
     }
 
@@ -449,25 +451,32 @@ pub const WriteTxn = struct {
     new_version: u64,
     in_flight_frees: std.ArrayList(FreeExtent),
     work_freelist: FreeList,
+    /// Nodes allocated AND freed within this uncommitted transaction. They are private
+    /// (no committed version or reader references them), so they are reused immediately
+    /// within the same transaction instead of accumulating as copy-on-write garbage.
+    txn_reuse: FreeList,
+    /// arena.top at transaction start. A freed ref >= this was bump-allocated during this
+    /// transaction and is txn-private; a ref below it belongs to a committed version.
+    txn_start_top: u64,
 
     pub fn deref(self: *WriteTxn, ref: Ref, len: usize) ![]const u8 {
         return self.db.arena.deref(ref, len);
     }
 
     pub fn alloc(self: *WriteTxn, size: usize) !Allocation {
-        // A freed extent is reusable only when no reader in ANY live process pins a version
-        // below its freeing-version. globalHorizon = min of live processes' min-pinned versions,
-        // clamped to this writer's active_version (the fallback when no reader constrains it).
-        // If this process could not claim a participant slot, it cannot advertise its own readers,
-        // so it stays conservative (horizon 0 = bump-only).
+        // 1. Reuse a transaction-private node first (allocated and freed within this same
+        //    uncommitted transaction; no committed version or reader can reference it, so
+        //    reusing it is always safe and keeps single-transaction bulk writes space-bounded).
+        //    Exact-size match: no carving, so fixed-size node churn never fragments the pool.
+        if (self.db.arena.allocFromPool(&self.txn_reuse, size, std.math.maxInt(u64))) |a| return a;
+        // 2. Reuse a committed-free node, horizon-gated: only safe when no reader in ANY live
+        //    process pins a version below its freeing-version. globalHorizon = min of live
+        //    processes' min-pinned versions, clamped to this writer's active_version. Without a
+        //    participant slot this process cannot advertise its readers, so it stays bump-only.
         const h: u64 = if (self.db.participant_slot == null) 0 else self.db.coord.globalHorizon(self.db.active_version);
-        return self.db.arena.allocReusing(size, &self.work_freelist, h) catch {
-            const needed = self.db.arena.top + std.mem.alignForward(usize, size, 8);
-            const target = @max(needed, self.db.store.map.len * 2);
-            try self.db.store.grow(target);
-            self.db.arena.map = self.db.store.map;
-            return self.db.arena.allocReusing(size, &self.work_freelist, h);
-        };
+        if (self.db.arena.allocFromPool(&self.work_freelist, size, h)) |a| return a;
+        // 3. Bump-allocate, growing the file if the arena is full.
+        return self.db.bumpGrowing(size);
     }
 
     pub fn setRoot(self: *WriteTxn, ref: Ref) void {
@@ -475,11 +484,19 @@ pub const WriteTxn = struct {
     }
 
     pub fn free(self: *WriteTxn, ref: Ref, len: usize) !void {
-        try self.in_flight_frees.append(self.db.store.allocator, .{
-            .offset = ref,
-            .len = @intCast(len),
-            .freed_version = self.new_version,
-        });
+        if (ref >= self.txn_start_top) {
+            // Allocated within this uncommitted transaction: private, immediately reusable.
+            // (freed_version is irrelevant for the txn-private pool; allocFromPool ignores it.)
+            try self.txn_reuse.add(.{ .offset = ref, .len = @intCast(len), .freed_version = 0 });
+        } else {
+            // Belongs to a committed version a reader may still pin: defer reclamation to the
+            // committed free list, tagged with this transaction's version (the freeing version).
+            try self.in_flight_frees.append(self.db.store.allocator, .{
+                .offset = ref,
+                .len = @intCast(len),
+                .freed_version = self.new_version,
+            });
+        }
     }
 
     pub fn writableCopy(self: *WriteTxn, ref: Ref, len: usize) !Allocation {
@@ -493,6 +510,7 @@ pub const WriteTxn = struct {
     pub fn deinit(self: *WriteTxn) void {
         self.in_flight_frees.deinit(self.db.store.allocator);
         self.work_freelist.deinit();
+        self.txn_reuse.deinit();
         self.db.coord.unlock();
     }
 
@@ -520,9 +538,10 @@ pub const WriteTxn = struct {
     /// so transferring ownership to db.free_list before returning is safe and
     /// cannot double-free.
     pub fn commit(self: *WriteTxn) !u64 {
-        // Free in_flight_frees and work_freelist on every error path; explicit deinits cover success.
+        // Free in_flight_frees, work_freelist, and txn_reuse on every error path; explicit deinits cover success.
         errdefer self.in_flight_frees.deinit(self.db.store.allocator);
         errdefer self.work_freelist.deinit();
+        errdefer self.txn_reuse.deinit();
         const db = self.db;
         const prev_active_slot = db.store.header.active_slot;
         const prev_logical_size = db.store.header.logical_size;
@@ -550,6 +569,12 @@ pub const WriteTxn = struct {
                 .len = @intCast(db.free_list_node_len),
                 .freed_version = self.new_version,
             });
+        }
+        // 3b. Reclaim any leftover transaction-private nodes that were freed but not reused
+        //     within this transaction. They are committed-but-unreferenced space; tag them
+        //     with this version so the committed free list can reclaim them (no leak).
+        for (self.txn_reuse.extents.items) |e| {
+            try new_fl.add(.{ .offset = e.offset, .len = e.len, .freed_version = self.new_version });
         }
 
         // 4. Encode the new free list onto the arena via a BUMP allocation (never
@@ -610,6 +635,7 @@ pub const WriteTxn = struct {
         db.free_list_node_len = node_len;
         self.in_flight_frees.deinit(self.db.store.allocator);
         self.work_freelist.deinit();
+        self.txn_reuse.deinit();
         self.db.coord.unlock();
         return self.new_version;
     }
@@ -674,9 +700,52 @@ test "writableCopy allocates a new node, copies bytes, and records the old as fr
     const copy = try w.writableCopy(a.ref, 8);
     try testing.expect(copy.ref != a.ref);
     try testing.expectEqualStrings("ORIGINAL", copy.bytes);
+    // The old node was allocated within this same uncommitted transaction, so freeing it
+    // routes to the transaction-private reuse pool (immediately reusable), not in_flight_frees.
+    try testing.expectEqual(@as(usize, 0), w.in_flight_frees.items.len);
+    try testing.expectEqual(@as(usize, 1), w.txn_reuse.extents.items.len);
+    try testing.expectEqual(a.ref, w.txn_reuse.extents.items[0].offset);
+    w.deinit(); // releases the transaction-private pools without committing
+}
+
+test "a node freed within a transaction is reused by the next allocation" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "txnreuse.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    const a = try w.alloc(64);
+    try w.free(a.ref, 64);
+    const b = try w.alloc(64);
+    // Reused the just-freed transaction-private node; no file growth, no committed garbage.
+    try testing.expectEqual(a.ref, b.ref);
+    w.deinit();
+}
+
+test "a committed node freed within a transaction is not reused mid-transaction" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "committedsafe.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    { // commit a node so it belongs to a committed version
+        var w0 = try db.beginWrite();
+        const a = try w0.alloc(64);
+        w0.setRoot(a.ref);
+        _ = try w0.commit();
+    }
+    const committed_ref = db.active_root;
+    var w = try db.beginWrite();
+    try w.free(committed_ref, 64); // committed node -> deferred reclaim, NOT txn-private
+    const b = try w.alloc(64);
+    // A committed node a reader might still pin must not be reused within this transaction.
+    try testing.expect(b.ref != committed_ref);
+    try testing.expectEqual(@as(usize, 0), w.txn_reuse.extents.items.len);
     try testing.expectEqual(@as(usize, 1), w.in_flight_frees.items.len);
-    try testing.expectEqual(a.ref, w.in_flight_frees.items[0].offset);
-    w.deinit(); // releases the in-flight list without committing
+    w.deinit();
 }
 
 test "commit then reopen sees the committed root" {

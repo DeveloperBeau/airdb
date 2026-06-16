@@ -50,6 +50,21 @@ pub const FreeList = struct {
             off += extent_bytes;
         }
     }
+    // Reuse an extent of EXACTLY `size` bytes whose freed_version <= horizon. No carving, so
+    // fixed-size node allocations never fragment the pool and the scan stays short. Removes the
+    // matched extent (swap-remove; pool order is irrelevant). Returns its offset, or null.
+    pub fn reuseExact(self: *FreeList, size: u64, horizon: u64) ?u64 {
+        var i: usize = 0;
+        while (i < self.extents.items.len) : (i += 1) {
+            const e = self.extents.items[i];
+            if (e.len == size and e.freed_version <= horizon) {
+                _ = self.extents.swapRemove(i);
+                return e.offset;
+            }
+        }
+        return null;
+    }
+
     // First-fit reusable extent of at least `size` whose freed_version <= horizon. Shrinks remainder.
     pub fn reuse(self: *FreeList, size: u64, horizon: u64) ?u64 {
         var i: usize = 0;
@@ -107,4 +122,22 @@ test "reuse picks an extent at least as large and shrinks remainder" {
     try testing.expectEqual(@as(usize, 1), list.extents.items.len);
     try testing.expectEqual(@as(u64, 4096 + 64), list.extents.items[0].offset);
     try testing.expectEqual(@as(u64, 256 - 64), list.extents.items[0].len);
+}
+
+test "reuseExact matches only an exact size within the horizon and does not fragment" {
+    const allocator = testing.allocator;
+    var list = FreeList.init(allocator);
+    defer list.deinit();
+    try list.add(.{ .offset = 4096, .len = 1027, .freed_version = 2 });
+    try list.add(.{ .offset = 8192, .len = 515, .freed_version = 2 });
+    // A 515 request must NOT carve the 1027 extent; it takes the exact 515 one.
+    try testing.expectEqual(@as(u64, 8192), list.reuseExact(515, 5).?);
+    try testing.expectEqual(@as(usize, 1), list.extents.items.len); // 1027 untouched, no fragment
+    // Horizon too low: the 1027 extent (freed_version 2) is not reusable at horizon 1.
+    try testing.expect(list.reuseExact(1027, 1) == null);
+    // No exact size match.
+    try testing.expect(list.reuseExact(999, 5) == null);
+    // Exact match within horizon.
+    try testing.expectEqual(@as(u64, 4096), list.reuseExact(1027, 2).?);
+    try testing.expectEqual(@as(usize, 0), list.extents.items.len);
 }
