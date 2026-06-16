@@ -413,3 +413,79 @@ test "a column persisted as the root survives commit and reopen" {
         r.end();
     }
 }
+
+test "two million element column builds, persists, and reads back" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try colTmpPath(testing.allocator, &tmp, "col2m.airdb");
+    defer testing.allocator.free(path);
+    const N: u64 = 2_000_000; // 2x the 1M headline target
+    const batch: u64 = 16384; // commit periodically so freed COW nodes are reclaimed between batches
+
+    {
+        var db = try Db.create(testing.allocator, path);
+        defer db.deinit();
+        // Commit an empty column as the root first.
+        var root: Ref = undefined;
+        {
+            var w = try db.beginWrite();
+            root = try create(&w);
+            w.setRoot(root);
+            _ = try w.commit();
+        }
+        // Build in batches; value at index i is i.
+        var v: u64 = 0;
+        while (v < N) {
+            var w = try db.beginWrite();
+            const end = @min(v + batch, N);
+            while (v < end) : (v += 1) root = try append(&w, root, v);
+            w.setRoot(root);
+            _ = try w.commit();
+        }
+    }
+    {
+        var db = try Db.open(testing.allocator, path);
+        defer db.deinit();
+        var r = try db.beginRead();
+        try testing.expectEqual(N, try len(&r, r.root()));
+        // Strided spot-checks across the whole 2M range: get(i) must equal i.
+        var i: u64 = 0;
+        while (i < N) : (i += 50_000) try testing.expectEqual(i, try get(&r, r.root(), i));
+        try testing.expectEqual(@as(u64, 0), try get(&r, r.root(), 0));
+        try testing.expectEqual(N - 1, try get(&r, r.root(), N - 1));
+        try testing.expectError(error.IndexOutOfBounds, get(&r, r.root(), N));
+        r.end();
+    }
+}
+
+test "two million element column built in a single transaction" {
+    // All 2M appends happen in ONE write transaction. In-transaction node reuse keeps the
+    // file bounded to roughly the live working set (the copy-on-write spine garbage produced
+    // by each append is private to the uncommitted transaction and reused immediately),
+    // instead of accumulating gigabytes of unreclaimed garbage.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try colTmpPath(testing.allocator, &tmp, "col2m1txn.airdb");
+    defer testing.allocator.free(path);
+    const N: u64 = 2_000_000;
+    {
+        var db = try Db.create(testing.allocator, path);
+        defer db.deinit();
+        var w = try db.beginWrite();
+        var root = try create(&w);
+        var v: u64 = 0;
+        while (v < N) : (v += 1) root = try append(&w, root, v);
+        w.setRoot(root);
+        _ = try w.commit();
+    }
+    {
+        var db = try Db.open(testing.allocator, path);
+        defer db.deinit();
+        var r = try db.beginRead();
+        try testing.expectEqual(N, try len(&r, r.root()));
+        var i: u64 = 0;
+        while (i < N) : (i += 50_000) try testing.expectEqual(i, try get(&r, r.root(), i));
+        try testing.expectEqual(N - 1, try get(&r, r.root(), N - 1));
+        r.end();
+    }
+}
