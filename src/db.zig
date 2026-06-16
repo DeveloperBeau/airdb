@@ -450,6 +450,10 @@ pub const WriteTxn = struct {
     in_flight_frees: std.ArrayList(FreeExtent),
     work_freelist: FreeList,
 
+    pub fn deref(self: *WriteTxn, ref: Ref, len: usize) ![]const u8 {
+        return self.db.arena.deref(ref, len);
+    }
+
     pub fn alloc(self: *WriteTxn, size: usize) !Allocation {
         // A freed extent is reusable only when no reader in ANY live process pins a version
         // below its freeing-version. globalHorizon = min of live processes' min-pinned versions,
