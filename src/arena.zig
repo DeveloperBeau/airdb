@@ -31,6 +31,18 @@ pub const Arena = struct {
         return self.alloc(size);
     }
 
+    // Reuse an EXACT-size node extent from a pool whose freed_version <= horizon, else null
+    // (no bump fallback, no carving). Exact-size matching keeps fixed-size node allocation
+    // fragment-free and the pool scan short. For a transaction-private pool (always safe to
+    // reuse) pass horizon = maxInt; for the committed pool pass the reclaim horizon.
+    pub fn allocFromPool(self: *Arena, fl: *FreeList, size: usize, horizon: u64) ?Allocation {
+        if (fl.reuseExact(@intCast(size), horizon)) |off| {
+            const offu: usize = @intCast(off);
+            return .{ .ref = off, .bytes = self.map[offu .. offu + size] };
+        }
+        return null;
+    }
+
     // The single bounds-checked chokepoint. All reads go through here.
     pub fn deref(self: *Arena, ref: Ref, len: usize) error{BadRef}![]const u8 {
         const offv: usize = @intCast(ref);
