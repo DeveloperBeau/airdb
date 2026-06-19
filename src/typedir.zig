@@ -11,6 +11,8 @@ const Ref = @import("ref.zig").Ref;
 const Objects = @import("objects.zig");
 
 pub const Schema = []const []const Objects.PropKind;
+pub const Value = Objects.Value;
+const PropKind = Objects.PropKind;
 
 fn dirSize(tc: u16) usize {
     return 2 + @as(usize, tc) * 8;
@@ -71,6 +73,49 @@ pub fn validate(txn: anytype, dir: Ref, expected: Schema) !void {
             if (v.kind(j) != expected[t][j]) return error.SchemaMismatch;
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Routing wrappers: read catalog ref for the type, do the op, COW the directory
+// ---------------------------------------------------------------------------
+
+pub const UpdateOk = struct { dir: Ref, version: u64 };
+pub const UpdateResult = union(enum) { ok: UpdateOk, conflict: Objects.Conflict, not_found };
+pub const DeleteResult = union(enum) { ok: Ref, conflict: Objects.Conflict, not_found };
+
+pub fn insert(txn: *WriteTxn, dir: Ref, type_id: u16, values: []const Value) !struct { dir: Ref, row: u64 } {
+    const cat = try catalogRef(txn, dir, type_id);
+    const r = try Objects.insertTyped(txn, cat, values);
+    const new_dir = try setCatalogRef(txn, dir, type_id, r.cat);
+    return .{ .dir = new_dir, .row = r.row };
+}
+
+pub fn get(txn: anytype, dir: Ref, type_id: u16, pk: u64, out: []Value) !?u64 {
+    return Objects.getTyped(txn, try catalogRef(txn, dir, type_id), pk, out);
+}
+
+pub fn update(txn: *WriteTxn, dir: Ref, type_id: u16, pk: u64, values: []const Value, expected_version: u64) !UpdateResult {
+    const cat = try catalogRef(txn, dir, type_id);
+    const r = try Objects.updateTyped(txn, cat, pk, values, expected_version);
+    return switch (r) {
+        .ok => |o| .{ .ok = .{ .dir = try setCatalogRef(txn, dir, type_id, o.cat), .version = o.version } },
+        .conflict => |c| .{ .conflict = c },
+        .not_found => .not_found,
+    };
+}
+
+pub fn delete(txn: *WriteTxn, dir: Ref, type_id: u16, pk: u64, expected_version: u64) !DeleteResult {
+    const cat = try catalogRef(txn, dir, type_id);
+    const r = try Objects.deleteTyped(txn, cat, pk, expected_version);
+    return switch (r) {
+        .ok => |c| .{ .ok = try setCatalogRef(txn, dir, type_id, c) },
+        .conflict => |c| .{ .conflict = c },
+        .not_found => .not_found,
+    };
+}
+
+pub fn liveCount(txn: anytype, dir: Ref, type_id: u16) !u64 {
+    return Objects.liveCount(txn, try catalogRef(txn, dir, type_id));
 }
 
 // ---------------------------------------------------------------------------
@@ -146,4 +191,42 @@ test "validate accepts a matching schema and rejects a mismatch" {
         try testing.expectError(error.SchemaMismatch, validate(&r, r.root(), &wrong_count));
         r.end();
     }
+}
+
+test "two types route independently through the directory" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tdTmpPath(testing.allocator, &tmp, "td3.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    const schema = [_][]const PropKind{ &.{ .int, .blob }, &.{ .int, .int } };
+    var dir = try create(&w, &schema);
+
+    dir = (try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .bytes = "Ada" } })).dir;
+    dir = (try insert(&w, dir, 1, &.{ .{ .int = 1 }, .{ .int = 42 } })).dir;
+
+    var out0: [2]Value = undefined;
+    _ = (try get(&w, dir, 0, 1, &out0)).?;
+    try testing.expectEqualStrings("Ada", out0[1].bytes);
+
+    var out1: [2]Value = undefined;
+    const ver1 = (try get(&w, dir, 1, 1, &out1)).?;
+    try testing.expectEqual(@as(u64, 42), out1[1].int);
+
+    const ur = try update(&w, dir, 1, 1, &.{ .{ .int = 1 }, .{ .int = 99 } }, ver1);
+    dir = ur.ok.dir;
+    _ = (try get(&w, dir, 1, 1, &out1)).?;
+    try testing.expectEqual(@as(u64, 99), out1[1].int);
+    _ = (try get(&w, dir, 0, 1, &out0)).?;
+    try testing.expectEqualStrings("Ada", out0[1].bytes);
+
+    // delete type 0's row
+    const v0 = (try get(&w, dir, 0, 1, &out0)).?;
+    const dr = try delete(&w, dir, 0, 1, v0);
+    dir = dr.ok;
+    try testing.expectEqual(@as(?u64, null), try get(&w, dir, 0, 1, &out0));
+    try testing.expectEqual(@as(u64, 1), try liveCount(&w, dir, 1)); // type 1 unaffected
+    w.deinit();
 }
