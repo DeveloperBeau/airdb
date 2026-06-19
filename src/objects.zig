@@ -5,9 +5,11 @@ const Db = @import("db.zig").Db;
 const Ref = @import("ref.zig").Ref;
 const Column = @import("column.zig");
 const Index = @import("index.zig");
+const blob = @import("blob.zig");
 
 pub const PropCount = u16;
 pub const PropKind = enum(u8) { int = 0, blob = 1 };
+pub const Value = union(enum) { int: u64, bytes: []const u8 };
 
 // Catalog node layout:
 // [prop_count u16 LE][next_row u64 LE][pk_index_ref u64 LE][version_col_ref u64 LE][live_col_ref u64 LE][prop_count * (prop_col_ref u64 LE)][prop_count * (kind u8)]
@@ -284,6 +286,132 @@ pub fn getByPk(txn: anytype, cat: Ref, pk: u64, out: []u64) !?u64 {
     return try Column.get(txn, version_col_ref, row);
 }
 
+// insertTyped encodes a []Value row into raw u64 storage, allocating a blob
+// node for each .blob property, then delegates to insert.
+pub fn insertTyped(txn: *WriteTxn, cat: Ref, values: []const Value) !struct { cat: Ref, row: u64 } {
+    const v = try loadCatalog(txn, cat);
+    const pc = v.prop_count;
+    std.debug.assert(values.len == pc);
+    std.debug.assert(pc <= max_prop_count);
+    // Capture kinds into a local buffer before any mutation that could
+    // invalidate the deref slice backing CatalogView.
+    var kinds: [max_prop_count]PropKind = undefined;
+    {
+        var j: usize = 0;
+        while (j < pc) : (j += 1) kinds[j] = v.kind(j);
+    }
+    var raw: [max_prop_count]u64 = undefined;
+    var i: usize = 0;
+    while (i < pc) : (i += 1) {
+        raw[i] = switch (kinds[i]) {
+            .int => values[i].int,
+            .blob => try blob.put(txn, values[i].bytes),
+        };
+    }
+    const r = try insert(txn, cat, raw[0..pc]);
+    return .{ .cat = r.cat, .row = r.row };
+}
+
+// getTyped reads a row by primary key and decodes each property into a Value.
+// .blob properties are zero-copy slices into the mapped storage.
+// Returns the row version, or null when the key is not found.
+pub fn getTyped(txn: anytype, cat: Ref, pk: u64, out: []Value) !?u64 {
+    const v = try loadCatalog(txn, cat);
+    const pc = v.prop_count;
+    std.debug.assert(out.len == pc);
+    std.debug.assert(pc <= max_prop_count);
+    // Capture kinds before the getByPk call may touch other catalog nodes.
+    var kinds: [max_prop_count]PropKind = undefined;
+    {
+        var j: usize = 0;
+        while (j < pc) : (j += 1) kinds[j] = v.kind(j);
+    }
+    var raw: [max_prop_count]u64 = undefined;
+    const ver = (try getByPk(txn, cat, pk, raw[0..pc])) orelse return null;
+    var i: usize = 0;
+    while (i < pc) : (i += 1) {
+        out[i] = switch (kinds[i]) {
+            .int => .{ .int = raw[i] },
+            .blob => .{ .bytes = try blob.get(txn, raw[i]) },
+        };
+    }
+    return ver;
+}
+
+// updateTyped is MVCC-safe: it does NOT free any blob unless the version check
+// passes. Steps: read current row, check version, then on the apply path free
+// old blobs and allocate new ones before delegating to update.
+pub fn updateTyped(
+    txn: *WriteTxn,
+    cat: Ref,
+    pk: u64,
+    values: []const Value,
+    expected_version: u64,
+) !UpdateResult {
+    const v = try loadCatalog(txn, cat);
+    const pc = v.prop_count;
+    std.debug.assert(values.len == pc);
+    std.debug.assert(pc <= max_prop_count);
+    // Capture kinds before any mutation.
+    var kinds: [max_prop_count]PropKind = undefined;
+    {
+        var j: usize = 0;
+        while (j < pc) : (j += 1) kinds[j] = v.kind(j);
+    }
+    // Step 1: read the current row into cur_raw.
+    var cur_raw: [max_prop_count]u64 = undefined;
+    const current_version = (try getByPk(txn, cat, pk, cur_raw[0..pc])) orelse return .not_found;
+    // Step 2: version check BEFORE freeing or allocating any blob.
+    if (current_version != expected_version)
+        return .{ .conflict = .{ .current_version = current_version } };
+    // Step 3: apply path -- free old blobs and allocate new ones.
+    var new_raw: [max_prop_count]u64 = undefined;
+    var i: usize = 0;
+    while (i < pc) : (i += 1) {
+        new_raw[i] = switch (kinds[i]) {
+            .int => values[i].int,
+            .blob => blk: {
+                try blob.free(txn, cur_raw[i]);
+                break :blk try blob.put(txn, values[i].bytes);
+            },
+        };
+    }
+    // Step 4: delegate to the core update; it will re-check the version (match).
+    return try update(txn, cat, pk, new_raw[0..pc], expected_version);
+}
+
+// deleteTyped is MVCC-safe: blobs are freed only on the apply path, never on
+// conflict or not_found.
+pub fn deleteTyped(
+    txn: *WriteTxn,
+    cat: Ref,
+    pk: u64,
+    expected_version: u64,
+) !DeleteResult {
+    const v = try loadCatalog(txn, cat);
+    const pc = v.prop_count;
+    std.debug.assert(pc <= max_prop_count);
+    // Capture kinds before any mutation.
+    var kinds: [max_prop_count]PropKind = undefined;
+    {
+        var j: usize = 0;
+        while (j < pc) : (j += 1) kinds[j] = v.kind(j);
+    }
+    // Step 1: read the current row.
+    var cur_raw: [max_prop_count]u64 = undefined;
+    const current_version = (try getByPk(txn, cat, pk, cur_raw[0..pc])) orelse return .not_found;
+    // Step 2: version check BEFORE freeing any blob.
+    if (current_version != expected_version)
+        return .{ .conflict = .{ .current_version = current_version } };
+    // Step 3: apply path -- free all blob props.
+    var i: usize = 0;
+    while (i < pc) : (i += 1) {
+        if (kinds[i] == .blob) try blob.free(txn, cur_raw[i]);
+    }
+    // Step 4: delegate to the core delete.
+    return try delete(txn, cat, pk, expected_version);
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -519,6 +647,84 @@ test "100k objects with updates and deletes match a reference map after reopen" 
             try testing.expect(ver != null);
             try testing.expectEqual(e.value_ptr.*, out[1]);
         }
+        r.end();
+    }
+}
+
+test "typed insert and get round-trip a string property" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "str1.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var cat = try createTyped(&w, &.{ .int, .blob, .int });
+    cat = (try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .bytes = "Ada" }, .{ .int = 30 } })).cat;
+    cat = (try insertTyped(&w, cat, &.{ .{ .int = 2 }, .{ .bytes = "Linus" }, .{ .int = 54 } })).cat;
+    var out: [3]Value = undefined;
+    const ver = try getTyped(&w, cat, 2, &out);
+    try testing.expect(ver != null);
+    try testing.expectEqual(@as(u64, 2), out[0].int);
+    try testing.expectEqualStrings("Linus", out[1].bytes);
+    try testing.expectEqual(@as(u64, 54), out[2].int);
+    w.deinit();
+}
+
+test "typed update replaces a string and frees the old blob; delete frees blobs" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "str2.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var cat = try createTyped(&w, &.{ .int, .blob });
+    cat = (try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .bytes = "short" } })).cat;
+    var out: [2]Value = undefined;
+    const ver = (try getTyped(&w, cat, 1, &out)).?;
+    // stale-version update must NOT free the old blob (conflict path)
+    const conflict = try updateTyped(&w, cat, 1, &.{ .{ .int = 1 }, .{ .bytes = "X" } }, ver + 1);
+    try testing.expect(conflict == .conflict);
+    _ = (try getTyped(&w, cat, 1, &out)).?;
+    try testing.expectEqualStrings("short", out[1].bytes);
+    const ures = try updateTyped(&w, cat, 1, &.{ .{ .int = 1 }, .{ .bytes = "a much longer value" } }, ver);
+    cat = ures.ok.cat;
+    _ = try getTyped(&w, cat, 1, &out);
+    try testing.expectEqualStrings("a much longer value", out[1].bytes);
+    const v2 = (try getTyped(&w, cat, 1, &out)).?;
+    const dres = try deleteTyped(&w, cat, 1, v2);
+    cat = dres.ok;
+    try testing.expectEqual(@as(?u64, null), try getTyped(&w, cat, 1, &out));
+    w.deinit();
+}
+
+test "strings persist across reopen" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "str3.airdb");
+    defer testing.allocator.free(path);
+    {
+        var db = try Db.create(testing.allocator, path);
+        defer db.deinit();
+        var w = try db.beginWrite();
+        var cat = try createTyped(&w, &.{ .int, .blob });
+        var i: u64 = 0;
+        var buf: [32]u8 = undefined;
+        while (i < 500) : (i += 1) {
+            const s = try std.fmt.bufPrint(&buf, "name-{d}", .{i});
+            cat = (try insertTyped(&w, cat, &.{ .{ .int = i }, .{ .bytes = s } })).cat;
+        }
+        w.setRoot(cat);
+        _ = try w.commit();
+    }
+    {
+        var db = try Db.open(testing.allocator, path);
+        defer db.deinit();
+        var r = try db.beginRead();
+        var out: [2]Value = undefined;
+        _ = (try getTyped(&r, r.root(), 321, &out)).?;
+        try testing.expectEqualStrings("name-321", out[1].bytes);
         r.end();
     }
 }
