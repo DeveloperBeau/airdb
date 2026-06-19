@@ -158,6 +158,28 @@ pub fn insert(txn: *WriteTxn, cat: Ref, values: []const u64) !struct { cat: Ref,
     return .{ .cat = new_cat, .row = row };
 }
 
+pub fn getByPk(txn: anytype, cat: Ref, pk: u64, out: []u64) !?u64 {
+    const v = try loadCatalog(txn, cat);
+    std.debug.assert(out.len == v.prop_count);
+    // Capture refs before any potential file growth from other ops.
+    const pk_index_ref = v.pk_index_ref;
+    const live_col_ref = v.live_col_ref;
+    const version_col_ref = v.version_col_ref;
+    var prop_refs: [max_prop_count]Ref = undefined;
+    {
+        var j: usize = 0;
+        while (j < v.prop_count) : (j += 1) prop_refs[j] = v.propColRef(j);
+    }
+    const prop_count = v.prop_count;
+    const row = (try Index.get(txn, pk_index_ref, pk)) orelse return null;
+    if ((try Column.get(txn, live_col_ref, row)) == 0) return null;
+    var i: usize = 0;
+    while (i < prop_count) : (i += 1) {
+        out[i] = try Column.get(txn, prop_refs[i], row);
+    }
+    return try Column.get(txn, version_col_ref, row);
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -197,5 +219,27 @@ test "insert appends rows and rejects a duplicate primary key" {
     cat = r2.cat;
     try testing.expectEqual(@as(u64, 2), try liveCount(&w, cat));
     try testing.expectError(error.DuplicateKey, insert(&w, cat, &.{ 100, 9, 1 }));
+    w.deinit();
+}
+
+test "getByPk reads property values and the row version" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "obj3.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var cat = try create(&w, 3);
+    cat = (try insert(&w, cat, &.{ 100, 7, 1 })).cat;
+    cat = (try insert(&w, cat, &.{ 200, 8, 0 })).cat;
+
+    var out: [3]u64 = undefined;
+    const ver = try getByPk(&w, cat, 200, &out);
+    try testing.expect(ver != null);
+    try testing.expectEqual(@as(u64, 200), out[0]);
+    try testing.expectEqual(@as(u64, 8), out[1]);
+    try testing.expectEqual(@as(u64, 0), out[2]);
+    try testing.expectEqual(@as(?u64, null), try getByPk(&w, cat, 999, &out));
     w.deinit();
 }
