@@ -230,3 +230,41 @@ test "two types route independently through the directory" {
     try testing.expectEqual(@as(u64, 1), try liveCount(&w, dir, 1)); // type 1 unaffected
     w.deinit();
 }
+
+test "multiple types persist across reopen and validate" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tdTmpPath(testing.allocator, &tmp, "td4.airdb");
+    defer testing.allocator.free(path);
+    const schema = [_][]const PropKind{ &.{ .int, .blob }, &.{ .int, .int } };
+    {
+        var db = try Db.create(testing.allocator, path);
+        defer db.deinit();
+        var w = try db.beginWrite();
+        var dir = try create(&w, &schema);
+        var i: u64 = 0;
+        var buf: [16]u8 = undefined;
+        while (i < 300) : (i += 1) {
+            const s = try std.fmt.bufPrint(&buf, "p{d}", .{i});
+            dir = (try insert(&w, dir, 0, &.{ .{ .int = i }, .{ .bytes = s } })).dir;
+            dir = (try insert(&w, dir, 1, &.{ .{ .int = i }, .{ .int = i * 10 } })).dir;
+        }
+        w.setRoot(dir);
+        _ = try w.commit();
+    }
+    {
+        var db = try Db.open(testing.allocator, path);
+        defer db.deinit();
+        var r = try db.beginRead();
+        try validate(&r, r.root(), &schema);
+        try testing.expectEqual(@as(u64, 300), try liveCount(&r, r.root(), 0));
+        try testing.expectEqual(@as(u64, 300), try liveCount(&r, r.root(), 1));
+        var out0: [2]Value = undefined;
+        _ = (try get(&r, r.root(), 0, 250, &out0)).?;
+        try testing.expectEqualStrings("p250", out0[1].bytes);
+        var out1: [2]Value = undefined;
+        _ = (try get(&r, r.root(), 1, 250, &out1)).?;
+        try testing.expectEqual(@as(u64, 2500), out1[1].int);
+        r.end();
+    }
+}
