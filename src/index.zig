@@ -53,6 +53,80 @@ pub fn parseLeaf(bytes: []const u8) error{Corrupt}!LeafView {
     return .{ .bytes = bytes, .count = leaf_count };
 }
 
+// ---------------------------------------------------------------------------
+// Inner-node encoding
+// ---------------------------------------------------------------------------
+
+pub fn encodeInner(buf: []u8, refs: []const u64, lows: []const u64) usize {
+    std.debug.assert(refs.len == lows.len and refs.len <= FANOUT);
+    buf[0] = kind_inner;
+    std.mem.writeInt(u16, buf[1..3], @intCast(refs.len), .little);
+    var off: usize = hdr;
+    for (refs, lows) |r, l| {
+        std.mem.writeInt(u64, buf[off..][0..8], r, .little);
+        std.mem.writeInt(u64, buf[off + 8 ..][0..8], l, .little);
+        off += 16;
+    }
+    return off;
+}
+
+pub const InnerView = struct {
+    bytes: []const u8,
+    child_count: u16,
+    pub fn childRef(self: InnerView, i: usize) u64 {
+        return std.mem.readInt(u64, self.bytes[hdr + i * 16 ..][0..8], .little);
+    }
+    pub fn lowKey(self: InnerView, i: usize) u64 {
+        return std.mem.readInt(u64, self.bytes[hdr + i * 16 + 8 ..][0..8], .little);
+    }
+};
+
+pub fn parseInner(bytes: []const u8) error{Corrupt}!InnerView {
+    if (bytes.len < hdr) return error.Corrupt;
+    if (bytes[0] != kind_inner) return error.Corrupt;
+    const child_count = std.mem.readInt(u16, bytes[1..3], .little);
+    if (child_count > FANOUT) return error.Corrupt;
+    if (bytes.len < hdr + @as(usize, child_count) * 16) return error.Corrupt;
+    return .{ .bytes = bytes, .child_count = child_count };
+}
+
+fn childIndexForKey(v: InnerView, k: u64) usize {
+    // Return the largest i with lowKey(i) <= k; fall back to 0 if k < lowKey(0).
+    var best: usize = 0;
+    var i: usize = 0;
+    while (i < v.child_count) : (i += 1) {
+        if (v.lowKey(i) <= k) {
+            best = i;
+        } else {
+            break;
+        }
+    }
+    return best;
+}
+
+fn derefNode(txn: anytype, ref: Ref) ![]const u8 {
+    const kind_bytes = try txn.deref(ref, 1);
+    const kind = kind_bytes[0];
+    if (kind == kind_leaf) {
+        return txn.deref(ref, leaf_node_size);
+    } else {
+        return txn.deref(ref, inner_node_size);
+    }
+}
+
+// Test-only helper: build an inner node from a slice of (ref, low) pairs.
+pub fn makeInnerForTest(txn: *WriteTxn, children: []const struct { ref: u64, low: u64 }) !Ref {
+    var refs: [FANOUT]u64 = undefined;
+    var lows: [FANOUT]u64 = undefined;
+    for (children, 0..) |c, i| {
+        refs[i] = c.ref;
+        lows[i] = c.low;
+    }
+    const a = try txn.alloc(inner_node_size);
+    _ = encodeInner(a.bytes, refs[0..children.len], lows[0..children.len]);
+    return a.ref;
+}
+
 test "leaf encode/decode round-trips sorted pairs" {
     var buf: [leaf_node_size]u8 = undefined;
     const keys = [_]u64{ 1, 5, 9 };
@@ -95,16 +169,18 @@ fn nodeKind(txn: anytype, ref: Ref) !u8 {
 
 /// Look up key in the tree rooted at root. Returns the associated value or null.
 pub fn get(txn: anytype, root: Ref, key: u64) !?u64 {
-    const k = try nodeKind(txn, root);
-    if (k == kind_leaf) {
-        const bytes = try txn.deref(root, leaf_node_size);
+    const bytes = try derefNode(txn, root);
+    if (bytes[0] == kind_leaf) {
         const v = try parseLeaf(bytes);
         const i = v.lowerBound(key);
         if (i < v.count and v.key(i) == key) return v.value(i);
         return null;
     }
-    // Inner node handling: Task 3.
-    return error.Unimplemented;
+    // Inner node: descend into the appropriate child.
+    const v = try parseInner(bytes);
+    const ci = childIndexForKey(v, key);
+    const child_ref: Ref = v.childRef(ci);
+    return get(txn, child_ref, key);
 }
 
 /// Insert or update key->val in the tree rooted at root.
@@ -170,14 +246,20 @@ pub fn remove(txn: *WriteTxn, root: Ref, key: u64) !Ref {
 
 /// Return the number of keys in the tree rooted at root.
 pub fn count(txn: anytype, root: Ref) !u64 {
-    const k = try nodeKind(txn, root);
-    if (k == kind_leaf) {
-        const bytes = try txn.deref(root, leaf_node_size);
+    const bytes = try derefNode(txn, root);
+    if (bytes[0] == kind_leaf) {
         const v = try parseLeaf(bytes);
         return v.count;
     }
-    // Inner node handling: Task 3.
-    return error.Unimplemented;
+    // Inner node: sum counts over all children.
+    const v = try parseInner(bytes);
+    var total: u64 = 0;
+    var i: usize = 0;
+    while (i < v.child_count) : (i += 1) {
+        const child_ref: Ref = v.childRef(i);
+        total += try count(txn, child_ref);
+    }
+    return total;
 }
 
 // ---------------------------------------------------------------------------
@@ -190,6 +272,30 @@ fn idxTmpPath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const 
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const dlen = try tmp.dir.realPath(testing.io, &path_buf);
     return std.fs.path.join(allocator, &.{ path_buf[0..dlen], name });
+}
+
+test "get and count traverse an inner node over two leaves" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try idxTmpPath(testing.allocator, &tmp, "idx3.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var a = try create(&w);
+    a = try insert(&w, a, 1, 11);
+    a = try insert(&w, a, 3, 33);
+    var b = try create(&w);
+    b = try insert(&w, b, 5, 55);
+    b = try insert(&w, b, 7, 77);
+    const inner = try makeInnerForTest(&w, &.{ .{ .ref = a, .low = 1 }, .{ .ref = b, .low = 5 } });
+    try testing.expectEqual(@as(u64, 4), try count(&w, inner));
+    try testing.expectEqual(@as(?u64, 11), try get(&w, inner, 1));
+    try testing.expectEqual(@as(?u64, 55), try get(&w, inner, 5));
+    try testing.expectEqual(@as(?u64, 77), try get(&w, inner, 7));
+    try testing.expect((try get(&w, inner, 6)) == null);
+    try testing.expect((try get(&w, inner, 0)) == null);
+    w.deinit();
 }
 
 test "single-leaf index: insert, get, upsert, remove, count" {
