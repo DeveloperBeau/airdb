@@ -158,6 +158,38 @@ pub fn insert(txn: *WriteTxn, cat: Ref, values: []const u64) !struct { cat: Ref,
     return .{ .cat = new_cat, .row = row };
 }
 
+pub const Conflict = struct { current_version: u64 };
+pub const UpdateResult = union(enum) {
+    ok: struct { cat: Ref, version: u64 },
+    conflict: Conflict,
+    not_found,
+};
+
+pub fn update(txn: *WriteTxn, cat: Ref, pk: u64, values: []const u64, expected_version: u64) !UpdateResult {
+    const v = try loadCatalog(txn, cat);
+    std.debug.assert(values.len == v.prop_count);
+    std.debug.assert(values[0] == pk); // pk is identity, must not change
+    const row = (try Index.get(txn, v.pk_index_ref, pk)) orelse return .not_found;
+    const cur = try Column.get(txn, v.version_col_ref, row);
+    if (cur != expected_version) return .{ .conflict = .{ .current_version = cur } };
+
+    // Capture refs into locals before mutating (avoid relying on the catalog deref slice).
+    const pc = v.prop_count;
+    const idx_ref = v.pk_index_ref;
+    const live_ref = v.live_col_ref;
+    const next_row = v.next_row;
+    var prop_refs: [256]Ref = undefined;
+    { var j: usize = 0; while (j < pc) : (j += 1) prop_refs[j] = v.propColRef(j); }
+    var ver_ref = v.version_col_ref;
+
+    var i: usize = 0;
+    while (i < pc) : (i += 1) prop_refs[i] = try Column.set(txn, prop_refs[i], row, values[i]);
+    ver_ref = try Column.set(txn, ver_ref, row, txn.new_version);
+
+    const new_cat = try writeCatalog(txn, pc, next_row, idx_ref, ver_ref, live_ref, prop_refs[0..pc]);
+    return .{ .ok = .{ .cat = new_cat, .version = txn.new_version } };
+}
+
 pub fn getByPk(txn: anytype, cat: Ref, pk: u64, out: []u64) !?u64 {
     const v = try loadCatalog(txn, cat);
     std.debug.assert(out.len == v.prop_count);
@@ -242,4 +274,45 @@ test "getByPk reads property values and the row version" {
     try testing.expectEqual(@as(u64, 0), out[2]);
     try testing.expectEqual(@as(?u64, null), try getByPk(&w, cat, 999, &out));
     w.deinit();
+}
+
+test "update applies on a matching version and conflicts on a stale one" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "obj4.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var cat: Ref = undefined;
+    var fetched_version: u64 = undefined;
+    {
+        var w = try db.beginWrite();
+        cat = try create(&w, 3);
+        cat = (try insert(&w, cat, &.{ 100, 7, 1 })).cat;
+        w.setRoot(cat);
+        _ = try w.commit();
+    }
+    {
+        var r = try db.beginRead();
+        var out: [3]u64 = undefined;
+        fetched_version = (try getByPk(&r, r.root(), 100, &out)).?;
+        r.end();
+    }
+    {
+        var w = try db.beginWrite();
+        const res = try update(&w, w.new_root, 100, &.{ 100, 77, 1 }, fetched_version);
+        try testing.expect(res == .ok);
+        cat = res.ok.cat;
+        const res2 = try update(&w, cat, 100, &.{ 100, 88, 1 }, fetched_version); // stale now
+        try testing.expect(res2 == .conflict);
+        w.setRoot(cat);
+        _ = try w.commit();
+    }
+    {
+        var r = try db.beginRead();
+        var out: [3]u64 = undefined;
+        _ = try getByPk(&r, r.root(), 100, &out);
+        try testing.expectEqual(@as(u64, 77), out[1]);
+        r.end();
+    }
 }
