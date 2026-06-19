@@ -185,7 +185,10 @@ pub fn update(txn: *WriteTxn, cat: Ref, pk: u64, values: []const u64, expected_v
     const live_ref = v.live_col_ref;
     const next_row = v.next_row;
     var prop_refs: [256]Ref = undefined;
-    { var j: usize = 0; while (j < pc) : (j += 1) prop_refs[j] = v.propColRef(j); }
+    {
+        var j: usize = 0;
+        while (j < pc) : (j += 1) prop_refs[j] = v.propColRef(j);
+    }
     var ver_ref = v.version_col_ref;
 
     var i: usize = 0;
@@ -206,14 +209,17 @@ pub fn delete(txn: *WriteTxn, cat: Ref, pk: u64, expected_version: u64) !DeleteR
     const pc = v.prop_count;
     const next_row = v.next_row;
     var prop_refs: [256]Ref = undefined;
-    { var j: usize = 0; while (j < pc) : (j += 1) prop_refs[j] = v.propColRef(j); }
+    {
+        var j: usize = 0;
+        while (j < pc) : (j += 1) prop_refs[j] = v.propColRef(j);
+    }
     var live_ref = v.live_col_ref;
     var ver_ref = v.version_col_ref;
     var idx_ref = v.pk_index_ref;
 
-    live_ref = try Column.set(txn, live_ref, row, 0);             // tombstone
+    live_ref = try Column.set(txn, live_ref, row, 0); // tombstone
     ver_ref = try Column.set(txn, ver_ref, row, txn.new_version); // bump version stamp
-    idx_ref = try Index.remove(txn, idx_ref, pk);                 // remove pk from the index
+    idx_ref = try Index.remove(txn, idx_ref, pk); // remove pk from the index
 
     const new_cat = try writeCatalog(txn, pc, next_row, idx_ref, ver_ref, live_ref, prop_refs[0..pc]);
     return .{ .ok = new_cat };
@@ -399,6 +405,63 @@ test "objects persist across commit and reopen" {
         try testing.expectEqual(@as(u64, 777), out[0]);
         try testing.expectEqual(@as(u64, 1554), out[1]);
         try testing.expectEqual(@as(?u64, null), try getByPk(&r, r.root(), 5000, &out));
+        r.end();
+    }
+}
+
+test "100k objects with updates and deletes match a reference map after reopen" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "obj7.airdb");
+    defer testing.allocator.free(path);
+    var ref = std.AutoHashMap(u64, u64).init(testing.allocator); // pk -> prop1 value, live only
+    defer ref.deinit();
+    const N: u64 = 100_000;
+    {
+        var db = try Db.create(testing.allocator, path);
+        defer db.deinit();
+        var w = try db.beginWrite();
+        var cat = try create(&w, 2);
+        var out: [2]u64 = undefined;
+        var i: u64 = 0;
+        while (i < N) : (i += 1) {
+            const pk = (i *% 2654435761) % 5_000_011;
+            if ((try getByPk(&w, cat, pk, &out)) != null) continue; // skip hash collision (dup pk)
+            cat = (try insert(&w, cat, &.{ pk, i })).cat;
+            try ref.put(pk, i);
+        }
+        // Snapshot the live keys, then update every 5th and delete every 7th.
+        var keys = std.ArrayList(u64).empty;
+        defer keys.deinit(testing.allocator);
+        var kit = ref.keyIterator();
+        while (kit.next()) |k| try keys.append(testing.allocator, k.*);
+        for (keys.items, 0..) |pk, idx| {
+            const ver = (try getByPk(&w, cat, pk, &out)).?;
+            if (idx % 5 == 0) {
+                const res = try update(&w, cat, pk, &.{ pk, out[1] +% 1 }, ver);
+                cat = res.ok.cat;
+                try ref.put(pk, out[1] +% 1);
+            } else if (idx % 7 == 0) {
+                const res = try delete(&w, cat, pk, ver);
+                cat = res.ok;
+                _ = ref.remove(pk);
+            }
+        }
+        w.setRoot(cat);
+        _ = try w.commit();
+    }
+    {
+        var db = try Db.open(testing.allocator, path);
+        defer db.deinit();
+        var r = try db.beginRead();
+        try testing.expectEqual(@as(u64, ref.count()), try liveCount(&r, r.root()));
+        var out: [2]u64 = undefined;
+        var it = ref.iterator();
+        while (it.next()) |e| {
+            const ver = try getByPk(&r, r.root(), e.key_ptr.*, &out);
+            try testing.expect(ver != null);
+            try testing.expectEqual(e.value_ptr.*, out[1]);
+        }
         r.end();
     }
 }
