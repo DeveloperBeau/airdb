@@ -111,7 +111,7 @@ pub const CatalogView = struct {
 // Deref the catalog at cat, read prop_count, then deref the full node and parse
 // all fixed fields. Returns a CatalogView whose bytes slice is valid for the
 // lifetime of the transaction.
-fn loadCatalog(txn: anytype, cat: Ref) !CatalogView {
+pub fn loadCatalog(txn: anytype, cat: Ref) !CatalogView {
     const pc_bytes = try txn.deref(cat, 2);
     const prop_count = std.mem.readInt(u16, pc_bytes[0..2], .little);
     std.debug.assert(prop_count <= max_prop_count);
