@@ -373,3 +373,32 @@ test "delete tombstones a row and conflicts on a stale version" {
     try testing.expectEqual(@as(u64, 2), try liveCount(&w, cat));
     w.deinit();
 }
+
+test "objects persist across commit and reopen" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "obj6.airdb");
+    defer testing.allocator.free(path);
+    {
+        var db = try Db.create(testing.allocator, path);
+        defer db.deinit();
+        var w = try db.beginWrite();
+        var cat = try create(&w, 2); // pk + one value
+        var i: u64 = 0;
+        while (i < 1000) : (i += 1) cat = (try insert(&w, cat, &.{ i, i * 2 })).cat;
+        w.setRoot(cat);
+        _ = try w.commit();
+    }
+    {
+        var db = try Db.open(testing.allocator, path);
+        defer db.deinit();
+        var r = try db.beginRead();
+        try testing.expectEqual(@as(u64, 1000), try liveCount(&r, r.root()));
+        var out: [2]u64 = undefined;
+        _ = (try getByPk(&r, r.root(), 777, &out)).?;
+        try testing.expectEqual(@as(u64, 777), out[0]);
+        try testing.expectEqual(@as(u64, 1554), out[1]);
+        try testing.expectEqual(@as(?u64, null), try getByPk(&r, r.root(), 5000, &out));
+        r.end();
+    }
+}
