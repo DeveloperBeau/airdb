@@ -1,3 +1,4 @@
+pub const objects = @import("objects.zig");
 pub const column = @import("column.zig");
 pub const index = @import("index.zig");
 pub const coord = @import("coord.zig");

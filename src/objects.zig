@@ -1,0 +1,136 @@
+const std = @import("std");
+const testing = std.testing;
+const WriteTxn = @import("db.zig").WriteTxn;
+const Db = @import("db.zig").Db;
+const Ref = @import("ref.zig").Ref;
+const Column = @import("column.zig");
+const Index = @import("index.zig");
+
+pub const PropCount = u16;
+
+// Catalog node layout:
+// [prop_count u16 LE][next_row u64 LE][pk_index_ref u64 LE][version_col_ref u64 LE][live_col_ref u64 LE][prop_count * (prop_col_ref u64 LE)]
+const off_prop_count: usize = 0; // u16, 2 bytes
+const off_next_row: usize = 2; // u64, 8 bytes
+const off_pk_index_ref: usize = 10; // u64, 8 bytes
+const off_version_col_ref: usize = 18; // u64, 8 bytes
+const off_live_col_ref: usize = 26; // u64, 8 bytes
+const off_prop_cols: usize = 34; // prop_count * u64
+
+// Maximum prop_count for stack-allocated ref buffers.
+const max_prop_count: usize = 256;
+
+fn catalogSize(pc: PropCount) usize {
+    return off_prop_cols + @as(usize, pc) * 8;
+}
+
+// Allocate and encode a fresh catalog node; return its ref.
+fn writeCatalog(
+    txn: *WriteTxn,
+    prop_count: PropCount,
+    next_row: u64,
+    pk_index_ref: Ref,
+    version_col_ref: Ref,
+    live_col_ref: Ref,
+    prop_col_refs: []const Ref,
+) !Ref {
+    const a = try txn.alloc(catalogSize(prop_count));
+    std.mem.writeInt(u16, a.bytes[off_prop_count..][0..2], prop_count, .little);
+    std.mem.writeInt(u64, a.bytes[off_next_row..][0..8], next_row, .little);
+    std.mem.writeInt(u64, a.bytes[off_pk_index_ref..][0..8], pk_index_ref, .little);
+    std.mem.writeInt(u64, a.bytes[off_version_col_ref..][0..8], version_col_ref, .little);
+    std.mem.writeInt(u64, a.bytes[off_live_col_ref..][0..8], live_col_ref, .little);
+    for (prop_col_refs, 0..) |ref, i| {
+        std.mem.writeInt(u64, a.bytes[off_prop_cols + i * 8 ..][0..8], ref, .little);
+    }
+    return a.ref;
+}
+
+// Create prop_count property columns, a version column, a live column, and an
+// empty pk index. Write a catalog node encoding all refs and return its ref.
+pub fn create(txn: *WriteTxn, prop_count: PropCount) !Ref {
+    std.debug.assert(prop_count <= max_prop_count);
+    var prop_col_refs: [max_prop_count]Ref = undefined;
+    var i: usize = 0;
+    while (i < prop_count) : (i += 1) {
+        prop_col_refs[i] = try Column.create(txn);
+    }
+    const version_col_ref = try Column.create(txn);
+    const live_col_ref = try Column.create(txn);
+    const pk_index_ref = try Index.create(txn);
+    return writeCatalog(
+        txn,
+        prop_count,
+        0,
+        pk_index_ref,
+        version_col_ref,
+        live_col_ref,
+        prop_col_refs[0..prop_count],
+    );
+}
+
+pub const CatalogView = struct {
+    prop_count: PropCount,
+    next_row: u64,
+    pk_index_ref: Ref,
+    version_col_ref: Ref,
+    live_col_ref: Ref,
+    bytes: []const u8,
+
+    pub fn propColRef(self: CatalogView, i: usize) Ref {
+        return std.mem.readInt(u64, self.bytes[off_prop_cols + i * 8 ..][0..8], .little);
+    }
+};
+
+// Deref the catalog at cat, read prop_count, then deref the full node and parse
+// all fixed fields. Returns a CatalogView whose bytes slice is valid for the
+// lifetime of the transaction.
+fn loadCatalog(txn: anytype, cat: Ref) !CatalogView {
+    const pc_bytes = try txn.deref(cat, 2);
+    const prop_count = std.mem.readInt(u16, pc_bytes[0..2], .little);
+    std.debug.assert(prop_count <= max_prop_count);
+    const bytes = try txn.deref(cat, catalogSize(prop_count));
+    return CatalogView{
+        .prop_count = prop_count,
+        .next_row = std.mem.readInt(u64, bytes[off_next_row..][0..8], .little),
+        .pk_index_ref = std.mem.readInt(u64, bytes[off_pk_index_ref..][0..8], .little),
+        .version_col_ref = std.mem.readInt(u64, bytes[off_version_col_ref..][0..8], .little),
+        .live_col_ref = std.mem.readInt(u64, bytes[off_live_col_ref..][0..8], .little),
+        .bytes = bytes,
+    };
+}
+
+pub fn propCount(txn: anytype, cat: Ref) !PropCount {
+    const view = try loadCatalog(txn, cat);
+    return view.prop_count;
+}
+
+// liveCount returns the number of live rows tracked by the pk index.
+pub fn liveCount(txn: anytype, cat: Ref) !u64 {
+    const view = try loadCatalog(txn, cat);
+    return Index.count(txn, view.pk_index_ref);
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+fn objTmpPath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const u8) ![]const u8 {
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dlen = try tmp.dir.realPath(testing.io, &path_buf);
+    return std.fs.path.join(allocator, &.{ path_buf[0..dlen], name });
+}
+
+test "create allocates an empty type and load reads it back" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "obj1.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    const cat = try create(&w, 3);
+    try testing.expectEqual(@as(PropCount, 3), try propCount(&w, cat));
+    try testing.expectEqual(@as(u64, 0), try liveCount(&w, cat));
+    w.deinit();
+}
