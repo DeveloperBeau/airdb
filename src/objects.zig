@@ -165,6 +165,12 @@ pub const UpdateResult = union(enum) {
     not_found,
 };
 
+pub const DeleteResult = union(enum) {
+    ok: Ref, // new catalog
+    conflict: Conflict,
+    not_found,
+};
+
 pub fn update(txn: *WriteTxn, cat: Ref, pk: u64, values: []const u64, expected_version: u64) !UpdateResult {
     const v = try loadCatalog(txn, cat);
     std.debug.assert(values.len == v.prop_count);
@@ -188,6 +194,29 @@ pub fn update(txn: *WriteTxn, cat: Ref, pk: u64, values: []const u64, expected_v
 
     const new_cat = try writeCatalog(txn, pc, next_row, idx_ref, ver_ref, live_ref, prop_refs[0..pc]);
     return .{ .ok = .{ .cat = new_cat, .version = txn.new_version } };
+}
+
+pub fn delete(txn: *WriteTxn, cat: Ref, pk: u64, expected_version: u64) !DeleteResult {
+    const v = try loadCatalog(txn, cat);
+    const row = (try Index.get(txn, v.pk_index_ref, pk)) orelse return .not_found;
+    const cur = try Column.get(txn, v.version_col_ref, row);
+    if (cur != expected_version) return .{ .conflict = .{ .current_version = cur } };
+
+    // Capture refs into locals before mutating.
+    const pc = v.prop_count;
+    const next_row = v.next_row;
+    var prop_refs: [256]Ref = undefined;
+    { var j: usize = 0; while (j < pc) : (j += 1) prop_refs[j] = v.propColRef(j); }
+    var live_ref = v.live_col_ref;
+    var ver_ref = v.version_col_ref;
+    var idx_ref = v.pk_index_ref;
+
+    live_ref = try Column.set(txn, live_ref, row, 0);             // tombstone
+    ver_ref = try Column.set(txn, ver_ref, row, txn.new_version); // bump version stamp
+    idx_ref = try Index.remove(txn, idx_ref, pk);                 // remove pk from the index
+
+    const new_cat = try writeCatalog(txn, pc, next_row, idx_ref, ver_ref, live_ref, prop_refs[0..pc]);
+    return .{ .ok = new_cat };
 }
 
 pub fn getByPk(txn: anytype, cat: Ref, pk: u64, out: []u64) !?u64 {
@@ -315,4 +344,32 @@ test "update applies on a matching version and conflicts on a stale one" {
         try testing.expectEqual(@as(u64, 77), out[1]);
         r.end();
     }
+}
+
+test "delete tombstones a row and conflicts on a stale version" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "obj5.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var cat = try create(&w, 3);
+    cat = (try insert(&w, cat, &.{ 100, 7, 1 })).cat;
+    cat = (try insert(&w, cat, &.{ 200, 8, 0 })).cat;
+    var out: [3]u64 = undefined;
+    const v100 = (try getByPk(&w, cat, 100, &out)).?;
+
+    const stale = try delete(&w, cat, 100, v100 + 1);
+    try testing.expect(stale == .conflict);
+
+    const ok = try delete(&w, cat, 100, v100);
+    try testing.expect(ok == .ok);
+    cat = ok.ok;
+    try testing.expectEqual(@as(?u64, null), try getByPk(&w, cat, 100, &out));
+    try testing.expectEqual(@as(u64, 1), try liveCount(&w, cat));
+    // pk 100 can be reinserted after deletion
+    cat = (try insert(&w, cat, &.{ 100, 70, 1 })).cat;
+    try testing.expectEqual(@as(u64, 2), try liveCount(&w, cat));
+    w.deinit();
 }
