@@ -183,40 +183,167 @@ pub fn get(txn: anytype, root: Ref, key: u64) !?u64 {
     return get(txn, child_ref, key);
 }
 
-/// Insert or update key->val in the tree rooted at root.
-/// Returns the (possibly new) root Ref.
-pub fn insert(txn: *WriteTxn, root: Ref, key: u64, val: u64) !Ref {
-    const k = try nodeKind(txn, root);
-    if (k == kind_leaf) {
-        const old_bytes = try txn.deref(root, leaf_node_size);
-        const v = try parseLeaf(old_bytes);
+// ---------------------------------------------------------------------------
+// B+tree insert with leaf/inner split and height growth (Task 4)
+// ---------------------------------------------------------------------------
+
+const Split = struct { ref: Ref, low: u64 };
+const InsertResult = struct { ref: Ref, split: ?Split };
+
+/// Descend the leftmost spine to the leftmost leaf and return its first key.
+fn minKey(txn: anytype, ref: Ref) !u64 {
+    const bytes = try derefNode(txn, ref);
+    if (bytes[0] == kind_leaf) {
+        const v = try parseLeaf(bytes);
+        return v.key(0);
+    }
+    const v = try parseInner(bytes);
+    return minKey(txn, v.childRef(0));
+}
+
+/// Recursive insert. Returns the (possibly new) node ref and an optional right
+/// sibling produced by a midpoint split.
+fn insertInto(txn: *WriteTxn, node_ref: Ref, key: u64, val: u64) !InsertResult {
+    const node_bytes = try txn.deref(node_ref, 1);
+    const kind = node_bytes[0];
+
+    // ---- LEAF ---------------------------------------------------------------
+    if (kind == kind_leaf) {
+        const leaf_bytes = try txn.deref(node_ref, leaf_node_size);
+        const v = try parseLeaf(leaf_bytes);
         const i = v.lowerBound(key);
+
+        // Upsert: key already present.
         if (i < v.count and v.key(i) == key) {
-            // Upsert: overwrite existing value in place via a writable copy.
-            const a = try txn.writableCopy(root, leaf_node_size);
+            const a = try txn.writableCopy(node_ref, leaf_node_size);
             std.mem.writeInt(u64, a.bytes[hdr + i * 16 + 8 ..][0..8], val, .little);
-            return a.ref;
+            return InsertResult{ .ref = a.ref, .split = null };
         }
-        // New key: leaf must not be full (split is Task 4).
-        if (v.count >= LEAF_CAP) return error.LeafFull;
-        const a = try txn.writableCopy(root, leaf_node_size);
-        // Shift slots [i, count) right by one to make room at slot i.
-        // Iterate from the end backward to avoid clobbering data.
-        var j: usize = v.count;
-        while (j > i) : (j -= 1) {
+
+        // Not full: shift and insert.
+        if (v.count < LEAF_CAP) {
+            const a = try txn.writableCopy(node_ref, leaf_node_size);
+            var j: usize = v.count;
+            while (j > i) : (j -= 1) {
+                const src = hdr + (j - 1) * 16;
+                const dst = hdr + j * 16;
+                @memcpy(a.bytes[dst..][0..16], a.bytes[src..][0..16]);
+            }
+            std.mem.writeInt(u64, a.bytes[hdr + i * 16 ..][0..8], key, .little);
+            std.mem.writeInt(u64, a.bytes[hdr + i * 16 + 8 ..][0..8], val, .little);
+            std.mem.writeInt(u16, a.bytes[1..3], v.count + 1, .little);
+            return InsertResult{ .ref = a.ref, .split = null };
+        }
+
+        // Full: build LEAF_CAP+1 sorted pairs, split at midpoint.
+        const total_leaf: usize = @as(usize, LEAF_CAP) + 1;
+        var keys_buf: [LEAF_CAP + 1]u64 = undefined;
+        var vals_buf: [LEAF_CAP + 1]u64 = undefined;
+        var j: usize = 0;
+        while (j < i) : (j += 1) {
+            keys_buf[j] = v.key(j);
+            vals_buf[j] = v.value(j);
+        }
+        keys_buf[i] = key;
+        vals_buf[i] = val;
+        j = i;
+        while (j < v.count) : (j += 1) {
+            keys_buf[j + 1] = v.key(j);
+            vals_buf[j + 1] = v.value(j);
+        }
+        // Build buffer from v before writableCopy to avoid any aliasing concern.
+        const m_leaf: usize = total_leaf / 2;
+        const left_a = try txn.writableCopy(node_ref, leaf_node_size);
+        std.mem.writeInt(u16, left_a.bytes[1..3], @intCast(m_leaf), .little);
+        j = 0;
+        while (j < m_leaf) : (j += 1) {
+            std.mem.writeInt(u64, left_a.bytes[hdr + j * 16 ..][0..8], keys_buf[j], .little);
+            std.mem.writeInt(u64, left_a.bytes[hdr + j * 16 + 8 ..][0..8], vals_buf[j], .little);
+        }
+        const right_a = try txn.alloc(leaf_node_size);
+        _ = encodeLeaf(right_a.bytes, keys_buf[m_leaf..total_leaf], vals_buf[m_leaf..total_leaf]);
+        return InsertResult{ .ref = left_a.ref, .split = Split{ .ref = right_a.ref, .low = keys_buf[m_leaf] } };
+    }
+
+    // ---- INNER --------------------------------------------------------------
+    const inner_bytes = try txn.deref(node_ref, inner_node_size);
+    const v = try parseInner(inner_bytes);
+    const ci = childIndexForKey(v, key);
+    const r = try insertInto(txn, v.childRef(ci), key, val);
+
+    // No split in child: just update the child ref.
+    if (r.split == null) {
+        const new_inner = try txn.writableCopy(node_ref, inner_node_size);
+        std.mem.writeInt(u64, new_inner.bytes[hdr + ci * 16 ..][0..8], r.ref, .little);
+        return InsertResult{ .ref = new_inner.ref, .split = null };
+    }
+
+    const split = r.split.?;
+
+    // Child split but this inner node is not full: shift and insert at ci+1.
+    if (v.child_count < FANOUT) {
+        const new_inner = try txn.writableCopy(node_ref, inner_node_size);
+        // Update child ci's ref (low_key unchanged: left half keeps same minimum).
+        std.mem.writeInt(u64, new_inner.bytes[hdr + ci * 16 ..][0..8], r.ref, .little);
+        // Shift slots [ci+1, child_count) right by one.
+        var j: usize = v.child_count;
+        while (j > ci + 1) : (j -= 1) {
             const src = hdr + (j - 1) * 16;
             const dst = hdr + j * 16;
-            @memcpy(a.bytes[dst..][0..16], a.bytes[src..][0..16]);
+            @memcpy(new_inner.bytes[dst..][0..16], new_inner.bytes[src..][0..16]);
         }
-        // Write (key, val) at slot i.
-        std.mem.writeInt(u64, a.bytes[hdr + i * 16 ..][0..8], key, .little);
-        std.mem.writeInt(u64, a.bytes[hdr + i * 16 + 8 ..][0..8], val, .little);
-        // Update count.
-        std.mem.writeInt(u16, a.bytes[1..3], v.count + 1, .little);
-        return a.ref;
+        std.mem.writeInt(u64, new_inner.bytes[hdr + (ci + 1) * 16 ..][0..8], split.ref, .little);
+        std.mem.writeInt(u64, new_inner.bytes[hdr + (ci + 1) * 16 + 8 ..][0..8], split.low, .little);
+        std.mem.writeInt(u16, new_inner.bytes[1..3], v.child_count + 1, .little);
+        return InsertResult{ .ref = new_inner.ref, .split = null };
     }
-    // Inner node handling: Task 3.
-    return error.Unimplemented;
+
+    // Child split AND this inner node is full: build FANOUT+1 entries, split at midpoint.
+    // Read all entries from v before calling writableCopy.
+    const total_inner: usize = @as(usize, FANOUT) + 1;
+    var refs_buf: [FANOUT + 1]u64 = undefined;
+    var lows_buf: [FANOUT + 1]u64 = undefined;
+    var j: usize = 0;
+    while (j < v.child_count) : (j += 1) {
+        refs_buf[j] = v.childRef(j);
+        lows_buf[j] = v.lowKey(j);
+    }
+    // Update ci's ref to the left half returned by the child split.
+    refs_buf[ci] = r.ref;
+    // Insert new right sibling immediately after ci.
+    j = v.child_count; // = FANOUT
+    while (j > ci + 1) : (j -= 1) {
+        refs_buf[j] = refs_buf[j - 1];
+        lows_buf[j] = lows_buf[j - 1];
+    }
+    refs_buf[ci + 1] = split.ref;
+    lows_buf[ci + 1] = split.low;
+
+    const m_inner: usize = total_inner / 2;
+    const left_a = try txn.writableCopy(node_ref, inner_node_size);
+    std.mem.writeInt(u16, left_a.bytes[1..3], @intCast(m_inner), .little);
+    j = 0;
+    while (j < m_inner) : (j += 1) {
+        std.mem.writeInt(u64, left_a.bytes[hdr + j * 16 ..][0..8], refs_buf[j], .little);
+        std.mem.writeInt(u64, left_a.bytes[hdr + j * 16 + 8 ..][0..8], lows_buf[j], .little);
+    }
+    const right_a = try txn.alloc(inner_node_size);
+    _ = encodeInner(right_a.bytes, refs_buf[m_inner..total_inner], lows_buf[m_inner..total_inner]);
+    return InsertResult{ .ref = left_a.ref, .split = Split{ .ref = right_a.ref, .low = lows_buf[m_inner] } };
+}
+
+/// Insert or update key->val in the tree rooted at root.
+/// Returns the (possibly new) root Ref. Grows the tree height on root split.
+pub fn insert(txn: *WriteTxn, root: Ref, key: u64, val: u64) !Ref {
+    const r = try insertInto(txn, root, key, val);
+    if (r.split == null) return r.ref;
+    // Root was split: build a new two-child inner root.
+    const left_min = try minKey(txn, r.ref);
+    const new_root = try txn.alloc(inner_node_size);
+    const root_refs = [_]u64{ r.ref, r.split.?.ref };
+    const root_lows = [_]u64{ left_min, r.split.?.low };
+    _ = encodeInner(new_root.bytes, &root_refs, &root_lows);
+    return new_root.ref;
 }
 
 /// Remove key from the tree rooted at root.
@@ -295,6 +422,36 @@ test "get and count traverse an inner node over two leaves" {
     try testing.expectEqual(@as(?u64, 77), try get(&w, inner, 7));
     try testing.expect((try get(&w, inner, 6)) == null);
     try testing.expect((try get(&w, inner, 0)) == null);
+    w.deinit();
+}
+
+test "insert builds a balanced tree across many leaves and reads back correctly" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try idxTmpPath(testing.allocator, &tmp, "idx4.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var root = try create(&w);
+    const N: u64 = 5000;
+    var i: u64 = 0;
+    while (i < N) : (i += 1) {
+        const k = (i *% 2654435761) % 1_000_003; // scattered keys force mid-splits
+        root = try insert(&w, root, k, k +% 7);
+    }
+    var ref_map = std.AutoHashMap(u64, u64).init(testing.allocator);
+    defer ref_map.deinit();
+    i = 0;
+    while (i < N) : (i += 1) {
+        const k = (i *% 2654435761) % 1_000_003;
+        try ref_map.put(k, k +% 7);
+    }
+    try testing.expectEqual(@as(u64, ref_map.count()), try count(&w, root));
+    var it = ref_map.iterator();
+    while (it.next()) |e| {
+        try testing.expectEqual(@as(?u64, e.value_ptr.*), try get(&w, root, e.key_ptr.*));
+    }
     w.deinit();
 }
 
