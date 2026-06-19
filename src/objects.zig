@@ -111,6 +111,53 @@ pub fn liveCount(txn: anytype, cat: Ref) !u64 {
     return Index.count(txn, view.pk_index_ref);
 }
 
+// insert appends a new row to all columns and updates the pk index.
+// values.len must equal the prop_count stored in the catalog.
+// Returns error.DuplicateKey if values[0] (the primary key) already exists.
+pub fn insert(txn: *WriteTxn, cat: Ref, values: []const u64) !struct { cat: Ref, row: u64 } {
+    const v = try loadCatalog(txn, cat);
+    std.debug.assert(values.len == v.prop_count);
+
+    // Capture all refs from the view into locals before any mutation so the
+    // bytes slice backing CatalogView cannot be invalidated by file growth.
+    const old_pk_index_ref = v.pk_index_ref;
+    const old_version_col_ref = v.version_col_ref;
+    const old_live_col_ref = v.live_col_ref;
+    var old_prop_refs: [max_prop_count]Ref = undefined;
+    {
+        var j: usize = 0;
+        while (j < v.prop_count) : (j += 1) old_prop_refs[j] = v.propColRef(j);
+    }
+    const prop_count = v.prop_count;
+    const row = v.next_row;
+
+    const pk = values[0];
+    if ((try Index.get(txn, old_pk_index_ref, pk)) != null) return error.DuplicateKey;
+
+    // COW-append to each property column.
+    var new_prop_refs: [max_prop_count]Ref = undefined;
+    {
+        var i: usize = 0;
+        while (i < prop_count) : (i += 1) {
+            new_prop_refs[i] = try Column.append(txn, old_prop_refs[i], values[i]);
+        }
+    }
+    const new_version_col = try Column.append(txn, old_version_col_ref, txn.new_version);
+    const new_live_col = try Column.append(txn, old_live_col_ref, 1);
+    const new_index = try Index.insert(txn, old_pk_index_ref, pk, row);
+
+    const new_cat = try writeCatalog(
+        txn,
+        prop_count,
+        row + 1,
+        new_index,
+        new_version_col,
+        new_live_col,
+        new_prop_refs[0..prop_count],
+    );
+    return .{ .cat = new_cat, .row = row };
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -132,5 +179,23 @@ test "create allocates an empty type and load reads it back" {
     const cat = try create(&w, 3);
     try testing.expectEqual(@as(PropCount, 3), try propCount(&w, cat));
     try testing.expectEqual(@as(u64, 0), try liveCount(&w, cat));
+    w.deinit();
+}
+
+test "insert appends rows and rejects a duplicate primary key" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "obj2.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var cat = try create(&w, 3);
+    const r1 = try insert(&w, cat, &.{ 100, 7, 1 });
+    cat = r1.cat;
+    const r2 = try insert(&w, cat, &.{ 200, 8, 0 });
+    cat = r2.cat;
+    try testing.expectEqual(@as(u64, 2), try liveCount(&w, cat));
+    try testing.expectError(error.DuplicateKey, insert(&w, cat, &.{ 100, 9, 1 }));
     w.deinit();
 }
