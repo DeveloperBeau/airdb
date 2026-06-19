@@ -59,6 +59,20 @@ pub fn setCatalogRef(txn: *WriteTxn, dir: Ref, type_id: u16, new_cat: Ref) !Ref 
     return a.ref;
 }
 
+pub fn validate(txn: anytype, dir: Ref, expected: Schema) !void {
+    const tc = try typeCount(txn, dir);
+    if (tc != expected.len) return error.SchemaMismatch;
+    var t: u16 = 0;
+    while (t < tc) : (t += 1) {
+        const v = try Objects.loadCatalog(txn, try catalogRef(txn, dir, t));
+        if (v.prop_count != expected[t].len) return error.SchemaMismatch;
+        var j: usize = 0;
+        while (j < v.prop_count) : (j += 1) {
+            if (v.kind(j) != expected[t][j]) return error.SchemaMismatch;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -103,4 +117,33 @@ test "catalogRef rejects an out-of-range type id" {
     const dir = try create(&w, &schema);
     try testing.expectError(error.NoSuchType, catalogRef(&w, dir, 5));
     w.deinit();
+}
+
+test "validate accepts a matching schema and rejects a mismatch" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tdTmpPath(testing.allocator, &tmp, "td2.airdb");
+    defer testing.allocator.free(path);
+    const schema = [_][]const Objects.PropKind{ &.{ .int, .blob }, &.{ .int, .int, .int } };
+    {
+        var db = try Db.create(testing.allocator, path);
+        defer db.deinit();
+        var w = try db.beginWrite();
+        const dir = try create(&w, &schema);
+        w.setRoot(dir);
+        _ = try w.commit();
+    }
+    {
+        var db = try Db.open(testing.allocator, path);
+        defer db.deinit();
+        var r = try db.beginRead();
+        try validate(&r, r.root(), &schema); // matches
+        const fewer = [_][]const Objects.PropKind{&.{ .int, .blob }};
+        try testing.expectError(error.SchemaMismatch, validate(&r, r.root(), &fewer));
+        const wrong_kind = [_][]const Objects.PropKind{ &.{ .int, .int }, &.{ .int, .int, .int } };
+        try testing.expectError(error.SchemaMismatch, validate(&r, r.root(), &wrong_kind));
+        const wrong_count = [_][]const Objects.PropKind{ &.{ .int, .blob }, &.{ .int, .int } };
+        try testing.expectError(error.SchemaMismatch, validate(&r, r.root(), &wrong_count));
+        r.end();
+    }
 }
