@@ -542,3 +542,51 @@ test "a committed index version stays intact for a pinned reader while a later c
     try testing.expectEqual(@as(?u64, 1235 * 10), try get(&r2, r2.root(), 1235)); // untouched key
     r2.end();
 }
+
+test "ordered index persists across reopen and matches a reference map under churn" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try idxTmpPath(testing.allocator, &tmp, "idx6.airdb");
+    defer testing.allocator.free(path);
+    var ref_map = std.AutoHashMap(u64, u64).init(testing.allocator);
+    defer ref_map.deinit();
+    const N: u64 = 100_000;
+    {
+        var db = try Db.create(testing.allocator, path);
+        defer db.deinit();
+        var w = try db.beginWrite();
+        var root = try create(&w);
+        var i: u64 = 0;
+        while (i < N) : (i += 1) {
+            const k = (i *% 2654435761) % 5_000_011;
+            root = try insert(&w, root, k, i);
+            try ref_map.put(k, i);
+        }
+        // Remove every 3rd inserted key.
+        i = 0;
+        while (i < N) : (i += 3) {
+            const k = (i *% 2654435761) % 5_000_011;
+            root = try remove(&w, root, k);
+            _ = ref_map.remove(k);
+        }
+        w.setRoot(root);
+        _ = try w.commit();
+    }
+    {
+        var db = try Db.open(testing.allocator, path);
+        defer db.deinit();
+        var r = try db.beginRead();
+        try testing.expectEqual(@as(u64, ref_map.count()), try count(&r, r.root()));
+        var it = ref_map.iterator();
+        while (it.next()) |e| {
+            try testing.expectEqual(@as(?u64, e.value_ptr.*), try get(&r, r.root(), e.key_ptr.*));
+        }
+        // Spot-check some removed keys are absent.
+        var j: u64 = 0;
+        while (j < 30) : (j += 3) {
+            const k = (j *% 2654435761) % 5_000_011;
+            if (!ref_map.contains(k)) try testing.expect((try get(&r, r.root(), k)) == null);
+        }
+        r.end();
+    }
+}
