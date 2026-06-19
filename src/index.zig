@@ -2,7 +2,6 @@ const std = @import("std");
 const testing = std.testing;
 const WriteTxn = @import("db.zig").WriteTxn;
 const Ref = @import("ref.zig").Ref;
-const Allocation = @import("arena.zig").Allocation;
 
 pub const LEAF_CAP: u16 = 64;
 pub const FANOUT: u16 = 64;
@@ -103,16 +102,6 @@ fn childIndexForKey(v: InnerView, k: u64) usize {
         }
     }
     return best;
-}
-
-/// Allocate a fresh node and copy the bytes of ref into it WITHOUT freeing ref.
-/// Use this everywhere instead of txn.writableCopy so that an old Ref remains
-/// a valid, readable snapshot after the copy is made.
-fn cowCopy(txn: *WriteTxn, ref: Ref, len: usize) !Allocation {
-    const old = try txn.deref(ref, len);
-    const fresh = try txn.alloc(len);
-    @memcpy(fresh.bytes, old);
-    return fresh;
 }
 
 fn derefNode(txn: anytype, ref: Ref) ![]const u8 {
@@ -226,14 +215,14 @@ fn insertInto(txn: *WriteTxn, node_ref: Ref, key: u64, val: u64) !InsertResult {
 
         // Upsert: key already present.
         if (i < v.count and v.key(i) == key) {
-            const a = try cowCopy(txn, node_ref, leaf_node_size);
+            const a = try txn.writableCopy(node_ref, leaf_node_size);
             std.mem.writeInt(u64, a.bytes[hdr + i * 16 + 8 ..][0..8], val, .little);
             return InsertResult{ .ref = a.ref, .split = null };
         }
 
         // Not full: shift and insert.
         if (v.count < LEAF_CAP) {
-            const a = try cowCopy(txn, node_ref, leaf_node_size);
+            const a = try txn.writableCopy(node_ref, leaf_node_size);
             var j: usize = v.count;
             while (j > i) : (j -= 1) {
                 const src = hdr + (j - 1) * 16;
@@ -262,9 +251,9 @@ fn insertInto(txn: *WriteTxn, node_ref: Ref, key: u64, val: u64) !InsertResult {
             keys_buf[j + 1] = v.key(j);
             vals_buf[j + 1] = v.value(j);
         }
-        // Build buffer from v before cowCopy to avoid any aliasing concern.
+        // Build buffer from v before writableCopy to avoid any aliasing concern.
         const m_leaf: usize = total_leaf / 2;
-        const left_a = try cowCopy(txn, node_ref, leaf_node_size);
+        const left_a = try txn.writableCopy(node_ref, leaf_node_size);
         std.mem.writeInt(u16, left_a.bytes[1..3], @intCast(m_leaf), .little);
         j = 0;
         while (j < m_leaf) : (j += 1) {
@@ -284,7 +273,7 @@ fn insertInto(txn: *WriteTxn, node_ref: Ref, key: u64, val: u64) !InsertResult {
 
     // No split in child: just update the child ref.
     if (r.split == null) {
-        const new_inner = try cowCopy(txn, node_ref, inner_node_size);
+        const new_inner = try txn.writableCopy(node_ref, inner_node_size);
         std.mem.writeInt(u64, new_inner.bytes[hdr + ci * 16 ..][0..8], r.ref, .little);
         return InsertResult{ .ref = new_inner.ref, .split = null };
     }
@@ -293,7 +282,7 @@ fn insertInto(txn: *WriteTxn, node_ref: Ref, key: u64, val: u64) !InsertResult {
 
     // Child split but this inner node is not full: shift and insert at ci+1.
     if (v.child_count < FANOUT) {
-        const new_inner = try cowCopy(txn, node_ref, inner_node_size);
+        const new_inner = try txn.writableCopy(node_ref, inner_node_size);
         // Update child ci's ref (low_key unchanged: left half keeps same minimum).
         std.mem.writeInt(u64, new_inner.bytes[hdr + ci * 16 ..][0..8], r.ref, .little);
         // Shift slots [ci+1, child_count) right by one.
@@ -310,7 +299,7 @@ fn insertInto(txn: *WriteTxn, node_ref: Ref, key: u64, val: u64) !InsertResult {
     }
 
     // Child split AND this inner node is full: build FANOUT+1 entries, split at midpoint.
-    // Read all entries from v before calling cowCopy.
+    // Read all entries from v before calling writableCopy.
     const total_inner: usize = @as(usize, FANOUT) + 1;
     var refs_buf: [FANOUT + 1]u64 = undefined;
     var lows_buf: [FANOUT + 1]u64 = undefined;
@@ -331,7 +320,7 @@ fn insertInto(txn: *WriteTxn, node_ref: Ref, key: u64, val: u64) !InsertResult {
     lows_buf[ci + 1] = split.low;
 
     const m_inner: usize = total_inner / 2;
-    const left_a = try cowCopy(txn, node_ref, inner_node_size);
+    const left_a = try txn.writableCopy(node_ref, inner_node_size);
     std.mem.writeInt(u16, left_a.bytes[1..3], @intCast(m_inner), .little);
     j = 0;
     while (j < m_inner) : (j += 1) {
@@ -368,7 +357,7 @@ fn removeInto(txn: *WriteTxn, node_ref: Ref, key: u64) !Ref {
         const v = try parseLeaf(leaf_bytes);
         const i = v.lowerBound(key);
         if (i >= v.count or v.key(i) != key) return node_ref; // no-op
-        const a = try cowCopy(txn, node_ref, leaf_node_size);
+        const a = try txn.writableCopy(node_ref, leaf_node_size);
         // Shift slots (i+1 .. count) left by one, overwriting slot i.
         var j: usize = i;
         while (j + 1 < v.count) : (j += 1) {
@@ -388,7 +377,7 @@ fn removeInto(txn: *WriteTxn, node_ref: Ref, key: u64) !Ref {
     const new_child = try removeInto(txn, old_child_ref, key);
     // No change in the subtree: skip COW on this inner node too.
     if (new_child == old_child_ref) return node_ref;
-    const new_inner = try cowCopy(txn, node_ref, inner_node_size);
+    const new_inner = try txn.writableCopy(node_ref, inner_node_size);
     std.mem.writeInt(u64, new_inner.bytes[hdr + ci * 16 ..][0..8], new_child, .little);
     return new_inner.ref;
 }
@@ -508,27 +497,48 @@ test "single-leaf index: insert, get, upsert, remove, count" {
     w.deinit();
 }
 
-test "insert and remove preserve the old root as an unchanged snapshot" {
+test "a committed index version stays intact for a pinned reader while a later commit mutates it" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try idxTmpPath(testing.allocator, &tmp, "idx5.airdb");
     defer testing.allocator.free(path);
     var db = try Db.create(testing.allocator, path);
     defer db.deinit();
-    var w = try db.beginWrite();
-    var root = try create(&w);
-    var i: u64 = 0;
-    while (i < 2000) : (i += 1) root = try insert(&w, root, i, i * 10);
-    const old_root = root;
-    const after_insert = try insert(&w, root, 1234, 999999); // update existing key 1234
-    const after_remove = try remove(&w, after_insert, 500);
-    // Old snapshot unchanged.
-    try testing.expectEqual(@as(?u64, 1234 * 10), try get(&w, old_root, 1234));
-    try testing.expectEqual(@as(?u64, 500 * 10), try get(&w, old_root, 500));
-    // New roots reflect the changes.
-    try testing.expectEqual(@as(?u64, 999999), try get(&w, after_insert, 1234));
-    try testing.expect((try get(&w, after_remove, 500)) == null);
-    // remove only affected after_remove, not after_insert (shared subtrees not mutated).
-    try testing.expectEqual(@as(?u64, 500 * 10), try get(&w, after_insert, 500));
-    w.deinit();
+
+    // Commit version 1: keys 0..1999, value = key*10.
+    {
+        var w = try db.beginWrite();
+        var root = try create(&w);
+        var i: u64 = 0;
+        while (i < 2000) : (i += 1) root = try insert(&w, root, i, i * 10);
+        w.setRoot(root);
+        _ = try w.commit();
+    }
+
+    // Pin a reader on version 1.
+    var r1 = try db.beginRead();
+    const root_v1 = r1.root();
+    try testing.expectEqual(@as(?u64, 1234 * 10), try get(&r1, root_v1, 1234));
+
+    // Commit version 2: update key 1234, remove key 500.
+    {
+        var w = try db.beginWrite();
+        var root = w.new_root; // start from the latest committed root (refreshed in beginWrite)
+        root = try insert(&w, root, 1234, 999999);
+        root = try remove(&w, root, 500);
+        w.setRoot(root);
+        _ = try w.commit();
+    }
+
+    // The pinned v1 reader still sees the original values (committed snapshot intact).
+    try testing.expectEqual(@as(?u64, 1234 * 10), try get(&r1, root_v1, 1234));
+    try testing.expectEqual(@as(?u64, 500 * 10), try get(&r1, root_v1, 500));
+    r1.end();
+
+    // A fresh read sees version 2.
+    var r2 = try db.beginRead();
+    try testing.expectEqual(@as(?u64, 999999), try get(&r2, r2.root(), 1234));
+    try testing.expect((try get(&r2, r2.root(), 500)) == null);
+    try testing.expectEqual(@as(?u64, 1235 * 10), try get(&r2, r2.root(), 1235)); // untouched key
+    r2.end();
 }
