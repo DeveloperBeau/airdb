@@ -683,6 +683,22 @@ pub fn backlinkCollect(
     try Index.forEachKey(txn, set_root, Sink{ .list = out, .alloc = allocator }, Sink.onKey);
 }
 
+// Set or clear link property `prop` of the object with primary key `pk`.
+// Maintains the backlink index and bumps the row version. No-op if unchanged.
+pub fn setLink(txn: *WriteTxn, cat: Ref, pk: u64, prop: usize, target: ?u64) !Ref {
+    const r0 = (try resolveProp(txn, cat, pk, prop)) orelse return cat;
+    const row = r0.row;
+    const old_raw = try Column.get(txn, r0.prop_col, row);
+    const old_target: ?u64 = if (old_raw == 0) null else old_raw - 1;
+    if (old_target == target) return cat; // unchanged
+
+    const new_raw: u64 = if (target) |t| t + 1 else 0;
+    var new_cat = try replaceCollRoot(txn, cat, row, prop, new_raw);
+    if (old_target) |ot| new_cat = try removeBacklink(txn, new_cat, prop, ot, row);
+    if (target) |nt| new_cat = try addBacklink(txn, new_cat, prop, nt, row);
+    return new_cat;
+}
+
 pub fn listAppendInt(txn: *WriteTxn, cat: Ref, pk: u64, prop: usize, value: u64) !Ref {
     const r = (try resolveProp(txn, cat, pk, prop)).?;
     const old_root = try Column.get(txn, r.prop_col, r.row);
@@ -1384,5 +1400,30 @@ test "insert stores a link and records the backlink" {
     try backlinkCollect(&w, cat, 2, boss.row, &srcs, testing.allocator);
     try testing.expectEqual(@as(usize, 1), srcs.items.len);
     try testing.expectEqual(rep.row, srcs.items[0]);
+    w.deinit();
+}
+
+test "setLink moves and clears links, keeping backlinks exact" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "link2.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var cat = try createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
+    const a = try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .link = null } });
+    cat = a.cat;
+    const b = try insertTyped(&w, cat, &.{ .{ .int = 2 }, .{ .link = null } });
+    cat = b.cat;
+    const c = try insertTyped(&w, cat, &.{ .{ .int = 3 }, .{ .link = a.row } });
+    cat = c.cat;
+    cat = try setLink(&w, cat, 3, 1, b.row);
+    try testing.expectEqual(@as(?u64, b.row), try getLink(&w, cat, 3, 1));
+    try testing.expectEqual(@as(u64, 0), try backlinkCount(&w, cat, 1, a.row));
+    try testing.expectEqual(@as(u64, 1), try backlinkCount(&w, cat, 1, b.row));
+    cat = try setLink(&w, cat, 3, 1, null);
+    try testing.expectEqual(@as(?u64, null), try getLink(&w, cat, 3, 1));
+    try testing.expectEqual(@as(u64, 0), try backlinkCount(&w, cat, 1, b.row));
     w.deinit();
 }
