@@ -332,6 +332,26 @@ pub fn getByPk(txn: anytype, cat: Ref, pk: u64, out: []u64) !?u64 {
     return try Column.get(txn, version_col_ref, row);
 }
 
+// Read a row by its stable object key (okey == the row assigned at insert).
+// Returns the row version, or null if the okey is out of range or tombstoned.
+pub fn getByObjectKey(txn: anytype, cat: Ref, okey: u64, out: []u64) !?u64 {
+    const v = try loadCatalog(txn, cat);
+    std.debug.assert(out.len == v.prop_count);
+    if (okey >= v.next_row) return null;
+    const live_col_ref = v.live_col_ref;
+    const version_col_ref = v.version_col_ref;
+    var prop_refs: [max_prop_count]Ref = undefined;
+    {
+        var j: usize = 0;
+        while (j < v.prop_count) : (j += 1) prop_refs[j] = v.propColRef(j);
+    }
+    const prop_count = v.prop_count;
+    if ((try Column.get(txn, live_col_ref, okey)) == 0) return null;
+    var i: usize = 0;
+    while (i < prop_count) : (i += 1) out[i] = try Column.get(txn, prop_refs[i], okey);
+    return try Column.get(txn, version_col_ref, okey);
+}
+
 fn buildListInt(txn: *WriteTxn, items: []const u64) !Ref {
     var root = try Column.create(txn);
     for (items) |x| root = try Column.append(txn, root, x);
@@ -1073,6 +1093,32 @@ test "collections persist across commit and reopen" {
         try testing.expectEqualStrings("zzz", try listGetBlob(&r, cat, 42, 3, 2));
         r.end();
     }
+}
+
+test "getByObjectKey reads a row by its stable object key" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "okey.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var cat = try create(&w, 2);
+    const r0 = try insert(&w, cat, &.{ 100, 7 });
+    cat = r0.cat;
+    const r1 = try insert(&w, cat, &.{ 200, 8 });
+    cat = r1.cat;
+    var out: [2]u64 = undefined;
+    const v1 = try getByObjectKey(&w, cat, r1.row, &out);
+    try testing.expect(v1 != null);
+    try testing.expectEqual(@as(u64, 200), out[0]);
+    try testing.expectEqual(@as(u64, 8), out[1]);
+    try testing.expectEqual(@as(?u64, null), try getByObjectKey(&w, cat, 999, &out));
+    const vk = (try getByObjectKey(&w, cat, r0.row, &out)).?;
+    const dres = try delete(&w, cat, 100, vk);
+    cat = dres.ok;
+    try testing.expectEqual(@as(?u64, null), try getByObjectKey(&w, cat, r0.row, &out));
+    w.deinit();
 }
 
 test "large list and set: 50k elements each, append and membership" {
