@@ -8,6 +8,11 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/airdb.zig"),
         .target = target,
         .optimize = optimize,
+        // The storage engine calls libc directly for durability and
+        // multi-process coordination: fcntl(F_FULLFSYNC) on Darwin, plus
+        // flock/getpid. macOS links libc implicitly; Linux requires it to be
+        // requested explicitly.
+        .link_libc = true,
     });
 
     const lib_tests = b.addTest(.{
@@ -18,6 +23,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("tests/storage_test.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
         .imports = &.{
             .{ .name = "airdb", .module = mod },
         },
