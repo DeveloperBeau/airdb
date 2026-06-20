@@ -435,7 +435,19 @@ pub fn insertTyped(txn: *WriteTxn, cat: Ref, values: []const Value) !struct { ca
         };
     }
     const r = try insert(txn, cat, raw[0..pc]);
-    return .{ .cat = r.cat, .row = r.row };
+    // Maintain backlinks for any non-null link the new row carries.
+    var cat_ref = r.cat;
+    {
+        var p: usize = 0;
+        while (p < pc) : (p += 1) {
+            if (kinds[p] == .link) {
+                if (values[p].link) |target| {
+                    cat_ref = try addBacklink(txn, cat_ref, p, target, r.row);
+                }
+            }
+        }
+    }
+    return .{ .cat = cat_ref, .row = r.row };
 }
 
 // getTyped reads a row by primary key and decodes each property into a Value.
@@ -544,6 +556,131 @@ fn replaceCollRoot(txn: *WriteTxn, cat: Ref, row: u64, prop: usize, new_root: Re
     prop_refs[prop] = try Column.set(txn, prop_refs[prop], row, new_root);
     ver_ref = try Column.set(txn, ver_ref, row, txn.new_version);
     return writeCatalog(txn, pc, next_row, idx_ref, ver_ref, live_ref, prop_refs[0..pc], kinds[0..pc], elems[0..pc], bl[0..pc]);
+}
+
+// ---------------------------------------------------------------------------
+// Links and backlinks
+//
+// A `link` property stores `target_okey + 1` in its column (0 = null). For each
+// link property the catalog holds a backlink index: target_okey -> set_root,
+// where set_root is an index of source_okey -> 1. The backlink index is updated
+// transactionally on every insert, set, clear, and delete.
+// ---------------------------------------------------------------------------
+
+// Add `source` to the backlink set for `target`, returning the new backlink ref.
+fn blAdd(txn: *WriteTxn, bl_ref: Ref, target: u64, source: u64) !Ref {
+    const existing = try Index.get(txn, bl_ref, target);
+    var set_root = existing orelse try Index.create(txn);
+    set_root = try Index.insert(txn, set_root, source, 1);
+    return try Index.insert(txn, bl_ref, target, set_root);
+}
+
+// Remove `source` from the backlink set for `target`. No-op if absent.
+fn blRemove(txn: *WriteTxn, bl_ref: Ref, target: u64, source: u64) !Ref {
+    const existing = try Index.get(txn, bl_ref, target);
+    const set_root = existing orelse return bl_ref;
+    const new_set = try Index.remove(txn, set_root, source);
+    return try Index.insert(txn, bl_ref, target, new_set);
+}
+
+// Write a new backlink ref into property `p`, preserving everything else.
+fn setBacklinkRef(txn: *WriteTxn, cat: Ref, p: usize, new_bl: Ref) !Ref {
+    const v = try loadCatalog(txn, cat);
+    const pc = v.prop_count;
+    const next_row = v.next_row;
+    const idx_ref = v.pk_index_ref;
+    const ver_ref = v.version_col_ref;
+    const live_ref = v.live_col_ref;
+    var prop_refs: [max_prop_count]Ref = undefined;
+    var kinds: [max_prop_count]PropKind = undefined;
+    var elems: [max_prop_count]ElemKind = undefined;
+    var bl: [max_prop_count]Ref = undefined;
+    {
+        var j: usize = 0;
+        while (j < pc) : (j += 1) {
+            prop_refs[j] = v.propColRef(j);
+            kinds[j] = v.kind(j);
+            elems[j] = v.elemKind(j);
+            bl[j] = v.backlinkRef(j);
+        }
+    }
+    bl[p] = new_bl;
+    return writeCatalog(txn, pc, next_row, idx_ref, ver_ref, live_ref, prop_refs[0..pc], kinds[0..pc], elems[0..pc], bl[0..pc]);
+}
+
+// Write a new column ref into property `p`, preserving everything else.
+fn setPropColRef(txn: *WriteTxn, cat: Ref, p: usize, new_col: Ref) !Ref {
+    const v = try loadCatalog(txn, cat);
+    const pc = v.prop_count;
+    const next_row = v.next_row;
+    const idx_ref = v.pk_index_ref;
+    const ver_ref = v.version_col_ref;
+    const live_ref = v.live_col_ref;
+    var prop_refs: [max_prop_count]Ref = undefined;
+    var kinds: [max_prop_count]PropKind = undefined;
+    var elems: [max_prop_count]ElemKind = undefined;
+    var bl: [max_prop_count]Ref = undefined;
+    {
+        var j: usize = 0;
+        while (j < pc) : (j += 1) {
+            prop_refs[j] = v.propColRef(j);
+            kinds[j] = v.kind(j);
+            elems[j] = v.elemKind(j);
+            bl[j] = v.backlinkRef(j);
+        }
+    }
+    prop_refs[p] = new_col;
+    return writeCatalog(txn, pc, next_row, idx_ref, ver_ref, live_ref, prop_refs[0..pc], kinds[0..pc], elems[0..pc], bl[0..pc]);
+}
+
+// Add source->target to link property p's backlink index. Returns new catalog.
+fn addBacklink(txn: *WriteTxn, cat: Ref, p: usize, target: u64, source: u64) !Ref {
+    const v = try loadCatalog(txn, cat);
+    const new_bl = try blAdd(txn, v.backlinkRef(p), target, source);
+    return try setBacklinkRef(txn, cat, p, new_bl);
+}
+
+// Remove source from link property p's backlink set for target.
+fn removeBacklink(txn: *WriteTxn, cat: Ref, p: usize, target: u64, source: u64) !Ref {
+    const v = try loadCatalog(txn, cat);
+    const new_bl = try blRemove(txn, v.backlinkRef(p), target, source);
+    return try setBacklinkRef(txn, cat, p, new_bl);
+}
+
+// Read the target okey of link property `prop` for the object with primary key
+// `pk`. Returns null if the link is unset (or the object is absent).
+pub fn getLink(txn: anytype, cat: Ref, pk: u64, prop: usize) !?u64 {
+    const r = (try resolveProp(txn, cat, pk, prop)) orelse return null;
+    const raw = try Column.get(txn, r.prop_col, r.row);
+    return if (raw == 0) null else raw - 1;
+}
+
+// Number of objects whose link property `prop` points at `target` okey.
+pub fn backlinkCount(txn: anytype, cat: Ref, prop: usize, target: u64) !u64 {
+    const v = try loadCatalog(txn, cat);
+    const set_root = (try Index.get(txn, v.backlinkRef(prop), target)) orelse return 0;
+    return try Index.count(txn, set_root);
+}
+
+// Collect the source okeys whose link property `prop` points at `target`.
+pub fn backlinkCollect(
+    txn: anytype,
+    cat: Ref,
+    prop: usize,
+    target: u64,
+    out: *std.ArrayList(u64),
+    allocator: std.mem.Allocator,
+) !void {
+    const v = try loadCatalog(txn, cat);
+    const set_root = (try Index.get(txn, v.backlinkRef(prop), target)) orelse return;
+    const Sink = struct {
+        list: *std.ArrayList(u64),
+        alloc: std.mem.Allocator,
+        fn onKey(self: @This(), key: u64) !void {
+            try self.list.append(self.alloc, key);
+        }
+    };
+    try Index.forEachKey(txn, set_root, Sink{ .list = out, .alloc = allocator }, Sink.onKey);
 }
 
 pub fn listAppendInt(txn: *WriteTxn, cat: Ref, pk: u64, prop: usize, value: u64) !Ref {
@@ -1223,5 +1360,29 @@ test "createDefs builds a backlink index for each link property" {
     try testing.expect(v.backlinkRef(2) != 0);
     try testing.expectEqual(@as(Ref, 0), v.backlinkRef(0));
     try testing.expectEqual(@as(Ref, 0), v.backlinkRef(1));
+    w.deinit();
+}
+
+test "insert stores a link and records the backlink" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "link1.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var cat = try createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .blob }, .{ .kind = .link } });
+    const boss = try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .bytes = "Boss" }, .{ .link = null } });
+    cat = boss.cat;
+    const rep = try insertTyped(&w, cat, &.{ .{ .int = 2 }, .{ .bytes = "Report" }, .{ .link = boss.row } });
+    cat = rep.cat;
+    try testing.expectEqual(@as(?u64, null), try getLink(&w, cat, 1, 2));
+    try testing.expectEqual(@as(?u64, boss.row), try getLink(&w, cat, 2, 2));
+    try testing.expectEqual(@as(u64, 1), try backlinkCount(&w, cat, 2, boss.row));
+    var srcs = std.ArrayList(u64).empty;
+    defer srcs.deinit(testing.allocator);
+    try backlinkCollect(&w, cat, 2, boss.row, &srcs, testing.allocator);
+    try testing.expectEqual(@as(usize, 1), srcs.items.len);
+    try testing.expectEqual(rep.row, srcs.items[0]);
     w.deinit();
 }
