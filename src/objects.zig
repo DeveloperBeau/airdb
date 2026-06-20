@@ -8,7 +8,7 @@ const Index = @import("index.zig");
 const blob = @import("blob.zig");
 
 pub const PropCount = u16;
-pub const PropKind = enum(u8) { int = 0, blob = 1, list = 2, set = 3 };
+pub const PropKind = enum(u8) { int = 0, blob = 1, list = 2, set = 3, link = 4 };
 pub const ElemKind = enum(u8) { int = 0, blob = 1 };
 pub const PropDef = struct { kind: PropKind, elem: ElemKind = .int };
 pub const Value = union(enum) {
@@ -18,11 +18,13 @@ pub const Value = union(enum) {
     list_blob: []const []const u8,
     set_int: []const u64,
     coll_root: Ref, // read side: getTyped returns this for list/set properties
+    link: ?u64,
 };
 
 // Catalog node layout:
 // [prop_count u16][next_row u64][pk_index_ref u64][version_col_ref u64][live_col_ref u64]
 // [prop_count * (prop_col_ref u64)][prop_count * (kind u8)][prop_count * (elem u8)]
+// [prop_count * (backlink_ref u64)]
 const off_prop_count: usize = 0;
 const off_next_row: usize = 2;
 const off_pk_index_ref: usize = 10;
@@ -33,7 +35,7 @@ const off_prop_cols: usize = 34;
 const max_prop_count: usize = 256;
 
 fn catalogSize(pc: PropCount) usize {
-    return off_prop_cols + @as(usize, pc) * 8 + @as(usize, pc) * 2;
+    return off_prop_cols + @as(usize, pc) * 8 + @as(usize, pc) * 2 + @as(usize, pc) * 8;
 }
 
 fn kindsOffset(pc: PropCount) usize {
@@ -42,6 +44,10 @@ fn kindsOffset(pc: PropCount) usize {
 
 fn elemsOffset(pc: PropCount) usize {
     return kindsOffset(pc) + pc;
+}
+
+fn backlinksOffset(pc: PropCount) usize {
+    return elemsOffset(pc) + pc;
 }
 
 // Allocate and encode a fresh catalog node; return its ref.
@@ -55,6 +61,7 @@ fn writeCatalog(
     prop_col_refs: []const Ref,
     kinds: []const PropKind,
     elems: []const ElemKind,
+    backlinks: []const Ref,
 ) !Ref {
     const a = try txn.alloc(catalogSize(prop_count));
     std.mem.writeInt(u16, a.bytes[off_prop_count..][0..2], prop_count, .little);
@@ -69,6 +76,10 @@ fn writeCatalog(
     for (kinds, 0..) |k, i| a.bytes[ko + i] = @intFromEnum(k);
     const eo = elemsOffset(prop_count);
     for (elems, 0..) |e, i| a.bytes[eo + i] = @intFromEnum(e);
+    const blo = backlinksOffset(prop_count);
+    for (backlinks, 0..) |bref, i| {
+        std.mem.writeInt(u64, a.bytes[blo + i * 8 ..][0..8], bref, .little);
+    }
     return a.ref;
 }
 
@@ -81,11 +92,13 @@ pub fn createDefs(txn: *WriteTxn, defs: []const PropDef) !Ref {
     var prop_col_refs: [max_prop_count]Ref = undefined;
     var kinds: [max_prop_count]PropKind = undefined;
     var elems: [max_prop_count]ElemKind = undefined;
+    var backlinks: [max_prop_count]Ref = undefined;
     var i: usize = 0;
     while (i < prop_count) : (i += 1) {
         prop_col_refs[i] = try Column.create(txn);
         kinds[i] = defs[i].kind;
         elems[i] = defs[i].elem;
+        backlinks[i] = if (defs[i].kind == .link) try Index.create(txn) else 0;
     }
     const version_col_ref = try Column.create(txn);
     const live_col_ref = try Column.create(txn);
@@ -100,6 +113,7 @@ pub fn createDefs(txn: *WriteTxn, defs: []const PropDef) !Ref {
         prop_col_refs[0..prop_count],
         kinds[0..prop_count],
         elems[0..prop_count],
+        backlinks[0..prop_count],
     );
 }
 
@@ -144,6 +158,11 @@ pub const CatalogView = struct {
     pub fn elemKind(self: CatalogView, i: usize) ElemKind {
         const eo = off_prop_cols + @as(usize, self.prop_count) * 8 + self.prop_count;
         return @enumFromInt(self.bytes[eo + i]);
+    }
+
+    pub fn backlinkRef(self: CatalogView, i: usize) Ref {
+        const blo = off_prop_cols + @as(usize, self.prop_count) * 8 + @as(usize, self.prop_count) * 2;
+        return std.mem.readInt(u64, self.bytes[blo + i * 8 ..][0..8], .little);
     }
 };
 
@@ -191,12 +210,14 @@ pub fn insert(txn: *WriteTxn, cat: Ref, values: []const u64) !struct { cat: Ref,
     var old_prop_refs: [max_prop_count]Ref = undefined;
     var old_kinds: [max_prop_count]PropKind = undefined;
     var old_elems: [max_prop_count]ElemKind = undefined;
+    var old_backlinks: [max_prop_count]Ref = undefined;
     {
         var j: usize = 0;
         while (j < v.prop_count) : (j += 1) {
             old_prop_refs[j] = v.propColRef(j);
             old_kinds[j] = v.kind(j);
             old_elems[j] = v.elemKind(j);
+            old_backlinks[j] = v.backlinkRef(j);
         }
     }
     const prop_count = v.prop_count;
@@ -227,6 +248,7 @@ pub fn insert(txn: *WriteTxn, cat: Ref, values: []const u64) !struct { cat: Ref,
         new_prop_refs[0..prop_count],
         old_kinds[0..prop_count],
         old_elems[0..prop_count],
+        old_backlinks[0..prop_count],
     );
     return .{ .cat = new_cat, .row = row };
 }
@@ -260,12 +282,14 @@ pub fn update(txn: *WriteTxn, cat: Ref, pk: u64, values: []const u64, expected_v
     var prop_refs: [256]Ref = undefined;
     var kinds: [256]PropKind = undefined;
     var elems_buf: [max_prop_count]ElemKind = undefined;
+    var bl_buf: [max_prop_count]Ref = undefined;
     {
         var j: usize = 0;
         while (j < pc) : (j += 1) {
             prop_refs[j] = v.propColRef(j);
             kinds[j] = v.kind(j);
             elems_buf[j] = v.elemKind(j);
+            bl_buf[j] = v.backlinkRef(j);
         }
     }
     var ver_ref = v.version_col_ref;
@@ -274,7 +298,7 @@ pub fn update(txn: *WriteTxn, cat: Ref, pk: u64, values: []const u64, expected_v
     while (i < pc) : (i += 1) prop_refs[i] = try Column.set(txn, prop_refs[i], row, values[i]);
     ver_ref = try Column.set(txn, ver_ref, row, txn.new_version);
 
-    const new_cat = try writeCatalog(txn, pc, next_row, idx_ref, ver_ref, live_ref, prop_refs[0..pc], kinds[0..pc], elems_buf[0..pc]);
+    const new_cat = try writeCatalog(txn, pc, next_row, idx_ref, ver_ref, live_ref, prop_refs[0..pc], kinds[0..pc], elems_buf[0..pc], bl_buf[0..pc]);
     return .{ .ok = .{ .cat = new_cat, .version = txn.new_version } };
 }
 
@@ -290,12 +314,14 @@ pub fn delete(txn: *WriteTxn, cat: Ref, pk: u64, expected_version: u64) !DeleteR
     var prop_refs: [256]Ref = undefined;
     var kinds: [256]PropKind = undefined;
     var elems_buf: [max_prop_count]ElemKind = undefined;
+    var bl_buf: [max_prop_count]Ref = undefined;
     {
         var j: usize = 0;
         while (j < pc) : (j += 1) {
             prop_refs[j] = v.propColRef(j);
             kinds[j] = v.kind(j);
             elems_buf[j] = v.elemKind(j);
+            bl_buf[j] = v.backlinkRef(j);
         }
     }
     var live_ref = v.live_col_ref;
@@ -306,7 +332,7 @@ pub fn delete(txn: *WriteTxn, cat: Ref, pk: u64, expected_version: u64) !DeleteR
     ver_ref = try Column.set(txn, ver_ref, row, txn.new_version); // bump version stamp
     idx_ref = try Index.remove(txn, idx_ref, pk); // remove pk from the index
 
-    const new_cat = try writeCatalog(txn, pc, next_row, idx_ref, ver_ref, live_ref, prop_refs[0..pc], kinds[0..pc], elems_buf[0..pc]);
+    const new_cat = try writeCatalog(txn, pc, next_row, idx_ref, ver_ref, live_ref, prop_refs[0..pc], kinds[0..pc], elems_buf[0..pc], bl_buf[0..pc]);
     return .{ .ok = new_cat };
 }
 
@@ -405,6 +431,7 @@ pub fn insertTyped(txn: *WriteTxn, cat: Ref, values: []const Value) !struct { ca
                 .int => try buildSetInt(txn, values[i].set_int),
                 .blob => unreachable, // set of blob out of scope this phase
             },
+            .link => if (values[i].link) |k| k + 1 else 0,
         };
     }
     const r = try insert(txn, cat, raw[0..pc]);
@@ -433,6 +460,32 @@ pub fn getTyped(txn: anytype, cat: Ref, pk: u64, out: []Value) !?u64 {
             .int => .{ .int = raw[i] },
             .blob => .{ .bytes = try blob.get(txn, raw[i]) },
             .list, .set => .{ .coll_root = raw[i] },
+            .link => .{ .link = if (raw[i] == 0) null else raw[i] - 1 },
+        };
+    }
+    return ver;
+}
+
+// getTypedByOkey decodes a row addressed by stable object key into Values.
+pub fn getTypedByOkey(txn: anytype, cat: Ref, okey: u64, out: []Value) !?u64 {
+    const v = try loadCatalog(txn, cat);
+    const pc = v.prop_count;
+    std.debug.assert(out.len == pc);
+    std.debug.assert(pc <= max_prop_count);
+    var kinds: [max_prop_count]PropKind = undefined;
+    {
+        var j: usize = 0;
+        while (j < pc) : (j += 1) kinds[j] = v.kind(j);
+    }
+    var raw: [max_prop_count]u64 = undefined;
+    const ver = (try getByObjectKey(txn, cat, okey, raw[0..pc])) orelse return null;
+    var i: usize = 0;
+    while (i < pc) : (i += 1) {
+        out[i] = switch (kinds[i]) {
+            .int => .{ .int = raw[i] },
+            .blob => .{ .bytes = try blob.get(txn, raw[i]) },
+            .list, .set => .{ .coll_root = raw[i] },
+            .link => .{ .link = if (raw[i] == 0) null else raw[i] - 1 },
         };
     }
     return ver;
@@ -477,18 +530,20 @@ fn replaceCollRoot(txn: *WriteTxn, cat: Ref, row: u64, prop: usize, new_root: Re
     var prop_refs: [max_prop_count]Ref = undefined;
     var kinds: [max_prop_count]PropKind = undefined;
     var elems: [max_prop_count]ElemKind = undefined;
+    var bl: [max_prop_count]Ref = undefined;
     {
         var j: usize = 0;
         while (j < pc) : (j += 1) {
             prop_refs[j] = v.propColRef(j);
             kinds[j] = v.kind(j);
             elems[j] = v.elemKind(j);
+            bl[j] = v.backlinkRef(j);
         }
     }
     var ver_ref = v.version_col_ref;
     prop_refs[prop] = try Column.set(txn, prop_refs[prop], row, new_root);
     ver_ref = try Column.set(txn, ver_ref, row, txn.new_version);
-    return writeCatalog(txn, pc, next_row, idx_ref, ver_ref, live_ref, prop_refs[0..pc], kinds[0..pc], elems[0..pc]);
+    return writeCatalog(txn, pc, next_row, idx_ref, ver_ref, live_ref, prop_refs[0..pc], kinds[0..pc], elems[0..pc], bl[0..pc]);
 }
 
 pub fn listAppendInt(txn: *WriteTxn, cat: Ref, pk: u64, prop: usize, value: u64) !Ref {
@@ -598,6 +653,7 @@ pub fn updateTyped(
                 break :blk try blob.put(txn, values[i].bytes);
             },
             .list, .set => unreachable, // collection update not yet implemented
+            .link => if (values[i].link) |k| k + 1 else 0,
         };
     }
     // Step 4: delegate to the core update; it will re-check the version (match).
@@ -1146,5 +1202,26 @@ test "large list and set: 50k elements each, append and membership" {
     const sc = (try setCountInt(&w, cat, 1, 2)).?;
     try testing.expect(sc > 0 and sc <= N);
     try testing.expect(try setContainsInt(&w, cat, 1, 2, 0));
+    w.deinit();
+}
+
+test "createDefs builds a backlink index for each link property" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "linkcat.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    const cat = try createDefs(&w, &.{
+        .{ .kind = .int },
+        .{ .kind = .int },
+        .{ .kind = .link },
+    });
+    const v = try loadCatalog(&w, cat);
+    try testing.expectEqual(PropKind.link, v.kind(2));
+    try testing.expect(v.backlinkRef(2) != 0);
+    try testing.expectEqual(@as(Ref, 0), v.backlinkRef(0));
+    try testing.expectEqual(@as(Ref, 0), v.backlinkRef(1));
     w.deinit();
 }
