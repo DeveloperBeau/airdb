@@ -1504,3 +1504,55 @@ test "deleting an object nullifies inbound links and cleans its outbound backlin
     try testing.expectEqual(@as(u64, 0), try backlinkCount(&w, cat, 1, a.row));
     w.deinit();
 }
+
+test "links and backlinks persist across commit and reopen" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "linkpersist.airdb");
+    defer testing.allocator.free(path);
+    var boss_row: u64 = undefined;
+    {
+        var db = try Db.create(testing.allocator, path);
+        defer db.deinit();
+        var w = try db.beginWrite();
+        var cat = try createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
+        const boss = try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .link = null } });
+        cat = boss.cat;
+        boss_row = boss.row;
+        var i: u64 = 2;
+        while (i <= 50) : (i += 1) cat = (try insertTyped(&w, cat, &.{ .{ .int = i }, .{ .link = boss.row } })).cat;
+        w.setRoot(cat);
+        _ = try w.commit();
+    }
+    {
+        var db = try Db.open(testing.allocator, path);
+        defer db.deinit();
+        var r = try db.beginRead();
+        try testing.expectEqual(@as(u64, 49), try backlinkCount(&r, r.root(), 1, boss_row));
+        try testing.expectEqual(@as(?u64, boss_row), try getLink(&r, r.root(), 25, 1));
+        r.end();
+    }
+}
+
+test "self-link and cycle are allowed" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "linkcycle.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var cat = try createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
+    const a = try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .link = null } });
+    cat = a.cat;
+    cat = try setLink(&w, cat, 1, 1, a.row);
+    try testing.expectEqual(@as(?u64, a.row), try getLink(&w, cat, 1, 1));
+    try testing.expectEqual(@as(u64, 1), try backlinkCount(&w, cat, 1, a.row));
+    const b = try insertTyped(&w, cat, &.{ .{ .int = 2 }, .{ .link = a.row } });
+    cat = b.cat;
+    cat = try setLink(&w, cat, 1, 1, b.row);
+    // a no longer self-links, but b still links to a, so a keeps one inbound.
+    try testing.expectEqual(@as(u64, 1), try backlinkCount(&w, cat, 1, a.row));
+    try testing.expectEqual(@as(u64, 1), try backlinkCount(&w, cat, 1, b.row));
+    w.deinit();
+}
