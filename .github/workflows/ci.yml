@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Build and run tests
+        run: zig build test --summary all
+
+  # Windows is not supported yet: the storage engine is POSIX-only (mmap with a
+  # fixed base, flock, fcntl(F_FULLFSYNC), getpid/kill). This job is expected to
+  # fail until a Windows platform layer lands. It is non-blocking
+  # (continue-on-error) so it tracks progress without gating merges; flip the
+  # flag off once Windows passes.
+  test-windows:
+    name: test (windows-latest, allowed to fail)
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Build and run tests
+        run: zig build test --summary all
+
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Check formatting
+        run: zig fmt --check src/ build.zig build.zig.zon
