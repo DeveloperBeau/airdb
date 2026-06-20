@@ -61,6 +61,33 @@ pub fn setCatalogRef(txn: *WriteTxn, dir: Ref, type_id: u16, new_cat: Ref) !Ref 
     return a.ref;
 }
 
+// Append a new object type to the directory and return the grown directory ref
+// plus the new type id. The new type's catalog is created from `type_schema`.
+pub fn addType(txn: *WriteTxn, dir: Ref, type_schema: []const PropKind) !struct { dir: Ref, type_id: u16 } {
+    // Capture existing catalog refs before createTyped, which can grow the file
+    // and invalidate the directory deref slice.
+    var old_refs: [256]Ref = undefined;
+    const old_tc = blk: {
+        const d = try loadDir(txn, dir);
+        var t: usize = 0;
+        while (t < d.type_count) : (t += 1) {
+            old_refs[t] = std.mem.readInt(u64, d.bytes[2 + t * 8 ..][0..8], .little);
+        }
+        break :blk d.type_count;
+    };
+    std.debug.assert(old_tc < 256);
+    const new_cat = try Objects.createTyped(txn, type_schema);
+    const new_tc: u16 = old_tc + 1;
+    const a = try txn.alloc(dirSize(new_tc));
+    std.mem.writeInt(u16, a.bytes[0..2], new_tc, .little);
+    var t: usize = 0;
+    while (t < old_tc) : (t += 1) {
+        std.mem.writeInt(u64, a.bytes[2 + t * 8 ..][0..8], old_refs[t], .little);
+    }
+    std.mem.writeInt(u64, a.bytes[2 + @as(usize, old_tc) * 8 ..][0..8], new_cat, .little);
+    return .{ .dir = a.ref, .type_id = old_tc };
+}
+
 pub fn validate(txn: anytype, dir: Ref, expected: Schema) !void {
     const tc = try typeCount(txn, dir);
     if (tc != expected.len) return error.SchemaMismatch;
@@ -267,4 +294,30 @@ test "multiple types persist across reopen and validate" {
         try testing.expectEqual(@as(u64, 2500), out1[1].int);
         r.end();
     }
+}
+
+test "addType grows the directory and routes the new type" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tdTmpPath(testing.allocator, &tmp, "td5.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    const schema = [_][]const PropKind{&.{ .int, .blob }};
+    var dir = try create(&w, &schema);
+    try testing.expectEqual(@as(u16, 1), try typeCount(&w, dir));
+    const added = try addType(&w, dir, &.{ .int, .int, .int });
+    dir = added.dir;
+    try testing.expectEqual(@as(u16, 1), added.type_id);
+    try testing.expectEqual(@as(u16, 2), try typeCount(&w, dir));
+    // old type still works; new type accepts rows
+    dir = (try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .bytes = "x" } })).dir;
+    dir = (try insert(&w, dir, 1, &.{ .{ .int = 1 }, .{ .int = 2 }, .{ .int = 3 } })).dir;
+    try testing.expectEqual(@as(u64, 1), try liveCount(&w, dir, 0));
+    try testing.expectEqual(@as(u64, 1), try liveCount(&w, dir, 1));
+    var out: [3]Value = undefined;
+    _ = (try get(&w, dir, 1, 1, &out)).?;
+    try testing.expectEqual(@as(u64, 3), out[2].int);
+    w.deinit();
 }
