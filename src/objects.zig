@@ -493,6 +493,54 @@ pub fn listAppendBlob(txn: *WriteTxn, cat: Ref, pk: u64, prop: usize, bytes: []c
     return replaceCollRoot(txn, cat, r.row, prop, new_root);
 }
 
+pub fn setCountInt(txn: anytype, cat: Ref, pk: u64, prop: usize) !?u64 {
+    const r = (try resolveProp(txn, cat, pk, prop)) orelse return null;
+    const set_root = try Column.get(txn, r.prop_col, r.row);
+    return try Index.count(txn, set_root);
+}
+
+pub fn setContainsInt(txn: anytype, cat: Ref, pk: u64, prop: usize, key: u64) !bool {
+    const r = (try resolveProp(txn, cat, pk, prop)).?;
+    const set_root = try Column.get(txn, r.prop_col, r.row);
+    return (try Index.get(txn, set_root, key)) != null;
+}
+
+pub fn setAddInt(txn: *WriteTxn, cat: Ref, pk: u64, prop: usize, key: u64) !Ref {
+    const r = (try resolveProp(txn, cat, pk, prop)).?;
+    const old_root = try Column.get(txn, r.prop_col, r.row);
+    if ((try Index.get(txn, old_root, key)) != null) return cat; // already a member, no version bump
+    const new_root = try Index.insert(txn, old_root, key, 1);
+    return replaceCollRoot(txn, cat, r.row, prop, new_root);
+}
+
+pub fn setRemoveInt(txn: *WriteTxn, cat: Ref, pk: u64, prop: usize, key: u64) !Ref {
+    const r = (try resolveProp(txn, cat, pk, prop)).?;
+    const old_root = try Column.get(txn, r.prop_col, r.row);
+    if ((try Index.get(txn, old_root, key)) == null) return cat; // not a member, no version bump
+    const new_root = try Index.remove(txn, old_root, key);
+    return replaceCollRoot(txn, cat, r.row, prop, new_root);
+}
+
+pub fn setCollectInt(
+    txn: anytype,
+    cat: Ref,
+    pk: u64,
+    prop: usize,
+    out: *std.ArrayList(u64),
+    allocator: std.mem.Allocator,
+) !void {
+    const r = (try resolveProp(txn, cat, pk, prop)).?;
+    const set_root = try Column.get(txn, r.prop_col, r.row);
+    const Sink = struct {
+        list: *std.ArrayList(u64),
+        alloc: std.mem.Allocator,
+        fn onKey(self: @This(), key: u64) !void {
+            try self.list.append(self.alloc, key);
+        }
+    };
+    try Index.forEachKey(txn, set_root, Sink{ .list = out, .alloc = allocator }, Sink.onKey);
+}
+
 // updateTyped is MVCC-safe: it does NOT free any blob unless the version check
 // passes. Steps: read current row, check version, then on the apply path free
 // old blobs and allocate new ones before delegating to update.
@@ -953,5 +1001,36 @@ test "list of blob: insert and read back element strings" {
     try testing.expectEqualStrings("beta", try listGetBlob(&w, cat, 7, 1, 1));
     cat = try listAppendBlob(&w, cat, 7, 1, "delta");
     try testing.expectEqualStrings("delta", try listGetBlob(&w, cat, 7, 1, 3));
+    w.deinit();
+}
+
+test "set of int: insert, membership, add (dedup), remove, count, collect" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "setint.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var cat = try createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .set, .elem = .int } });
+    cat = (try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .set_int = &.{ 5, 9, 5, 12 } } })).cat;
+    try testing.expectEqual(@as(?u64, 3), try setCountInt(&w, cat, 1, 1));
+    try testing.expect(try setContainsInt(&w, cat, 1, 1, 9));
+    try testing.expect(!(try setContainsInt(&w, cat, 1, 1, 7)));
+    cat = try setAddInt(&w, cat, 1, 1, 7);
+    try testing.expect(try setContainsInt(&w, cat, 1, 1, 7));
+    try testing.expectEqual(@as(?u64, 4), try setCountInt(&w, cat, 1, 1));
+    cat = try setAddInt(&w, cat, 1, 1, 7); // dedup: no change
+    try testing.expectEqual(@as(?u64, 4), try setCountInt(&w, cat, 1, 1));
+    cat = try setRemoveInt(&w, cat, 1, 1, 9);
+    try testing.expect(!(try setContainsInt(&w, cat, 1, 1, 9)));
+    try testing.expectEqual(@as(?u64, 3), try setCountInt(&w, cat, 1, 1));
+    var members = std.ArrayList(u64).empty;
+    defer members.deinit(testing.allocator);
+    try setCollectInt(&w, cat, 1, 1, &members, testing.allocator);
+    try testing.expectEqual(@as(usize, 3), members.items.len);
+    try testing.expectEqual(@as(u64, 5), members.items[0]);
+    try testing.expectEqual(@as(u64, 7), members.items[1]);
+    try testing.expectEqual(@as(u64, 12), members.items[2]);
     w.deinit();
 }
