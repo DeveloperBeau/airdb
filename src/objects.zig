@@ -699,6 +699,55 @@ pub fn setLink(txn: *WriteTxn, cat: Ref, pk: u64, prop: usize, target: ?u64) !Re
     return new_cat;
 }
 
+// For each link property: (1) nullify every inbound link pointing at `okey`
+// (and drop those backlink entries); (2) remove the deleted row's own outbound
+// link entry from its target's backlink set. Returns the new catalog ref.
+fn fixBacklinksForDelete(txn: *WriteTxn, cat: Ref, okey: u64) !Ref {
+    var cur = cat;
+    const v0 = try loadCatalog(txn, cat);
+    const pc = v0.prop_count;
+    const alloc = txn.db.store.allocator;
+    var p: usize = 0;
+    while (p < pc) : (p += 1) {
+        {
+            const vk = try loadCatalog(txn, cur);
+            if (vk.kind(p) != .link) continue;
+        }
+        // (1) Nullify inbound: snapshot the sources, then clear each one's link.
+        var sources = std.ArrayList(u64).empty;
+        defer sources.deinit(alloc);
+        try backlinkCollect(txn, cur, p, okey, &sources, alloc);
+        for (sources.items) |src| {
+            const vv = try loadCatalog(txn, cur);
+            const new_col = try Column.set(txn, vv.propColRef(p), src, 0);
+            cur = try setPropColRef(txn, cur, p, new_col);
+        }
+        // Drop the whole backlink set for okey (its inbound links are now clear).
+        {
+            const vv = try loadCatalog(txn, cur);
+            const empty = try Index.create(txn);
+            const new_bl = try Index.insert(txn, vv.backlinkRef(p), okey, empty);
+            cur = try setBacklinkRef(txn, cur, p, new_bl);
+        }
+        // (2) Outbound: if the deleted row links somewhere, remove its backlink.
+        const vv2 = try loadCatalog(txn, cur);
+        const out_raw = try Column.get(txn, vv2.propColRef(p), okey);
+        if (out_raw != 0) cur = try removeBacklink(txn, cur, p, out_raw - 1, okey);
+    }
+    return cur;
+}
+
+// Delete an object and keep the graph consistent: nullify inbound links and
+// clean the deleted object's outbound backlink entries.
+pub fn deleteAndNullify(txn: *WriteTxn, cat: Ref, pk: u64, expected_version: u64) !DeleteResult {
+    const v = try loadCatalog(txn, cat);
+    const okey = (try Index.get(txn, v.pk_index_ref, pk)) orelse return .not_found;
+    const cur_ver = try Column.get(txn, v.version_col_ref, okey);
+    if (cur_ver != expected_version) return .{ .conflict = .{ .current_version = cur_ver } };
+    const fixed = try fixBacklinksForDelete(txn, cat, okey);
+    return try delete(txn, fixed, pk, expected_version);
+}
+
 pub fn listAppendInt(txn: *WriteTxn, cat: Ref, pk: u64, prop: usize, value: u64) !Ref {
     const r = (try resolveProp(txn, cat, pk, prop)).?;
     const old_root = try Column.get(txn, r.prop_col, r.row);
@@ -841,8 +890,8 @@ pub fn deleteTyped(
     while (i < pc) : (i += 1) {
         if (kinds[i] == .blob) try blob.free(txn, cur_raw[i]);
     }
-    // Step 4: delegate to the core delete.
-    return try delete(txn, cat, pk, expected_version);
+    // Step 4: delegate to the graph-safe delete (nullifies inbound links).
+    return try deleteAndNullify(txn, cat, pk, expected_version);
 }
 
 // ---------------------------------------------------------------------------
@@ -1425,5 +1474,33 @@ test "setLink moves and clears links, keeping backlinks exact" {
     cat = try setLink(&w, cat, 3, 1, null);
     try testing.expectEqual(@as(?u64, null), try getLink(&w, cat, 3, 1));
     try testing.expectEqual(@as(u64, 0), try backlinkCount(&w, cat, 1, b.row));
+    w.deinit();
+}
+
+test "deleting an object nullifies inbound links and cleans its outbound backlinks" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "link3.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var cat = try createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
+    const a = try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .link = null } });
+    cat = a.cat;
+    const b = try insertTyped(&w, cat, &.{ .{ .int = 2 }, .{ .link = a.row } });
+    cat = b.cat;
+    const c = try insertTyped(&w, cat, &.{ .{ .int = 3 }, .{ .link = a.row } });
+    cat = c.cat;
+    try testing.expectEqual(@as(u64, 2), try backlinkCount(&w, cat, 1, a.row));
+    var out: [2]Value = undefined;
+    const va = (try getTyped(&w, cat, 1, &out)).?;
+    const dres = try deleteTyped(&w, cat, 1, va);
+    cat = dres.ok;
+    try testing.expectEqual(@as(?u64, null), try getLink(&w, cat, 2, 1));
+    try testing.expectEqual(@as(?u64, null), try getLink(&w, cat, 3, 1));
+    const vb = (try getTyped(&w, cat, 2, &out)).?;
+    cat = (try deleteTyped(&w, cat, 2, vb)).ok;
+    try testing.expectEqual(@as(u64, 0), try backlinkCount(&w, cat, 1, a.row));
     w.deinit();
 }
