@@ -1034,3 +1034,71 @@ test "set of int: insert, membership, add (dedup), remove, count, collect" {
     try testing.expectEqual(@as(u64, 12), members.items[2]);
     w.deinit();
 }
+
+test "collections persist across commit and reopen" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "collpersist.airdb");
+    defer testing.allocator.free(path);
+    {
+        var db = try Db.create(testing.allocator, path);
+        defer db.deinit();
+        var w = try db.beginWrite();
+        var cat = try createDefs(&w, &.{
+            .{ .kind = .int },
+            .{ .kind = .list, .elem = .int },
+            .{ .kind = .set, .elem = .int },
+            .{ .kind = .list, .elem = .blob },
+        });
+        cat = (try insertTyped(&w, cat, &.{
+            .{ .int = 42 },
+            .{ .list_int = &.{ 1, 2, 3 } },
+            .{ .set_int = &.{ 100, 200, 300 } },
+            .{ .list_blob = &.{ "x", "yy", "zzz" } },
+        })).cat;
+        cat = try listAppendInt(&w, cat, 42, 1, 4);
+        cat = try setAddInt(&w, cat, 42, 2, 400);
+        w.setRoot(cat);
+        _ = try w.commit();
+    }
+    {
+        var db = try Db.open(testing.allocator, path);
+        defer db.deinit();
+        var r = try db.beginRead();
+        const cat = r.root();
+        try testing.expectEqual(@as(?u64, 4), try listLen(&r, cat, 42, 1));
+        try testing.expectEqual(@as(u64, 4), try listGetInt(&r, cat, 42, 1, 3));
+        try testing.expectEqual(@as(?u64, 4), try setCountInt(&r, cat, 42, 2));
+        try testing.expect(try setContainsInt(&r, cat, 42, 2, 400));
+        try testing.expectEqualStrings("zzz", try listGetBlob(&r, cat, 42, 3, 2));
+        r.end();
+    }
+}
+
+test "large list and set: 50k elements each, append and membership" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "collscale.airdb");
+    defer testing.allocator.free(path);
+    const N: u64 = 50_000;
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var cat = try createDefs(&w, &.{
+        .{ .kind = .int },
+        .{ .kind = .list, .elem = .int },
+        .{ .kind = .set, .elem = .int },
+    });
+    cat = (try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .list_int = &.{} }, .{ .set_int = &.{} } })).cat;
+    var i: u64 = 0;
+    while (i < N) : (i += 1) {
+        cat = try listAppendInt(&w, cat, 1, 1, i);
+        cat = try setAddInt(&w, cat, 1, 2, i *% 2654435761 % 1_000_003);
+    }
+    try testing.expectEqual(@as(?u64, N), try listLen(&w, cat, 1, 1));
+    try testing.expectEqual(@as(u64, 12345), try listGetInt(&w, cat, 1, 1, 12345));
+    const sc = (try setCountInt(&w, cat, 1, 2)).?;
+    try testing.expect(sc > 0 and sc <= N);
+    try testing.expect(try setContainsInt(&w, cat, 1, 2, 0));
+    w.deinit();
+}
