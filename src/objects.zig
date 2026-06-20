@@ -332,6 +332,27 @@ pub fn getByPk(txn: anytype, cat: Ref, pk: u64, out: []u64) !?u64 {
     return try Column.get(txn, version_col_ref, row);
 }
 
+fn buildListInt(txn: *WriteTxn, items: []const u64) !Ref {
+    var root = try Column.create(txn);
+    for (items) |x| root = try Column.append(txn, root, x);
+    return root;
+}
+
+fn buildListBlob(txn: *WriteTxn, items: []const []const u8) !Ref {
+    var root = try Column.create(txn);
+    for (items) |s| {
+        const bref = try blob.put(txn, s);
+        root = try Column.append(txn, root, bref);
+    }
+    return root;
+}
+
+fn buildSetInt(txn: *WriteTxn, items: []const u64) !Ref {
+    var root = try Index.create(txn);
+    for (items) |k| root = try Index.insert(txn, root, k, 1);
+    return root;
+}
+
 // insertTyped encodes a []Value row into raw u64 storage, allocating a blob
 // node for each .blob property, then delegates to insert.
 pub fn insertTyped(txn: *WriteTxn, cat: Ref, values: []const Value) !struct { cat: Ref, row: u64 } {
@@ -339,12 +360,16 @@ pub fn insertTyped(txn: *WriteTxn, cat: Ref, values: []const Value) !struct { ca
     const pc = v.prop_count;
     std.debug.assert(values.len == pc);
     std.debug.assert(pc <= max_prop_count);
-    // Capture kinds into a local buffer before any mutation that could
+    // Capture kinds and elems into local buffers before any mutation that could
     // invalidate the deref slice backing CatalogView.
     var kinds: [max_prop_count]PropKind = undefined;
+    var elems: [max_prop_count]ElemKind = undefined;
     {
         var j: usize = 0;
-        while (j < pc) : (j += 1) kinds[j] = v.kind(j);
+        while (j < pc) : (j += 1) {
+            kinds[j] = v.kind(j);
+            elems[j] = v.elemKind(j);
+        }
     }
     var raw: [max_prop_count]u64 = undefined;
     var i: usize = 0;
@@ -352,7 +377,14 @@ pub fn insertTyped(txn: *WriteTxn, cat: Ref, values: []const Value) !struct { ca
         raw[i] = switch (kinds[i]) {
             .int => values[i].int,
             .blob => try blob.put(txn, values[i].bytes),
-            .list, .set => unreachable, // collection insert not yet implemented
+            .list => switch (elems[i]) {
+                .int => try buildListInt(txn, values[i].list_int),
+                .blob => try buildListBlob(txn, values[i].list_blob),
+            },
+            .set => switch (elems[i]) {
+                .int => try buildSetInt(txn, values[i].set_int),
+                .blob => unreachable, // set of blob out of scope this phase
+            },
         };
     }
     const r = try insert(txn, cat, raw[0..pc]);
@@ -384,6 +416,81 @@ pub fn getTyped(txn: anytype, cat: Ref, pk: u64, out: []Value) !?u64 {
         };
     }
     return ver;
+}
+
+// Resolve (cat, pk, prop) to the property column ref and the row;
+// null if pk absent or row tombstoned.
+fn resolveProp(txn: anytype, cat: Ref, pk: u64, prop: usize) !?struct { row: u64, prop_col: Ref } {
+    const v = try loadCatalog(txn, cat);
+    const row = (try Index.get(txn, v.pk_index_ref, pk)) orelse return null;
+    if ((try Column.get(txn, v.live_col_ref, row)) == 0) return null;
+    return .{ .row = row, .prop_col = v.propColRef(prop) };
+}
+
+pub fn listLen(txn: anytype, cat: Ref, pk: u64, prop: usize) !?u64 {
+    const r = (try resolveProp(txn, cat, pk, prop)) orelse return null;
+    const list_root = try Column.get(txn, r.prop_col, r.row);
+    return try Column.len(txn, list_root);
+}
+
+pub fn listGetInt(txn: anytype, cat: Ref, pk: u64, prop: usize, index: u64) !u64 {
+    const r = (try resolveProp(txn, cat, pk, prop)).?;
+    const list_root = try Column.get(txn, r.prop_col, r.row);
+    return try Column.get(txn, list_root, index);
+}
+
+pub fn listGetBlob(txn: anytype, cat: Ref, pk: u64, prop: usize, index: u64) ![]const u8 {
+    const r = (try resolveProp(txn, cat, pk, prop)).?;
+    const list_root = try Column.get(txn, r.prop_col, r.row);
+    const bref = try Column.get(txn, list_root, index);
+    return try blob.get(txn, bref);
+}
+
+// Write new_root into property `prop` at `row`, bump that row's version stamp,
+// return the new catalog ref. Reloads the catalog fresh and captures all refs.
+fn replaceCollRoot(txn: *WriteTxn, cat: Ref, row: u64, prop: usize, new_root: Ref) !Ref {
+    const v = try loadCatalog(txn, cat);
+    const pc = v.prop_count;
+    const next_row = v.next_row;
+    const idx_ref = v.pk_index_ref;
+    const live_ref = v.live_col_ref;
+    var prop_refs: [max_prop_count]Ref = undefined;
+    var kinds: [max_prop_count]PropKind = undefined;
+    var elems: [max_prop_count]ElemKind = undefined;
+    {
+        var j: usize = 0;
+        while (j < pc) : (j += 1) {
+            prop_refs[j] = v.propColRef(j);
+            kinds[j] = v.kind(j);
+            elems[j] = v.elemKind(j);
+        }
+    }
+    var ver_ref = v.version_col_ref;
+    prop_refs[prop] = try Column.set(txn, prop_refs[prop], row, new_root);
+    ver_ref = try Column.set(txn, ver_ref, row, txn.new_version);
+    return writeCatalog(txn, pc, next_row, idx_ref, ver_ref, live_ref, prop_refs[0..pc], kinds[0..pc], elems[0..pc]);
+}
+
+pub fn listAppendInt(txn: *WriteTxn, cat: Ref, pk: u64, prop: usize, value: u64) !Ref {
+    const r = (try resolveProp(txn, cat, pk, prop)).?;
+    const old_root = try Column.get(txn, r.prop_col, r.row);
+    const new_root = try Column.append(txn, old_root, value);
+    return replaceCollRoot(txn, cat, r.row, prop, new_root);
+}
+
+pub fn listSetInt(txn: *WriteTxn, cat: Ref, pk: u64, prop: usize, index: u64, value: u64) !Ref {
+    const r = (try resolveProp(txn, cat, pk, prop)).?;
+    const old_root = try Column.get(txn, r.prop_col, r.row);
+    const new_root = try Column.set(txn, old_root, index, value);
+    return replaceCollRoot(txn, cat, r.row, prop, new_root);
+}
+
+pub fn listAppendBlob(txn: *WriteTxn, cat: Ref, pk: u64, prop: usize, bytes: []const u8) !Ref {
+    const r = (try resolveProp(txn, cat, pk, prop)).?;
+    const old_root = try Column.get(txn, r.prop_col, r.row);
+    const bref = try blob.put(txn, bytes);
+    const new_root = try Column.append(txn, old_root, bref);
+    return replaceCollRoot(txn, cat, r.row, prop, new_root);
 }
 
 // updateTyped is MVCC-safe: it does NOT free any blob unless the version check
@@ -806,4 +913,45 @@ test "strings persist across reopen" {
         try testing.expectEqualStrings("name-321", out[1].bytes);
         r.end();
     }
+}
+
+test "list of int: insert, read, append, set" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "listint.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var cat = try createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .list, .elem = .int } });
+    cat = (try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .list_int = &.{ 10, 20, 30 } } })).cat;
+    try testing.expectEqual(@as(?u64, 3), try listLen(&w, cat, 1, 1));
+    try testing.expectEqual(@as(u64, 20), try listGetInt(&w, cat, 1, 1, 1));
+    cat = try listAppendInt(&w, cat, 1, 1, 40);
+    try testing.expectEqual(@as(?u64, 4), try listLen(&w, cat, 1, 1));
+    try testing.expectEqual(@as(u64, 40), try listGetInt(&w, cat, 1, 1, 3));
+    cat = try listSetInt(&w, cat, 1, 1, 0, 99);
+    try testing.expectEqual(@as(u64, 99), try listGetInt(&w, cat, 1, 1, 0));
+    var out: [2]Value = undefined;
+    _ = (try getTyped(&w, cat, 1, &out)).?;
+    try testing.expectEqual(@as(u64, 1), out[0].int);
+    try testing.expect(out[1].coll_root != 0);
+    w.deinit();
+}
+
+test "list of blob: insert and read back element strings" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "listblob.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var cat = try createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .list, .elem = .blob } });
+    cat = (try insertTyped(&w, cat, &.{ .{ .int = 7 }, .{ .list_blob = &.{ "alpha", "beta", "gamma" } } })).cat;
+    try testing.expectEqual(@as(?u64, 3), try listLen(&w, cat, 7, 1));
+    try testing.expectEqualStrings("beta", try listGetBlob(&w, cat, 7, 1, 1));
+    cat = try listAppendBlob(&w, cat, 7, 1, "delta");
+    try testing.expectEqualStrings("delta", try listGetBlob(&w, cat, 7, 1, 3));
+    w.deinit();
 }
