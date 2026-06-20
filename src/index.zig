@@ -406,6 +406,29 @@ pub fn count(txn: anytype, root: Ref) !u64 {
     return total;
 }
 
+// Visit every key in ascending order, calling onKey(ctx, key) for each.
+// Inner nodes are recursed left to right; leaf keys are already sorted.
+pub fn forEachKey(
+    txn: anytype,
+    root: Ref,
+    ctx: anytype,
+    comptime onKey: fn (@TypeOf(ctx), u64) anyerror!void,
+) !void {
+    const bytes = try derefNode(txn, root);
+    if (bytes[0] == kind_leaf) {
+        const leaf = try parseLeaf(bytes);
+        var i: usize = 0;
+        while (i < leaf.count) : (i += 1) try onKey(ctx, leaf.key(i));
+        return;
+    }
+    const inner = try parseInner(bytes);
+    var i: usize = 0;
+    while (i < inner.child_count) : (i += 1) {
+        const child_ref: Ref = inner.childRef(i);
+        try forEachKey(txn, child_ref, ctx, onKey);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -541,6 +564,40 @@ test "a committed index version stays intact for a pinned reader while a later c
     try testing.expect((try get(&r2, r2.root(), 500)) == null);
     try testing.expectEqual(@as(?u64, 1235 * 10), try get(&r2, r2.root(), 1235)); // untouched key
     r2.end();
+}
+
+test "forEachKey visits all keys in ascending order" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try idxTmpPath(testing.allocator, &tmp, "iter.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var root = try create(&w);
+    var i: u64 = 0;
+    while (i < 500) : (i += 1) {
+        const k = (i *% 2654435761) % 100_003;
+        root = try insert(&w, root, k, k + 1);
+    }
+    const Collector = struct {
+        list: *std.ArrayList(u64),
+        fn onKey(self: @This(), key: u64) !void {
+            try self.list.append(testing.allocator, key);
+        }
+    };
+    var seen = std.ArrayList(u64).empty;
+    defer seen.deinit(testing.allocator);
+    try forEachKey(&w, root, Collector{ .list = &seen }, Collector.onKey);
+    try testing.expectEqual(try count(&w, root), @as(u64, seen.items.len));
+    var prev: u64 = 0;
+    var first = true;
+    for (seen.items) |k| {
+        if (!first) try testing.expect(k > prev);
+        prev = k;
+        first = false;
+    }
+    w.deinit();
 }
 
 test "ordered index persists across reopen and matches a reference map under churn" {
