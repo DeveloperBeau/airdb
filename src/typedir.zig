@@ -1,7 +1,8 @@
 // typedir.zig -- type directory node mapping type ids to catalog refs.
 //
 // Node layout: [type_count u16 LE @0][type_count * (catalog_ref u64 LE) @2]
-// dirSize(tc) = 2 + tc * 8
+//              [type_count * (is_embedded u8) @ 2 + tc*8]
+// dirSize(tc) = 2 + tc * 8 + tc
 
 const std = @import("std");
 const testing = std.testing;
@@ -22,27 +23,38 @@ const PropKind = catalog.PropKind;
 const PropDef = catalog.PropDef;
 
 fn dirSize(tc: u16) usize {
-    return 2 + @as(usize, tc) * 8;
+    return 2 + @as(usize, tc) * 8 + tc;
 }
 
-// Pack `tc` catalog refs into a fresh directory node.
-fn writeDir(txn: *WriteTxn, cat_refs: []const Ref) !Ref {
+// Pack `tc` catalog refs + per-type embedded flags into a fresh directory node.
+fn writeDir(txn: *WriteTxn, cat_refs: []const Ref, embedded: []const bool) !Ref {
+    std.debug.assert(embedded.len == cat_refs.len);
     const tc: u16 = @intCast(cat_refs.len);
     const a = try txn.alloc(dirSize(tc));
     std.mem.writeInt(u16, a.bytes[0..2], tc, .little);
     for (cat_refs, 0..) |cref, i| {
         std.mem.writeInt(u64, a.bytes[2 + i * 8 ..][0..8], cref, .little);
     }
+    for (embedded, 0..) |e, i| a.bytes[2 + cat_refs.len * 8 + i] = if (e) 1 else 0;
     return a.ref;
+}
+
+// Create a directory from a full PropDef schema (supports links/collections),
+// with the given per-type embedded flags.
+pub fn createTypes(txn: *WriteTxn, schema: DefSchema, embedded: []const bool) !Ref {
+    std.debug.assert(schema.len <= 256);
+    std.debug.assert(embedded.len == schema.len);
+    var cat_refs: [256]Ref = undefined;
+    var t: usize = 0;
+    while (t < schema.len) : (t += 1) cat_refs[t] = try catalog.createDefs(txn, schema[t]);
+    return writeDir(txn, cat_refs[0..schema.len], embedded);
 }
 
 // Create a directory from a full PropDef schema (supports links/collections).
 pub fn createWithDefs(txn: *WriteTxn, schema: DefSchema) !Ref {
-    std.debug.assert(schema.len <= 256);
-    var cat_refs: [256]Ref = undefined;
-    var t: usize = 0;
-    while (t < schema.len) : (t += 1) cat_refs[t] = try catalog.createDefs(txn, schema[t]);
-    return writeDir(txn, cat_refs[0..schema.len]);
+    var flags: [256]bool = undefined;
+    @memset(flags[0..schema.len], false);
+    return createTypes(txn, schema, flags[0..schema.len]);
 }
 
 // Scalar-kinds convenience: each property gets elem = int.
@@ -53,7 +65,9 @@ pub fn create(txn: *WriteTxn, schema: Schema) !Ref {
     while (t < schema.len) : (t += 1) {
         cat_refs[t] = try catalog.createTyped(txn, schema[t]);
     }
-    return writeDir(txn, cat_refs[0..schema.len]);
+    var flags: [256]bool = undefined;
+    @memset(flags[0..schema.len], false);
+    return writeDir(txn, cat_refs[0..schema.len], flags[0..schema.len]);
 }
 
 fn loadDir(txn: anytype, dir: Ref) !struct { type_count: u16, bytes: []const u8 } {
@@ -83,13 +97,20 @@ pub fn setCatalogRef(txn: *WriteTxn, dir: Ref, type_id: u16, new_cat: Ref) !Ref 
 }
 
 // Append an already-created catalog to the directory; returns grown dir + id.
-fn appendCatalog(txn: *WriteTxn, old_refs: []const Ref, new_cat: Ref) !Ref {
+// Carries the existing per-type embedded flags and appends the new type's flag.
+fn appendCatalog(txn: *WriteTxn, old_refs: []const Ref, old_embedded: []const bool, new_cat: Ref, new_embedded: bool) !Ref {
+    std.debug.assert(old_refs.len == old_embedded.len);
     const old_tc = old_refs.len;
     var refs: [256]Ref = undefined;
+    var flags: [256]bool = undefined;
     var t: usize = 0;
-    while (t < old_tc) : (t += 1) refs[t] = old_refs[t];
+    while (t < old_tc) : (t += 1) {
+        refs[t] = old_refs[t];
+        flags[t] = old_embedded[t];
+    }
     refs[old_tc] = new_cat;
-    return writeDir(txn, refs[0 .. old_tc + 1]);
+    flags[old_tc] = new_embedded;
+    return writeDir(txn, refs[0 .. old_tc + 1], flags[0 .. old_tc + 1]);
 }
 
 // Snapshot existing catalog refs (before any file-growing create call).
@@ -102,41 +123,55 @@ fn snapshotRefs(txn: anytype, dir: Ref, out: *[256]Ref) !u16 {
     return d.type_count;
 }
 
+// Snapshot existing per-type embedded flags (before any file-growing call).
+fn snapshotFlags(txn: anytype, dir: Ref, out: *[256]bool) !u16 {
+    const d = try loadDir(txn, dir);
+    var t: usize = 0;
+    while (t < d.type_count) : (t += 1) {
+        out[t] = d.bytes[2 + @as(usize, d.type_count) * 8 + t] != 0;
+    }
+    return d.type_count;
+}
+
+pub const AddTypeResult = struct { dir: Ref, type_id: u16 };
+
 // Append a new type from a full PropDef schema (supports links/collections).
-pub fn addTypeDefs(txn: *WriteTxn, dir: Ref, defs: []const PropDef) !struct { dir: Ref, type_id: u16 } {
+pub fn addTypeDefs(txn: *WriteTxn, dir: Ref, defs: []const PropDef) !AddTypeResult {
+    return addTypeDefsEmbedded(txn, dir, defs, false);
+}
+
+// Like addTypeDefs but marks the new type embedded when `is_embedded` is set.
+pub fn addTypeDefsEmbedded(txn: *WriteTxn, dir: Ref, defs: []const PropDef, is_embedded: bool) !AddTypeResult {
     var old_refs: [256]Ref = undefined;
+    var old_flags: [256]bool = undefined;
     const old_tc = try snapshotRefs(txn, dir, &old_refs);
+    _ = try snapshotFlags(txn, dir, &old_flags);
     std.debug.assert(old_tc < 256);
     const new_cat = try catalog.createDefs(txn, defs);
-    const new_dir = try appendCatalog(txn, old_refs[0..old_tc], new_cat);
+    const new_dir = try appendCatalog(txn, old_refs[0..old_tc], old_flags[0..old_tc], new_cat, is_embedded);
     return .{ .dir = new_dir, .type_id = old_tc };
 }
 
 // Append a new object type to the directory and return the grown directory ref
 // plus the new type id. The new type's catalog is created from `type_schema`.
-pub fn addType(txn: *WriteTxn, dir: Ref, type_schema: []const PropKind) !struct { dir: Ref, type_id: u16 } {
-    // Capture existing catalog refs before createTyped, which can grow the file
-    // and invalidate the directory deref slice.
+pub fn addType(txn: *WriteTxn, dir: Ref, type_schema: []const PropKind) !AddTypeResult {
+    // Capture existing catalog refs and embedded flags before createTyped, which
+    // can grow the file and invalidate the directory deref slice.
     var old_refs: [256]Ref = undefined;
-    const old_tc = blk: {
-        const d = try loadDir(txn, dir);
-        var t: usize = 0;
-        while (t < d.type_count) : (t += 1) {
-            old_refs[t] = std.mem.readInt(u64, d.bytes[2 + t * 8 ..][0..8], .little);
-        }
-        break :blk d.type_count;
-    };
+    var old_flags: [256]bool = undefined;
+    const old_tc = try snapshotRefs(txn, dir, &old_refs);
+    _ = try snapshotFlags(txn, dir, &old_flags);
     std.debug.assert(old_tc < 256);
     const new_cat = try catalog.createTyped(txn, type_schema);
-    const new_tc: u16 = old_tc + 1;
-    const a = try txn.alloc(dirSize(new_tc));
-    std.mem.writeInt(u16, a.bytes[0..2], new_tc, .little);
-    var t: usize = 0;
-    while (t < old_tc) : (t += 1) {
-        std.mem.writeInt(u64, a.bytes[2 + t * 8 ..][0..8], old_refs[t], .little);
-    }
-    std.mem.writeInt(u64, a.bytes[2 + @as(usize, old_tc) * 8 ..][0..8], new_cat, .little);
-    return .{ .dir = a.ref, .type_id = old_tc };
+    const new_dir = try appendCatalog(txn, old_refs[0..old_tc], old_flags[0..old_tc], new_cat, false);
+    return .{ .dir = new_dir, .type_id = old_tc };
+}
+
+// Report whether `type_id` was created as an embedded (single-owner) type.
+pub fn isEmbedded(txn: anytype, dir: Ref, type_id: u16) !bool {
+    const d = try loadDir(txn, dir);
+    if (type_id >= d.type_count) return error.NoSuchType;
+    return d.bytes[2 + @as(usize, d.type_count) * 8 + type_id] != 0;
 }
 
 pub fn validate(txn: anytype, dir: Ref, expected: Schema) !void {
@@ -344,6 +379,56 @@ fn deleteWorker(txn: *WriteTxn, dir: Ref, type_id: u16, okey: u64, visited: *std
         }
     }
     return cur;
+}
+
+// ---------------------------------------------------------------------------
+// Embedded-object lifecycle: single-owner objects created and cleared through
+// their owner via a cascade-rule to-one link.
+// ---------------------------------------------------------------------------
+
+// Create an embedded child for `owner`'s to-one link `prop` and link it in.
+// If the owner already has a child via `prop`, the old child is deleted first
+// (replace semantics). Returns the new directory ref.
+pub fn insertEmbedded(txn: *WriteTxn, dir: Ref, owner_type: u16, owner_pk: u64, prop: usize, child_values: []const Value) !Ref {
+    var cur = dir;
+    const child_type = (try catalog.loadCatalog(txn, try catalogRef(txn, cur, owner_type))).linkTarget(prop);
+
+    // Replace: delete any existing owned child first.
+    if (try getLink(txn, cur, owner_type, owner_pk, prop)) |old_okey| {
+        const child_cat = try catalogRef(txn, cur, child_type);
+        const pc = (try catalog.loadCatalog(txn, child_cat)).prop_count;
+        var buf: [256]u64 = undefined;
+        if (try Objects.getByObjectKey(txn, child_cat, old_okey, buf[0..pc])) |old_ver| {
+            const old_pk = buf[0];
+            const dres = try deleteNullifyX(txn, cur, child_type, old_pk, old_ver);
+            switch (dres) {
+                .ok => |d| cur = d,
+                else => {},
+            }
+        }
+    }
+
+    const ins = try insert(txn, cur, child_type, child_values);
+    cur = ins.dir;
+    return try setLink(txn, cur, owner_type, owner_pk, prop, ins.row);
+}
+
+// Delete the embedded child owned by `owner` via to-one link `prop`. Deleting
+// the child cross-type-nullifies the owner's inbound link automatically.
+// Returns the new directory ref (unchanged if there is no child).
+pub fn clearEmbedded(txn: *WriteTxn, dir: Ref, owner_type: u16, owner_pk: u64, prop: usize) !Ref {
+    const child_okey = (try getLink(txn, dir, owner_type, owner_pk, prop)) orelse return dir;
+    const child_type = (try catalog.loadCatalog(txn, try catalogRef(txn, dir, owner_type))).linkTarget(prop);
+    const child_cat = try catalogRef(txn, dir, child_type);
+    const pc = (try catalog.loadCatalog(txn, child_cat)).prop_count;
+    var buf: [256]u64 = undefined;
+    const child_ver = (try Objects.getByObjectKey(txn, child_cat, child_okey, buf[0..pc])) orelse return dir;
+    const child_pk = buf[0];
+    const dres = try deleteNullifyX(txn, dir, child_type, child_pk, child_ver);
+    return switch (dres) {
+        .ok => |d| d,
+        else => dir,
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -735,6 +820,117 @@ test "cascade deletes owned children" {
     dir = dp.ok;
     try testing.expectEqual(@as(?u64, null), try get(&w, dir, 0, 1, &pv)); // parent gone
     try testing.expectEqual(@as(u64, 0), try liveCount(&w, dir, 1)); // all children gone
+    w.deinit();
+}
+
+test "directory records per-type embedded flags" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tdTmpPath(testing.allocator, &tmp, "emb1.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    const PD = catalog.PropDef;
+    const schema = [_][]const PD{
+        &.{ .{ .kind = .int }, .{ .kind = .blob } },
+        &.{ .{ .kind = .int }, .{ .kind = .int } },
+    };
+    var dir = try createTypes(&w, &schema, &.{ false, true });
+    try testing.expectEqual(false, try isEmbedded(&w, dir, 0));
+    try testing.expectEqual(true, try isEmbedded(&w, dir, 1));
+
+    // A setCatalogRef (via insert) rebuilds the node; flags must survive.
+    dir = (try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .bytes = "x" } })).dir;
+    try testing.expectEqual(false, try isEmbedded(&w, dir, 0));
+    try testing.expectEqual(true, try isEmbedded(&w, dir, 1));
+    w.deinit();
+}
+
+const embedded_owner_schema = [_][]const catalog.PropDef{
+    &.{ .{ .kind = .int }, .{ .kind = .link, .link_target = 1, .del_rule = .cascade } }, // 0: owner
+    &.{ .{ .kind = .int }, .{ .kind = .blob } }, // 1: embedded child
+};
+
+test "insertEmbedded creates an owned child reachable from the owner" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tdTmpPath(testing.allocator, &tmp, "emb2.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var dir = try createTypes(&w, &embedded_owner_schema, &.{ false, true });
+
+    dir = (try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .link = null } })).dir;
+    dir = try insertEmbedded(&w, dir, 0, 1, 1, &.{ .{ .int = 100 }, .{ .bytes = "note" } });
+
+    var out: [2]Value = undefined;
+    _ = (try getLinked(&w, dir, 0, 1, 1, &out)).?;
+    try testing.expectEqualStrings("note", out[1].bytes);
+    try testing.expectEqual(@as(u64, 1), try liveCount(&w, dir, 1));
+    w.deinit();
+}
+
+test "clearEmbedded deletes the owned child" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tdTmpPath(testing.allocator, &tmp, "emb3.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var dir = try createTypes(&w, &embedded_owner_schema, &.{ false, true });
+
+    dir = (try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .link = null } })).dir;
+    dir = try insertEmbedded(&w, dir, 0, 1, 1, &.{ .{ .int = 100 }, .{ .bytes = "note" } });
+    dir = try clearEmbedded(&w, dir, 0, 1, 1);
+
+    try testing.expectEqual(@as(?u64, null), try getLink(&w, dir, 0, 1, 1));
+    try testing.expectEqual(@as(u64, 0), try liveCount(&w, dir, 1));
+    w.deinit();
+}
+
+test "replacing an embedded child deletes the old one" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tdTmpPath(testing.allocator, &tmp, "emb4.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var dir = try createTypes(&w, &embedded_owner_schema, &.{ false, true });
+
+    dir = (try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .link = null } })).dir;
+    dir = try insertEmbedded(&w, dir, 0, 1, 1, &.{ .{ .int = 1 }, .{ .bytes = "first" } });
+    dir = try insertEmbedded(&w, dir, 0, 1, 1, &.{ .{ .int = 2 }, .{ .bytes = "second" } });
+
+    try testing.expectEqual(@as(u64, 1), try liveCount(&w, dir, 1));
+    var out: [2]Value = undefined;
+    _ = (try getLinked(&w, dir, 0, 1, 1, &out)).?;
+    try testing.expectEqualStrings("second", out[1].bytes);
+    w.deinit();
+}
+
+test "deleting the owner cascades to the embedded child" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tdTmpPath(testing.allocator, &tmp, "emb5.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var dir = try createTypes(&w, &embedded_owner_schema, &.{ false, true });
+
+    dir = (try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .link = null } })).dir;
+    dir = try insertEmbedded(&w, dir, 0, 1, 1, &.{ .{ .int = 100 }, .{ .bytes = "note" } });
+
+    var ov: [2]Value = undefined;
+    const owner_ver = (try get(&w, dir, 0, 1, &ov)).?;
+    const dres = try deleteNullifyX(&w, dir, 0, 1, owner_ver);
+    dir = dres.ok;
+    try testing.expectEqual(@as(?u64, null), try get(&w, dir, 0, 1, &ov));
+    try testing.expectEqual(@as(u64, 0), try liveCount(&w, dir, 1));
     w.deinit();
 }
 
