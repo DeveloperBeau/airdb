@@ -2,6 +2,7 @@ pub const blob = @import("blob.zig");
 pub const typedir = @import("typedir.zig");
 pub const objects = @import("objects.zig");
 pub const query = @import("query.zig");
+pub const ffi = @import("ffi.zig");
 pub const column = @import("column.zig");
 pub const index = @import("index.zig");
 pub const coord = @import("coord.zig");
