@@ -1,6 +1,10 @@
 pub const blob = @import("blob.zig");
 pub const typedir = @import("typedir.zig");
 pub const objects = @import("objects.zig");
+pub const catalog = @import("catalog.zig");
+pub const collections = @import("collections.zig");
+pub const links = @import("links.zig");
+pub const migrations = @import("migrations.zig");
 pub const query = @import("query.zig");
 pub const ffi = @import("ffi.zig");
 pub const column = @import("column.zig");

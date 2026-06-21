@@ -1,5 +1,6 @@
 const std = @import("std");
 const objects = @import("objects.zig");
+const catalog = @import("catalog.zig");
 const Column = @import("column.zig");
 const Ref = @import("ref.zig").Ref;
 
@@ -44,7 +45,7 @@ const Scan = struct {
 };
 
 fn openScan(txn: anytype, cat: Ref) !Scan {
-    const v = try objects.loadCatalog(txn, cat);
+    const v = try catalog.loadCatalog(txn, cat);
     var s: Scan = undefined;
     s.prop_count = v.prop_count;
     s.live_ref = v.live_col_ref;
@@ -139,7 +140,7 @@ pub fn sortByPropAsc(
     prop: usize,
     allocator: std.mem.Allocator,
 ) !void {
-    const v = try objects.loadCatalog(txn, cat);
+    const v = try catalog.loadCatalog(txn, cat);
     const col = v.propColRef(prop);
     const Pair = struct { val: u64, key: u64 };
     const pairs = try allocator.alloc(Pair, okeys.len);
@@ -168,7 +169,7 @@ fn qTmpPath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const u8
 
 // Build a type with pk(int) + age(int) and insert (pk, age) rows.
 fn seed(w: anytype, pairs: []const [2]u64) !Ref {
-    var cat = try objects.create(w, 2);
+    var cat = try catalog.create(w, 2);
     for (pairs) |p| cat = (try objects.insert(w, cat, &.{ p[0], p[1] })).cat;
     return cat;
 }
@@ -262,7 +263,7 @@ test "scan over 100k rows finds the matching slice" {
     var db = try Db.create(testing.allocator, path);
     defer db.deinit();
     var w = try db.beginWrite();
-    var cat = try objects.create(&w, 2);
+    var cat = try catalog.create(&w, 2);
     var i: u64 = 0;
     while (i < 100_000) : (i += 1) cat = (try objects.insert(&w, cat, &.{ i, i % 100 })).cat;
     // 1000 rows have (i % 100 == 7)
