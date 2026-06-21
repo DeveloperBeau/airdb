@@ -1,200 +1,24 @@
 const std = @import("std");
-const testing = std.testing;
 const WriteTxn = @import("db.zig").WriteTxn;
 const Db = @import("db.zig").Db;
 const Ref = @import("ref.zig").Ref;
 const Column = @import("column.zig");
 const Index = @import("index.zig");
 const blob = @import("blob.zig");
+const catalog = @import("catalog.zig");
+const collections = @import("collections.zig");
+const links = @import("links.zig");
 
-pub const PropCount = u16;
-pub const PropKind = enum(u8) { int = 0, blob = 1, list = 2, set = 3, link = 4, link_set = 5 };
-pub const ElemKind = enum(u8) { int = 0, blob = 1 };
-pub const PropDef = struct { kind: PropKind, elem: ElemKind = .int };
-pub const Value = union(enum) {
-    int: u64,
-    bytes: []const u8,
-    list_int: []const u64,
-    list_blob: []const []const u8,
-    set_int: []const u64,
-    coll_root: Ref, // read side: getTyped returns this for list/set/link_set properties
-    link: ?u64,
-    link_set: []const u64, // to-many: initial set of target okeys
-};
+const PropKind = catalog.PropKind;
+const ElemKind = catalog.ElemKind;
+const PropDef = catalog.PropDef;
+const Value = catalog.Value;
+const PropCount = catalog.PropCount;
+const CatalogView = catalog.CatalogView;
+const max_prop_count = catalog.max_prop_count;
 
-// Catalog node layout:
-// [prop_count u16][next_row u64][pk_index_ref u64][version_col_ref u64][live_col_ref u64]
-// [prop_count * (prop_col_ref u64)][prop_count * (kind u8)][prop_count * (elem u8)]
-// [prop_count * (backlink_ref u64)]
-const off_prop_count: usize = 0;
-const off_next_row: usize = 2;
-const off_pk_index_ref: usize = 10;
-const off_version_col_ref: usize = 18;
-const off_live_col_ref: usize = 26;
-const off_prop_cols: usize = 34;
-
-const max_prop_count: usize = 256;
-
-fn catalogSize(pc: PropCount) usize {
-    return off_prop_cols + @as(usize, pc) * 8 + @as(usize, pc) * 2 + @as(usize, pc) * 8;
-}
-
-fn kindsOffset(pc: PropCount) usize {
-    return off_prop_cols + @as(usize, pc) * 8;
-}
-
-fn elemsOffset(pc: PropCount) usize {
-    return kindsOffset(pc) + pc;
-}
-
-fn backlinksOffset(pc: PropCount) usize {
-    return elemsOffset(pc) + pc;
-}
-
-// Allocate and encode a fresh catalog node; return its ref.
-fn writeCatalog(
-    txn: *WriteTxn,
-    prop_count: PropCount,
-    next_row: u64,
-    pk_index_ref: Ref,
-    version_col_ref: Ref,
-    live_col_ref: Ref,
-    prop_col_refs: []const Ref,
-    kinds: []const PropKind,
-    elems: []const ElemKind,
-    backlinks: []const Ref,
-) !Ref {
-    const a = try txn.alloc(catalogSize(prop_count));
-    std.mem.writeInt(u16, a.bytes[off_prop_count..][0..2], prop_count, .little);
-    std.mem.writeInt(u64, a.bytes[off_next_row..][0..8], next_row, .little);
-    std.mem.writeInt(u64, a.bytes[off_pk_index_ref..][0..8], pk_index_ref, .little);
-    std.mem.writeInt(u64, a.bytes[off_version_col_ref..][0..8], version_col_ref, .little);
-    std.mem.writeInt(u64, a.bytes[off_live_col_ref..][0..8], live_col_ref, .little);
-    for (prop_col_refs, 0..) |ref, i| {
-        std.mem.writeInt(u64, a.bytes[off_prop_cols + i * 8 ..][0..8], ref, .little);
-    }
-    const ko = kindsOffset(prop_count);
-    for (kinds, 0..) |k, i| a.bytes[ko + i] = @intFromEnum(k);
-    const eo = elemsOffset(prop_count);
-    for (elems, 0..) |e, i| a.bytes[eo + i] = @intFromEnum(e);
-    const blo = backlinksOffset(prop_count);
-    for (backlinks, 0..) |bref, i| {
-        std.mem.writeInt(u64, a.bytes[blo + i * 8 ..][0..8], bref, .little);
-    }
-    return a.ref;
-}
-
-// createDefs allocates columns, a pk index, version/live columns, and a catalog
-// node from explicit per-property definitions. defs[0].kind must be .int (the pk).
-pub fn createDefs(txn: *WriteTxn, defs: []const PropDef) !Ref {
-    std.debug.assert(defs.len >= 1 and defs[0].kind == .int);
-    const prop_count: PropCount = @intCast(defs.len);
-    std.debug.assert(prop_count <= max_prop_count);
-    var prop_col_refs: [max_prop_count]Ref = undefined;
-    var kinds: [max_prop_count]PropKind = undefined;
-    var elems: [max_prop_count]ElemKind = undefined;
-    var backlinks: [max_prop_count]Ref = undefined;
-    var i: usize = 0;
-    while (i < prop_count) : (i += 1) {
-        prop_col_refs[i] = try Column.create(txn);
-        kinds[i] = defs[i].kind;
-        elems[i] = defs[i].elem;
-        backlinks[i] = if (defs[i].kind == .link or defs[i].kind == .link_set) try Index.create(txn) else 0;
-    }
-    const version_col_ref = try Column.create(txn);
-    const live_col_ref = try Column.create(txn);
-    const pk_index_ref = try Index.create(txn);
-    return writeCatalog(
-        txn,
-        prop_count,
-        0,
-        pk_index_ref,
-        version_col_ref,
-        live_col_ref,
-        prop_col_refs[0..prop_count],
-        kinds[0..prop_count],
-        elems[0..prop_count],
-        backlinks[0..prop_count],
-    );
-}
-
-// createTyped keeps its scalar-only signature; every property gets elem = int.
-pub fn createTyped(txn: *WriteTxn, kinds: []const PropKind) !Ref {
-    std.debug.assert(kinds.len >= 1 and kinds[0] == .int);
-    const pc: PropCount = @intCast(kinds.len);
-    std.debug.assert(pc <= max_prop_count);
-    var defs: [max_prop_count]PropDef = undefined;
-    var i: usize = 0;
-    while (i < pc) : (i += 1) defs[i] = .{ .kind = kinds[i], .elem = .int };
-    return createDefs(txn, defs[0..pc]);
-}
-
-// Create prop_count property columns, a version column, a live column, and an
-// empty pk index. All property kinds default to .int.
-pub fn create(txn: *WriteTxn, prop_count: PropCount) !Ref {
-    std.debug.assert(prop_count <= max_prop_count);
-    var all_int: [max_prop_count]PropKind = undefined;
-    var i: usize = 0;
-    while (i < prop_count) : (i += 1) all_int[i] = .int;
-    return createTyped(txn, all_int[0..prop_count]);
-}
-
-pub const CatalogView = struct {
-    prop_count: PropCount,
-    next_row: u64,
-    pk_index_ref: Ref,
-    version_col_ref: Ref,
-    live_col_ref: Ref,
-    bytes: []const u8,
-
-    pub fn propColRef(self: CatalogView, i: usize) Ref {
-        return std.mem.readInt(u64, self.bytes[off_prop_cols + i * 8 ..][0..8], .little);
-    }
-
-    pub fn kind(self: CatalogView, i: usize) PropKind {
-        const kinds_offset = off_prop_cols + @as(usize, self.prop_count) * 8;
-        return @enumFromInt(self.bytes[kinds_offset + i]);
-    }
-
-    pub fn elemKind(self: CatalogView, i: usize) ElemKind {
-        const eo = off_prop_cols + @as(usize, self.prop_count) * 8 + self.prop_count;
-        return @enumFromInt(self.bytes[eo + i]);
-    }
-
-    pub fn backlinkRef(self: CatalogView, i: usize) Ref {
-        const blo = off_prop_cols + @as(usize, self.prop_count) * 8 + @as(usize, self.prop_count) * 2;
-        return std.mem.readInt(u64, self.bytes[blo + i * 8 ..][0..8], .little);
-    }
-};
-
-// Deref the catalog at cat, read prop_count, then deref the full node and parse
-// all fixed fields. Returns a CatalogView whose bytes slice is valid for the
-// lifetime of the transaction.
-pub fn loadCatalog(txn: anytype, cat: Ref) !CatalogView {
-    const pc_bytes = try txn.deref(cat, 2);
-    const prop_count = std.mem.readInt(u16, pc_bytes[0..2], .little);
-    std.debug.assert(prop_count <= max_prop_count);
-    const bytes = try txn.deref(cat, catalogSize(prop_count));
-    return CatalogView{
-        .prop_count = prop_count,
-        .next_row = std.mem.readInt(u64, bytes[off_next_row..][0..8], .little),
-        .pk_index_ref = std.mem.readInt(u64, bytes[off_pk_index_ref..][0..8], .little),
-        .version_col_ref = std.mem.readInt(u64, bytes[off_version_col_ref..][0..8], .little),
-        .live_col_ref = std.mem.readInt(u64, bytes[off_live_col_ref..][0..8], .little),
-        .bytes = bytes,
-    };
-}
-
-pub fn propCount(txn: anytype, cat: Ref) !PropCount {
-    const view = try loadCatalog(txn, cat);
-    return view.prop_count;
-}
-
-// liveCount returns the number of live rows tracked by the pk index.
-pub fn liveCount(txn: anytype, cat: Ref) !u64 {
-    const view = try loadCatalog(txn, cat);
-    return Index.count(txn, view.pk_index_ref);
-}
+const loadCatalog = catalog.loadCatalog;
+const writeCatalog = catalog.writeCatalog;
 
 // insert appends a new row to all columns and updates the pk index.
 // values.len must equal the prop_count stored in the catalog.
@@ -379,27 +203,6 @@ pub fn getByObjectKey(txn: anytype, cat: Ref, okey: u64, out: []u64) !?u64 {
     return try Column.get(txn, version_col_ref, okey);
 }
 
-fn buildListInt(txn: *WriteTxn, items: []const u64) !Ref {
-    var root = try Column.create(txn);
-    for (items) |x| root = try Column.append(txn, root, x);
-    return root;
-}
-
-fn buildListBlob(txn: *WriteTxn, items: []const []const u8) !Ref {
-    var root = try Column.create(txn);
-    for (items) |s| {
-        const bref = try blob.put(txn, s);
-        root = try Column.append(txn, root, bref);
-    }
-    return root;
-}
-
-fn buildSetInt(txn: *WriteTxn, items: []const u64) !Ref {
-    var root = try Index.create(txn);
-    for (items) |k| root = try Index.insert(txn, root, k, 1);
-    return root;
-}
-
 // insertTyped encodes a []Value row into raw u64 storage, allocating a blob
 // node for each .blob property, then delegates to insert.
 pub fn insertTyped(txn: *WriteTxn, cat: Ref, values: []const Value) !struct { cat: Ref, row: u64 } {
@@ -425,15 +228,15 @@ pub fn insertTyped(txn: *WriteTxn, cat: Ref, values: []const Value) !struct { ca
             .int => values[i].int,
             .blob => try blob.put(txn, values[i].bytes),
             .list => switch (elems[i]) {
-                .int => try buildListInt(txn, values[i].list_int),
-                .blob => try buildListBlob(txn, values[i].list_blob),
+                .int => try collections.buildListInt(txn, values[i].list_int),
+                .blob => try collections.buildListBlob(txn, values[i].list_blob),
             },
             .set => switch (elems[i]) {
-                .int => try buildSetInt(txn, values[i].set_int),
+                .int => try collections.buildSetInt(txn, values[i].set_int),
                 .blob => unreachable, // set of blob out of scope this phase
             },
             .link => if (values[i].link) |k| k + 1 else 0,
-            .link_set => try buildSetInt(txn, values[i].link_set),
+            .link_set => try collections.buildSetInt(txn, values[i].link_set),
         };
     }
     const r = try insert(txn, cat, raw[0..pc]);
@@ -445,12 +248,12 @@ pub fn insertTyped(txn: *WriteTxn, cat: Ref, values: []const Value) !struct { ca
             switch (kinds[p]) {
                 .link => {
                     if (values[p].link) |target| {
-                        cat_ref = try addBacklink(txn, cat_ref, p, target, r.row);
+                        cat_ref = try links.addBacklink(txn, cat_ref, p, target, r.row);
                     }
                 },
                 .link_set => {
                     for (values[p].link_set) |target| {
-                        cat_ref = try addBacklink(txn, cat_ref, p, target, r.row);
+                        cat_ref = try links.addBacklink(txn, cat_ref, p, target, r.row);
                     }
                 },
                 else => {},
@@ -513,332 +316,6 @@ pub fn getTypedByOkey(txn: anytype, cat: Ref, okey: u64, out: []Value) !?u64 {
     return ver;
 }
 
-// Resolve (cat, pk, prop) to the property column ref and the row;
-// null if pk absent or row tombstoned.
-fn resolveProp(txn: anytype, cat: Ref, pk: u64, prop: usize) !?struct { row: u64, prop_col: Ref } {
-    const v = try loadCatalog(txn, cat);
-    const row = (try Index.get(txn, v.pk_index_ref, pk)) orelse return null;
-    if ((try Column.get(txn, v.live_col_ref, row)) == 0) return null;
-    return .{ .row = row, .prop_col = v.propColRef(prop) };
-}
-
-pub fn listLen(txn: anytype, cat: Ref, pk: u64, prop: usize) !?u64 {
-    const r = (try resolveProp(txn, cat, pk, prop)) orelse return null;
-    const list_root = try Column.get(txn, r.prop_col, r.row);
-    return try Column.len(txn, list_root);
-}
-
-pub fn listGetInt(txn: anytype, cat: Ref, pk: u64, prop: usize, index: u64) !u64 {
-    const r = (try resolveProp(txn, cat, pk, prop)).?;
-    const list_root = try Column.get(txn, r.prop_col, r.row);
-    return try Column.get(txn, list_root, index);
-}
-
-pub fn listGetBlob(txn: anytype, cat: Ref, pk: u64, prop: usize, index: u64) ![]const u8 {
-    const r = (try resolveProp(txn, cat, pk, prop)).?;
-    const list_root = try Column.get(txn, r.prop_col, r.row);
-    const bref = try Column.get(txn, list_root, index);
-    return try blob.get(txn, bref);
-}
-
-// Write new_root into property `prop` at `row`, bump that row's version stamp,
-// return the new catalog ref. Reloads the catalog fresh and captures all refs.
-fn replaceCollRoot(txn: *WriteTxn, cat: Ref, row: u64, prop: usize, new_root: Ref) !Ref {
-    const v = try loadCatalog(txn, cat);
-    const pc = v.prop_count;
-    const next_row = v.next_row;
-    const idx_ref = v.pk_index_ref;
-    const live_ref = v.live_col_ref;
-    var prop_refs: [max_prop_count]Ref = undefined;
-    var kinds: [max_prop_count]PropKind = undefined;
-    var elems: [max_prop_count]ElemKind = undefined;
-    var bl: [max_prop_count]Ref = undefined;
-    {
-        var j: usize = 0;
-        while (j < pc) : (j += 1) {
-            prop_refs[j] = v.propColRef(j);
-            kinds[j] = v.kind(j);
-            elems[j] = v.elemKind(j);
-            bl[j] = v.backlinkRef(j);
-        }
-    }
-    var ver_ref = v.version_col_ref;
-    prop_refs[prop] = try Column.set(txn, prop_refs[prop], row, new_root);
-    ver_ref = try Column.set(txn, ver_ref, row, txn.new_version);
-    return writeCatalog(txn, pc, next_row, idx_ref, ver_ref, live_ref, prop_refs[0..pc], kinds[0..pc], elems[0..pc], bl[0..pc]);
-}
-
-// ---------------------------------------------------------------------------
-// Links and backlinks
-//
-// A `link` property stores `target_okey + 1` in its column (0 = null). For each
-// link property the catalog holds a backlink index: target_okey -> set_root,
-// where set_root is an index of source_okey -> 1. The backlink index is updated
-// transactionally on every insert, set, clear, and delete.
-// ---------------------------------------------------------------------------
-
-// Add `source` to the backlink set for `target`, returning the new backlink ref.
-fn blAdd(txn: *WriteTxn, bl_ref: Ref, target: u64, source: u64) !Ref {
-    const existing = try Index.get(txn, bl_ref, target);
-    var set_root = existing orelse try Index.create(txn);
-    set_root = try Index.insert(txn, set_root, source, 1);
-    return try Index.insert(txn, bl_ref, target, set_root);
-}
-
-// Remove `source` from the backlink set for `target`. No-op if absent.
-fn blRemove(txn: *WriteTxn, bl_ref: Ref, target: u64, source: u64) !Ref {
-    const existing = try Index.get(txn, bl_ref, target);
-    const set_root = existing orelse return bl_ref;
-    const new_set = try Index.remove(txn, set_root, source);
-    return try Index.insert(txn, bl_ref, target, new_set);
-}
-
-// Write a new backlink ref into property `p`, preserving everything else.
-fn setBacklinkRef(txn: *WriteTxn, cat: Ref, p: usize, new_bl: Ref) !Ref {
-    const v = try loadCatalog(txn, cat);
-    const pc = v.prop_count;
-    const next_row = v.next_row;
-    const idx_ref = v.pk_index_ref;
-    const ver_ref = v.version_col_ref;
-    const live_ref = v.live_col_ref;
-    var prop_refs: [max_prop_count]Ref = undefined;
-    var kinds: [max_prop_count]PropKind = undefined;
-    var elems: [max_prop_count]ElemKind = undefined;
-    var bl: [max_prop_count]Ref = undefined;
-    {
-        var j: usize = 0;
-        while (j < pc) : (j += 1) {
-            prop_refs[j] = v.propColRef(j);
-            kinds[j] = v.kind(j);
-            elems[j] = v.elemKind(j);
-            bl[j] = v.backlinkRef(j);
-        }
-    }
-    bl[p] = new_bl;
-    return writeCatalog(txn, pc, next_row, idx_ref, ver_ref, live_ref, prop_refs[0..pc], kinds[0..pc], elems[0..pc], bl[0..pc]);
-}
-
-// Write a new column ref into property `p`, preserving everything else.
-fn setPropColRef(txn: *WriteTxn, cat: Ref, p: usize, new_col: Ref) !Ref {
-    const v = try loadCatalog(txn, cat);
-    const pc = v.prop_count;
-    const next_row = v.next_row;
-    const idx_ref = v.pk_index_ref;
-    const ver_ref = v.version_col_ref;
-    const live_ref = v.live_col_ref;
-    var prop_refs: [max_prop_count]Ref = undefined;
-    var kinds: [max_prop_count]PropKind = undefined;
-    var elems: [max_prop_count]ElemKind = undefined;
-    var bl: [max_prop_count]Ref = undefined;
-    {
-        var j: usize = 0;
-        while (j < pc) : (j += 1) {
-            prop_refs[j] = v.propColRef(j);
-            kinds[j] = v.kind(j);
-            elems[j] = v.elemKind(j);
-            bl[j] = v.backlinkRef(j);
-        }
-    }
-    prop_refs[p] = new_col;
-    return writeCatalog(txn, pc, next_row, idx_ref, ver_ref, live_ref, prop_refs[0..pc], kinds[0..pc], elems[0..pc], bl[0..pc]);
-}
-
-// Add source->target to link property p's backlink index. Returns new catalog.
-fn addBacklink(txn: *WriteTxn, cat: Ref, p: usize, target: u64, source: u64) !Ref {
-    const v = try loadCatalog(txn, cat);
-    const new_bl = try blAdd(txn, v.backlinkRef(p), target, source);
-    return try setBacklinkRef(txn, cat, p, new_bl);
-}
-
-// Remove source from link property p's backlink set for target.
-fn removeBacklink(txn: *WriteTxn, cat: Ref, p: usize, target: u64, source: u64) !Ref {
-    const v = try loadCatalog(txn, cat);
-    const new_bl = try blRemove(txn, v.backlinkRef(p), target, source);
-    return try setBacklinkRef(txn, cat, p, new_bl);
-}
-
-// Read the target okey of link property `prop` for the object with primary key
-// `pk`. Returns null if the link is unset (or the object is absent).
-pub fn getLink(txn: anytype, cat: Ref, pk: u64, prop: usize) !?u64 {
-    const r = (try resolveProp(txn, cat, pk, prop)) orelse return null;
-    const raw = try Column.get(txn, r.prop_col, r.row);
-    return if (raw == 0) null else raw - 1;
-}
-
-// Number of objects whose link property `prop` points at `target` okey.
-pub fn backlinkCount(txn: anytype, cat: Ref, prop: usize, target: u64) !u64 {
-    const v = try loadCatalog(txn, cat);
-    const set_root = (try Index.get(txn, v.backlinkRef(prop), target)) orelse return 0;
-    return try Index.count(txn, set_root);
-}
-
-// Collect the source okeys whose link property `prop` points at `target`.
-pub fn backlinkCollect(
-    txn: anytype,
-    cat: Ref,
-    prop: usize,
-    target: u64,
-    out: *std.ArrayList(u64),
-    allocator: std.mem.Allocator,
-) !void {
-    const v = try loadCatalog(txn, cat);
-    const set_root = (try Index.get(txn, v.backlinkRef(prop), target)) orelse return;
-    const Sink = struct {
-        list: *std.ArrayList(u64),
-        alloc: std.mem.Allocator,
-        fn onKey(self: @This(), key: u64) !void {
-            try self.list.append(self.alloc, key);
-        }
-    };
-    try Index.forEachKey(txn, set_root, Sink{ .list = out, .alloc = allocator }, Sink.onKey);
-}
-
-// Set or clear link property `prop` of the object with primary key `pk`.
-// Maintains the backlink index and bumps the row version. No-op if unchanged.
-pub fn setLink(txn: *WriteTxn, cat: Ref, pk: u64, prop: usize, target: ?u64) !Ref {
-    const r0 = (try resolveProp(txn, cat, pk, prop)) orelse return cat;
-    const row = r0.row;
-    const old_raw = try Column.get(txn, r0.prop_col, row);
-    const old_target: ?u64 = if (old_raw == 0) null else old_raw - 1;
-    if (old_target == target) return cat; // unchanged
-
-    const new_raw: u64 = if (target) |t| t + 1 else 0;
-    var new_cat = try replaceCollRoot(txn, cat, row, prop, new_raw);
-    if (old_target) |ot| new_cat = try removeBacklink(txn, new_cat, prop, ot, row);
-    if (target) |nt| new_cat = try addBacklink(txn, new_cat, prop, nt, row);
-    return new_cat;
-}
-
-// ---------------------------------------------------------------------------
-// To-many links (link_set): a set of target okeys with backlink maintenance.
-// ---------------------------------------------------------------------------
-
-pub fn linkSetCount(txn: anytype, cat: Ref, pk: u64, prop: usize) !?u64 {
-    const r = (try resolveProp(txn, cat, pk, prop)) orelse return null;
-    const set_root = try Column.get(txn, r.prop_col, r.row);
-    return try Index.count(txn, set_root);
-}
-
-pub fn linkSetContains(txn: anytype, cat: Ref, pk: u64, prop: usize, target: u64) !bool {
-    const r = (try resolveProp(txn, cat, pk, prop)).?;
-    const set_root = try Column.get(txn, r.prop_col, r.row);
-    return (try Index.get(txn, set_root, target)) != null;
-}
-
-pub fn linkSetCollect(
-    txn: anytype,
-    cat: Ref,
-    pk: u64,
-    prop: usize,
-    out: *std.ArrayList(u64),
-    allocator: std.mem.Allocator,
-) !void {
-    const r = (try resolveProp(txn, cat, pk, prop)).?;
-    const set_root = try Column.get(txn, r.prop_col, r.row);
-    const Sink = struct {
-        list: *std.ArrayList(u64),
-        alloc: std.mem.Allocator,
-        fn onKey(self: @This(), key: u64) !void {
-            try self.list.append(self.alloc, key);
-        }
-    };
-    try Index.forEachKey(txn, set_root, Sink{ .list = out, .alloc = allocator }, Sink.onKey);
-}
-
-// Add `target` to the to-many link set of object `pk`; records the backlink.
-// No-op if already a member.
-pub fn linkSetAdd(txn: *WriteTxn, cat: Ref, pk: u64, prop: usize, target: u64) !Ref {
-    const r = (try resolveProp(txn, cat, pk, prop)).?;
-    const row = r.row;
-    const old_root = try Column.get(txn, r.prop_col, row);
-    if ((try Index.get(txn, old_root, target)) != null) return cat; // already a member
-    const new_root = try Index.insert(txn, old_root, target, 1);
-    var new_cat = try replaceCollRoot(txn, cat, row, prop, new_root);
-    new_cat = try addBacklink(txn, new_cat, prop, target, row);
-    return new_cat;
-}
-
-// Remove `target` from the to-many link set of object `pk`; drops the backlink.
-// No-op if not a member.
-pub fn linkSetRemove(txn: *WriteTxn, cat: Ref, pk: u64, prop: usize, target: u64) !Ref {
-    const r = (try resolveProp(txn, cat, pk, prop)).?;
-    const row = r.row;
-    const old_root = try Column.get(txn, r.prop_col, row);
-    if ((try Index.get(txn, old_root, target)) == null) return cat; // not a member
-    const new_root = try Index.remove(txn, old_root, target);
-    var new_cat = try replaceCollRoot(txn, cat, row, prop, new_root);
-    new_cat = try removeBacklink(txn, new_cat, prop, target, row);
-    return new_cat;
-}
-
-// For each link property: (1) nullify every inbound link pointing at `okey`
-// (and drop those backlink entries); (2) remove the deleted row's own outbound
-// link entry from its target's backlink set. Returns the new catalog ref.
-fn fixBacklinksForDelete(txn: *WriteTxn, cat: Ref, okey: u64) !Ref {
-    var cur = cat;
-    const v0 = try loadCatalog(txn, cat);
-    const pc = v0.prop_count;
-    const alloc = txn.db.store.allocator;
-    var p: usize = 0;
-    while (p < pc) : (p += 1) {
-        const kind = blk: {
-            const vk = try loadCatalog(txn, cur);
-            break :blk vk.kind(p);
-        };
-        if (kind != .link and kind != .link_set) continue;
-
-        // (1) Nullify inbound: snapshot the sources, then clear each one's link
-        // to okey. For to-one, set the column to null; for to-many, remove okey
-        // from the source's set.
-        var sources = std.ArrayList(u64).empty;
-        defer sources.deinit(alloc);
-        try backlinkCollect(txn, cur, p, okey, &sources, alloc);
-        for (sources.items) |src| {
-            const vv = try loadCatalog(txn, cur);
-            const col = vv.propColRef(p);
-            const new_col = if (kind == .link)
-                try Column.set(txn, col, src, 0)
-            else blk: {
-                const src_set = try Column.get(txn, col, src);
-                const new_set = try Index.remove(txn, src_set, okey);
-                break :blk try Column.set(txn, col, src, new_set);
-            };
-            cur = try setPropColRef(txn, cur, p, new_col);
-        }
-        // Drop the whole backlink set for okey (its inbound links are now clear).
-        {
-            const vv = try loadCatalog(txn, cur);
-            const empty = try Index.create(txn);
-            const new_bl = try Index.insert(txn, vv.backlinkRef(p), okey, empty);
-            cur = try setBacklinkRef(txn, cur, p, new_bl);
-        }
-        // (2) Outbound: remove okey's own entries from its targets' backlink sets.
-        if (kind == .link) {
-            const vv2 = try loadCatalog(txn, cur);
-            const out_raw = try Column.get(txn, vv2.propColRef(p), okey);
-            if (out_raw != 0) cur = try removeBacklink(txn, cur, p, out_raw - 1, okey);
-        } else {
-            // to-many: iterate the deleted row's set members.
-            var members = std.ArrayList(u64).empty;
-            defer members.deinit(alloc);
-            {
-                const vv2 = try loadCatalog(txn, cur);
-                const set_root = try Column.get(txn, vv2.propColRef(p), okey);
-                const Sink = struct {
-                    list: *std.ArrayList(u64),
-                    alloc: std.mem.Allocator,
-                    fn onKey(self: @This(), key: u64) !void {
-                        try self.list.append(self.alloc, key);
-                    }
-                };
-                try Index.forEachKey(txn, set_root, Sink{ .list = &members, .alloc = alloc }, Sink.onKey);
-            }
-            for (members.items) |m| cur = try removeBacklink(txn, cur, p, m, okey);
-        }
-    }
-    return cur;
-}
-
 // Delete an object and keep the graph consistent: nullify inbound links and
 // clean the deleted object's outbound backlink entries.
 pub fn deleteAndNullify(txn: *WriteTxn, cat: Ref, pk: u64, expected_version: u64) !DeleteResult {
@@ -846,78 +323,8 @@ pub fn deleteAndNullify(txn: *WriteTxn, cat: Ref, pk: u64, expected_version: u64
     const okey = (try Index.get(txn, v.pk_index_ref, pk)) orelse return .not_found;
     const cur_ver = try Column.get(txn, v.version_col_ref, okey);
     if (cur_ver != expected_version) return .{ .conflict = .{ .current_version = cur_ver } };
-    const fixed = try fixBacklinksForDelete(txn, cat, okey);
+    const fixed = try links.fixBacklinksForDelete(txn, cat, okey);
     return try delete(txn, fixed, pk, expected_version);
-}
-
-pub fn listAppendInt(txn: *WriteTxn, cat: Ref, pk: u64, prop: usize, value: u64) !Ref {
-    const r = (try resolveProp(txn, cat, pk, prop)).?;
-    const old_root = try Column.get(txn, r.prop_col, r.row);
-    const new_root = try Column.append(txn, old_root, value);
-    return replaceCollRoot(txn, cat, r.row, prop, new_root);
-}
-
-pub fn listSetInt(txn: *WriteTxn, cat: Ref, pk: u64, prop: usize, index: u64, value: u64) !Ref {
-    const r = (try resolveProp(txn, cat, pk, prop)).?;
-    const old_root = try Column.get(txn, r.prop_col, r.row);
-    const new_root = try Column.set(txn, old_root, index, value);
-    return replaceCollRoot(txn, cat, r.row, prop, new_root);
-}
-
-pub fn listAppendBlob(txn: *WriteTxn, cat: Ref, pk: u64, prop: usize, bytes: []const u8) !Ref {
-    const r = (try resolveProp(txn, cat, pk, prop)).?;
-    const old_root = try Column.get(txn, r.prop_col, r.row);
-    const bref = try blob.put(txn, bytes);
-    const new_root = try Column.append(txn, old_root, bref);
-    return replaceCollRoot(txn, cat, r.row, prop, new_root);
-}
-
-pub fn setCountInt(txn: anytype, cat: Ref, pk: u64, prop: usize) !?u64 {
-    const r = (try resolveProp(txn, cat, pk, prop)) orelse return null;
-    const set_root = try Column.get(txn, r.prop_col, r.row);
-    return try Index.count(txn, set_root);
-}
-
-pub fn setContainsInt(txn: anytype, cat: Ref, pk: u64, prop: usize, key: u64) !bool {
-    const r = (try resolveProp(txn, cat, pk, prop)).?;
-    const set_root = try Column.get(txn, r.prop_col, r.row);
-    return (try Index.get(txn, set_root, key)) != null;
-}
-
-pub fn setAddInt(txn: *WriteTxn, cat: Ref, pk: u64, prop: usize, key: u64) !Ref {
-    const r = (try resolveProp(txn, cat, pk, prop)).?;
-    const old_root = try Column.get(txn, r.prop_col, r.row);
-    if ((try Index.get(txn, old_root, key)) != null) return cat; // already a member, no version bump
-    const new_root = try Index.insert(txn, old_root, key, 1);
-    return replaceCollRoot(txn, cat, r.row, prop, new_root);
-}
-
-pub fn setRemoveInt(txn: *WriteTxn, cat: Ref, pk: u64, prop: usize, key: u64) !Ref {
-    const r = (try resolveProp(txn, cat, pk, prop)).?;
-    const old_root = try Column.get(txn, r.prop_col, r.row);
-    if ((try Index.get(txn, old_root, key)) == null) return cat; // not a member, no version bump
-    const new_root = try Index.remove(txn, old_root, key);
-    return replaceCollRoot(txn, cat, r.row, prop, new_root);
-}
-
-pub fn setCollectInt(
-    txn: anytype,
-    cat: Ref,
-    pk: u64,
-    prop: usize,
-    out: *std.ArrayList(u64),
-    allocator: std.mem.Allocator,
-) !void {
-    const r = (try resolveProp(txn, cat, pk, prop)).?;
-    const set_root = try Column.get(txn, r.prop_col, r.row);
-    const Sink = struct {
-        list: *std.ArrayList(u64),
-        alloc: std.mem.Allocator,
-        fn onKey(self: @This(), key: u64) !void {
-            try self.list.append(self.alloc, key);
-        }
-    };
-    try Index.forEachKey(txn, set_root, Sink{ .list = out, .alloc = allocator }, Sink.onKey);
 }
 
 // updateTyped is MVCC-safe: it does NOT free any blob unless the version check
@@ -997,79 +404,14 @@ pub fn deleteTyped(
 }
 
 // ---------------------------------------------------------------------------
-// Migrations (structural schema evolution)
-//
-// The catalog stores properties by position, not name, so renaming is a no-op
-// at this layer (names live in the binding/schema layer). Add and remove
-// rewrite the catalog transactionally (COW); existing snapshots are unaffected.
-// ---------------------------------------------------------------------------
-
-// Append a new property to the type. The new column is filled with
-// `default_value` for every existing row (live or tombstoned). For a link or
-// link_set property a fresh backlink index is created. Returns the new catalog.
-pub fn addProperty(txn: *WriteTxn, cat: Ref, def: PropDef, default_value: u64) !Ref {
-    const v = try loadCatalog(txn, cat);
-    const pc = v.prop_count;
-    std.debug.assert(pc + 1 <= max_prop_count);
-    const next_row = v.next_row;
-    const idx_ref = v.pk_index_ref;
-    const ver_ref = v.version_col_ref;
-    const live_ref = v.live_col_ref;
-    var prop_refs: [max_prop_count]Ref = undefined;
-    var kinds: [max_prop_count]PropKind = undefined;
-    var elems: [max_prop_count]ElemKind = undefined;
-    var bl: [max_prop_count]Ref = undefined;
-    {
-        var j: usize = 0;
-        while (j < pc) : (j += 1) {
-            prop_refs[j] = v.propColRef(j);
-            kinds[j] = v.kind(j);
-            elems[j] = v.elemKind(j);
-            bl[j] = v.backlinkRef(j);
-        }
-    }
-    // Build the new column, backfilled with the default for every existing row.
-    var new_col = try Column.create(txn);
-    var i: u64 = 0;
-    while (i < next_row) : (i += 1) new_col = try Column.append(txn, new_col, default_value);
-    prop_refs[pc] = new_col;
-    kinds[pc] = def.kind;
-    elems[pc] = def.elem;
-    bl[pc] = if (def.kind == .link or def.kind == .link_set) try Index.create(txn) else 0;
-    return writeCatalog(txn, pc + 1, next_row, idx_ref, ver_ref, live_ref, prop_refs[0 .. pc + 1], kinds[0 .. pc + 1], elems[0 .. pc + 1], bl[0 .. pc + 1]);
-}
-
-// Remove property `prop` (must be >= 1; the primary key at 0 cannot be removed).
-// The dropped column is left for compaction to reclaim. Returns the new catalog.
-pub fn removeProperty(txn: *WriteTxn, cat: Ref, prop: usize) !Ref {
-    std.debug.assert(prop >= 1);
-    const v = try loadCatalog(txn, cat);
-    const pc = v.prop_count;
-    std.debug.assert(prop < pc);
-    const next_row = v.next_row;
-    const idx_ref = v.pk_index_ref;
-    const ver_ref = v.version_col_ref;
-    const live_ref = v.live_col_ref;
-    var prop_refs: [max_prop_count]Ref = undefined;
-    var kinds: [max_prop_count]PropKind = undefined;
-    var elems: [max_prop_count]ElemKind = undefined;
-    var bl: [max_prop_count]Ref = undefined;
-    var out: usize = 0;
-    var j: usize = 0;
-    while (j < pc) : (j += 1) {
-        if (j == prop) continue;
-        prop_refs[out] = v.propColRef(j);
-        kinds[out] = v.kind(j);
-        elems[out] = v.elemKind(j);
-        bl[out] = v.backlinkRef(j);
-        out += 1;
-    }
-    return writeCatalog(txn, pc - 1, next_row, idx_ref, ver_ref, live_ref, prop_refs[0..out], kinds[0..out], elems[0..out], bl[0..out]);
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+const testing = std.testing;
+const create = catalog.create;
+const createTyped = catalog.createTyped;
+const propCount = catalog.propCount;
+const liveCount = catalog.liveCount;
 
 fn objTmpPath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const u8) ![]const u8 {
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
@@ -1077,24 +419,10 @@ fn objTmpPath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const 
     return std.fs.path.join(allocator, &.{ path_buf[0..dlen], name });
 }
 
-test "create allocates an empty type and load reads it back" {
+test "insert appends a row" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const path = try objTmpPath(testing.allocator, &tmp, "obj1.airdb");
-    defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
-    const cat = try create(&w, 3);
-    try testing.expectEqual(@as(PropCount, 3), try propCount(&w, cat));
-    try testing.expectEqual(@as(u64, 0), try liveCount(&w, cat));
-    w.deinit();
-}
-
-test "insert appends rows and rejects a duplicate primary key" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try objTmpPath(testing.allocator, &tmp, "obj2.airdb");
+    const path = try objTmpPath(testing.allocator, &tmp, "obj2_append.airdb");
     defer testing.allocator.free(path);
     var db = try Db.create(testing.allocator, path);
     defer db.deinit();
@@ -1105,6 +433,19 @@ test "insert appends rows and rejects a duplicate primary key" {
     const r2 = try insert(&w, cat, &.{ 200, 8, 0 });
     cat = r2.cat;
     try testing.expectEqual(@as(u64, 2), try liveCount(&w, cat));
+    w.deinit();
+}
+
+test "insert rejects a duplicate primary key" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "obj2_dup.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var cat = try create(&w, 3);
+    cat = (try insert(&w, cat, &.{ 100, 7, 1 })).cat;
     try testing.expectError(error.DuplicateKey, insert(&w, cat, &.{ 100, 9, 1 }));
     w.deinit();
 }
@@ -1131,10 +472,49 @@ test "getByPk reads property values and the row version" {
     w.deinit();
 }
 
-test "update applies on a matching version and conflicts on a stale one" {
+test "update applies on a matching version" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const path = try objTmpPath(testing.allocator, &tmp, "obj4.airdb");
+    const path = try objTmpPath(testing.allocator, &tmp, "obj4_apply.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var cat: Ref = undefined;
+    var fetched_version: u64 = undefined;
+    {
+        var w = try db.beginWrite();
+        cat = try create(&w, 3);
+        cat = (try insert(&w, cat, &.{ 100, 7, 1 })).cat;
+        w.setRoot(cat);
+        _ = try w.commit();
+    }
+    {
+        var r = try db.beginRead();
+        var out: [3]u64 = undefined;
+        fetched_version = (try getByPk(&r, r.root(), 100, &out)).?;
+        r.end();
+    }
+    {
+        var w = try db.beginWrite();
+        const res = try update(&w, w.new_root, 100, &.{ 100, 77, 1 }, fetched_version);
+        try testing.expect(res == .ok);
+        cat = res.ok.cat;
+        w.setRoot(cat);
+        _ = try w.commit();
+    }
+    {
+        var r = try db.beginRead();
+        var out: [3]u64 = undefined;
+        _ = try getByPk(&r, r.root(), 100, &out);
+        try testing.expectEqual(@as(u64, 77), out[1]);
+        r.end();
+    }
+}
+
+test "update conflicts on a stale version" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "obj4_conflict.airdb");
     defer testing.allocator.free(path);
     var db = try Db.create(testing.allocator, path);
     defer db.deinit();
@@ -1160,22 +540,14 @@ test "update applies on a matching version and conflicts on a stale one" {
         cat = res.ok.cat;
         const res2 = try update(&w, cat, 100, &.{ 100, 88, 1 }, fetched_version); // stale now
         try testing.expect(res2 == .conflict);
-        w.setRoot(cat);
-        _ = try w.commit();
-    }
-    {
-        var r = try db.beginRead();
-        var out: [3]u64 = undefined;
-        _ = try getByPk(&r, r.root(), 100, &out);
-        try testing.expectEqual(@as(u64, 77), out[1]);
-        r.end();
+        w.deinit();
     }
 }
 
-test "delete tombstones a row and conflicts on a stale version" {
+test "delete conflicts on a stale version" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const path = try objTmpPath(testing.allocator, &tmp, "obj5.airdb");
+    const path = try objTmpPath(testing.allocator, &tmp, "obj5_conflict.airdb");
     defer testing.allocator.free(path);
     var db = try Db.create(testing.allocator, path);
     defer db.deinit();
@@ -1185,15 +557,46 @@ test "delete tombstones a row and conflicts on a stale version" {
     cat = (try insert(&w, cat, &.{ 200, 8, 0 })).cat;
     var out: [3]u64 = undefined;
     const v100 = (try getByPk(&w, cat, 100, &out)).?;
-
     const stale = try delete(&w, cat, 100, v100 + 1);
     try testing.expect(stale == .conflict);
+    w.deinit();
+}
 
+test "delete tombstones a row" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "obj5_tombstone.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var cat = try create(&w, 3);
+    cat = (try insert(&w, cat, &.{ 100, 7, 1 })).cat;
+    cat = (try insert(&w, cat, &.{ 200, 8, 0 })).cat;
+    var out: [3]u64 = undefined;
+    const v100 = (try getByPk(&w, cat, 100, &out)).?;
     const ok = try delete(&w, cat, 100, v100);
     try testing.expect(ok == .ok);
     cat = ok.ok;
     try testing.expectEqual(@as(?u64, null), try getByPk(&w, cat, 100, &out));
     try testing.expectEqual(@as(u64, 1), try liveCount(&w, cat));
+    w.deinit();
+}
+
+test "a deleted primary key can be reinserted" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "obj5_reinsert.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var cat = try create(&w, 3);
+    cat = (try insert(&w, cat, &.{ 100, 7, 1 })).cat;
+    cat = (try insert(&w, cat, &.{ 200, 8, 0 })).cat;
+    var out: [3]u64 = undefined;
+    const v100 = (try getByPk(&w, cat, 100, &out)).?;
+    cat = (try delete(&w, cat, 100, v100)).ok;
     // pk 100 can be reinserted after deletion
     cat = (try insert(&w, cat, &.{ 100, 70, 1 })).cat;
     try testing.expectEqual(@as(u64, 2), try liveCount(&w, cat));
@@ -1227,26 +630,6 @@ test "objects persist across commit and reopen" {
         try testing.expectEqual(@as(?u64, null), try getByPk(&r, r.root(), 5000, &out));
         r.end();
     }
-}
-
-test "createTyped records property kinds; create defaults to all int" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try objTmpPath(testing.allocator, &tmp, "kinds.airdb");
-    defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
-    const cat = try createTyped(&w, &.{ .int, .blob, .int });
-    const v = try loadCatalog(&w, cat);
-    try testing.expectEqual(PropKind.int, v.kind(0));
-    try testing.expectEqual(PropKind.blob, v.kind(1));
-    try testing.expectEqual(PropKind.int, v.kind(2));
-    const cat2 = try create(&w, 2);
-    const v2 = try loadCatalog(&w, cat2);
-    try testing.expectEqual(PropKind.int, v2.kind(0));
-    try testing.expectEqual(PropKind.int, v2.kind(1));
-    w.deinit();
 }
 
 test "100k objects with updates and deletes match a reference map after reopen" {
@@ -1326,10 +709,10 @@ test "typed insert and get round-trip a string property" {
     w.deinit();
 }
 
-test "typed update replaces a string and frees the old blob; delete frees blobs" {
+test "typed update on a stale version does not free the old blob" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const path = try objTmpPath(testing.allocator, &tmp, "str2.airdb");
+    const path = try objTmpPath(testing.allocator, &tmp, "str2_stale.airdb");
     defer testing.allocator.free(path);
     var db = try Db.create(testing.allocator, path);
     defer db.deinit();
@@ -1343,44 +726,43 @@ test "typed update replaces a string and frees the old blob; delete frees blobs"
     try testing.expect(conflict == .conflict);
     _ = (try getTyped(&w, cat, 1, &out)).?;
     try testing.expectEqualStrings("short", out[1].bytes);
-    const ures = try updateTyped(&w, cat, 1, &.{ .{ .int = 1 }, .{ .bytes = "a much longer value" } }, ver);
-    cat = ures.ok.cat;
-    _ = try getTyped(&w, cat, 1, &out);
-    try testing.expectEqualStrings("a much longer value", out[1].bytes);
-    const v2 = (try getTyped(&w, cat, 1, &out)).?;
-    const dres = try deleteTyped(&w, cat, 1, v2);
-    cat = dres.ok;
-    try testing.expectEqual(@as(?u64, null), try getTyped(&w, cat, 1, &out));
     w.deinit();
 }
 
-test "createDefs records kind and element kind per property" {
+test "typed update replaces a string" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const path = try objTmpPath(testing.allocator, &tmp, "defs.airdb");
+    const path = try objTmpPath(testing.allocator, &tmp, "str2_replace.airdb");
     defer testing.allocator.free(path);
     var db = try Db.create(testing.allocator, path);
     defer db.deinit();
     var w = try db.beginWrite();
-    const cat = try createDefs(&w, &.{
-        .{ .kind = .int },
-        .{ .kind = .list, .elem = .int },
-        .{ .kind = .set, .elem = .int },
-        .{ .kind = .list, .elem = .blob },
-    });
-    const v = try loadCatalog(&w, cat);
-    try testing.expectEqual(@as(PropCount, 4), v.prop_count);
-    try testing.expectEqual(PropKind.int, v.kind(0));
-    try testing.expectEqual(PropKind.list, v.kind(1));
-    try testing.expectEqual(ElemKind.int, v.elemKind(1));
-    try testing.expectEqual(PropKind.set, v.kind(2));
-    try testing.expectEqual(ElemKind.int, v.elemKind(2));
-    try testing.expectEqual(PropKind.list, v.kind(3));
-    try testing.expectEqual(ElemKind.blob, v.elemKind(3));
-    const cat2 = try createTyped(&w, &.{ .int, .blob });
-    const v2 = try loadCatalog(&w, cat2);
-    try testing.expectEqual(PropKind.blob, v2.kind(1));
-    try testing.expectEqual(ElemKind.int, v2.elemKind(1));
+    var cat = try createTyped(&w, &.{ .int, .blob });
+    cat = (try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .bytes = "short" } })).cat;
+    var out: [2]Value = undefined;
+    const ver = (try getTyped(&w, cat, 1, &out)).?;
+    const ures = try updateTyped(&w, cat, 1, &.{ .{ .int = 1 }, .{ .bytes = "a much longer value" } }, ver);
+    cat = ures.ok.cat;
+    _ = try getTyped(&w, cat, 1, &out);
+    try testing.expectEqualStrings("a much longer value", out[1].bytes);
+    w.deinit();
+}
+
+test "typed delete removes the row" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "str2_delete.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var cat = try createTyped(&w, &.{ .int, .blob });
+    cat = (try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .bytes = "short" } })).cat;
+    var out: [2]Value = undefined;
+    const v2 = (try getTyped(&w, cat, 1, &out)).?;
+    const dres = try deleteTyped(&w, cat, 1, v2);
+    cat = dres.ok;
+    try testing.expectEqual(@as(?u64, null), try getTyped(&w, cat, 1, &out));
     w.deinit();
 }
 
@@ -1414,118 +796,6 @@ test "strings persist across reopen" {
     }
 }
 
-test "list of int: insert, read, append, set" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try objTmpPath(testing.allocator, &tmp, "listint.airdb");
-    defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
-    var cat = try createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .list, .elem = .int } });
-    cat = (try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .list_int = &.{ 10, 20, 30 } } })).cat;
-    try testing.expectEqual(@as(?u64, 3), try listLen(&w, cat, 1, 1));
-    try testing.expectEqual(@as(u64, 20), try listGetInt(&w, cat, 1, 1, 1));
-    cat = try listAppendInt(&w, cat, 1, 1, 40);
-    try testing.expectEqual(@as(?u64, 4), try listLen(&w, cat, 1, 1));
-    try testing.expectEqual(@as(u64, 40), try listGetInt(&w, cat, 1, 1, 3));
-    cat = try listSetInt(&w, cat, 1, 1, 0, 99);
-    try testing.expectEqual(@as(u64, 99), try listGetInt(&w, cat, 1, 1, 0));
-    var out: [2]Value = undefined;
-    _ = (try getTyped(&w, cat, 1, &out)).?;
-    try testing.expectEqual(@as(u64, 1), out[0].int);
-    try testing.expect(out[1].coll_root != 0);
-    w.deinit();
-}
-
-test "list of blob: insert and read back element strings" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try objTmpPath(testing.allocator, &tmp, "listblob.airdb");
-    defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
-    var cat = try createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .list, .elem = .blob } });
-    cat = (try insertTyped(&w, cat, &.{ .{ .int = 7 }, .{ .list_blob = &.{ "alpha", "beta", "gamma" } } })).cat;
-    try testing.expectEqual(@as(?u64, 3), try listLen(&w, cat, 7, 1));
-    try testing.expectEqualStrings("beta", try listGetBlob(&w, cat, 7, 1, 1));
-    cat = try listAppendBlob(&w, cat, 7, 1, "delta");
-    try testing.expectEqualStrings("delta", try listGetBlob(&w, cat, 7, 1, 3));
-    w.deinit();
-}
-
-test "set of int: insert, membership, add (dedup), remove, count, collect" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try objTmpPath(testing.allocator, &tmp, "setint.airdb");
-    defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
-    var cat = try createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .set, .elem = .int } });
-    cat = (try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .set_int = &.{ 5, 9, 5, 12 } } })).cat;
-    try testing.expectEqual(@as(?u64, 3), try setCountInt(&w, cat, 1, 1));
-    try testing.expect(try setContainsInt(&w, cat, 1, 1, 9));
-    try testing.expect(!(try setContainsInt(&w, cat, 1, 1, 7)));
-    cat = try setAddInt(&w, cat, 1, 1, 7);
-    try testing.expect(try setContainsInt(&w, cat, 1, 1, 7));
-    try testing.expectEqual(@as(?u64, 4), try setCountInt(&w, cat, 1, 1));
-    cat = try setAddInt(&w, cat, 1, 1, 7); // dedup: no change
-    try testing.expectEqual(@as(?u64, 4), try setCountInt(&w, cat, 1, 1));
-    cat = try setRemoveInt(&w, cat, 1, 1, 9);
-    try testing.expect(!(try setContainsInt(&w, cat, 1, 1, 9)));
-    try testing.expectEqual(@as(?u64, 3), try setCountInt(&w, cat, 1, 1));
-    var members = std.ArrayList(u64).empty;
-    defer members.deinit(testing.allocator);
-    try setCollectInt(&w, cat, 1, 1, &members, testing.allocator);
-    try testing.expectEqual(@as(usize, 3), members.items.len);
-    try testing.expectEqual(@as(u64, 5), members.items[0]);
-    try testing.expectEqual(@as(u64, 7), members.items[1]);
-    try testing.expectEqual(@as(u64, 12), members.items[2]);
-    w.deinit();
-}
-
-test "collections persist across commit and reopen" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try objTmpPath(testing.allocator, &tmp, "collpersist.airdb");
-    defer testing.allocator.free(path);
-    {
-        var db = try Db.create(testing.allocator, path);
-        defer db.deinit();
-        var w = try db.beginWrite();
-        var cat = try createDefs(&w, &.{
-            .{ .kind = .int },
-            .{ .kind = .list, .elem = .int },
-            .{ .kind = .set, .elem = .int },
-            .{ .kind = .list, .elem = .blob },
-        });
-        cat = (try insertTyped(&w, cat, &.{
-            .{ .int = 42 },
-            .{ .list_int = &.{ 1, 2, 3 } },
-            .{ .set_int = &.{ 100, 200, 300 } },
-            .{ .list_blob = &.{ "x", "yy", "zzz" } },
-        })).cat;
-        cat = try listAppendInt(&w, cat, 42, 1, 4);
-        cat = try setAddInt(&w, cat, 42, 2, 400);
-        w.setRoot(cat);
-        _ = try w.commit();
-    }
-    {
-        var db = try Db.open(testing.allocator, path);
-        defer db.deinit();
-        var r = try db.beginRead();
-        const cat = r.root();
-        try testing.expectEqual(@as(?u64, 4), try listLen(&r, cat, 42, 1));
-        try testing.expectEqual(@as(u64, 4), try listGetInt(&r, cat, 42, 1, 3));
-        try testing.expectEqual(@as(?u64, 4), try setCountInt(&r, cat, 42, 2));
-        try testing.expect(try setContainsInt(&r, cat, 42, 2, 400));
-        try testing.expectEqualStrings("zzz", try listGetBlob(&r, cat, 42, 3, 2));
-        r.end();
-    }
-}
-
 test "getByObjectKey reads a row by its stable object key" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1549,331 +819,5 @@ test "getByObjectKey reads a row by its stable object key" {
     const dres = try delete(&w, cat, 100, vk);
     cat = dres.ok;
     try testing.expectEqual(@as(?u64, null), try getByObjectKey(&w, cat, r0.row, &out));
-    w.deinit();
-}
-
-test "large list and set: 50k elements each, append and membership" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try objTmpPath(testing.allocator, &tmp, "collscale.airdb");
-    defer testing.allocator.free(path);
-    const N: u64 = 50_000;
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
-    var cat = try createDefs(&w, &.{
-        .{ .kind = .int },
-        .{ .kind = .list, .elem = .int },
-        .{ .kind = .set, .elem = .int },
-    });
-    cat = (try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .list_int = &.{} }, .{ .set_int = &.{} } })).cat;
-    var i: u64 = 0;
-    while (i < N) : (i += 1) {
-        cat = try listAppendInt(&w, cat, 1, 1, i);
-        cat = try setAddInt(&w, cat, 1, 2, i *% 2654435761 % 1_000_003);
-    }
-    try testing.expectEqual(@as(?u64, N), try listLen(&w, cat, 1, 1));
-    try testing.expectEqual(@as(u64, 12345), try listGetInt(&w, cat, 1, 1, 12345));
-    const sc = (try setCountInt(&w, cat, 1, 2)).?;
-    try testing.expect(sc > 0 and sc <= N);
-    try testing.expect(try setContainsInt(&w, cat, 1, 2, 0));
-    w.deinit();
-}
-
-test "createDefs builds a backlink index for each link property" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try objTmpPath(testing.allocator, &tmp, "linkcat.airdb");
-    defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
-    const cat = try createDefs(&w, &.{
-        .{ .kind = .int },
-        .{ .kind = .int },
-        .{ .kind = .link },
-    });
-    const v = try loadCatalog(&w, cat);
-    try testing.expectEqual(PropKind.link, v.kind(2));
-    try testing.expect(v.backlinkRef(2) != 0);
-    try testing.expectEqual(@as(Ref, 0), v.backlinkRef(0));
-    try testing.expectEqual(@as(Ref, 0), v.backlinkRef(1));
-    w.deinit();
-}
-
-test "insert stores a link and records the backlink" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try objTmpPath(testing.allocator, &tmp, "link1.airdb");
-    defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
-    var cat = try createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .blob }, .{ .kind = .link } });
-    const boss = try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .bytes = "Boss" }, .{ .link = null } });
-    cat = boss.cat;
-    const rep = try insertTyped(&w, cat, &.{ .{ .int = 2 }, .{ .bytes = "Report" }, .{ .link = boss.row } });
-    cat = rep.cat;
-    try testing.expectEqual(@as(?u64, null), try getLink(&w, cat, 1, 2));
-    try testing.expectEqual(@as(?u64, boss.row), try getLink(&w, cat, 2, 2));
-    try testing.expectEqual(@as(u64, 1), try backlinkCount(&w, cat, 2, boss.row));
-    var srcs = std.ArrayList(u64).empty;
-    defer srcs.deinit(testing.allocator);
-    try backlinkCollect(&w, cat, 2, boss.row, &srcs, testing.allocator);
-    try testing.expectEqual(@as(usize, 1), srcs.items.len);
-    try testing.expectEqual(rep.row, srcs.items[0]);
-    w.deinit();
-}
-
-test "setLink moves and clears links, keeping backlinks exact" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try objTmpPath(testing.allocator, &tmp, "link2.airdb");
-    defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
-    var cat = try createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
-    const a = try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .link = null } });
-    cat = a.cat;
-    const b = try insertTyped(&w, cat, &.{ .{ .int = 2 }, .{ .link = null } });
-    cat = b.cat;
-    const c = try insertTyped(&w, cat, &.{ .{ .int = 3 }, .{ .link = a.row } });
-    cat = c.cat;
-    cat = try setLink(&w, cat, 3, 1, b.row);
-    try testing.expectEqual(@as(?u64, b.row), try getLink(&w, cat, 3, 1));
-    try testing.expectEqual(@as(u64, 0), try backlinkCount(&w, cat, 1, a.row));
-    try testing.expectEqual(@as(u64, 1), try backlinkCount(&w, cat, 1, b.row));
-    cat = try setLink(&w, cat, 3, 1, null);
-    try testing.expectEqual(@as(?u64, null), try getLink(&w, cat, 3, 1));
-    try testing.expectEqual(@as(u64, 0), try backlinkCount(&w, cat, 1, b.row));
-    w.deinit();
-}
-
-test "deleting an object nullifies inbound links and cleans its outbound backlinks" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try objTmpPath(testing.allocator, &tmp, "link3.airdb");
-    defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
-    var cat = try createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
-    const a = try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .link = null } });
-    cat = a.cat;
-    const b = try insertTyped(&w, cat, &.{ .{ .int = 2 }, .{ .link = a.row } });
-    cat = b.cat;
-    const c = try insertTyped(&w, cat, &.{ .{ .int = 3 }, .{ .link = a.row } });
-    cat = c.cat;
-    try testing.expectEqual(@as(u64, 2), try backlinkCount(&w, cat, 1, a.row));
-    var out: [2]Value = undefined;
-    const va = (try getTyped(&w, cat, 1, &out)).?;
-    const dres = try deleteTyped(&w, cat, 1, va);
-    cat = dres.ok;
-    try testing.expectEqual(@as(?u64, null), try getLink(&w, cat, 2, 1));
-    try testing.expectEqual(@as(?u64, null), try getLink(&w, cat, 3, 1));
-    const vb = (try getTyped(&w, cat, 2, &out)).?;
-    cat = (try deleteTyped(&w, cat, 2, vb)).ok;
-    try testing.expectEqual(@as(u64, 0), try backlinkCount(&w, cat, 1, a.row));
-    w.deinit();
-}
-
-test "links and backlinks persist across commit and reopen" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try objTmpPath(testing.allocator, &tmp, "linkpersist.airdb");
-    defer testing.allocator.free(path);
-    var boss_row: u64 = undefined;
-    {
-        var db = try Db.create(testing.allocator, path);
-        defer db.deinit();
-        var w = try db.beginWrite();
-        var cat = try createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
-        const boss = try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .link = null } });
-        cat = boss.cat;
-        boss_row = boss.row;
-        var i: u64 = 2;
-        while (i <= 50) : (i += 1) cat = (try insertTyped(&w, cat, &.{ .{ .int = i }, .{ .link = boss.row } })).cat;
-        w.setRoot(cat);
-        _ = try w.commit();
-    }
-    {
-        var db = try Db.open(testing.allocator, path);
-        defer db.deinit();
-        var r = try db.beginRead();
-        try testing.expectEqual(@as(u64, 49), try backlinkCount(&r, r.root(), 1, boss_row));
-        try testing.expectEqual(@as(?u64, boss_row), try getLink(&r, r.root(), 25, 1));
-        r.end();
-    }
-}
-
-test "self-link and cycle are allowed" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try objTmpPath(testing.allocator, &tmp, "linkcycle.airdb");
-    defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
-    var cat = try createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
-    const a = try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .link = null } });
-    cat = a.cat;
-    cat = try setLink(&w, cat, 1, 1, a.row);
-    try testing.expectEqual(@as(?u64, a.row), try getLink(&w, cat, 1, 1));
-    try testing.expectEqual(@as(u64, 1), try backlinkCount(&w, cat, 1, a.row));
-    const b = try insertTyped(&w, cat, &.{ .{ .int = 2 }, .{ .link = a.row } });
-    cat = b.cat;
-    cat = try setLink(&w, cat, 1, 1, b.row);
-    // a no longer self-links, but b still links to a, so a keeps one inbound.
-    try testing.expectEqual(@as(u64, 1), try backlinkCount(&w, cat, 1, a.row));
-    try testing.expectEqual(@as(u64, 1), try backlinkCount(&w, cat, 1, b.row));
-    w.deinit();
-}
-
-test "to-many link set: insert, add, remove, membership, backlinks" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try objTmpPath(testing.allocator, &tmp, "lset1.airdb");
-    defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
-    // props: pk(int), tags(link_set -> same type)
-    var cat = try createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link_set } });
-    const a = try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .link_set = &.{} } });
-    cat = a.cat;
-    const b = try insertTyped(&w, cat, &.{ .{ .int = 2 }, .{ .link_set = &.{} } });
-    cat = b.cat;
-    // c links to both a and b at insert.
-    const c = try insertTyped(&w, cat, &.{ .{ .int = 3 }, .{ .link_set = &.{ a.row, b.row } } });
-    cat = c.cat;
-    try testing.expectEqual(@as(?u64, 2), try linkSetCount(&w, cat, 3, 1));
-    try testing.expect(try linkSetContains(&w, cat, 3, 1, a.row));
-    try testing.expectEqual(@as(u64, 1), try backlinkCount(&w, cat, 1, a.row));
-    try testing.expectEqual(@as(u64, 1), try backlinkCount(&w, cat, 1, b.row));
-    // d also links to a.
-    const d = try insertTyped(&w, cat, &.{ .{ .int = 4 }, .{ .link_set = &.{a.row} } });
-    cat = d.cat;
-    try testing.expectEqual(@as(u64, 2), try backlinkCount(&w, cat, 1, a.row));
-    // remove a from c's set (dedup add is a no-op).
-    cat = try linkSetAdd(&w, cat, 3, 1, a.row); // already member, no change
-    try testing.expectEqual(@as(?u64, 2), try linkSetCount(&w, cat, 3, 1));
-    cat = try linkSetRemove(&w, cat, 3, 1, a.row);
-    try testing.expect(!(try linkSetContains(&w, cat, 3, 1, a.row)));
-    try testing.expectEqual(@as(u64, 1), try backlinkCount(&w, cat, 1, a.row)); // only d now
-    w.deinit();
-}
-
-test "deleting a to-many target removes it from all linkers; deleting a linker cleans backlinks" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try objTmpPath(testing.allocator, &tmp, "lset2.airdb");
-    defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
-    var cat = try createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link_set } });
-    const a = try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .link_set = &.{} } });
-    cat = a.cat;
-    const b = try insertTyped(&w, cat, &.{ .{ .int = 2 }, .{ .link_set = &.{a.row} } });
-    cat = b.cat;
-    const c = try insertTyped(&w, cat, &.{ .{ .int = 3 }, .{ .link_set = &.{a.row} } });
-    cat = c.cat;
-    try testing.expectEqual(@as(u64, 2), try backlinkCount(&w, cat, 1, a.row));
-    // Delete a: b and c must lose a from their sets.
-    var out: [2]Value = undefined;
-    const va = (try getTyped(&w, cat, 1, &out)).?;
-    cat = (try deleteTyped(&w, cat, 1, va)).ok;
-    try testing.expect(!(try linkSetContains(&w, cat, 2, 1, a.row)));
-    try testing.expect(!(try linkSetContains(&w, cat, 3, 1, a.row)));
-    try testing.expectEqual(@as(?u64, 0), try linkSetCount(&w, cat, 2, 1));
-    // Delete b (linked a, now gone): no lingering backlink on a's okey.
-    const vb = (try getTyped(&w, cat, 2, &out)).?;
-    cat = (try deleteTyped(&w, cat, 2, vb)).ok;
-    try testing.expectEqual(@as(u64, 0), try backlinkCount(&w, cat, 1, a.row));
-    w.deinit();
-}
-
-test "to-many links persist across commit and reopen" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try objTmpPath(testing.allocator, &tmp, "lset3.airdb");
-    defer testing.allocator.free(path);
-    var hub_row: u64 = undefined;
-    {
-        var db = try Db.create(testing.allocator, path);
-        defer db.deinit();
-        var w = try db.beginWrite();
-        var cat = try createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link_set } });
-        const hub = try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .link_set = &.{} } });
-        cat = hub.cat;
-        hub_row = hub.row;
-        var i: u64 = 2;
-        while (i <= 30) : (i += 1) {
-            const o = try insertTyped(&w, cat, &.{ .{ .int = i }, .{ .link_set = &.{hub.row} } });
-            cat = o.cat;
-        }
-        w.setRoot(cat);
-        _ = try w.commit();
-    }
-    {
-        var db = try Db.open(testing.allocator, path);
-        defer db.deinit();
-        var r = try db.beginRead();
-        try testing.expectEqual(@as(u64, 29), try backlinkCount(&r, r.root(), 1, hub_row));
-        try testing.expect(try linkSetContains(&r, r.root(), 15, 1, hub_row));
-        r.end();
-    }
-}
-
-test "addProperty backfills a default and removeProperty drops a column" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try objTmpPath(testing.allocator, &tmp, "mig1.airdb");
-    defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
-    // start with pk + one value
-    var cat = try create(&w, 2);
-    cat = (try insert(&w, cat, &.{ 1, 10 })).cat;
-    cat = (try insert(&w, cat, &.{ 2, 20 })).cat;
-    // add a third int property defaulting to 7
-    cat = try addProperty(&w, cat, .{ .kind = .int }, 7);
-    try testing.expectEqual(@as(PropCount, 3), try propCount(&w, cat));
-    var out: [3]u64 = undefined;
-    _ = (try getByPk(&w, cat, 1, &out)).?;
-    try testing.expectEqual(@as(u64, 10), out[1]);
-    try testing.expectEqual(@as(u64, 7), out[2]); // backfilled
-    // new inserts provide all three
-    cat = (try insert(&w, cat, &.{ 3, 30, 99 })).cat;
-    _ = (try getByPk(&w, cat, 3, &out)).?;
-    try testing.expectEqual(@as(u64, 99), out[2]);
-    // remove the middle property (index 1); now pk + the added prop
-    cat = try removeProperty(&w, cat, 1);
-    try testing.expectEqual(@as(PropCount, 2), try propCount(&w, cat));
-    var out2: [2]u64 = undefined;
-    _ = (try getByPk(&w, cat, 3, &out2)).?;
-    try testing.expectEqual(@as(u64, 3), out2[0]); // pk preserved
-    try testing.expectEqual(@as(u64, 99), out2[1]); // the formerly-third prop shifted to index 1
-    w.deinit();
-}
-
-test "addProperty link type gets a backlink index" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try objTmpPath(testing.allocator, &tmp, "mig2.airdb");
-    defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
-    var cat = try create(&w, 1); // just a pk
-    cat = (try insert(&w, cat, &.{1})).cat;
-    cat = try addProperty(&w, cat, .{ .kind = .link }, 0); // 0 == null link
-    const v = try loadCatalog(&w, cat);
-    try testing.expectEqual(PropKind.link, v.kind(1));
-    try testing.expect(v.backlinkRef(1) != 0);
-    // a row created before the migration reads as a null link
-    try testing.expectEqual(@as(?u64, null), try getLink(&w, cat, 1, 1));
     w.deinit();
 }

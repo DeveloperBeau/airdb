@@ -13,6 +13,7 @@
 const std = @import("std");
 const Db = @import("db.zig").Db;
 const objects = @import("objects.zig");
+const catalog = @import("catalog.zig");
 
 pub const AIRDB_OK: i64 = 0;
 pub const AIRDB_E_GENERIC: i64 = -1;
@@ -49,7 +50,7 @@ export fn airdb_open(path_ptr: [*:0]const u8, prop_count: u16) ?*Database {
             alloc.destroy(self);
             return null;
         };
-        const pc = objects.propCount(&r, r.root()) catch {
+        const pc = catalog.propCount(&r, r.root()) catch {
             r.end();
             self.db.deinit();
             alloc.destroy(self);
@@ -68,7 +69,7 @@ export fn airdb_open(path_ptr: [*:0]const u8, prop_count: u16) ?*Database {
             alloc.destroy(self);
             return null;
         };
-        const cat = objects.create(&w, prop_count) catch {
+        const cat = catalog.create(&w, prop_count) catch {
             w.deinit();
             self.db.deinit();
             alloc.destroy(self);
@@ -129,7 +130,7 @@ export fn airdb_count(handle: ?*Database) i64 {
     const self = handle orelse return AIRDB_E_GENERIC;
     var r = self.db.beginRead() catch return AIRDB_E_GENERIC;
     defer r.end();
-    const c = objects.liveCount(&r, r.root()) catch return AIRDB_E_GENERIC;
+    const c = catalog.liveCount(&r, r.root()) catch return AIRDB_E_GENERIC;
     return @intCast(c);
 }
 

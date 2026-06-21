@@ -9,14 +9,17 @@ const WriteTxn = @import("db.zig").WriteTxn;
 const Db = @import("db.zig").Db;
 const Ref = @import("ref.zig").Ref;
 const Objects = @import("objects.zig");
+const catalog = @import("catalog.zig");
+const collections = @import("collections.zig");
+const links = @import("links.zig");
 
-pub const Schema = []const []const Objects.PropKind;
+pub const Schema = []const []const catalog.PropKind;
 // Full schema: each type is a slice of PropDefs, so a multi-type directory can
 // hold link and collection properties (not just scalar kinds).
-pub const DefSchema = []const []const Objects.PropDef;
-pub const Value = Objects.Value;
-const PropKind = Objects.PropKind;
-const PropDef = Objects.PropDef;
+pub const DefSchema = []const []const catalog.PropDef;
+pub const Value = catalog.Value;
+const PropKind = catalog.PropKind;
+const PropDef = catalog.PropDef;
 
 fn dirSize(tc: u16) usize {
     return 2 + @as(usize, tc) * 8;
@@ -38,7 +41,7 @@ pub fn createWithDefs(txn: *WriteTxn, schema: DefSchema) !Ref {
     std.debug.assert(schema.len <= 256);
     var cat_refs: [256]Ref = undefined;
     var t: usize = 0;
-    while (t < schema.len) : (t += 1) cat_refs[t] = try Objects.createDefs(txn, schema[t]);
+    while (t < schema.len) : (t += 1) cat_refs[t] = try catalog.createDefs(txn, schema[t]);
     return writeDir(txn, cat_refs[0..schema.len]);
 }
 
@@ -48,7 +51,7 @@ pub fn create(txn: *WriteTxn, schema: Schema) !Ref {
     var cat_refs: [256]Ref = undefined;
     var t: usize = 0;
     while (t < schema.len) : (t += 1) {
-        cat_refs[t] = try Objects.createTyped(txn, schema[t]);
+        cat_refs[t] = try catalog.createTyped(txn, schema[t]);
     }
     return writeDir(txn, cat_refs[0..schema.len]);
 }
@@ -104,7 +107,7 @@ pub fn addTypeDefs(txn: *WriteTxn, dir: Ref, defs: []const PropDef) !struct { di
     var old_refs: [256]Ref = undefined;
     const old_tc = try snapshotRefs(txn, dir, &old_refs);
     std.debug.assert(old_tc < 256);
-    const new_cat = try Objects.createDefs(txn, defs);
+    const new_cat = try catalog.createDefs(txn, defs);
     const new_dir = try appendCatalog(txn, old_refs[0..old_tc], new_cat);
     return .{ .dir = new_dir, .type_id = old_tc };
 }
@@ -124,7 +127,7 @@ pub fn addType(txn: *WriteTxn, dir: Ref, type_schema: []const PropKind) !struct 
         break :blk d.type_count;
     };
     std.debug.assert(old_tc < 256);
-    const new_cat = try Objects.createTyped(txn, type_schema);
+    const new_cat = try catalog.createTyped(txn, type_schema);
     const new_tc: u16 = old_tc + 1;
     const a = try txn.alloc(dirSize(new_tc));
     std.mem.writeInt(u16, a.bytes[0..2], new_tc, .little);
@@ -141,7 +144,7 @@ pub fn validate(txn: anytype, dir: Ref, expected: Schema) !void {
     if (tc != expected.len) return error.SchemaMismatch;
     var t: u16 = 0;
     while (t < tc) : (t += 1) {
-        const v = try Objects.loadCatalog(txn, try catalogRef(txn, dir, t));
+        const v = try catalog.loadCatalog(txn, try catalogRef(txn, dir, t));
         if (v.prop_count != expected[t].len) return error.SchemaMismatch;
         var j: usize = 0;
         while (j < v.prop_count) : (j += 1) {
@@ -190,39 +193,39 @@ pub fn delete(txn: *WriteTxn, dir: Ref, type_id: u16, pk: u64, expected_version:
 }
 
 pub fn liveCount(txn: anytype, dir: Ref, type_id: u16) !u64 {
-    return Objects.liveCount(txn, try catalogRef(txn, dir, type_id));
+    return catalog.liveCount(txn, try catalogRef(txn, dir, type_id));
 }
 
 // --- link / to-many routing (mutators COW the directory) ---
 
 pub fn getLink(txn: anytype, dir: Ref, type_id: u16, pk: u64, prop: usize) !?u64 {
-    return Objects.getLink(txn, try catalogRef(txn, dir, type_id), pk, prop);
+    return links.getLink(txn, try catalogRef(txn, dir, type_id), pk, prop);
 }
 
 pub fn setLink(txn: *WriteTxn, dir: Ref, type_id: u16, pk: u64, prop: usize, target: ?u64) !Ref {
     const cat = try catalogRef(txn, dir, type_id);
-    const new_cat = try Objects.setLink(txn, cat, pk, prop, target);
+    const new_cat = try links.setLink(txn, cat, pk, prop, target);
     return try setCatalogRef(txn, dir, type_id, new_cat);
 }
 
 pub fn backlinkCount(txn: anytype, dir: Ref, type_id: u16, prop: usize, target: u64) !u64 {
-    return Objects.backlinkCount(txn, try catalogRef(txn, dir, type_id), prop, target);
+    return links.backlinkCount(txn, try catalogRef(txn, dir, type_id), prop, target);
 }
 
 pub fn linkSetAdd(txn: *WriteTxn, dir: Ref, type_id: u16, pk: u64, prop: usize, target: u64) !Ref {
     const cat = try catalogRef(txn, dir, type_id);
-    const new_cat = try Objects.linkSetAdd(txn, cat, pk, prop, target);
+    const new_cat = try links.linkSetAdd(txn, cat, pk, prop, target);
     return try setCatalogRef(txn, dir, type_id, new_cat);
 }
 
 pub fn linkSetRemove(txn: *WriteTxn, dir: Ref, type_id: u16, pk: u64, prop: usize, target: u64) !Ref {
     const cat = try catalogRef(txn, dir, type_id);
-    const new_cat = try Objects.linkSetRemove(txn, cat, pk, prop, target);
+    const new_cat = try links.linkSetRemove(txn, cat, pk, prop, target);
     return try setCatalogRef(txn, dir, type_id, new_cat);
 }
 
 pub fn linkSetContains(txn: anytype, dir: Ref, type_id: u16, pk: u64, prop: usize, target: u64) !bool {
-    return Objects.linkSetContains(txn, try catalogRef(txn, dir, type_id), pk, prop, target);
+    return links.linkSetContains(txn, try catalogRef(txn, dir, type_id), pk, prop, target);
 }
 
 // ---------------------------------------------------------------------------
@@ -243,7 +246,7 @@ test "create builds a directory with one catalog per type" {
     var db = try Db.create(testing.allocator, path);
     defer db.deinit();
     var w = try db.beginWrite();
-    const schema = [_][]const Objects.PropKind{
+    const schema = [_][]const catalog.PropKind{
         &.{ .int, .blob },
         &.{ .int, .int, .int },
     };
@@ -252,8 +255,8 @@ test "create builds a directory with one catalog per type" {
     const c0 = try catalogRef(&w, dir, 0);
     const c1 = try catalogRef(&w, dir, 1);
     try testing.expect(c0 != 0 and c1 != 0 and c0 != c1);
-    try testing.expectEqual(@as(Objects.PropCount, 2), (try Objects.loadCatalog(&w, c0)).prop_count);
-    try testing.expectEqual(@as(Objects.PropCount, 3), (try Objects.loadCatalog(&w, c1)).prop_count);
+    try testing.expectEqual(@as(catalog.PropCount, 2), (try catalog.loadCatalog(&w, c0)).prop_count);
+    try testing.expectEqual(@as(catalog.PropCount, 3), (try catalog.loadCatalog(&w, c1)).prop_count);
     w.deinit();
 }
 
@@ -265,7 +268,7 @@ test "catalogRef rejects an out-of-range type id" {
     var db = try Db.create(testing.allocator, path);
     defer db.deinit();
     var w = try db.beginWrite();
-    const schema = [_][]const Objects.PropKind{&.{ .int, .int }};
+    const schema = [_][]const catalog.PropKind{&.{ .int, .int }};
     const dir = try create(&w, &schema);
     try testing.expectError(error.NoSuchType, catalogRef(&w, dir, 5));
     w.deinit();
@@ -276,7 +279,7 @@ test "validate accepts a matching schema and rejects a mismatch" {
     defer tmp.cleanup();
     const path = try tdTmpPath(testing.allocator, &tmp, "td2.airdb");
     defer testing.allocator.free(path);
-    const schema = [_][]const Objects.PropKind{ &.{ .int, .blob }, &.{ .int, .int, .int } };
+    const schema = [_][]const catalog.PropKind{ &.{ .int, .blob }, &.{ .int, .int, .int } };
     {
         var db = try Db.create(testing.allocator, path);
         defer db.deinit();
@@ -290,11 +293,11 @@ test "validate accepts a matching schema and rejects a mismatch" {
         defer db.deinit();
         var r = try db.beginRead();
         try validate(&r, r.root(), &schema); // matches
-        const fewer = [_][]const Objects.PropKind{&.{ .int, .blob }};
+        const fewer = [_][]const catalog.PropKind{&.{ .int, .blob }};
         try testing.expectError(error.SchemaMismatch, validate(&r, r.root(), &fewer));
-        const wrong_kind = [_][]const Objects.PropKind{ &.{ .int, .int }, &.{ .int, .int, .int } };
+        const wrong_kind = [_][]const catalog.PropKind{ &.{ .int, .int }, &.{ .int, .int, .int } };
         try testing.expectError(error.SchemaMismatch, validate(&r, r.root(), &wrong_kind));
-        const wrong_count = [_][]const Objects.PropKind{ &.{ .int, .blob }, &.{ .int, .int } };
+        const wrong_count = [_][]const catalog.PropKind{ &.{ .int, .blob }, &.{ .int, .int } };
         try testing.expectError(error.SchemaMismatch, validate(&r, r.root(), &wrong_count));
         r.end();
     }
@@ -410,7 +413,7 @@ test "multi-type directory carries links and collections via createWithDefs" {
     var db = try Db.create(testing.allocator, path);
     defer db.deinit();
     var w = try db.beginWrite();
-    const PD = Objects.PropDef;
+    const PD = catalog.PropDef;
     // type 0: scalar (int pk, blob name); type 1: int pk + a to-one link + a to-many link_set
     const schema = [_][]const PD{
         &.{ .{ .kind = .int }, .{ .kind = .blob } },
@@ -437,6 +440,6 @@ test "multi-type directory carries links and collections via createWithDefs" {
     dir = added.dir;
     try testing.expectEqual(@as(u16, 2), added.type_id);
     dir = (try insert(&w, dir, 2, &.{ .{ .int = 1 }, .{ .list_int = &.{ 7, 8, 9 } } })).dir;
-    try testing.expectEqual(@as(?u64, 3), try Objects.listLen(&w, try catalogRef(&w, dir, 2), 1, 1));
+    try testing.expectEqual(@as(?u64, 3), try collections.listLen(&w, try catalogRef(&w, dir, 2), 1, 1));
     w.deinit();
 }
