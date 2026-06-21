@@ -8,7 +8,7 @@ const Index = @import("index.zig");
 const blob = @import("blob.zig");
 
 pub const PropCount = u16;
-pub const PropKind = enum(u8) { int = 0, blob = 1, list = 2, set = 3, link = 4 };
+pub const PropKind = enum(u8) { int = 0, blob = 1, list = 2, set = 3, link = 4, link_set = 5 };
 pub const ElemKind = enum(u8) { int = 0, blob = 1 };
 pub const PropDef = struct { kind: PropKind, elem: ElemKind = .int };
 pub const Value = union(enum) {
@@ -17,8 +17,9 @@ pub const Value = union(enum) {
     list_int: []const u64,
     list_blob: []const []const u8,
     set_int: []const u64,
-    coll_root: Ref, // read side: getTyped returns this for list/set properties
+    coll_root: Ref, // read side: getTyped returns this for list/set/link_set properties
     link: ?u64,
+    link_set: []const u64, // to-many: initial set of target okeys
 };
 
 // Catalog node layout:
@@ -98,7 +99,7 @@ pub fn createDefs(txn: *WriteTxn, defs: []const PropDef) !Ref {
         prop_col_refs[i] = try Column.create(txn);
         kinds[i] = defs[i].kind;
         elems[i] = defs[i].elem;
-        backlinks[i] = if (defs[i].kind == .link) try Index.create(txn) else 0;
+        backlinks[i] = if (defs[i].kind == .link or defs[i].kind == .link_set) try Index.create(txn) else 0;
     }
     const version_col_ref = try Column.create(txn);
     const live_col_ref = try Column.create(txn);
@@ -432,18 +433,27 @@ pub fn insertTyped(txn: *WriteTxn, cat: Ref, values: []const Value) !struct { ca
                 .blob => unreachable, // set of blob out of scope this phase
             },
             .link => if (values[i].link) |k| k + 1 else 0,
+            .link_set => try buildSetInt(txn, values[i].link_set),
         };
     }
     const r = try insert(txn, cat, raw[0..pc]);
-    // Maintain backlinks for any non-null link the new row carries.
+    // Maintain backlinks for any links the new row carries.
     var cat_ref = r.cat;
     {
         var p: usize = 0;
         while (p < pc) : (p += 1) {
-            if (kinds[p] == .link) {
-                if (values[p].link) |target| {
-                    cat_ref = try addBacklink(txn, cat_ref, p, target, r.row);
-                }
+            switch (kinds[p]) {
+                .link => {
+                    if (values[p].link) |target| {
+                        cat_ref = try addBacklink(txn, cat_ref, p, target, r.row);
+                    }
+                },
+                .link_set => {
+                    for (values[p].link_set) |target| {
+                        cat_ref = try addBacklink(txn, cat_ref, p, target, r.row);
+                    }
+                },
+                else => {},
             }
         }
     }
@@ -471,7 +481,7 @@ pub fn getTyped(txn: anytype, cat: Ref, pk: u64, out: []Value) !?u64 {
         out[i] = switch (kinds[i]) {
             .int => .{ .int = raw[i] },
             .blob => .{ .bytes = try blob.get(txn, raw[i]) },
-            .list, .set => .{ .coll_root = raw[i] },
+            .list, .set, .link_set => .{ .coll_root = raw[i] },
             .link => .{ .link = if (raw[i] == 0) null else raw[i] - 1 },
         };
     }
@@ -496,7 +506,7 @@ pub fn getTypedByOkey(txn: anytype, cat: Ref, okey: u64, out: []Value) !?u64 {
         out[i] = switch (kinds[i]) {
             .int => .{ .int = raw[i] },
             .blob => .{ .bytes = try blob.get(txn, raw[i]) },
-            .list, .set => .{ .coll_root = raw[i] },
+            .list, .set, .link_set => .{ .coll_root = raw[i] },
             .link => .{ .link = if (raw[i] == 0) null else raw[i] - 1 },
         };
     }
@@ -699,6 +709,68 @@ pub fn setLink(txn: *WriteTxn, cat: Ref, pk: u64, prop: usize, target: ?u64) !Re
     return new_cat;
 }
 
+// ---------------------------------------------------------------------------
+// To-many links (link_set): a set of target okeys with backlink maintenance.
+// ---------------------------------------------------------------------------
+
+pub fn linkSetCount(txn: anytype, cat: Ref, pk: u64, prop: usize) !?u64 {
+    const r = (try resolveProp(txn, cat, pk, prop)) orelse return null;
+    const set_root = try Column.get(txn, r.prop_col, r.row);
+    return try Index.count(txn, set_root);
+}
+
+pub fn linkSetContains(txn: anytype, cat: Ref, pk: u64, prop: usize, target: u64) !bool {
+    const r = (try resolveProp(txn, cat, pk, prop)).?;
+    const set_root = try Column.get(txn, r.prop_col, r.row);
+    return (try Index.get(txn, set_root, target)) != null;
+}
+
+pub fn linkSetCollect(
+    txn: anytype,
+    cat: Ref,
+    pk: u64,
+    prop: usize,
+    out: *std.ArrayList(u64),
+    allocator: std.mem.Allocator,
+) !void {
+    const r = (try resolveProp(txn, cat, pk, prop)).?;
+    const set_root = try Column.get(txn, r.prop_col, r.row);
+    const Sink = struct {
+        list: *std.ArrayList(u64),
+        alloc: std.mem.Allocator,
+        fn onKey(self: @This(), key: u64) !void {
+            try self.list.append(self.alloc, key);
+        }
+    };
+    try Index.forEachKey(txn, set_root, Sink{ .list = out, .alloc = allocator }, Sink.onKey);
+}
+
+// Add `target` to the to-many link set of object `pk`; records the backlink.
+// No-op if already a member.
+pub fn linkSetAdd(txn: *WriteTxn, cat: Ref, pk: u64, prop: usize, target: u64) !Ref {
+    const r = (try resolveProp(txn, cat, pk, prop)).?;
+    const row = r.row;
+    const old_root = try Column.get(txn, r.prop_col, row);
+    if ((try Index.get(txn, old_root, target)) != null) return cat; // already a member
+    const new_root = try Index.insert(txn, old_root, target, 1);
+    var new_cat = try replaceCollRoot(txn, cat, row, prop, new_root);
+    new_cat = try addBacklink(txn, new_cat, prop, target, row);
+    return new_cat;
+}
+
+// Remove `target` from the to-many link set of object `pk`; drops the backlink.
+// No-op if not a member.
+pub fn linkSetRemove(txn: *WriteTxn, cat: Ref, pk: u64, prop: usize, target: u64) !Ref {
+    const r = (try resolveProp(txn, cat, pk, prop)).?;
+    const row = r.row;
+    const old_root = try Column.get(txn, r.prop_col, row);
+    if ((try Index.get(txn, old_root, target)) == null) return cat; // not a member
+    const new_root = try Index.remove(txn, old_root, target);
+    var new_cat = try replaceCollRoot(txn, cat, row, prop, new_root);
+    new_cat = try removeBacklink(txn, new_cat, prop, target, row);
+    return new_cat;
+}
+
 // For each link property: (1) nullify every inbound link pointing at `okey`
 // (and drop those backlink entries); (2) remove the deleted row's own outbound
 // link entry from its target's backlink set. Returns the new catalog ref.
@@ -709,17 +781,28 @@ fn fixBacklinksForDelete(txn: *WriteTxn, cat: Ref, okey: u64) !Ref {
     const alloc = txn.db.store.allocator;
     var p: usize = 0;
     while (p < pc) : (p += 1) {
-        {
+        const kind = blk: {
             const vk = try loadCatalog(txn, cur);
-            if (vk.kind(p) != .link) continue;
-        }
-        // (1) Nullify inbound: snapshot the sources, then clear each one's link.
+            break :blk vk.kind(p);
+        };
+        if (kind != .link and kind != .link_set) continue;
+
+        // (1) Nullify inbound: snapshot the sources, then clear each one's link
+        // to okey. For to-one, set the column to null; for to-many, remove okey
+        // from the source's set.
         var sources = std.ArrayList(u64).empty;
         defer sources.deinit(alloc);
         try backlinkCollect(txn, cur, p, okey, &sources, alloc);
         for (sources.items) |src| {
             const vv = try loadCatalog(txn, cur);
-            const new_col = try Column.set(txn, vv.propColRef(p), src, 0);
+            const col = vv.propColRef(p);
+            const new_col = if (kind == .link)
+                try Column.set(txn, col, src, 0)
+            else blk: {
+                const src_set = try Column.get(txn, col, src);
+                const new_set = try Index.remove(txn, src_set, okey);
+                break :blk try Column.set(txn, col, src, new_set);
+            };
             cur = try setPropColRef(txn, cur, p, new_col);
         }
         // Drop the whole backlink set for okey (its inbound links are now clear).
@@ -729,10 +812,29 @@ fn fixBacklinksForDelete(txn: *WriteTxn, cat: Ref, okey: u64) !Ref {
             const new_bl = try Index.insert(txn, vv.backlinkRef(p), okey, empty);
             cur = try setBacklinkRef(txn, cur, p, new_bl);
         }
-        // (2) Outbound: if the deleted row links somewhere, remove its backlink.
-        const vv2 = try loadCatalog(txn, cur);
-        const out_raw = try Column.get(txn, vv2.propColRef(p), okey);
-        if (out_raw != 0) cur = try removeBacklink(txn, cur, p, out_raw - 1, okey);
+        // (2) Outbound: remove okey's own entries from its targets' backlink sets.
+        if (kind == .link) {
+            const vv2 = try loadCatalog(txn, cur);
+            const out_raw = try Column.get(txn, vv2.propColRef(p), okey);
+            if (out_raw != 0) cur = try removeBacklink(txn, cur, p, out_raw - 1, okey);
+        } else {
+            // to-many: iterate the deleted row's set members.
+            var members = std.ArrayList(u64).empty;
+            defer members.deinit(alloc);
+            {
+                const vv2 = try loadCatalog(txn, cur);
+                const set_root = try Column.get(txn, vv2.propColRef(p), okey);
+                const Sink = struct {
+                    list: *std.ArrayList(u64),
+                    alloc: std.mem.Allocator,
+                    fn onKey(self: @This(), key: u64) !void {
+                        try self.list.append(self.alloc, key);
+                    }
+                };
+                try Index.forEachKey(txn, set_root, Sink{ .list = &members, .alloc = alloc }, Sink.onKey);
+            }
+            for (members.items) |m| cur = try removeBacklink(txn, cur, p, m, okey);
+        }
     }
     return cur;
 }
@@ -854,7 +956,7 @@ pub fn updateTyped(
                 try blob.free(txn, cur_raw[i]);
                 break :blk try blob.put(txn, values[i].bytes);
             },
-            .list, .set => unreachable, // collection update not yet implemented
+            .list, .set, .link_set => unreachable, // collection update not yet implemented
             .link => if (values[i].link) |k| k + 1 else 0,
         };
     }
@@ -1555,4 +1657,100 @@ test "self-link and cycle are allowed" {
     try testing.expectEqual(@as(u64, 1), try backlinkCount(&w, cat, 1, a.row));
     try testing.expectEqual(@as(u64, 1), try backlinkCount(&w, cat, 1, b.row));
     w.deinit();
+}
+
+test "to-many link set: insert, add, remove, membership, backlinks" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "lset1.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    // props: pk(int), tags(link_set -> same type)
+    var cat = try createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link_set } });
+    const a = try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .link_set = &.{} } });
+    cat = a.cat;
+    const b = try insertTyped(&w, cat, &.{ .{ .int = 2 }, .{ .link_set = &.{} } });
+    cat = b.cat;
+    // c links to both a and b at insert.
+    const c = try insertTyped(&w, cat, &.{ .{ .int = 3 }, .{ .link_set = &.{ a.row, b.row } } });
+    cat = c.cat;
+    try testing.expectEqual(@as(?u64, 2), try linkSetCount(&w, cat, 3, 1));
+    try testing.expect(try linkSetContains(&w, cat, 3, 1, a.row));
+    try testing.expectEqual(@as(u64, 1), try backlinkCount(&w, cat, 1, a.row));
+    try testing.expectEqual(@as(u64, 1), try backlinkCount(&w, cat, 1, b.row));
+    // d also links to a.
+    const d = try insertTyped(&w, cat, &.{ .{ .int = 4 }, .{ .link_set = &.{a.row} } });
+    cat = d.cat;
+    try testing.expectEqual(@as(u64, 2), try backlinkCount(&w, cat, 1, a.row));
+    // remove a from c's set (dedup add is a no-op).
+    cat = try linkSetAdd(&w, cat, 3, 1, a.row); // already member, no change
+    try testing.expectEqual(@as(?u64, 2), try linkSetCount(&w, cat, 3, 1));
+    cat = try linkSetRemove(&w, cat, 3, 1, a.row);
+    try testing.expect(!(try linkSetContains(&w, cat, 3, 1, a.row)));
+    try testing.expectEqual(@as(u64, 1), try backlinkCount(&w, cat, 1, a.row)); // only d now
+    w.deinit();
+}
+
+test "deleting a to-many target removes it from all linkers; deleting a linker cleans backlinks" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "lset2.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var cat = try createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link_set } });
+    const a = try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .link_set = &.{} } });
+    cat = a.cat;
+    const b = try insertTyped(&w, cat, &.{ .{ .int = 2 }, .{ .link_set = &.{a.row} } });
+    cat = b.cat;
+    const c = try insertTyped(&w, cat, &.{ .{ .int = 3 }, .{ .link_set = &.{a.row} } });
+    cat = c.cat;
+    try testing.expectEqual(@as(u64, 2), try backlinkCount(&w, cat, 1, a.row));
+    // Delete a: b and c must lose a from their sets.
+    var out: [2]Value = undefined;
+    const va = (try getTyped(&w, cat, 1, &out)).?;
+    cat = (try deleteTyped(&w, cat, 1, va)).ok;
+    try testing.expect(!(try linkSetContains(&w, cat, 2, 1, a.row)));
+    try testing.expect(!(try linkSetContains(&w, cat, 3, 1, a.row)));
+    try testing.expectEqual(@as(?u64, 0), try linkSetCount(&w, cat, 2, 1));
+    // Delete b (linked a, now gone): no lingering backlink on a's okey.
+    const vb = (try getTyped(&w, cat, 2, &out)).?;
+    cat = (try deleteTyped(&w, cat, 2, vb)).ok;
+    try testing.expectEqual(@as(u64, 0), try backlinkCount(&w, cat, 1, a.row));
+    w.deinit();
+}
+
+test "to-many links persist across commit and reopen" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "lset3.airdb");
+    defer testing.allocator.free(path);
+    var hub_row: u64 = undefined;
+    {
+        var db = try Db.create(testing.allocator, path);
+        defer db.deinit();
+        var w = try db.beginWrite();
+        var cat = try createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link_set } });
+        const hub = try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .link_set = &.{} } });
+        cat = hub.cat;
+        hub_row = hub.row;
+        var i: u64 = 2;
+        while (i <= 30) : (i += 1) {
+            const o = try insertTyped(&w, cat, &.{ .{ .int = i }, .{ .link_set = &.{hub.row} } });
+            cat = o.cat;
+        }
+        w.setRoot(cat);
+        _ = try w.commit();
+    }
+    {
+        var db = try Db.open(testing.allocator, path);
+        defer db.deinit();
+        var r = try db.beginRead();
+        try testing.expectEqual(@as(u64, 29), try backlinkCount(&r, r.root(), 1, hub_row));
+        try testing.expect(try linkSetContains(&r, r.root(), 15, 1, hub_row));
+        r.end();
+    }
 }
