@@ -159,7 +159,7 @@ pub fn validate(txn: anytype, dir: Ref, expected: Schema) !void {
 
 pub const UpdateOk = struct { dir: Ref, version: u64 };
 pub const UpdateResult = union(enum) { ok: UpdateOk, conflict: Objects.Conflict, not_found };
-pub const DeleteResult = union(enum) { ok: Ref, conflict: Objects.Conflict, not_found };
+pub const DeleteResult = union(enum) { ok: Ref, conflict: Objects.Conflict, not_found, blocked };
 
 pub fn insert(txn: *WriteTxn, dir: Ref, type_id: u16, values: []const Value) !struct { dir: Ref, row: u64 } {
     const cat = try catalogRef(txn, dir, type_id);
@@ -247,6 +247,10 @@ pub fn getLinked(txn: anytype, dir: Ref, src_type: u16, pk: u64, prop: usize, ou
     return Objects.getTypedByOkey(txn, target_cat, r.okey, out);
 }
 
+// Delete an object, enforcing per-property deletion rules across the directory:
+// block (refuse while a block-rule link points at it), cascade (delete owned
+// children first), nullify (clear dangling inbound links). Cascade is recursive
+// and cycle-safe.
 pub fn deleteNullifyX(txn: *WriteTxn, dir: Ref, type_id: u16, pk: u64, expected_version: u64) !DeleteResult {
     const cat0 = try catalogRef(txn, dir, type_id);
     const pc = (try catalog.loadCatalog(txn, cat0)).prop_count;
@@ -255,31 +259,91 @@ pub fn deleteNullifyX(txn: *WriteTxn, dir: Ref, type_id: u16, pk: u64, expected_
     if (ver != expected_version) return .{ .conflict = .{ .current_version = ver } };
     const okey = (try catalog.resolveProp(txn, cat0, pk, 0)).?.row;
 
-    // Nullify inbound links to `okey` across every type. For the deleted object's
-    // OWN catalog, match all link props (they are definitionally same-type); for
-    // other types, match only props whose linkTarget == type_id.
-    var cur = dir;
-    const tc = try typeCount(txn, cur);
+    // BLOCK check (top-level only): refuse if any block-rule link points at it.
+    const tc = try typeCount(txn, dir);
     var s: u16 = 0;
     while (s < tc) : (s += 1) {
-        const s_cat = try catalogRef(txn, cur, s);
-        const new_s = try links.nullifyInboundInCatalog(txn, s_cat, okey, type_id, s == type_id);
-        cur = try setCatalogRef(txn, cur, s, new_s);
+        const s_cat = try catalogRef(txn, dir, s);
+        const sv = try catalog.loadCatalog(txn, s_cat);
+        var p: usize = 0;
+        while (p < sv.prop_count) : (p += 1) {
+            const k = sv.kind(p);
+            if ((k == .link or k == .link_set) and sv.linkTarget(p) == type_id and sv.delRule(p) == .block) {
+                if ((try links.backlinkCount(txn, s_cat, p, okey)) > 0) return .blocked;
+            }
+        }
     }
-    // Clean the deleted object's own outbound backlink entries.
+
+    var visited = std.AutoHashMap(u64, void).init(txn.db.store.allocator);
+    defer visited.deinit();
+    const new_dir = try deleteWorker(txn, dir, type_id, okey, &visited);
+    return .{ .ok = new_dir };
+}
+
+// Recursively delete object `okey` of `type_id`: cascade to owned children
+// first, then nullify inbound links to it, clean its outbound backlinks, and
+// tombstone. Cycle/repeat-safe via `visited`. Inner deletes do not re-enforce
+// block (a cascade never half-applies). Returns the new directory ref.
+fn deleteWorker(txn: *WriteTxn, dir: Ref, type_id: u16, okey: u64, visited: *std.AutoHashMap(u64, void)) !Ref {
+    const key = (@as(u64, type_id) << 48) | okey;
+    if (visited.contains(key)) return dir;
+    try visited.put(key, {});
+
+    var cur = dir;
+    var rbuf: [256]u64 = undefined;
+    const cat_t0 = try catalogRef(txn, cur, type_id);
+    const pc = (try catalog.loadCatalog(txn, cat_t0)).prop_count;
+    if ((try Objects.getByObjectKey(txn, cat_t0, okey, rbuf[0..pc])) == null) return cur; // already gone
+    const pk = rbuf[0];
+
+    // 1) Cascade: delete children reached by this object's cascade-rule props.
+    {
+        const sv = try catalog.loadCatalog(txn, cat_t0);
+        var p: usize = 0;
+        while (p < sv.prop_count) : (p += 1) {
+            const k = sv.kind(p);
+            if ((k != .link and k != .link_set) or sv.delRule(p) != .cascade) continue;
+            const child_type = sv.linkTarget(p);
+            if (k == .link) {
+                if (try links.getLink(txn, try catalogRef(txn, cur, type_id), pk, p)) |child| {
+                    cur = try deleteWorker(txn, cur, child_type, child, visited);
+                }
+            } else {
+                var members = std.ArrayList(u64).empty;
+                defer members.deinit(txn.db.store.allocator);
+                try links.linkSetCollect(txn, try catalogRef(txn, cur, type_id), pk, p, &members, txn.db.store.allocator);
+                for (members.items) |child| cur = try deleteWorker(txn, cur, child_type, child, visited);
+            }
+        }
+    }
+
+    // 2) Nullify inbound links to this object across all types.
+    {
+        const n = try typeCount(txn, cur);
+        var s: u16 = 0;
+        while (s < n) : (s += 1) {
+            const s_cat = try catalogRef(txn, cur, s);
+            const new_s = try links.nullifyInboundInCatalog(txn, s_cat, okey, type_id, s == type_id);
+            cur = try setCatalogRef(txn, cur, s, new_s);
+        }
+    }
+    // 3) Clean this object's own outbound backlink entries.
     {
         const t_cat = try catalogRef(txn, cur, type_id);
         const cleaned = try links.cleanOutboundInCatalog(txn, t_cat, okey);
         cur = try setCatalogRef(txn, cur, type_id, cleaned);
     }
-    // Tombstone the row.
-    const t_cat2 = try catalogRef(txn, cur, type_id);
-    const dres = try Objects.delete(txn, t_cat2, pk, expected_version);
-    return switch (dres) {
-        .ok => |new_cat| .{ .ok = try setCatalogRef(txn, cur, type_id, new_cat) },
-        .conflict => |c| .{ .conflict = c },
-        .not_found => .not_found,
-    };
+    // 4) Tombstone (re-read current version, which matches in this txn).
+    {
+        const t_cat = try catalogRef(txn, cur, type_id);
+        const cur_ver = (try Objects.getByObjectKey(txn, t_cat, okey, rbuf[0..pc])) orelse return cur;
+        const dres = try Objects.delete(txn, t_cat, pk, cur_ver);
+        switch (dres) {
+            .ok => |new_cat| cur = try setCatalogRef(txn, cur, type_id, new_cat),
+            else => {},
+        }
+    }
+    return cur;
 }
 
 // ---------------------------------------------------------------------------
@@ -601,4 +665,103 @@ test "cross-type links persist across reopen" {
         try testing.expectEqualStrings("Ada", out[1].bytes);
         r.end();
     }
+}
+
+test "block prevents deleting a referenced object" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tdTmpPath(testing.allocator, &tmp, "block1.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    const PD = catalog.PropDef;
+    const schema = [_][]const PD{
+        &.{ .{ .kind = .int }, .{ .kind = .blob } }, // Author
+        &.{ .{ .kind = .int }, .{ .kind = .link, .link_target = 0, .del_rule = .block } }, // Book.author (block)
+    };
+    var dir = try createWithDefs(&w, &schema);
+    const author = try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .bytes = "Ada" } });
+    dir = author.dir;
+    const book = try insert(&w, dir, 1, &.{ .{ .int = 1 }, .{ .link = author.row } });
+    dir = book.dir;
+
+    var av: [2]Value = undefined;
+    const aver = (try get(&w, dir, 0, 1, &av)).?;
+    const blocked = try deleteNullifyX(&w, dir, 0, 1, aver);
+    try testing.expect(blocked == .blocked);
+    try testing.expect((try get(&w, dir, 0, 1, &av)) != null); // author still there
+
+    // Remove the book, then the author deletes fine.
+    var bv: [2]Value = undefined;
+    const bver = (try get(&w, dir, 1, 1, &bv)).?;
+    const dbk = try deleteNullifyX(&w, dir, 1, 1, bver);
+    dir = dbk.ok;
+    const aver2 = (try get(&w, dir, 0, 1, &av)).?;
+    const da = try deleteNullifyX(&w, dir, 0, 1, aver2);
+    try testing.expect(da == .ok);
+    dir = da.ok;
+    try testing.expectEqual(@as(?u64, null), try get(&w, dir, 0, 1, &av));
+    w.deinit();
+}
+
+test "cascade deletes owned children" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tdTmpPath(testing.allocator, &tmp, "cascade1.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    const PD = catalog.PropDef;
+    const schema = [_][]const PD{
+        &.{ .{ .kind = .int }, .{ .kind = .link_set, .link_target = 1, .del_rule = .cascade } }, // Parent.children
+        &.{.{ .kind = .int }}, // Child
+    };
+    var dir = try createWithDefs(&w, &schema);
+    const c1 = try insert(&w, dir, 1, &.{.{ .int = 10 }});
+    dir = c1.dir;
+    const c2 = try insert(&w, dir, 1, &.{.{ .int = 20 }});
+    dir = c2.dir;
+    const c3 = try insert(&w, dir, 1, &.{.{ .int = 30 }});
+    dir = c3.dir;
+    const parent = try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .link_set = &.{ c1.row, c2.row, c3.row } } });
+    dir = parent.dir;
+    try testing.expectEqual(@as(u64, 3), try liveCount(&w, dir, 1));
+
+    var pv: [2]Value = undefined;
+    const pver = (try get(&w, dir, 0, 1, &pv)).?;
+    const dp = try deleteNullifyX(&w, dir, 0, 1, pver);
+    dir = dp.ok;
+    try testing.expectEqual(@as(?u64, null), try get(&w, dir, 0, 1, &pv)); // parent gone
+    try testing.expectEqual(@as(u64, 0), try liveCount(&w, dir, 1)); // all children gone
+    w.deinit();
+}
+
+test "cascade is cycle-safe" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tdTmpPath(testing.allocator, &tmp, "cascade2.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    const PD = catalog.PropDef;
+    const schema = [_][]const PD{
+        &.{ .{ .kind = .int }, .{ .kind = .link, .link_target = 0, .del_rule = .cascade } }, // Node.next (self type)
+    };
+    var dir = try createWithDefs(&w, &schema);
+    const a = try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .link = null } });
+    dir = a.dir;
+    const b = try insert(&w, dir, 0, &.{ .{ .int = 2 }, .{ .link = a.row } }); // b -> a
+    dir = b.dir;
+    dir = try setLink(&w, dir, 0, 1, 1, b.row); // a -> b (cycle)
+    try testing.expectEqual(@as(u64, 2), try liveCount(&w, dir, 0));
+
+    var av: [2]Value = undefined;
+    const aver = (try get(&w, dir, 0, 1, &av)).?;
+    const da = try deleteNullifyX(&w, dir, 0, 1, aver); // must terminate
+    dir = da.ok;
+    try testing.expectEqual(@as(u64, 0), try liveCount(&w, dir, 0)); // both gone
+    w.deinit();
 }
