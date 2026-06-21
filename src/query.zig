@@ -45,7 +45,6 @@ const Scan = struct {
     prop_count: usize,
     live_ref: Ref,
     keyrow_index_ref: Ref,
-    pk_index_ref: Ref,
     next_row: u64,
 };
 
@@ -55,22 +54,18 @@ fn openScan(txn: anytype, cat: Ref) !Scan {
     s.prop_count = v.prop_count;
     s.live_ref = v.live_col_ref;
     s.keyrow_index_ref = v.keyrow_index_ref;
-    s.pk_index_ref = v.pk_index_ref;
     s.next_row = v.next_row;
     var j: usize = 0;
     while (j < v.prop_count) : (j += 1) s.prop_refs[j] = v.propColRef(j);
     return s;
 }
 
-// A keyrow entry counts only if its row is live AND this okey is the canonical
-// one for that row. A deleted object leaves its okey->row mapping in the keyrow
-// index; if that dead slot is later reused by a relocation, the stale okey would
-// otherwise alias a live row that belongs to a different okey. The pk index maps
-// the row's pk back to the single owning okey, so we use it to reject aliases.
-fn entryIsCanonical(txn: anytype, s: *const Scan, pr: Pair) !bool {
-    if ((try Column.get(txn, s.live_ref, pr.row)) == 0) return false;
-    const pk = try Column.get(txn, s.prop_refs[0], pr.row);
-    return (try index.get(txn, s.pk_index_ref, pk)) == pr.okey;
+// A keyrow entry is live unless its row is tombstoned. `delete` removes the
+// object key from the key->row index, so the current snapshot's index never
+// holds a stale key that could alias a relocated row; the live check is the
+// only filter needed.
+fn rowLive(txn: anytype, s: *const Scan, pr: Pair) !bool {
+    return (try Column.get(txn, s.live_ref, pr.row)) != 0;
 }
 
 fn rowMatches(txn: anytype, s: *const Scan, row: u64, preds: []const Predicate) !bool {
@@ -114,7 +109,7 @@ pub fn where(
     defer pairs.deinit(allocator);
     try collectPairs(txn, &s, &pairs, allocator);
     for (pairs.items) |pr| {
-        if (!(try entryIsCanonical(txn, &s, pr))) continue;
+        if (!(try rowLive(txn, &s, pr))) continue;
         if (try rowMatches(txn, &s, pr.row, preds)) try out.append(allocator, pr.okey);
     }
 }
@@ -127,7 +122,7 @@ pub fn countWhere(txn: anytype, cat: Ref, preds: []const Predicate, allocator: s
     try collectPairs(txn, &s, &pairs, allocator);
     var n: u64 = 0;
     for (pairs.items) |pr| {
-        if (!(try entryIsCanonical(txn, &s, pr))) continue;
+        if (!(try rowLive(txn, &s, pr))) continue;
         if (try rowMatches(txn, &s, pr.row, preds)) n += 1;
     }
     return n;
@@ -144,7 +139,7 @@ pub fn aggregateInt(txn: anytype, cat: Ref, prop: usize, preds: []const Predicat
     try collectPairs(txn, &s, &pairs, allocator);
     var agg = Aggregate{ .count = 0, .sum = 0, .min = null, .max = null };
     for (pairs.items) |pr| {
-        if (!(try entryIsCanonical(txn, &s, pr))) continue;
+        if (!(try rowLive(txn, &s, pr))) continue;
         if (!(try rowMatches(txn, &s, pr.row, preds))) continue;
         const val = try Column.get(txn, s.prop_refs[prop], pr.row);
         agg.count += 1;
