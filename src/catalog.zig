@@ -7,7 +7,7 @@ const Index = @import("index.zig");
 pub const PropCount = u16;
 pub const PropKind = enum(u8) { int = 0, blob = 1, list = 2, set = 3, link = 4, link_set = 5 };
 pub const ElemKind = enum(u8) { int = 0, blob = 1 };
-pub const PropDef = struct { kind: PropKind, elem: ElemKind = .int };
+pub const PropDef = struct { kind: PropKind, elem: ElemKind = .int, link_target: u16 = 0 };
 pub const Value = union(enum) {
     int: u64,
     bytes: []const u8,
@@ -22,7 +22,7 @@ pub const Value = union(enum) {
 // Catalog node layout:
 // [prop_count u16][next_row u64][pk_index_ref u64][version_col_ref u64][live_col_ref u64]
 // [prop_count * (prop_col_ref u64)][prop_count * (kind u8)][prop_count * (elem u8)]
-// [prop_count * (backlink_ref u64)]
+// [prop_count * (backlink_ref u64)][prop_count * (link_target u16)]
 const off_prop_count: usize = 0;
 const off_next_row: usize = 2;
 const off_pk_index_ref: usize = 10;
@@ -33,7 +33,7 @@ const off_prop_cols: usize = 34;
 pub const max_prop_count: usize = 256;
 
 fn catalogSize(pc: PropCount) usize {
-    return off_prop_cols + @as(usize, pc) * 8 + @as(usize, pc) * 2 + @as(usize, pc) * 8;
+    return off_prop_cols + @as(usize, pc) * 8 + @as(usize, pc) * 2 + @as(usize, pc) * 8 + @as(usize, pc) * 2;
 }
 
 fn kindsOffset(pc: PropCount) usize {
@@ -48,6 +48,10 @@ fn backlinksOffset(pc: PropCount) usize {
     return elemsOffset(pc) + pc;
 }
 
+fn targetsOffset(pc: PropCount) usize {
+    return backlinksOffset(pc) + @as(usize, pc) * 8;
+}
+
 // Allocate and encode a fresh catalog node; return its ref.
 pub fn writeCatalog(
     txn: *WriteTxn,
@@ -60,6 +64,7 @@ pub fn writeCatalog(
     kinds: []const PropKind,
     elems: []const ElemKind,
     backlinks: []const Ref,
+    targets: []const u16,
 ) !Ref {
     const a = try txn.alloc(catalogSize(prop_count));
     std.mem.writeInt(u16, a.bytes[off_prop_count..][0..2], prop_count, .little);
@@ -78,6 +83,8 @@ pub fn writeCatalog(
     for (backlinks, 0..) |bref, i| {
         std.mem.writeInt(u64, a.bytes[blo + i * 8 ..][0..8], bref, .little);
     }
+    const to = targetsOffset(prop_count);
+    for (targets, 0..) |t, i| std.mem.writeInt(u16, a.bytes[to + i * 2 ..][0..2], t, .little);
     return a.ref;
 }
 
@@ -91,12 +98,14 @@ pub fn createDefs(txn: *WriteTxn, defs: []const PropDef) !Ref {
     var kinds: [max_prop_count]PropKind = undefined;
     var elems: [max_prop_count]ElemKind = undefined;
     var backlinks: [max_prop_count]Ref = undefined;
+    var targets: [max_prop_count]u16 = undefined;
     var i: usize = 0;
     while (i < prop_count) : (i += 1) {
         prop_col_refs[i] = try Column.create(txn);
         kinds[i] = defs[i].kind;
         elems[i] = defs[i].elem;
         backlinks[i] = if (defs[i].kind == .link or defs[i].kind == .link_set) try Index.create(txn) else 0;
+        targets[i] = defs[i].link_target;
     }
     const version_col_ref = try Column.create(txn);
     const live_col_ref = try Column.create(txn);
@@ -112,6 +121,7 @@ pub fn createDefs(txn: *WriteTxn, defs: []const PropDef) !Ref {
         kinds[0..prop_count],
         elems[0..prop_count],
         backlinks[0..prop_count],
+        targets[0..prop_count],
     );
 }
 
@@ -161,6 +171,11 @@ pub const CatalogView = struct {
     pub fn backlinkRef(self: CatalogView, i: usize) Ref {
         const blo = off_prop_cols + @as(usize, self.prop_count) * 8 + @as(usize, self.prop_count) * 2;
         return std.mem.readInt(u64, self.bytes[blo + i * 8 ..][0..8], .little);
+    }
+
+    pub fn linkTarget(self: CatalogView, i: usize) u16 {
+        const to = off_prop_cols + @as(usize, self.prop_count) * 8 + @as(usize, self.prop_count) * 2 + @as(usize, self.prop_count) * 8;
+        return std.mem.readInt(u16, self.bytes[to + i * 2 ..][0..2], .little);
     }
 };
 
@@ -214,6 +229,7 @@ pub fn replaceCollRoot(txn: *WriteTxn, cat: Ref, row: u64, prop: usize, new_root
     var kinds: [max_prop_count]PropKind = undefined;
     var elems: [max_prop_count]ElemKind = undefined;
     var bl: [max_prop_count]Ref = undefined;
+    var targets_buf: [max_prop_count]u16 = undefined;
     {
         var j: usize = 0;
         while (j < pc) : (j += 1) {
@@ -221,12 +237,13 @@ pub fn replaceCollRoot(txn: *WriteTxn, cat: Ref, row: u64, prop: usize, new_root
             kinds[j] = v.kind(j);
             elems[j] = v.elemKind(j);
             bl[j] = v.backlinkRef(j);
+            targets_buf[j] = v.linkTarget(j);
         }
     }
     var ver_ref = v.version_col_ref;
     prop_refs[prop] = try Column.set(txn, prop_refs[prop], row, new_root);
     ver_ref = try Column.set(txn, ver_ref, row, txn.new_version);
-    return writeCatalog(txn, pc, next_row, idx_ref, ver_ref, live_ref, prop_refs[0..pc], kinds[0..pc], elems[0..pc], bl[0..pc]);
+    return writeCatalog(txn, pc, next_row, idx_ref, ver_ref, live_ref, prop_refs[0..pc], kinds[0..pc], elems[0..pc], bl[0..pc], targets_buf[0..pc]);
 }
 
 // Write a new backlink ref into property `p`, preserving everything else.
@@ -241,6 +258,7 @@ pub fn setBacklinkRef(txn: *WriteTxn, cat: Ref, p: usize, new_bl: Ref) !Ref {
     var kinds: [max_prop_count]PropKind = undefined;
     var elems: [max_prop_count]ElemKind = undefined;
     var bl: [max_prop_count]Ref = undefined;
+    var targets_buf: [max_prop_count]u16 = undefined;
     {
         var j: usize = 0;
         while (j < pc) : (j += 1) {
@@ -248,10 +266,11 @@ pub fn setBacklinkRef(txn: *WriteTxn, cat: Ref, p: usize, new_bl: Ref) !Ref {
             kinds[j] = v.kind(j);
             elems[j] = v.elemKind(j);
             bl[j] = v.backlinkRef(j);
+            targets_buf[j] = v.linkTarget(j);
         }
     }
     bl[p] = new_bl;
-    return writeCatalog(txn, pc, next_row, idx_ref, ver_ref, live_ref, prop_refs[0..pc], kinds[0..pc], elems[0..pc], bl[0..pc]);
+    return writeCatalog(txn, pc, next_row, idx_ref, ver_ref, live_ref, prop_refs[0..pc], kinds[0..pc], elems[0..pc], bl[0..pc], targets_buf[0..pc]);
 }
 
 // Write a new column ref into property `p`, preserving everything else.
@@ -266,6 +285,7 @@ pub fn setPropColRef(txn: *WriteTxn, cat: Ref, p: usize, new_col: Ref) !Ref {
     var kinds: [max_prop_count]PropKind = undefined;
     var elems: [max_prop_count]ElemKind = undefined;
     var bl: [max_prop_count]Ref = undefined;
+    var targets_buf: [max_prop_count]u16 = undefined;
     {
         var j: usize = 0;
         while (j < pc) : (j += 1) {
@@ -273,10 +293,11 @@ pub fn setPropColRef(txn: *WriteTxn, cat: Ref, p: usize, new_col: Ref) !Ref {
             kinds[j] = v.kind(j);
             elems[j] = v.elemKind(j);
             bl[j] = v.backlinkRef(j);
+            targets_buf[j] = v.linkTarget(j);
         }
     }
     prop_refs[p] = new_col;
-    return writeCatalog(txn, pc, next_row, idx_ref, ver_ref, live_ref, prop_refs[0..pc], kinds[0..pc], elems[0..pc], bl[0..pc]);
+    return writeCatalog(txn, pc, next_row, idx_ref, ver_ref, live_ref, prop_refs[0..pc], kinds[0..pc], elems[0..pc], bl[0..pc], targets_buf[0..pc]);
 }
 
 // ---------------------------------------------------------------------------
@@ -374,5 +395,25 @@ test "createDefs builds a backlink index for each link property" {
     try testing.expect(v.backlinkRef(2) != 0);
     try testing.expectEqual(@as(Ref, 0), v.backlinkRef(0));
     try testing.expectEqual(@as(Ref, 0), v.backlinkRef(1));
+    w.deinit();
+}
+
+test "createDefs records a link target type id" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "ltarget.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    const cat = try createDefs(&w, &.{
+        .{ .kind = .int },
+        .{ .kind = .link, .link_target = 3 },
+        .{ .kind = .link_set, .link_target = 7 },
+    });
+    const v = try loadCatalog(&w, cat);
+    try testing.expectEqual(@as(u16, 0), v.linkTarget(0));
+    try testing.expectEqual(@as(u16, 3), v.linkTarget(1));
+    try testing.expectEqual(@as(u16, 7), v.linkTarget(2));
     w.deinit();
 }

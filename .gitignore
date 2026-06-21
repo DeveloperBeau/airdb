@@ -3,3 +3,4 @@ graphy-out/
 CLAUDE.local.md
 
 .zig-cache/
+zig-out/

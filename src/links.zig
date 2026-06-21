@@ -166,10 +166,11 @@ pub fn linkSetRemove(txn: *WriteTxn, cat: Ref, pk: u64, prop: usize, target: u64
     return new_cat;
 }
 
-// For each link property: (1) nullify every inbound link pointing at `okey`
-// (and drop those backlink entries); (2) remove the deleted row's own outbound
-// link entry from its target's backlink set. Returns the new catalog ref.
-pub fn fixBacklinksForDelete(txn: *WriteTxn, cat: Ref, okey: u64) !Ref {
+// Nullify every inbound link pointing at `okey` (and drop those backlink
+// entries) for each link/link_set property, restricted to properties where
+// `match_all` is true OR the property's link target type equals `target_type`.
+// Returns the new catalog ref.
+pub fn nullifyInboundInCatalog(txn: *WriteTxn, cat: Ref, okey: u64, target_type: u16, match_all: bool) !Ref {
     var cur = cat;
     const v0 = try catalog.loadCatalog(txn, cat);
     const pc = v0.prop_count;
@@ -181,9 +182,13 @@ pub fn fixBacklinksForDelete(txn: *WriteTxn, cat: Ref, okey: u64) !Ref {
             break :blk vk.kind(p);
         };
         if (kind != .link and kind != .link_set) continue;
+        if (!match_all) {
+            const vt = try catalog.loadCatalog(txn, cur);
+            if (vt.linkTarget(p) != target_type) continue;
+        }
 
-        // (1) Nullify inbound: snapshot the sources, then clear each one's link
-        // to okey. For to-one, set the column to null; for to-many, remove okey
+        // Nullify inbound: snapshot the sources, then clear each one's link to
+        // okey. For to-one, set the column to null; for to-many, remove okey
         // from the source's set.
         var sources = std.ArrayList(u64).empty;
         defer sources.deinit(alloc);
@@ -207,7 +212,26 @@ pub fn fixBacklinksForDelete(txn: *WriteTxn, cat: Ref, okey: u64) !Ref {
             const new_bl = try Index.insert(txn, vv.backlinkRef(p), okey, empty);
             cur = try catalog.setBacklinkRef(txn, cur, p, new_bl);
         }
-        // (2) Outbound: remove okey's own entries from its targets' backlink sets.
+    }
+    return cur;
+}
+
+// Remove `okey`'s own outbound link entries from its targets' backlink sets for
+// each link/link_set property. Returns the new catalog ref.
+pub fn cleanOutboundInCatalog(txn: *WriteTxn, cat: Ref, okey: u64) !Ref {
+    var cur = cat;
+    const v0 = try catalog.loadCatalog(txn, cat);
+    const pc = v0.prop_count;
+    const alloc = txn.db.store.allocator;
+    var p: usize = 0;
+    while (p < pc) : (p += 1) {
+        const kind = blk: {
+            const vk = try catalog.loadCatalog(txn, cur);
+            break :blk vk.kind(p);
+        };
+        if (kind != .link and kind != .link_set) continue;
+
+        // Outbound: remove okey's own entries from its targets' backlink sets.
         if (kind == .link) {
             const vv2 = try catalog.loadCatalog(txn, cur);
             const out_raw = try Column.get(txn, vv2.propColRef(p), okey);
@@ -232,6 +256,14 @@ pub fn fixBacklinksForDelete(txn: *WriteTxn, cat: Ref, okey: u64) !Ref {
         }
     }
     return cur;
+}
+
+// For each link property: (1) nullify every inbound link pointing at `okey`
+// (and drop those backlink entries); (2) remove the deleted row's own outbound
+// link entry from its target's backlink set. Returns the new catalog ref.
+pub fn fixBacklinksForDelete(txn: *WriteTxn, cat: Ref, okey: u64) !Ref {
+    const c1 = try nullifyInboundInCatalog(txn, cat, okey, 0, true);
+    return try cleanOutboundInCatalog(txn, c1, okey);
 }
 
 // ---------------------------------------------------------------------------
@@ -313,6 +345,36 @@ test "setLink clearing a link drops the backlink" {
     cat = try setLink(&w, cat, 3, 1, null);
     try testing.expectEqual(@as(?u64, null), try getLink(&w, cat, 3, 1));
     try testing.expectEqual(@as(u64, 0), try backlinkCount(&w, cat, 1, b.row));
+    w.deinit();
+}
+
+test "nullifyInboundInCatalog clears only links whose target type matches the filter" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "nullify_filter.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    // props: pk(int), prop1(link -> type 5), prop2(link -> type 9)
+    var cat = try catalog.createDefs(&w, &.{
+        .{ .kind = .int },
+        .{ .kind = .link, .link_target = 5 },
+        .{ .kind = .link, .link_target = 9 },
+    });
+    // Target row T, plus S1 (prop1 -> T) and S2 (prop2 -> T).
+    const t = try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .link = null }, .{ .link = null } });
+    cat = t.cat;
+    const s1 = try insertTyped(&w, cat, &.{ .{ .int = 2 }, .{ .link = t.row }, .{ .link = null } });
+    cat = s1.cat;
+    const s2 = try insertTyped(&w, cat, &.{ .{ .int = 3 }, .{ .link = null }, .{ .link = t.row } });
+    cat = s2.cat;
+    try testing.expectEqual(@as(?u64, t.row), try getLink(&w, cat, 2, 1));
+    try testing.expectEqual(@as(?u64, t.row), try getLink(&w, cat, 3, 2));
+    // Filtered nullify on target type 5 clears only prop1's inbound link.
+    cat = try nullifyInboundInCatalog(&w, cat, t.row, 5, false);
+    try testing.expectEqual(@as(?u64, null), try getLink(&w, cat, 2, 1));
+    try testing.expectEqual(@as(?u64, t.row), try getLink(&w, cat, 3, 2));
     w.deinit();
 }
 
