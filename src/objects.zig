@@ -29,6 +29,8 @@ pub fn insert(txn: *WriteTxn, cat: Ref, values: []const u64) !struct { cat: Ref,
 
     // Capture all refs from the view into locals before any mutation so the
     // bytes slice backing CatalogView cannot be invalidated by file growth.
+    const old_keyrow = v.keyrow_index_ref;
+    const old_next_key = v.next_key;
     const old_pk_index_ref = v.pk_index_ref;
     const old_version_col_ref = v.version_col_ref;
     const old_live_col_ref = v.live_col_ref;
@@ -51,6 +53,7 @@ pub fn insert(txn: *WriteTxn, cat: Ref, values: []const u64) !struct { cat: Ref,
     }
     const prop_count = v.prop_count;
     const row = v.next_row;
+    const okey = old_next_key;
 
     const pk = values[0];
     if ((try Index.get(txn, old_pk_index_ref, pk)) != null) return error.DuplicateKey;
@@ -65,12 +68,16 @@ pub fn insert(txn: *WriteTxn, cat: Ref, values: []const u64) !struct { cat: Ref,
     }
     const new_version_col = try Column.append(txn, old_version_col_ref, txn.new_version);
     const new_live_col = try Column.append(txn, old_live_col_ref, 1);
-    const new_index = try Index.insert(txn, old_pk_index_ref, pk, row);
+    // pk index maps pk -> okey; keyrow index maps okey -> physical row.
+    const new_index = try Index.insert(txn, old_pk_index_ref, pk, okey);
+    const new_keyrow = try Index.insert(txn, old_keyrow, okey, row);
 
     const new_cat = try writeCatalog(
         txn,
         prop_count,
         row + 1,
+        new_keyrow,
+        old_next_key + 1,
         new_index,
         new_version_col,
         new_live_col,
@@ -81,7 +88,7 @@ pub fn insert(txn: *WriteTxn, cat: Ref, values: []const u64) !struct { cat: Ref,
         old_targets[0..prop_count],
         old_rules[0..prop_count],
     );
-    return .{ .cat = new_cat, .row = row };
+    return .{ .cat = new_cat, .row = okey };
 }
 
 pub const Conflict = struct { current_version: u64 };
@@ -101,7 +108,8 @@ pub fn update(txn: *WriteTxn, cat: Ref, pk: u64, values: []const u64, expected_v
     const v = try loadCatalog(txn, cat);
     std.debug.assert(values.len == v.prop_count);
     std.debug.assert(values[0] == pk); // pk is identity, must not change
-    const row = (try Index.get(txn, v.pk_index_ref, pk)) orelse return .not_found;
+    const okey = (try Index.get(txn, v.pk_index_ref, pk)) orelse return .not_found;
+    const row = (try catalog.okeyToRow(txn, cat, okey)).?;
     const cur = try Column.get(txn, v.version_col_ref, row);
     if (cur != expected_version) return .{ .conflict = .{ .current_version = cur } };
 
@@ -133,13 +141,14 @@ pub fn update(txn: *WriteTxn, cat: Ref, pk: u64, values: []const u64, expected_v
     while (i < pc) : (i += 1) prop_refs[i] = try Column.set(txn, prop_refs[i], row, values[i]);
     ver_ref = try Column.set(txn, ver_ref, row, txn.new_version);
 
-    const new_cat = try writeCatalog(txn, pc, next_row, idx_ref, ver_ref, live_ref, prop_refs[0..pc], kinds[0..pc], elems_buf[0..pc], bl_buf[0..pc], targets_buf[0..pc], rules_buf[0..pc]);
+    const new_cat = try writeCatalog(txn, pc, next_row, v.keyrow_index_ref, v.next_key, idx_ref, ver_ref, live_ref, prop_refs[0..pc], kinds[0..pc], elems_buf[0..pc], bl_buf[0..pc], targets_buf[0..pc], rules_buf[0..pc]);
     return .{ .ok = .{ .cat = new_cat, .version = txn.new_version } };
 }
 
 pub fn delete(txn: *WriteTxn, cat: Ref, pk: u64, expected_version: u64) !DeleteResult {
     const v = try loadCatalog(txn, cat);
-    const row = (try Index.get(txn, v.pk_index_ref, pk)) orelse return .not_found;
+    const okey = (try Index.get(txn, v.pk_index_ref, pk)) orelse return .not_found;
+    const row = (try catalog.okeyToRow(txn, cat, okey)).?;
     const cur = try Column.get(txn, v.version_col_ref, row);
     if (cur != expected_version) return .{ .conflict = .{ .current_version = cur } };
 
@@ -171,38 +180,24 @@ pub fn delete(txn: *WriteTxn, cat: Ref, pk: u64, expected_version: u64) !DeleteR
     ver_ref = try Column.set(txn, ver_ref, row, txn.new_version); // bump version stamp
     idx_ref = try Index.remove(txn, idx_ref, pk); // remove pk from the index
 
-    const new_cat = try writeCatalog(txn, pc, next_row, idx_ref, ver_ref, live_ref, prop_refs[0..pc], kinds[0..pc], elems_buf[0..pc], bl_buf[0..pc], targets_buf[0..pc], rules_buf[0..pc]);
+    const new_cat = try writeCatalog(txn, pc, next_row, v.keyrow_index_ref, v.next_key, idx_ref, ver_ref, live_ref, prop_refs[0..pc], kinds[0..pc], elems_buf[0..pc], bl_buf[0..pc], targets_buf[0..pc], rules_buf[0..pc]);
     return .{ .ok = new_cat };
 }
 
 pub fn getByPk(txn: anytype, cat: Ref, pk: u64, out: []u64) !?u64 {
     const v = try loadCatalog(txn, cat);
     std.debug.assert(out.len == v.prop_count);
-    // Capture refs before any potential file growth from other ops.
-    const pk_index_ref = v.pk_index_ref;
-    const live_col_ref = v.live_col_ref;
-    const version_col_ref = v.version_col_ref;
-    var prop_refs: [max_prop_count]Ref = undefined;
-    {
-        var j: usize = 0;
-        while (j < v.prop_count) : (j += 1) prop_refs[j] = v.propColRef(j);
-    }
-    const prop_count = v.prop_count;
-    const row = (try Index.get(txn, pk_index_ref, pk)) orelse return null;
-    if ((try Column.get(txn, live_col_ref, row)) == 0) return null;
-    var i: usize = 0;
-    while (i < prop_count) : (i += 1) {
-        out[i] = try Column.get(txn, prop_refs[i], row);
-    }
-    return try Column.get(txn, version_col_ref, row);
+    const okey = (try Index.get(txn, v.pk_index_ref, pk)) orelse return null;
+    return getByObjectKey(txn, cat, okey, out);
 }
 
-// Read a row by its stable object key (okey == the row assigned at insert).
-// Returns the row version, or null if the okey is out of range or tombstoned.
+// Read a row by its stable object key. Resolves the okey to a physical row via
+// the key-to-row index. Returns the row version, or null if the okey is unknown
+// or the row is tombstoned.
 pub fn getByObjectKey(txn: anytype, cat: Ref, okey: u64, out: []u64) !?u64 {
     const v = try loadCatalog(txn, cat);
     std.debug.assert(out.len == v.prop_count);
-    if (okey >= v.next_row) return null;
+    const row = (try catalog.okeyToRow(txn, cat, okey)) orelse return null;
     const live_col_ref = v.live_col_ref;
     const version_col_ref = v.version_col_ref;
     var prop_refs: [max_prop_count]Ref = undefined;
@@ -211,10 +206,10 @@ pub fn getByObjectKey(txn: anytype, cat: Ref, okey: u64, out: []u64) !?u64 {
         while (j < v.prop_count) : (j += 1) prop_refs[j] = v.propColRef(j);
     }
     const prop_count = v.prop_count;
-    if ((try Column.get(txn, live_col_ref, okey)) == 0) return null;
+    if ((try Column.get(txn, live_col_ref, row)) == 0) return null;
     var i: usize = 0;
-    while (i < prop_count) : (i += 1) out[i] = try Column.get(txn, prop_refs[i], okey);
-    return try Column.get(txn, version_col_ref, okey);
+    while (i < prop_count) : (i += 1) out[i] = try Column.get(txn, prop_refs[i], row);
+    return try Column.get(txn, version_col_ref, row);
 }
 
 // insertTyped encodes a []Value row into raw u64 storage, allocating a blob
@@ -335,7 +330,8 @@ pub fn getTypedByOkey(txn: anytype, cat: Ref, okey: u64, out: []Value) !?u64 {
 pub fn deleteAndNullify(txn: *WriteTxn, cat: Ref, pk: u64, expected_version: u64) !DeleteResult {
     const v = try loadCatalog(txn, cat);
     const okey = (try Index.get(txn, v.pk_index_ref, pk)) orelse return .not_found;
-    const cur_ver = try Column.get(txn, v.version_col_ref, okey);
+    const row = (try catalog.okeyToRow(txn, cat, okey)).?;
+    const cur_ver = try Column.get(txn, v.version_col_ref, row);
     if (cur_ver != expected_version) return .{ .conflict = .{ .current_version = cur_ver } };
     const fixed = try links.fixBacklinksForDelete(txn, cat, okey);
     return try delete(txn, fixed, pk, expected_version);
@@ -833,5 +829,60 @@ test "getByObjectKey reads a row by its stable object key" {
     const dres = try delete(&w, cat, 100, vk);
     cat = dres.ok;
     try testing.expectEqual(@as(?u64, null), try getByObjectKey(&w, cat, r0.row, &out));
+    w.deinit();
+}
+
+test "getByObjectKey resolves through the key-to-row index" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "okey_index.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var cat = try create(&w, 2);
+    const r0 = try insert(&w, cat, &.{ 100, 7 });
+    cat = r0.cat;
+    const r1 = try insert(&w, cat, &.{ 200, 8 });
+    cat = r1.cat;
+    var out: [2]u64 = undefined;
+    try testing.expect((try getByObjectKey(&w, cat, r0.row, &out)) != null);
+    try testing.expectEqual(@as(u64, 100), out[0]);
+    try testing.expectEqual(@as(u64, 7), out[1]);
+    try testing.expect((try getByObjectKey(&w, cat, r1.row, &out)) != null);
+    try testing.expectEqual(@as(u64, 200), out[0]);
+    try testing.expectEqual(@as(u64, 8), out[1]);
+    // An object key with no mapping resolves to null.
+    try testing.expectEqual(@as(?u64, null), try getByObjectKey(&w, cat, 999, &out));
+    w.deinit();
+}
+
+test "reinserting a primary key after delete yields a new object key" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "okey_reinsert.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var cat = try create(&w, 2);
+    const first = try insert(&w, cat, &.{ 100, 7 });
+    cat = first.cat;
+    const okey_a = first.row;
+    var out: [2]u64 = undefined;
+    const v = (try getByPk(&w, cat, 100, &out)).?;
+    cat = (try delete(&w, cat, 100, v)).ok;
+    const second = try insert(&w, cat, &.{ 100, 70 });
+    cat = second.cat;
+    const okey_b = second.row;
+    try testing.expect(okey_a != okey_b);
+    // The old object key is tombstoned and resolves to null.
+    try testing.expectEqual(@as(?u64, null), try getByObjectKey(&w, cat, okey_a, &out));
+    // The new object key returns the new row.
+    try testing.expect((try getByObjectKey(&w, cat, okey_b, &out)) != null);
+    try testing.expectEqual(@as(u64, 70), out[1]);
+    // Lookup by pk returns the new values.
+    try testing.expect((try getByPk(&w, cat, 100, &out)) != null);
+    try testing.expectEqual(@as(u64, 70), out[1]);
     w.deinit();
 }

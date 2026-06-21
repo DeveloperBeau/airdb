@@ -29,7 +29,9 @@ const off_next_row: usize = 2;
 const off_pk_index_ref: usize = 10;
 const off_version_col_ref: usize = 18;
 const off_live_col_ref: usize = 26;
-const off_prop_cols: usize = 34;
+const off_keyrow_index_ref: usize = 34;
+const off_next_key: usize = 42;
+const off_prop_cols: usize = 50;
 
 pub const max_prop_count: usize = 256;
 
@@ -62,6 +64,8 @@ pub fn writeCatalog(
     txn: *WriteTxn,
     prop_count: PropCount,
     next_row: u64,
+    keyrow_index_ref: Ref,
+    next_key: u64,
     pk_index_ref: Ref,
     version_col_ref: Ref,
     live_col_ref: Ref,
@@ -75,6 +79,8 @@ pub fn writeCatalog(
     const a = try txn.alloc(catalogSize(prop_count));
     std.mem.writeInt(u16, a.bytes[off_prop_count..][0..2], prop_count, .little);
     std.mem.writeInt(u64, a.bytes[off_next_row..][0..8], next_row, .little);
+    std.mem.writeInt(u64, a.bytes[off_keyrow_index_ref..][0..8], keyrow_index_ref, .little);
+    std.mem.writeInt(u64, a.bytes[off_next_key..][0..8], next_key, .little);
     std.mem.writeInt(u64, a.bytes[off_pk_index_ref..][0..8], pk_index_ref, .little);
     std.mem.writeInt(u64, a.bytes[off_version_col_ref..][0..8], version_col_ref, .little);
     std.mem.writeInt(u64, a.bytes[off_live_col_ref..][0..8], live_col_ref, .little);
@@ -120,9 +126,12 @@ pub fn createDefs(txn: *WriteTxn, defs: []const PropDef) !Ref {
     const version_col_ref = try Column.create(txn);
     const live_col_ref = try Column.create(txn);
     const pk_index_ref = try Index.create(txn);
+    const keyrow = try Index.create(txn);
     return writeCatalog(
         txn,
         prop_count,
+        0,
+        keyrow,
         0,
         pk_index_ref,
         version_col_ref,
@@ -160,6 +169,8 @@ pub fn create(txn: *WriteTxn, prop_count: PropCount) !Ref {
 pub const CatalogView = struct {
     prop_count: PropCount,
     next_row: u64,
+    keyrow_index_ref: Ref,
+    next_key: u64,
     pk_index_ref: Ref,
     version_col_ref: Ref,
     live_col_ref: Ref,
@@ -206,6 +217,8 @@ pub fn loadCatalog(txn: anytype, cat: Ref) !CatalogView {
     return CatalogView{
         .prop_count = prop_count,
         .next_row = std.mem.readInt(u64, bytes[off_next_row..][0..8], .little),
+        .keyrow_index_ref = std.mem.readInt(u64, bytes[off_keyrow_index_ref..][0..8], .little),
+        .next_key = std.mem.readInt(u64, bytes[off_next_key..][0..8], .little),
         .pk_index_ref = std.mem.readInt(u64, bytes[off_pk_index_ref..][0..8], .little),
         .version_col_ref = std.mem.readInt(u64, bytes[off_version_col_ref..][0..8], .little),
         .live_col_ref = std.mem.readInt(u64, bytes[off_live_col_ref..][0..8], .little),
@@ -224,11 +237,20 @@ pub fn liveCount(txn: anytype, cat: Ref) !u64 {
     return Index.count(txn, view.pk_index_ref);
 }
 
+// Resolve an object key to its physical row via the key-to-row index.
+// Returns null if the okey has no mapping.
+pub fn okeyToRow(txn: anytype, cat: Ref, okey: u64) !?u64 {
+    const v = try loadCatalog(txn, cat);
+    return Index.get(txn, v.keyrow_index_ref, okey);
+}
+
 // Resolve (cat, pk, prop) to the property column ref and the row;
-// null if pk absent or row tombstoned.
+// null if pk absent or row tombstoned. The pk index maps pk -> okey, and the
+// keyrow index maps okey -> physical row.
 pub fn resolveProp(txn: anytype, cat: Ref, pk: u64, prop: usize) !?struct { row: u64, prop_col: Ref } {
     const v = try loadCatalog(txn, cat);
-    const row = (try Index.get(txn, v.pk_index_ref, pk)) orelse return null;
+    const okey = (try Index.get(txn, v.pk_index_ref, pk)) orelse return null;
+    const row = (try Index.get(txn, v.keyrow_index_ref, okey)) orelse return null;
     if ((try Column.get(txn, v.live_col_ref, row)) == 0) return null;
     return .{ .row = row, .prop_col = v.propColRef(prop) };
 }
@@ -261,7 +283,7 @@ pub fn replaceCollRoot(txn: *WriteTxn, cat: Ref, row: u64, prop: usize, new_root
     var ver_ref = v.version_col_ref;
     prop_refs[prop] = try Column.set(txn, prop_refs[prop], row, new_root);
     ver_ref = try Column.set(txn, ver_ref, row, txn.new_version);
-    return writeCatalog(txn, pc, next_row, idx_ref, ver_ref, live_ref, prop_refs[0..pc], kinds[0..pc], elems[0..pc], bl[0..pc], targets_buf[0..pc], rules_buf[0..pc]);
+    return writeCatalog(txn, pc, next_row, v.keyrow_index_ref, v.next_key, idx_ref, ver_ref, live_ref, prop_refs[0..pc], kinds[0..pc], elems[0..pc], bl[0..pc], targets_buf[0..pc], rules_buf[0..pc]);
 }
 
 // Write a new backlink ref into property `p`, preserving everything else.
@@ -290,7 +312,7 @@ pub fn setBacklinkRef(txn: *WriteTxn, cat: Ref, p: usize, new_bl: Ref) !Ref {
         }
     }
     bl[p] = new_bl;
-    return writeCatalog(txn, pc, next_row, idx_ref, ver_ref, live_ref, prop_refs[0..pc], kinds[0..pc], elems[0..pc], bl[0..pc], targets_buf[0..pc], rules_buf[0..pc]);
+    return writeCatalog(txn, pc, next_row, v.keyrow_index_ref, v.next_key, idx_ref, ver_ref, live_ref, prop_refs[0..pc], kinds[0..pc], elems[0..pc], bl[0..pc], targets_buf[0..pc], rules_buf[0..pc]);
 }
 
 // Write a new column ref into property `p`, preserving everything else.
@@ -319,7 +341,7 @@ pub fn setPropColRef(txn: *WriteTxn, cat: Ref, p: usize, new_col: Ref) !Ref {
         }
     }
     prop_refs[p] = new_col;
-    return writeCatalog(txn, pc, next_row, idx_ref, ver_ref, live_ref, prop_refs[0..pc], kinds[0..pc], elems[0..pc], bl[0..pc], targets_buf[0..pc], rules_buf[0..pc]);
+    return writeCatalog(txn, pc, next_row, v.keyrow_index_ref, v.next_key, idx_ref, ver_ref, live_ref, prop_refs[0..pc], kinds[0..pc], elems[0..pc], bl[0..pc], targets_buf[0..pc], rules_buf[0..pc]);
 }
 
 // ---------------------------------------------------------------------------
@@ -437,6 +459,21 @@ test "createDefs records a link target type id" {
     try testing.expectEqual(@as(u16, 0), v.linkTarget(0));
     try testing.expectEqual(@as(u16, 3), v.linkTarget(1));
     try testing.expectEqual(@as(u16, 7), v.linkTarget(2));
+    w.deinit();
+}
+
+test "createDefs creates an empty key-to-row index and zero next_key" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "keyrow.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    const cat = try createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .int } });
+    const v = try loadCatalog(&w, cat);
+    try testing.expect(v.keyrow_index_ref != 0);
+    try testing.expectEqual(@as(u64, 0), v.next_key);
     w.deinit();
 }
 
