@@ -196,12 +196,14 @@ pub fn nullifyInboundInCatalog(txn: *WriteTxn, cat: Ref, okey: u64, target_type:
         for (sources.items) |src| {
             const vv = try catalog.loadCatalog(txn, cur);
             const col = vv.propColRef(p);
+            // src is a source object key; resolve to its physical row for column access.
+            const src_row = (try catalog.okeyToRow(txn, cur, src)).?;
             const new_col = if (kind == .link)
-                try Column.set(txn, col, src, 0)
+                try Column.set(txn, col, src_row, 0)
             else blk: {
-                const src_set = try Column.get(txn, col, src);
+                const src_set = try Column.get(txn, col, src_row);
                 const new_set = try Index.remove(txn, src_set, okey);
-                break :blk try Column.set(txn, col, src, new_set);
+                break :blk try Column.set(txn, col, src_row, new_set);
             };
             cur = try catalog.setPropColRef(txn, cur, p, new_col);
         }
@@ -232,9 +234,11 @@ pub fn cleanOutboundInCatalog(txn: *WriteTxn, cat: Ref, okey: u64) !Ref {
         if (kind != .link and kind != .link_set) continue;
 
         // Outbound: remove okey's own entries from its targets' backlink sets.
+        // okey is an object key; resolve to the physical row to read its columns.
+        const row = (try catalog.okeyToRow(txn, cur, okey)).?;
         if (kind == .link) {
             const vv2 = try catalog.loadCatalog(txn, cur);
-            const out_raw = try Column.get(txn, vv2.propColRef(p), okey);
+            const out_raw = try Column.get(txn, vv2.propColRef(p), row);
             if (out_raw != 0) cur = try removeBacklink(txn, cur, p, out_raw - 1, okey);
         } else {
             // to-many: iterate the deleted row's set members.
@@ -242,7 +246,7 @@ pub fn cleanOutboundInCatalog(txn: *WriteTxn, cat: Ref, okey: u64) !Ref {
             defer members.deinit(alloc);
             {
                 const vv2 = try catalog.loadCatalog(txn, cur);
-                const set_root = try Column.get(txn, vv2.propColRef(p), okey);
+                const set_root = try Column.get(txn, vv2.propColRef(p), row);
                 const Sink = struct {
                     list: *std.ArrayList(u64),
                     alloc: std.mem.Allocator,

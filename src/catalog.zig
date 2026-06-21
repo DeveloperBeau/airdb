@@ -237,11 +237,20 @@ pub fn liveCount(txn: anytype, cat: Ref) !u64 {
     return Index.count(txn, view.pk_index_ref);
 }
 
+// Resolve an object key to its physical row via the key-to-row index.
+// Returns null if the okey has no mapping.
+pub fn okeyToRow(txn: anytype, cat: Ref, okey: u64) !?u64 {
+    const v = try loadCatalog(txn, cat);
+    return Index.get(txn, v.keyrow_index_ref, okey);
+}
+
 // Resolve (cat, pk, prop) to the property column ref and the row;
-// null if pk absent or row tombstoned.
+// null if pk absent or row tombstoned. The pk index maps pk -> okey, and the
+// keyrow index maps okey -> physical row.
 pub fn resolveProp(txn: anytype, cat: Ref, pk: u64, prop: usize) !?struct { row: u64, prop_col: Ref } {
     const v = try loadCatalog(txn, cat);
-    const row = (try Index.get(txn, v.pk_index_ref, pk)) orelse return null;
+    const okey = (try Index.get(txn, v.pk_index_ref, pk)) orelse return null;
+    const row = (try Index.get(txn, v.keyrow_index_ref, okey)) orelse return null;
     if ((try Column.get(txn, v.live_col_ref, row)) == 0) return null;
     return .{ .row = row, .prop_col = v.propColRef(prop) };
 }
