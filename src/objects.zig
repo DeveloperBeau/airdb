@@ -37,6 +37,7 @@ pub fn insert(txn: *WriteTxn, cat: Ref, values: []const u64) !struct { cat: Ref,
     var old_elems: [max_prop_count]ElemKind = undefined;
     var old_backlinks: [max_prop_count]Ref = undefined;
     var old_targets: [max_prop_count]u16 = undefined;
+    var old_rules: [max_prop_count]catalog.DeletionRule = undefined;
     {
         var j: usize = 0;
         while (j < v.prop_count) : (j += 1) {
@@ -45,6 +46,7 @@ pub fn insert(txn: *WriteTxn, cat: Ref, values: []const u64) !struct { cat: Ref,
             old_elems[j] = v.elemKind(j);
             old_backlinks[j] = v.backlinkRef(j);
             old_targets[j] = v.linkTarget(j);
+            old_rules[j] = v.delRule(j);
         }
     }
     const prop_count = v.prop_count;
@@ -77,6 +79,7 @@ pub fn insert(txn: *WriteTxn, cat: Ref, values: []const u64) !struct { cat: Ref,
         old_elems[0..prop_count],
         old_backlinks[0..prop_count],
         old_targets[0..prop_count],
+        old_rules[0..prop_count],
     );
     return .{ .cat = new_cat, .row = row };
 }
@@ -112,6 +115,7 @@ pub fn update(txn: *WriteTxn, cat: Ref, pk: u64, values: []const u64, expected_v
     var elems_buf: [max_prop_count]ElemKind = undefined;
     var bl_buf: [max_prop_count]Ref = undefined;
     var targets_buf: [max_prop_count]u16 = undefined;
+    var rules_buf: [max_prop_count]catalog.DeletionRule = undefined;
     {
         var j: usize = 0;
         while (j < pc) : (j += 1) {
@@ -120,6 +124,7 @@ pub fn update(txn: *WriteTxn, cat: Ref, pk: u64, values: []const u64, expected_v
             elems_buf[j] = v.elemKind(j);
             bl_buf[j] = v.backlinkRef(j);
             targets_buf[j] = v.linkTarget(j);
+            rules_buf[j] = v.delRule(j);
         }
     }
     var ver_ref = v.version_col_ref;
@@ -128,7 +133,7 @@ pub fn update(txn: *WriteTxn, cat: Ref, pk: u64, values: []const u64, expected_v
     while (i < pc) : (i += 1) prop_refs[i] = try Column.set(txn, prop_refs[i], row, values[i]);
     ver_ref = try Column.set(txn, ver_ref, row, txn.new_version);
 
-    const new_cat = try writeCatalog(txn, pc, next_row, idx_ref, ver_ref, live_ref, prop_refs[0..pc], kinds[0..pc], elems_buf[0..pc], bl_buf[0..pc], targets_buf[0..pc]);
+    const new_cat = try writeCatalog(txn, pc, next_row, idx_ref, ver_ref, live_ref, prop_refs[0..pc], kinds[0..pc], elems_buf[0..pc], bl_buf[0..pc], targets_buf[0..pc], rules_buf[0..pc]);
     return .{ .ok = .{ .cat = new_cat, .version = txn.new_version } };
 }
 
@@ -146,6 +151,7 @@ pub fn delete(txn: *WriteTxn, cat: Ref, pk: u64, expected_version: u64) !DeleteR
     var elems_buf: [max_prop_count]ElemKind = undefined;
     var bl_buf: [max_prop_count]Ref = undefined;
     var targets_buf: [max_prop_count]u16 = undefined;
+    var rules_buf: [max_prop_count]catalog.DeletionRule = undefined;
     {
         var j: usize = 0;
         while (j < pc) : (j += 1) {
@@ -154,6 +160,7 @@ pub fn delete(txn: *WriteTxn, cat: Ref, pk: u64, expected_version: u64) !DeleteR
             elems_buf[j] = v.elemKind(j);
             bl_buf[j] = v.backlinkRef(j);
             targets_buf[j] = v.linkTarget(j);
+            rules_buf[j] = v.delRule(j);
         }
     }
     var live_ref = v.live_col_ref;
@@ -164,7 +171,7 @@ pub fn delete(txn: *WriteTxn, cat: Ref, pk: u64, expected_version: u64) !DeleteR
     ver_ref = try Column.set(txn, ver_ref, row, txn.new_version); // bump version stamp
     idx_ref = try Index.remove(txn, idx_ref, pk); // remove pk from the index
 
-    const new_cat = try writeCatalog(txn, pc, next_row, idx_ref, ver_ref, live_ref, prop_refs[0..pc], kinds[0..pc], elems_buf[0..pc], bl_buf[0..pc], targets_buf[0..pc]);
+    const new_cat = try writeCatalog(txn, pc, next_row, idx_ref, ver_ref, live_ref, prop_refs[0..pc], kinds[0..pc], elems_buf[0..pc], bl_buf[0..pc], targets_buf[0..pc], rules_buf[0..pc]);
     return .{ .ok = new_cat };
 }
 
