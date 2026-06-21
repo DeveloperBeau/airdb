@@ -8,6 +8,7 @@ pub const migrations = @import("migrations.zig");
 pub const query = @import("query.zig");
 pub const ffi = @import("ffi.zig");
 pub const column = @import("column.zig");
+pub const column_node = @import("column_node.zig");
 pub const index = @import("index.zig");
 pub const coord = @import("coord.zig");
 pub const freelist = @import("freelist.zig");
