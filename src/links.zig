@@ -274,10 +274,10 @@ test "insert stores a link and records the backlink" {
     w.deinit();
 }
 
-test "setLink moves and clears links, keeping backlinks exact" {
+test "setLink moves a link and updates both backlink sets" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const path = try objTmpPath(testing.allocator, &tmp, "link2.airdb");
+    const path = try objTmpPath(testing.allocator, &tmp, "link2_move.airdb");
     defer testing.allocator.free(path);
     var db = try Db.create(testing.allocator, path);
     defer db.deinit();
@@ -293,16 +293,33 @@ test "setLink moves and clears links, keeping backlinks exact" {
     try testing.expectEqual(@as(?u64, b.row), try getLink(&w, cat, 3, 1));
     try testing.expectEqual(@as(u64, 0), try backlinkCount(&w, cat, 1, a.row));
     try testing.expectEqual(@as(u64, 1), try backlinkCount(&w, cat, 1, b.row));
+    w.deinit();
+}
+
+test "setLink clearing a link drops the backlink" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "link2_clear.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
+    const b = try insertTyped(&w, cat, &.{ .{ .int = 2 }, .{ .link = null } });
+    cat = b.cat;
+    const c = try insertTyped(&w, cat, &.{ .{ .int = 3 }, .{ .link = b.row } });
+    cat = c.cat;
+    try testing.expectEqual(@as(u64, 1), try backlinkCount(&w, cat, 1, b.row));
     cat = try setLink(&w, cat, 3, 1, null);
     try testing.expectEqual(@as(?u64, null), try getLink(&w, cat, 3, 1));
     try testing.expectEqual(@as(u64, 0), try backlinkCount(&w, cat, 1, b.row));
     w.deinit();
 }
 
-test "deleting an object nullifies inbound links and cleans its outbound backlinks" {
+test "deleting a target nullifies inbound to-one links" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const path = try objTmpPath(testing.allocator, &tmp, "link3.airdb");
+    const path = try objTmpPath(testing.allocator, &tmp, "link3_target.airdb");
     defer testing.allocator.free(path);
     var db = try Db.create(testing.allocator, path);
     defer db.deinit();
@@ -321,6 +338,24 @@ test "deleting an object nullifies inbound links and cleans its outbound backlin
     cat = dres.ok;
     try testing.expectEqual(@as(?u64, null), try getLink(&w, cat, 2, 1));
     try testing.expectEqual(@as(?u64, null), try getLink(&w, cat, 3, 1));
+    w.deinit();
+}
+
+test "deleting a source removes its outbound backlink entry" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "link3_source.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
+    const a = try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .link = null } });
+    cat = a.cat;
+    const b = try insertTyped(&w, cat, &.{ .{ .int = 2 }, .{ .link = a.row } });
+    cat = b.cat;
+    try testing.expectEqual(@as(u64, 1), try backlinkCount(&w, cat, 1, a.row));
+    var out: [2]Value = undefined;
     const vb = (try getTyped(&w, cat, 2, &out)).?;
     cat = (try deleteTyped(&w, cat, 2, vb)).ok;
     try testing.expectEqual(@as(u64, 0), try backlinkCount(&w, cat, 1, a.row));
@@ -356,10 +391,10 @@ test "links and backlinks persist across commit and reopen" {
     }
 }
 
-test "self-link and cycle are allowed" {
+test "a self-link is allowed and recorded" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const path = try objTmpPath(testing.allocator, &tmp, "linkcycle.airdb");
+    const path = try objTmpPath(testing.allocator, &tmp, "linkcycle_self.airdb");
     defer testing.allocator.free(path);
     var db = try Db.create(testing.allocator, path);
     defer db.deinit();
@@ -370,19 +405,34 @@ test "self-link and cycle are allowed" {
     cat = try setLink(&w, cat, 1, 1, a.row);
     try testing.expectEqual(@as(?u64, a.row), try getLink(&w, cat, 1, 1));
     try testing.expectEqual(@as(u64, 1), try backlinkCount(&w, cat, 1, a.row));
+    w.deinit();
+}
+
+test "a two-node cycle is allowed" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "linkcycle_cycle.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
+    const a = try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .link = null } });
+    cat = a.cat;
     const b = try insertTyped(&w, cat, &.{ .{ .int = 2 }, .{ .link = a.row } });
     cat = b.cat;
     cat = try setLink(&w, cat, 1, 1, b.row);
-    // a no longer self-links, but b still links to a, so a keeps one inbound.
+    try testing.expectEqual(@as(?u64, b.row), try getLink(&w, cat, 1, 1));
+    // a links to b, and b still links to a, so each keeps one inbound.
     try testing.expectEqual(@as(u64, 1), try backlinkCount(&w, cat, 1, a.row));
     try testing.expectEqual(@as(u64, 1), try backlinkCount(&w, cat, 1, b.row));
     w.deinit();
 }
 
-test "to-many link set: insert, add, remove, membership, backlinks" {
+test "to-many link set: insert seeds members and backlinks" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const path = try objTmpPath(testing.allocator, &tmp, "lset1.airdb");
+    const path = try objTmpPath(testing.allocator, &tmp, "lset1_insert.airdb");
     defer testing.allocator.free(path);
     var db = try Db.create(testing.allocator, path);
     defer db.deinit();
@@ -397,26 +447,107 @@ test "to-many link set: insert, add, remove, membership, backlinks" {
     const c = try insertTyped(&w, cat, &.{ .{ .int = 3 }, .{ .link_set = &.{ a.row, b.row } } });
     cat = c.cat;
     try testing.expectEqual(@as(?u64, 2), try linkSetCount(&w, cat, 3, 1));
-    try testing.expect(try linkSetContains(&w, cat, 3, 1, a.row));
     try testing.expectEqual(@as(u64, 1), try backlinkCount(&w, cat, 1, a.row));
     try testing.expectEqual(@as(u64, 1), try backlinkCount(&w, cat, 1, b.row));
-    // d also links to a.
+    // d also links to a, so a now has two inbound.
     const d = try insertTyped(&w, cat, &.{ .{ .int = 4 }, .{ .link_set = &.{a.row} } });
     cat = d.cat;
     try testing.expectEqual(@as(u64, 2), try backlinkCount(&w, cat, 1, a.row));
-    // remove a from c's set (dedup add is a no-op).
+    w.deinit();
+}
+
+test "to-many link set: membership query reflects members" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "lset1_member.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link_set } });
+    const a = try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .link_set = &.{} } });
+    cat = a.cat;
+    const b = try insertTyped(&w, cat, &.{ .{ .int = 2 }, .{ .link_set = &.{} } });
+    cat = b.cat;
+    const c = try insertTyped(&w, cat, &.{ .{ .int = 3 }, .{ .link_set = &.{a.row} } });
+    cat = c.cat;
+    try testing.expect(try linkSetContains(&w, cat, 3, 1, a.row));
+    try testing.expect(!(try linkSetContains(&w, cat, 3, 1, b.row)));
+    w.deinit();
+}
+
+test "to-many link set: add inserts a new member" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "lset1_addnew.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link_set } });
+    const a = try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .link_set = &.{} } });
+    cat = a.cat;
+    const b = try insertTyped(&w, cat, &.{ .{ .int = 2 }, .{ .link_set = &.{} } });
+    cat = b.cat;
+    const c = try insertTyped(&w, cat, &.{ .{ .int = 3 }, .{ .link_set = &.{a.row} } });
+    cat = c.cat;
+    cat = try linkSetAdd(&w, cat, 3, 1, b.row);
+    try testing.expectEqual(@as(?u64, 2), try linkSetCount(&w, cat, 3, 1));
+    try testing.expect(try linkSetContains(&w, cat, 3, 1, b.row));
+    try testing.expectEqual(@as(u64, 1), try backlinkCount(&w, cat, 1, b.row));
+    w.deinit();
+}
+
+test "to-many link set: adding an existing member is a no-op" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "lset1_addexist.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link_set } });
+    const a = try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .link_set = &.{} } });
+    cat = a.cat;
+    const b = try insertTyped(&w, cat, &.{ .{ .int = 2 }, .{ .link_set = &.{} } });
+    cat = b.cat;
+    const c = try insertTyped(&w, cat, &.{ .{ .int = 3 }, .{ .link_set = &.{ a.row, b.row } } });
+    cat = c.cat;
     cat = try linkSetAdd(&w, cat, 3, 1, a.row); // already member, no change
     try testing.expectEqual(@as(?u64, 2), try linkSetCount(&w, cat, 3, 1));
+    try testing.expectEqual(@as(u64, 1), try backlinkCount(&w, cat, 1, a.row));
+    w.deinit();
+}
+
+test "to-many link set: remove drops a member" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "lset1_remove.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link_set } });
+    const a = try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .link_set = &.{} } });
+    cat = a.cat;
+    const b = try insertTyped(&w, cat, &.{ .{ .int = 2 }, .{ .link_set = &.{} } });
+    cat = b.cat;
+    const c = try insertTyped(&w, cat, &.{ .{ .int = 3 }, .{ .link_set = &.{ a.row, b.row } } });
+    cat = c.cat;
+    // d also links to a, so a has two inbound before the removal.
+    const d = try insertTyped(&w, cat, &.{ .{ .int = 4 }, .{ .link_set = &.{a.row} } });
+    cat = d.cat;
+    try testing.expectEqual(@as(u64, 2), try backlinkCount(&w, cat, 1, a.row));
     cat = try linkSetRemove(&w, cat, 3, 1, a.row);
     try testing.expect(!(try linkSetContains(&w, cat, 3, 1, a.row)));
     try testing.expectEqual(@as(u64, 1), try backlinkCount(&w, cat, 1, a.row)); // only d now
     w.deinit();
 }
 
-test "deleting a to-many target removes it from all linkers; deleting a linker cleans backlinks" {
+test "deleting a to-many target removes it from all linkers" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const path = try objTmpPath(testing.allocator, &tmp, "lset2.airdb");
+    const path = try objTmpPath(testing.allocator, &tmp, "lset2_target.airdb");
     defer testing.allocator.free(path);
     var db = try Db.create(testing.allocator, path);
     defer db.deinit();
@@ -436,7 +567,25 @@ test "deleting a to-many target removes it from all linkers; deleting a linker c
     try testing.expect(!(try linkSetContains(&w, cat, 2, 1, a.row)));
     try testing.expect(!(try linkSetContains(&w, cat, 3, 1, a.row)));
     try testing.expectEqual(@as(?u64, 0), try linkSetCount(&w, cat, 2, 1));
-    // Delete b (linked a, now gone): no lingering backlink on a's okey.
+    w.deinit();
+}
+
+test "deleting a to-many linker cleans its backlinks" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "lset2_linker.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link_set } });
+    const a = try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .link_set = &.{} } });
+    cat = a.cat;
+    const b = try insertTyped(&w, cat, &.{ .{ .int = 2 }, .{ .link_set = &.{a.row} } });
+    cat = b.cat;
+    try testing.expectEqual(@as(u64, 1), try backlinkCount(&w, cat, 1, a.row));
+    // Delete b (the linker): no lingering backlink on a's okey.
+    var out: [2]Value = undefined;
     const vb = (try getTyped(&w, cat, 2, &out)).?;
     cat = (try deleteTyped(&w, cat, 2, vb)).ok;
     try testing.expectEqual(@as(u64, 0), try backlinkCount(&w, cat, 1, a.row));

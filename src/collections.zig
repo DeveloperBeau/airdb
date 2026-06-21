@@ -139,10 +139,10 @@ fn objTmpPath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const 
     return std.fs.path.join(allocator, &.{ path_buf[0..dlen], name });
 }
 
-test "list of int: insert, read, append, set" {
+test "list of int: insert seeds members and reads back" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const path = try objTmpPath(testing.allocator, &tmp, "listint.airdb");
+    const path = try objTmpPath(testing.allocator, &tmp, "listint_seed.airdb");
     defer testing.allocator.free(path);
     var db = try Db.create(testing.allocator, path);
     defer db.deinit();
@@ -151,15 +151,41 @@ test "list of int: insert, read, append, set" {
     cat = (try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .list_int = &.{ 10, 20, 30 } } })).cat;
     try testing.expectEqual(@as(?u64, 3), try listLen(&w, cat, 1, 1));
     try testing.expectEqual(@as(u64, 20), try listGetInt(&w, cat, 1, 1, 1));
-    cat = try listAppendInt(&w, cat, 1, 1, 40);
-    try testing.expectEqual(@as(?u64, 4), try listLen(&w, cat, 1, 1));
-    try testing.expectEqual(@as(u64, 40), try listGetInt(&w, cat, 1, 1, 3));
-    cat = try listSetInt(&w, cat, 1, 1, 0, 99);
-    try testing.expectEqual(@as(u64, 99), try listGetInt(&w, cat, 1, 1, 0));
     var out: [2]Value = undefined;
     _ = (try getTyped(&w, cat, 1, &out)).?;
     try testing.expectEqual(@as(u64, 1), out[0].int);
     try testing.expect(out[1].coll_root != 0);
+    w.deinit();
+}
+
+test "list of int: append grows the list" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "listint_append.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .list, .elem = .int } });
+    cat = (try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .list_int = &.{ 10, 20, 30 } } })).cat;
+    cat = try listAppendInt(&w, cat, 1, 1, 40);
+    try testing.expectEqual(@as(?u64, 4), try listLen(&w, cat, 1, 1));
+    try testing.expectEqual(@as(u64, 40), try listGetInt(&w, cat, 1, 1, 3));
+    w.deinit();
+}
+
+test "list of int: set overwrites an element" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "listint_set.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .list, .elem = .int } });
+    cat = (try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .list_int = &.{ 10, 20, 30 } } })).cat;
+    cat = try listSetInt(&w, cat, 1, 1, 0, 99);
+    try testing.expectEqual(@as(u64, 99), try listGetInt(&w, cat, 1, 1, 0));
     w.deinit();
 }
 
@@ -180,10 +206,10 @@ test "list of blob: insert and read back element strings" {
     w.deinit();
 }
 
-test "set of int: insert, membership, add (dedup), remove, count, collect" {
+test "set of int: build from initial members dedups and counts" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const path = try objTmpPath(testing.allocator, &tmp, "setint.airdb");
+    const path = try objTmpPath(testing.allocator, &tmp, "setint_count.airdb");
     defer testing.allocator.free(path);
     var db = try Db.create(testing.allocator, path);
     defer db.deinit();
@@ -191,16 +217,82 @@ test "set of int: insert, membership, add (dedup), remove, count, collect" {
     var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .set, .elem = .int } });
     cat = (try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .set_int = &.{ 5, 9, 5, 12 } } })).cat;
     try testing.expectEqual(@as(?u64, 3), try setCountInt(&w, cat, 1, 1));
+    w.deinit();
+}
+
+test "set of int: membership reports contains true and false" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "setint_member.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .set, .elem = .int } });
+    cat = (try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .set_int = &.{ 5, 9, 5, 12 } } })).cat;
     try testing.expect(try setContainsInt(&w, cat, 1, 1, 9));
     try testing.expect(!(try setContainsInt(&w, cat, 1, 1, 7)));
+    w.deinit();
+}
+
+test "set of int: add inserts a new member" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "setint_addnew.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .set, .elem = .int } });
+    cat = (try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .set_int = &.{ 5, 9, 12 } } })).cat;
     cat = try setAddInt(&w, cat, 1, 1, 7);
     try testing.expect(try setContainsInt(&w, cat, 1, 1, 7));
     try testing.expectEqual(@as(?u64, 4), try setCountInt(&w, cat, 1, 1));
+    w.deinit();
+}
+
+test "set of int: adding an existing member is a no-op" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "setint_addexist.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .set, .elem = .int } });
+    cat = (try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .set_int = &.{ 5, 7, 9, 12 } } })).cat;
+    try testing.expectEqual(@as(?u64, 4), try setCountInt(&w, cat, 1, 1));
     cat = try setAddInt(&w, cat, 1, 1, 7); // dedup: no change
     try testing.expectEqual(@as(?u64, 4), try setCountInt(&w, cat, 1, 1));
+    w.deinit();
+}
+
+test "set of int: remove drops a member" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "setint_remove.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .set, .elem = .int } });
+    cat = (try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .set_int = &.{ 5, 7, 9, 12 } } })).cat;
     cat = try setRemoveInt(&w, cat, 1, 1, 9);
     try testing.expect(!(try setContainsInt(&w, cat, 1, 1, 9)));
     try testing.expectEqual(@as(?u64, 3), try setCountInt(&w, cat, 1, 1));
+    w.deinit();
+}
+
+test "set of int: collect returns ascending members" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "setint_collect.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .set, .elem = .int } });
+    cat = (try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .set_int = &.{ 12, 5, 7 } } })).cat;
     var members = std.ArrayList(u64).empty;
     defer members.deinit(testing.allocator);
     try setCollectInt(&w, cat, 1, 1, &members, testing.allocator);

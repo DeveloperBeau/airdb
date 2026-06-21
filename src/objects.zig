@@ -419,10 +419,10 @@ fn objTmpPath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const 
     return std.fs.path.join(allocator, &.{ path_buf[0..dlen], name });
 }
 
-test "insert appends rows and rejects a duplicate primary key" {
+test "insert appends a row" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const path = try objTmpPath(testing.allocator, &tmp, "obj2.airdb");
+    const path = try objTmpPath(testing.allocator, &tmp, "obj2_append.airdb");
     defer testing.allocator.free(path);
     var db = try Db.create(testing.allocator, path);
     defer db.deinit();
@@ -433,6 +433,19 @@ test "insert appends rows and rejects a duplicate primary key" {
     const r2 = try insert(&w, cat, &.{ 200, 8, 0 });
     cat = r2.cat;
     try testing.expectEqual(@as(u64, 2), try liveCount(&w, cat));
+    w.deinit();
+}
+
+test "insert rejects a duplicate primary key" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "obj2_dup.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var cat = try create(&w, 3);
+    cat = (try insert(&w, cat, &.{ 100, 7, 1 })).cat;
     try testing.expectError(error.DuplicateKey, insert(&w, cat, &.{ 100, 9, 1 }));
     w.deinit();
 }
@@ -459,10 +472,49 @@ test "getByPk reads property values and the row version" {
     w.deinit();
 }
 
-test "update applies on a matching version and conflicts on a stale one" {
+test "update applies on a matching version" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const path = try objTmpPath(testing.allocator, &tmp, "obj4.airdb");
+    const path = try objTmpPath(testing.allocator, &tmp, "obj4_apply.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var cat: Ref = undefined;
+    var fetched_version: u64 = undefined;
+    {
+        var w = try db.beginWrite();
+        cat = try create(&w, 3);
+        cat = (try insert(&w, cat, &.{ 100, 7, 1 })).cat;
+        w.setRoot(cat);
+        _ = try w.commit();
+    }
+    {
+        var r = try db.beginRead();
+        var out: [3]u64 = undefined;
+        fetched_version = (try getByPk(&r, r.root(), 100, &out)).?;
+        r.end();
+    }
+    {
+        var w = try db.beginWrite();
+        const res = try update(&w, w.new_root, 100, &.{ 100, 77, 1 }, fetched_version);
+        try testing.expect(res == .ok);
+        cat = res.ok.cat;
+        w.setRoot(cat);
+        _ = try w.commit();
+    }
+    {
+        var r = try db.beginRead();
+        var out: [3]u64 = undefined;
+        _ = try getByPk(&r, r.root(), 100, &out);
+        try testing.expectEqual(@as(u64, 77), out[1]);
+        r.end();
+    }
+}
+
+test "update conflicts on a stale version" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "obj4_conflict.airdb");
     defer testing.allocator.free(path);
     var db = try Db.create(testing.allocator, path);
     defer db.deinit();
@@ -488,22 +540,14 @@ test "update applies on a matching version and conflicts on a stale one" {
         cat = res.ok.cat;
         const res2 = try update(&w, cat, 100, &.{ 100, 88, 1 }, fetched_version); // stale now
         try testing.expect(res2 == .conflict);
-        w.setRoot(cat);
-        _ = try w.commit();
-    }
-    {
-        var r = try db.beginRead();
-        var out: [3]u64 = undefined;
-        _ = try getByPk(&r, r.root(), 100, &out);
-        try testing.expectEqual(@as(u64, 77), out[1]);
-        r.end();
+        w.deinit();
     }
 }
 
-test "delete tombstones a row and conflicts on a stale version" {
+test "delete conflicts on a stale version" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const path = try objTmpPath(testing.allocator, &tmp, "obj5.airdb");
+    const path = try objTmpPath(testing.allocator, &tmp, "obj5_conflict.airdb");
     defer testing.allocator.free(path);
     var db = try Db.create(testing.allocator, path);
     defer db.deinit();
@@ -513,15 +557,46 @@ test "delete tombstones a row and conflicts on a stale version" {
     cat = (try insert(&w, cat, &.{ 200, 8, 0 })).cat;
     var out: [3]u64 = undefined;
     const v100 = (try getByPk(&w, cat, 100, &out)).?;
-
     const stale = try delete(&w, cat, 100, v100 + 1);
     try testing.expect(stale == .conflict);
+    w.deinit();
+}
 
+test "delete tombstones a row" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "obj5_tombstone.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var cat = try create(&w, 3);
+    cat = (try insert(&w, cat, &.{ 100, 7, 1 })).cat;
+    cat = (try insert(&w, cat, &.{ 200, 8, 0 })).cat;
+    var out: [3]u64 = undefined;
+    const v100 = (try getByPk(&w, cat, 100, &out)).?;
     const ok = try delete(&w, cat, 100, v100);
     try testing.expect(ok == .ok);
     cat = ok.ok;
     try testing.expectEqual(@as(?u64, null), try getByPk(&w, cat, 100, &out));
     try testing.expectEqual(@as(u64, 1), try liveCount(&w, cat));
+    w.deinit();
+}
+
+test "a deleted primary key can be reinserted" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "obj5_reinsert.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var cat = try create(&w, 3);
+    cat = (try insert(&w, cat, &.{ 100, 7, 1 })).cat;
+    cat = (try insert(&w, cat, &.{ 200, 8, 0 })).cat;
+    var out: [3]u64 = undefined;
+    const v100 = (try getByPk(&w, cat, 100, &out)).?;
+    cat = (try delete(&w, cat, 100, v100)).ok;
     // pk 100 can be reinserted after deletion
     cat = (try insert(&w, cat, &.{ 100, 70, 1 })).cat;
     try testing.expectEqual(@as(u64, 2), try liveCount(&w, cat));
@@ -634,10 +709,10 @@ test "typed insert and get round-trip a string property" {
     w.deinit();
 }
 
-test "typed update replaces a string and frees the old blob; delete frees blobs" {
+test "typed update on a stale version does not free the old blob" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const path = try objTmpPath(testing.allocator, &tmp, "str2.airdb");
+    const path = try objTmpPath(testing.allocator, &tmp, "str2_stale.airdb");
     defer testing.allocator.free(path);
     var db = try Db.create(testing.allocator, path);
     defer db.deinit();
@@ -651,10 +726,39 @@ test "typed update replaces a string and frees the old blob; delete frees blobs"
     try testing.expect(conflict == .conflict);
     _ = (try getTyped(&w, cat, 1, &out)).?;
     try testing.expectEqualStrings("short", out[1].bytes);
+    w.deinit();
+}
+
+test "typed update replaces a string" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "str2_replace.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var cat = try createTyped(&w, &.{ .int, .blob });
+    cat = (try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .bytes = "short" } })).cat;
+    var out: [2]Value = undefined;
+    const ver = (try getTyped(&w, cat, 1, &out)).?;
     const ures = try updateTyped(&w, cat, 1, &.{ .{ .int = 1 }, .{ .bytes = "a much longer value" } }, ver);
     cat = ures.ok.cat;
     _ = try getTyped(&w, cat, 1, &out);
     try testing.expectEqualStrings("a much longer value", out[1].bytes);
+    w.deinit();
+}
+
+test "typed delete removes the row" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "str2_delete.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var cat = try createTyped(&w, &.{ .int, .blob });
+    cat = (try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .bytes = "short" } })).cat;
+    var out: [2]Value = undefined;
     const v2 = (try getTyped(&w, cat, 1, &out)).?;
     const dres = try deleteTyped(&w, cat, 1, v2);
     cat = dres.ok;

@@ -102,10 +102,10 @@ fn objTmpPath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const 
     return std.fs.path.join(allocator, &.{ path_buf[0..dlen], name });
 }
 
-test "addProperty backfills a default and removeProperty drops a column" {
+test "addProperty backfills the default for existing rows" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const path = try objTmpPath(testing.allocator, &tmp, "mig1.airdb");
+    const path = try objTmpPath(testing.allocator, &tmp, "mig1_backfill.airdb");
     defer testing.allocator.free(path);
     var db = try Db.create(testing.allocator, path);
     defer db.deinit();
@@ -121,10 +121,41 @@ test "addProperty backfills a default and removeProperty drops a column" {
     _ = (try getByPk(&w, cat, 1, &out)).?;
     try testing.expectEqual(@as(u64, 10), out[1]);
     try testing.expectEqual(@as(u64, 7), out[2]); // backfilled
+    w.deinit();
+}
+
+test "addProperty: new inserts supply the added property" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "mig1_newinsert.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var cat = try create(&w, 2);
+    cat = (try insert(&w, cat, &.{ 1, 10 })).cat;
+    cat = (try insert(&w, cat, &.{ 2, 20 })).cat;
+    cat = try addProperty(&w, cat, .{ .kind = .int }, 7);
     // new inserts provide all three
     cat = (try insert(&w, cat, &.{ 3, 30, 99 })).cat;
+    var out: [3]u64 = undefined;
     _ = (try getByPk(&w, cat, 3, &out)).?;
     try testing.expectEqual(@as(u64, 99), out[2]);
+    w.deinit();
+}
+
+test "removeProperty drops a property and shifts the rest" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "mig1_remove.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var cat = try create(&w, 2);
+    cat = (try insert(&w, cat, &.{ 1, 10 })).cat;
+    cat = try addProperty(&w, cat, .{ .kind = .int }, 7);
+    cat = (try insert(&w, cat, &.{ 3, 30, 99 })).cat;
     // remove the middle property (index 1); now pk + the added prop
     cat = try removeProperty(&w, cat, 1);
     try testing.expectEqual(@as(PropCount, 2), try propCount(&w, cat));
