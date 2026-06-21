@@ -11,13 +11,38 @@ const Ref = @import("ref.zig").Ref;
 const Objects = @import("objects.zig");
 
 pub const Schema = []const []const Objects.PropKind;
+// Full schema: each type is a slice of PropDefs, so a multi-type directory can
+// hold link and collection properties (not just scalar kinds).
+pub const DefSchema = []const []const Objects.PropDef;
 pub const Value = Objects.Value;
 const PropKind = Objects.PropKind;
+const PropDef = Objects.PropDef;
 
 fn dirSize(tc: u16) usize {
     return 2 + @as(usize, tc) * 8;
 }
 
+// Pack `tc` catalog refs into a fresh directory node.
+fn writeDir(txn: *WriteTxn, cat_refs: []const Ref) !Ref {
+    const tc: u16 = @intCast(cat_refs.len);
+    const a = try txn.alloc(dirSize(tc));
+    std.mem.writeInt(u16, a.bytes[0..2], tc, .little);
+    for (cat_refs, 0..) |cref, i| {
+        std.mem.writeInt(u64, a.bytes[2 + i * 8 ..][0..8], cref, .little);
+    }
+    return a.ref;
+}
+
+// Create a directory from a full PropDef schema (supports links/collections).
+pub fn createWithDefs(txn: *WriteTxn, schema: DefSchema) !Ref {
+    std.debug.assert(schema.len <= 256);
+    var cat_refs: [256]Ref = undefined;
+    var t: usize = 0;
+    while (t < schema.len) : (t += 1) cat_refs[t] = try Objects.createDefs(txn, schema[t]);
+    return writeDir(txn, cat_refs[0..schema.len]);
+}
+
+// Scalar-kinds convenience: each property gets elem = int.
 pub fn create(txn: *WriteTxn, schema: Schema) !Ref {
     std.debug.assert(schema.len <= 256);
     var cat_refs: [256]Ref = undefined;
@@ -25,14 +50,7 @@ pub fn create(txn: *WriteTxn, schema: Schema) !Ref {
     while (t < schema.len) : (t += 1) {
         cat_refs[t] = try Objects.createTyped(txn, schema[t]);
     }
-    const tc: u16 = @intCast(schema.len);
-    const a = try txn.alloc(dirSize(tc));
-    std.mem.writeInt(u16, a.bytes[0..2], tc, .little);
-    var i: usize = 0;
-    while (i < schema.len) : (i += 1) {
-        std.mem.writeInt(u64, a.bytes[2 + i * 8 ..][0..8], cat_refs[i], .little);
-    }
-    return a.ref;
+    return writeDir(txn, cat_refs[0..schema.len]);
 }
 
 fn loadDir(txn: anytype, dir: Ref) !struct { type_count: u16, bytes: []const u8 } {
@@ -59,6 +77,36 @@ pub fn setCatalogRef(txn: *WriteTxn, dir: Ref, type_id: u16, new_cat: Ref) !Ref 
     const a = try txn.writableCopy(dir, dirSize(d.type_count));
     std.mem.writeInt(u64, a.bytes[2 + @as(usize, type_id) * 8 ..][0..8], new_cat, .little);
     return a.ref;
+}
+
+// Append an already-created catalog to the directory; returns grown dir + id.
+fn appendCatalog(txn: *WriteTxn, old_refs: []const Ref, new_cat: Ref) !Ref {
+    const old_tc = old_refs.len;
+    var refs: [256]Ref = undefined;
+    var t: usize = 0;
+    while (t < old_tc) : (t += 1) refs[t] = old_refs[t];
+    refs[old_tc] = new_cat;
+    return writeDir(txn, refs[0 .. old_tc + 1]);
+}
+
+// Snapshot existing catalog refs (before any file-growing create call).
+fn snapshotRefs(txn: anytype, dir: Ref, out: *[256]Ref) !u16 {
+    const d = try loadDir(txn, dir);
+    var t: usize = 0;
+    while (t < d.type_count) : (t += 1) {
+        out[t] = std.mem.readInt(u64, d.bytes[2 + t * 8 ..][0..8], .little);
+    }
+    return d.type_count;
+}
+
+// Append a new type from a full PropDef schema (supports links/collections).
+pub fn addTypeDefs(txn: *WriteTxn, dir: Ref, defs: []const PropDef) !struct { dir: Ref, type_id: u16 } {
+    var old_refs: [256]Ref = undefined;
+    const old_tc = try snapshotRefs(txn, dir, &old_refs);
+    std.debug.assert(old_tc < 256);
+    const new_cat = try Objects.createDefs(txn, defs);
+    const new_dir = try appendCatalog(txn, old_refs[0..old_tc], new_cat);
+    return .{ .dir = new_dir, .type_id = old_tc };
 }
 
 // Append a new object type to the directory and return the grown directory ref
@@ -143,6 +191,38 @@ pub fn delete(txn: *WriteTxn, dir: Ref, type_id: u16, pk: u64, expected_version:
 
 pub fn liveCount(txn: anytype, dir: Ref, type_id: u16) !u64 {
     return Objects.liveCount(txn, try catalogRef(txn, dir, type_id));
+}
+
+// --- link / to-many routing (mutators COW the directory) ---
+
+pub fn getLink(txn: anytype, dir: Ref, type_id: u16, pk: u64, prop: usize) !?u64 {
+    return Objects.getLink(txn, try catalogRef(txn, dir, type_id), pk, prop);
+}
+
+pub fn setLink(txn: *WriteTxn, dir: Ref, type_id: u16, pk: u64, prop: usize, target: ?u64) !Ref {
+    const cat = try catalogRef(txn, dir, type_id);
+    const new_cat = try Objects.setLink(txn, cat, pk, prop, target);
+    return try setCatalogRef(txn, dir, type_id, new_cat);
+}
+
+pub fn backlinkCount(txn: anytype, dir: Ref, type_id: u16, prop: usize, target: u64) !u64 {
+    return Objects.backlinkCount(txn, try catalogRef(txn, dir, type_id), prop, target);
+}
+
+pub fn linkSetAdd(txn: *WriteTxn, dir: Ref, type_id: u16, pk: u64, prop: usize, target: u64) !Ref {
+    const cat = try catalogRef(txn, dir, type_id);
+    const new_cat = try Objects.linkSetAdd(txn, cat, pk, prop, target);
+    return try setCatalogRef(txn, dir, type_id, new_cat);
+}
+
+pub fn linkSetRemove(txn: *WriteTxn, dir: Ref, type_id: u16, pk: u64, prop: usize, target: u64) !Ref {
+    const cat = try catalogRef(txn, dir, type_id);
+    const new_cat = try Objects.linkSetRemove(txn, cat, pk, prop, target);
+    return try setCatalogRef(txn, dir, type_id, new_cat);
+}
+
+pub fn linkSetContains(txn: anytype, dir: Ref, type_id: u16, pk: u64, prop: usize, target: u64) !bool {
+    return Objects.linkSetContains(txn, try catalogRef(txn, dir, type_id), pk, prop, target);
 }
 
 // ---------------------------------------------------------------------------
@@ -319,5 +399,44 @@ test "addType grows the directory and routes the new type" {
     var out: [3]Value = undefined;
     _ = (try get(&w, dir, 1, 1, &out)).?;
     try testing.expectEqual(@as(u64, 3), out[2].int);
+    w.deinit();
+}
+
+test "multi-type directory carries links and collections via createWithDefs" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tdTmpPath(testing.allocator, &tmp, "td6.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    const PD = Objects.PropDef;
+    // type 0: scalar (int pk, blob name); type 1: int pk + a to-one link + a to-many link_set
+    const schema = [_][]const PD{
+        &.{ .{ .kind = .int }, .{ .kind = .blob } },
+        &.{ .{ .kind = .int }, .{ .kind = .link }, .{ .kind = .link_set } },
+    };
+    var dir = try createWithDefs(&w, &schema);
+    try testing.expectEqual(@as(u16, 2), try typeCount(&w, dir));
+
+    // insert two type-1 rows; row a links to nothing, b's set links to a.
+    const a = try Objects.insertTyped(&w, try catalogRef(&w, dir, 1), &.{ .{ .int = 10 }, .{ .link = null }, .{ .link_set = &.{} } });
+    dir = try setCatalogRef(&w, dir, 1, a.cat);
+    const b = try Objects.insertTyped(&w, try catalogRef(&w, dir, 1), &.{ .{ .int = 20 }, .{ .link = a.row }, .{ .link_set = &.{a.row} } });
+    dir = try setCatalogRef(&w, dir, 1, b.cat);
+
+    // route a to-many add through the directory
+    dir = try linkSetAdd(&w, dir, 1, 20, 2, a.row); // already member -> no-op
+    try testing.expect(try linkSetContains(&w, dir, 1, 20, 2, a.row));
+    try testing.expectEqual(@as(?u64, a.row), try getLink(&w, dir, 1, 20, 1));
+    // a has 2 inbound to-one? no: only b's to-one links a -> backlink on prop 1 == 1
+    try testing.expectEqual(@as(u64, 1), try backlinkCount(&w, dir, 1, 1, a.row));
+
+    // addTypeDefs: append a type with a list property
+    const added = try addTypeDefs(&w, dir, &.{ .{ .kind = .int }, .{ .kind = .list, .elem = .int } });
+    dir = added.dir;
+    try testing.expectEqual(@as(u16, 2), added.type_id);
+    dir = (try insert(&w, dir, 2, &.{ .{ .int = 1 }, .{ .list_int = &.{ 7, 8, 9 } } })).dir;
+    try testing.expectEqual(@as(?u64, 3), try Objects.listLen(&w, try catalogRef(&w, dir, 2), 1, 1));
     w.deinit();
 }
