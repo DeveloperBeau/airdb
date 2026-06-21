@@ -229,6 +229,60 @@ pub fn linkSetContains(txn: anytype, dir: Ref, type_id: u16, pk: u64, prop: usiz
 }
 
 // ---------------------------------------------------------------------------
+// Cross-type link resolution and delete-nullify
+// ---------------------------------------------------------------------------
+
+pub fn resolveLink(txn: anytype, dir: Ref, src_type: u16, pk: u64, prop: usize) !?struct { target_type: u16, okey: u64 } {
+    const src_cat = try catalogRef(txn, dir, src_type);
+    const okey = (try links.getLink(txn, src_cat, pk, prop)) orelse return null;
+    const target_type = (try catalog.loadCatalog(txn, src_cat)).linkTarget(prop);
+    return .{ .target_type = target_type, .okey = okey };
+}
+
+// Materialize the linked object into `out` (sized to the TARGET type's prop_count).
+// Returns the target row version, or null if the link is unset or the target is gone.
+pub fn getLinked(txn: anytype, dir: Ref, src_type: u16, pk: u64, prop: usize, out: []Value) !?u64 {
+    const r = (try resolveLink(txn, dir, src_type, pk, prop)) orelse return null;
+    const target_cat = try catalogRef(txn, dir, r.target_type);
+    return Objects.getTypedByOkey(txn, target_cat, r.okey, out);
+}
+
+pub fn deleteNullifyX(txn: *WriteTxn, dir: Ref, type_id: u16, pk: u64, expected_version: u64) !DeleteResult {
+    const cat0 = try catalogRef(txn, dir, type_id);
+    const pc = (try catalog.loadCatalog(txn, cat0)).prop_count;
+    var buf: [256]u64 = undefined;
+    const ver = (try Objects.getByPk(txn, cat0, pk, buf[0..pc])) orelse return .not_found;
+    if (ver != expected_version) return .{ .conflict = .{ .current_version = ver } };
+    const okey = (try catalog.resolveProp(txn, cat0, pk, 0)).?.row;
+
+    // Nullify inbound links to `okey` across every type. For the deleted object's
+    // OWN catalog, match all link props (they are definitionally same-type); for
+    // other types, match only props whose linkTarget == type_id.
+    var cur = dir;
+    const tc = try typeCount(txn, cur);
+    var s: u16 = 0;
+    while (s < tc) : (s += 1) {
+        const s_cat = try catalogRef(txn, cur, s);
+        const new_s = try links.nullifyInboundInCatalog(txn, s_cat, okey, type_id, s == type_id);
+        cur = try setCatalogRef(txn, cur, s, new_s);
+    }
+    // Clean the deleted object's own outbound backlink entries.
+    {
+        const t_cat = try catalogRef(txn, cur, type_id);
+        const cleaned = try links.cleanOutboundInCatalog(txn, t_cat, okey);
+        cur = try setCatalogRef(txn, cur, type_id, cleaned);
+    }
+    // Tombstone the row.
+    const t_cat2 = try catalogRef(txn, cur, type_id);
+    const dres = try Objects.delete(txn, t_cat2, pk, expected_version);
+    return switch (dres) {
+        .ok => |new_cat| .{ .ok = try setCatalogRef(txn, cur, type_id, new_cat) },
+        .conflict => |c| .{ .conflict = c },
+        .not_found => .not_found,
+    };
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -442,4 +496,109 @@ test "multi-type directory carries links and collections via createWithDefs" {
     dir = (try insert(&w, dir, 2, &.{ .{ .int = 1 }, .{ .list_int = &.{ 7, 8, 9 } } })).dir;
     try testing.expectEqual(@as(?u64, 3), try collections.listLen(&w, try catalogRef(&w, dir, 2), 1, 1));
     w.deinit();
+}
+
+test "a cross-type link resolves to the target type's object" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tdTmpPath(testing.allocator, &tmp, "tdx1.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    const PD = catalog.PropDef;
+    const schema = [_][]const PD{
+        &.{ .{ .kind = .int }, .{ .kind = .blob } }, // 0: Author
+        &.{ .{ .kind = .int }, .{ .kind = .link, .link_target = 0 } }, // 1: Book.author -> Author
+    };
+    var dir = try createWithDefs(&w, &schema);
+
+    const ains = try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .bytes = "Ada" } });
+    dir = ains.dir;
+    const author_okey = ains.row;
+    dir = (try insert(&w, dir, 1, &.{ .{ .int = 1 }, .{ .link = author_okey } })).dir;
+
+    const r = (try resolveLink(&w, dir, 1, 1, 1)).?;
+    try testing.expectEqual(@as(u16, 0), r.target_type);
+    try testing.expectEqual(author_okey, r.okey);
+
+    var out: [2]Value = undefined;
+    _ = (try getLinked(&w, dir, 1, 1, 1, &out)).?;
+    try testing.expectEqualStrings("Ada", out[1].bytes);
+    w.deinit();
+}
+
+test "deleting a target nullifies inbound links from another type" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tdTmpPath(testing.allocator, &tmp, "tdx2.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    const PD = catalog.PropDef;
+    const schema = [_][]const PD{
+        &.{ .{ .kind = .int }, .{ .kind = .blob } }, // 0: Author
+        &.{ .{ .kind = .int }, .{ .kind = .link, .link_target = 0 } }, // 1: Book.author -> Author
+    };
+    var dir = try createWithDefs(&w, &schema);
+
+    const ains = try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .bytes = "Ada" } });
+    dir = ains.dir;
+    const author_okey = ains.row;
+    dir = (try insert(&w, dir, 1, &.{ .{ .int = 1 }, .{ .link = author_okey } })).dir;
+    dir = (try insert(&w, dir, 1, &.{ .{ .int = 2 }, .{ .link = author_okey } })).dir;
+
+    try testing.expectEqual(@as(u64, 2), try backlinkCount(&w, dir, 1, 1, author_okey));
+
+    var abuf: [2]Value = undefined;
+    const author_ver = (try get(&w, dir, 0, 1, &abuf)).?;
+    const dres = try deleteNullifyX(&w, dir, 0, 1, author_ver);
+    dir = dres.ok;
+
+    try testing.expectEqual(@as(?u64, null), try getLink(&w, dir, 1, 1, 1));
+    try testing.expectEqual(@as(?u64, null), try getLink(&w, dir, 1, 2, 1));
+    try testing.expectEqual(@as(u64, 0), try backlinkCount(&w, dir, 1, 1, author_okey));
+    w.deinit();
+}
+
+test "cross-type links persist across reopen" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tdTmpPath(testing.allocator, &tmp, "tdx3.airdb");
+    defer testing.allocator.free(path);
+    const PD = catalog.PropDef;
+    const schema = [_][]const PD{
+        &.{ .{ .kind = .int }, .{ .kind = .blob } }, // 0: Author
+        &.{ .{ .kind = .int }, .{ .kind = .link, .link_target = 0 } }, // 1: Book.author -> Author
+    };
+    var author_okey: u64 = undefined;
+    {
+        var db = try Db.create(testing.allocator, path);
+        defer db.deinit();
+        var w = try db.beginWrite();
+        var dir = try createWithDefs(&w, &schema);
+        const ains = try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .bytes = "Ada" } });
+        dir = ains.dir;
+        author_okey = ains.row;
+        var i: u64 = 1;
+        while (i <= 20) : (i += 1) {
+            dir = (try insert(&w, dir, 1, &.{ .{ .int = i }, .{ .link = author_okey } })).dir;
+        }
+        w.setRoot(dir);
+        _ = try w.commit();
+    }
+    {
+        var db = try Db.open(testing.allocator, path);
+        defer db.deinit();
+        var r = try db.beginRead();
+        try testing.expectEqual(@as(u64, 20), try backlinkCount(&r, r.root(), 1, 1, author_okey));
+        const res = (try resolveLink(&r, r.root(), 1, 7, 1)).?;
+        try testing.expectEqual(@as(u16, 0), res.target_type);
+        try testing.expectEqual(author_okey, res.okey);
+        var out: [2]Value = undefined;
+        _ = (try getLinked(&r, r.root(), 1, 13, 1, &out)).?;
+        try testing.expectEqualStrings("Ada", out[1].bytes);
+        r.end();
+    }
 }
