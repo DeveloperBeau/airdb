@@ -437,6 +437,72 @@ pub fn compactToNewFile(allocator: std.mem.Allocator, src_path: []const u8, dst_
     dst_db_alive = false;
 }
 
+const Io = std.Io;
+
+// Delete an absolute path, treating a missing file as success. Used to remove
+// coordination files during the publish step of in-place compaction. Any other
+// failure is swallowed best-effort: the data file is already published by the
+// atomic rename, and a leftover/stale coord is recreated fresh by Db.open
+// (openOrCreate), so it cannot corrupt the published data.
+fn deleteAbsoluteIgnoreMissing(io: Io, abs_path: []const u8) void {
+    Io.Dir.deleteFileAbsolute(io, abs_path) catch {};
+}
+
+// Best-effort fsync of the directory containing `path` so a rename into it is
+// durable across a crash. POSIX fsync on a directory fd flushes the directory
+// entry; we obtain it by opening the parent dir and syncing its handle. All
+// errors are swallowed: the atomic rename already gives crash-safety of the
+// data file's contents; this only tightens durability of the rename itself.
+fn syncParentDir(io: Io, path: []const u8) void {
+    const dir_path = std.fs.path.dirname(path) orelse return;
+    var dir = Io.Dir.openDirAbsolute(io, dir_path, .{}) catch return;
+    defer dir.close(io);
+    const dir_file = Io.File{ .handle = dir.handle, .flags = .{ .nonblocking = false } };
+    dir_file.sync(io) catch {};
+}
+
+// Compact a database file in place, crash-safely.
+//
+// The live data is first compacted into a sibling temp file "<path>.compacting"
+// (written, verified equivalent, committed, and fsync'd by compactToNewFile),
+// then the temp data file is atomically renamed over the original. The rename is
+// the single publish point: a crash BEFORE it leaves the original `path`
+// completely untouched (the orphan `.compacting` temp is simply overwritten on
+// the next run); a crash AFTER it leaves the new compacted file in place, and
+// the coord is recreated on the next Db.open.
+//
+// After the rename the stale coordination files are removed so the next open
+// recreates "<path>.coord" fresh: the old coord describes the pre-compaction
+// data file, and the temp's coord is orphaned once its data file is renamed away.
+//
+// `path` must be ABSOLUTE. The caller must close ALL handles to the database
+// (and end any read/write transactions) before calling this -- there must be no
+// other open Db on `path` while it is replaced.
+pub fn compactInPlace(allocator: std.mem.Allocator, path: []const u8) !void {
+    // Build "<path>.compacting" temp path.
+    const tmp = try std.fmt.allocPrint(allocator, "{s}.compacting", .{path});
+    defer allocator.free(tmp);
+
+    // 1) Compact into the temp file (verified + committed inside compactToNewFile).
+    try compactToNewFile(allocator, path, tmp);
+
+    // 2) Publish atomically: rename temp data file over the original. Note the
+    //    0.16 signature takes `io` LAST: renameAbsolute(old, new, io).
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try Io.Dir.renameAbsolute(tmp, path, io);
+
+    // 3) Remove stale coord files; next open recreates path.coord fresh.
+    const tmp_coord = try std.fmt.allocPrint(allocator, "{s}.coord", .{tmp});
+    defer allocator.free(tmp_coord);
+    const path_coord = try std.fmt.allocPrint(allocator, "{s}.coord", .{path});
+    defer allocator.free(path_coord);
+    deleteAbsoluteIgnoreMissing(io, path_coord); // old coord (now describes replaced data)
+    deleteAbsoluteIgnoreMissing(io, tmp_coord); // compaction's coord (orphaned by the rename)
+
+    // 4) Best-effort directory fsync so the rename is durable.
+    syncParentDir(io, path);
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -810,4 +876,99 @@ test "compactToNewFile produces a verified, smaller, equivalent file" {
     // A deleted book (pk 3) is absent.
     var b3: [3]catalog.Value = undefined;
     try testing.expectEqual(@as(?u64, null), try typedir.get(&r, dir, 1, 3, &b3));
+}
+
+test "compactInPlace shrinks and preserves data" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try cmpTmpPath(testing.allocator, &tmp, "inplace.airdb");
+    defer testing.allocator.free(path);
+
+    const PD = catalog.PropDef;
+
+    // Build a churned database (two types) at `path`, then CLOSE it so no handle
+    // remains while compactInPlace replaces the file. Capture the logical size
+    // (arena high-water) before closing to compare against the compacted file.
+    var pre_top: u64 = undefined;
+    var author_okeys: [200]u64 = undefined;
+    {
+        var db = try Db.create(testing.allocator, path);
+        var w = try db.beginWrite();
+        const schema = [_][]const PD{
+            &.{ .{ .kind = .int }, .{ .kind = .blob } }, // 0: Author{int pk, blob name}
+            &.{ .{ .kind = .int }, .{ .kind = .link, .link_target = 0 } }, // 1: Book{int pk, link author}
+        };
+        var dir = try typedir.createTypes(&w, &schema, &.{ false, false });
+
+        var i: u64 = 0;
+        var nbuf: [32]u8 = undefined;
+        while (i < 200) : (i += 1) {
+            const s = try std.fmt.bufPrint(&nbuf, "author-{d}", .{i});
+            const r = try typedir.insert(&w, dir, 0, &.{ .{ .int = i }, .{ .bytes = s } });
+            dir = r.dir;
+            author_okeys[@intCast(i)] = r.row;
+        }
+        i = 0;
+        while (i < 200) : (i += 1) {
+            const r = try typedir.insert(&w, dir, 1, &.{ .{ .int = i }, .{ .link = author_okeys[@intCast(i)] } });
+            dir = r.dir;
+        }
+        // Churn: delete every even-pk book (~100 holes).
+        i = 0;
+        while (i < 200) : (i += 2) {
+            var out: [2]catalog.Value = undefined;
+            const ver = (try typedir.get(&w, dir, 1, i, &out)).?;
+            const dres = try typedir.deleteNullifyX(&w, dir, 1, i, ver);
+            dir = dres.ok;
+        }
+        w.setRoot(dir);
+        _ = try w.commit();
+
+        pre_top = db.arena.top;
+        db.deinit();
+    }
+
+    // Compact in place over the SAME path.
+    try compactInPlace(testing.allocator, path);
+
+    // The ".compacting" temp data file must have been renamed away.
+    {
+        const temp_data = try std.fmt.allocPrint(testing.allocator, "{s}.compacting", .{path});
+        defer testing.allocator.free(temp_data);
+        const io = std.Io.Threaded.global_single_threaded.io();
+        try testing.expectError(error.FileNotFound, Io.Dir.openFileAbsolute(io, temp_data, .{}));
+    }
+
+    // Reopen the SAME path and verify the live data survived intact.
+    var db = try Db.open(testing.allocator, path);
+    defer db.deinit();
+
+    // The compacted file's logical footprint must not exceed the churned source's.
+    try testing.expect(db.arena.top <= pre_top);
+
+    var r = try db.beginRead();
+    defer r.end();
+    const dir = r.root();
+
+    // All 200 authors survive; only the 100 odd-pk books remain.
+    try testing.expectEqual(@as(u64, 200), try typedir.liveCount(&r, dir, 0));
+    try testing.expectEqual(@as(u64, 100), try typedir.liveCount(&r, dir, 1));
+
+    // A surviving author reads back identically.
+    var ao: [2]catalog.Value = undefined;
+    _ = (try typedir.get(&r, dir, 0, 137, &ao)).?;
+    try testing.expectEqual(@as(u64, 137), ao[0].int);
+    try testing.expectEqualStrings("author-137", ao[1].bytes);
+
+    // A surviving (odd-pk) book keeps its author link, resolving to the same author.
+    var bo: [2]catalog.Value = undefined;
+    _ = (try typedir.get(&r, dir, 1, 137, &bo)).?;
+    try testing.expectEqual(@as(?u64, author_okeys[137]), try typedir.getLink(&r, dir, 1, 137, 1));
+    var la: [2]catalog.Value = undefined;
+    _ = (try typedir.getLinked(&r, dir, 1, 137, 1, &la)).?;
+    try testing.expectEqual(@as(u64, 137), la[0].int);
+
+    // A deleted (even-pk) book is absent.
+    var b2: [2]catalog.Value = undefined;
+    try testing.expectEqual(@as(?u64, null), try typedir.get(&r, dir, 1, 42, &b2));
 }
