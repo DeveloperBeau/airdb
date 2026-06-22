@@ -448,19 +448,6 @@ fn deleteAbsoluteIgnoreMissing(io: Io, abs_path: []const u8) void {
     Io.Dir.deleteFileAbsolute(io, abs_path) catch {};
 }
 
-// Best-effort fsync of the directory containing `path` so a rename into it is
-// durable across a crash. POSIX fsync on a directory fd flushes the directory
-// entry; we obtain it by opening the parent dir and syncing its handle. All
-// errors are swallowed: the atomic rename already gives crash-safety of the
-// data file's contents; this only tightens durability of the rename itself.
-fn syncParentDir(io: Io, path: []const u8) void {
-    const dir_path = std.fs.path.dirname(path) orelse return;
-    var dir = Io.Dir.openDirAbsolute(io, dir_path, .{}) catch return;
-    defer dir.close(io);
-    const dir_file = Io.File{ .handle = dir.handle, .flags = .{ .nonblocking = false } };
-    dir_file.sync(io) catch {};
-}
-
 // Compact a database file in place, crash-safely.
 //
 // The live data is first compacted into a sibling temp file "<path>.compacting"
@@ -499,8 +486,11 @@ pub fn compactInPlace(allocator: std.mem.Allocator, path: []const u8) !void {
     deleteAbsoluteIgnoreMissing(io, path_coord); // old coord (now describes replaced data)
     deleteAbsoluteIgnoreMissing(io, tmp_coord); // compaction's coord (orphaned by the rename)
 
-    // 4) Best-effort directory fsync so the rename is durable.
-    syncParentDir(io, path);
+    // NOTE: the data file is F_FULLFSYNC'd by compactToNewFile and the rename is
+    // atomic, so the publish (which file `path` names) is crash-safe. Making the
+    // directory ENTRY itself durable across power loss would need a portable
+    // directory fsync; std.Io's file sync panics on a directory handle on Linux,
+    // so that hardening is deferred rather than done non-portably here.
 }
 
 // ---------------------------------------------------------------------------
