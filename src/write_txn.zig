@@ -45,7 +45,11 @@ pub const WriteTxn = struct {
         //    processes' min-pinned versions, clamped to this writer's active_version. Without a
         //    participant slot this process cannot advertise its readers, so it stays bump-only.
         const h: u64 = if (self.db.participant_slot == null) 0 else self.db.coord.globalHorizon(self.db.active_version);
-        if (self.db.arena.allocFromPool(&self.work_freelist, size, h)) |a| return a;
+        // Clamp by the retention window: withhold space freed within the most recent
+        // `retain_versions` versions. With retain_versions == 0, eff == h (h is already
+        // <= active_version), so behavior is unchanged.
+        const eff = @min(h, self.db.active_version -| self.db.retain_versions);
+        if (self.db.arena.allocFromPool(&self.work_freelist, size, eff)) |a| return a;
         // 3. Bump-allocate, growing the file if the arena is full.
         return self.db.bumpGrowing(size);
     }
@@ -216,11 +220,73 @@ pub const WriteTxn = struct {
 // Tests
 // ---------------------------------------------------------------------------
 
+const catalog = @import("catalog.zig");
+const objects = @import("objects.zig");
+
 fn tmpFilePath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const u8) ![]const u8 {
     var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
     const path_len = try tmp.dir.realPath(testing.io, &path_buf);
     const dir_path = path_buf[0..path_len];
     return std.fs.path.join(allocator, &.{ dir_path, name });
+}
+
+// Churn a single-row int type across `n` commits: each iteration commits an insert
+// then commits a delete, so every cycle frees committed nodes into the free pool.
+// Returns the final logical size (arena high-water).
+fn churnLogicalSize(path: []const u8, retain: u64, n: u64) !u64 {
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    db.setRetainVersions(retain);
+
+    var cat: Ref = blk: {
+        var w = try db.beginWrite();
+        const c = try catalog.create(&w, 1);
+        w.setRoot(c);
+        _ = try w.commit();
+        break :blk c;
+    };
+
+    var i: u64 = 0;
+    while (i < n) : (i += 1) {
+        {
+            var w = try db.beginWrite();
+            cat = db.active_root; // reload the committed catalog ref
+            const r = try objects.insert(&w, cat, &.{i});
+            cat = r.cat;
+            w.setRoot(cat);
+            _ = try w.commit();
+        }
+        {
+            var w = try db.beginWrite();
+            cat = db.active_root;
+            var out: [1]u64 = undefined;
+            const ver = (try objects.getByPk(&w, cat, i, &out)).?;
+            cat = switch (try objects.delete(&w, cat, i, ver)) {
+                .ok => |c| c,
+                else => unreachable,
+            };
+            w.setRoot(cat);
+            _ = try w.commit();
+        }
+    }
+    return db.logicalSize();
+}
+
+test "retention window withholds recently freed space from reuse" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const p0 = try tmpFilePath(testing.allocator, &tmp, "retain0.airdb");
+    defer testing.allocator.free(p0);
+    const p1 = try tmpFilePath(testing.allocator, &tmp, "retainmax.airdb");
+    defer testing.allocator.free(p1);
+
+    const n: u64 = 200;
+    const size0 = try churnLogicalSize(p0, 0, n); // reuse freed space
+    const size1 = try churnLogicalSize(p1, 1_000_000, n); // retain everything -> no reuse
+
+    // Retaining all recently-freed space prevents reuse, so the arena must grow
+    // strictly larger than the reuse-enabled run.
+    try testing.expect(size1 > size0);
 }
 
 test "writableCopy allocates a new node, copies bytes, and records the old as freed" {
