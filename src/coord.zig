@@ -18,6 +18,7 @@
 //   - File.length(io), File.setLength(io, n), File.close(io)
 
 const std = @import("std");
+const platform = @import("platform.zig");
 
 pub fn coordIo() std.Io {
     return std.Io.Threaded.global_single_threaded.io();
@@ -35,23 +36,13 @@ const participants_off: usize = 64;
 const slot_stride: usize = 16;
 
 fn currentPid() u32 {
-    return @intCast(std.c.getpid());
+    return platform.currentPid();
 }
 
 /// Returns true if the process with the given pid is alive.
 /// pid==0 is always considered dead (free slot sentinel).
-/// Uses kill(pid, 0): success or EPERM means alive; ESRCH means dead.
 fn pidAlive(pid: u32) bool {
-    if (pid == 0) return false;
-    std.posix.kill(
-        @as(std.posix.pid_t, @intCast(pid)),
-        @as(std.posix.SIG, @enumFromInt(0)),
-    ) catch |e| switch (e) {
-        error.ProcessNotFound => return false, // ESRCH: no such process
-        error.PermissionDenied => return true, // EPERM: alive, not ours
-        else => return true, // conservative: treat unknown errors as alive
-    };
-    return true;
+    return platform.processAlive(pid);
 }
 
 pub const Coord = struct {
@@ -76,15 +67,8 @@ pub const Coord = struct {
         const len = try file.length(io);
         if (len < coord_size) try file.setLength(io, coord_size);
 
-        const map = try std.posix.mmap(
-            null,
-            coord_size,
-            .{ .READ = true, .WRITE = true },
-            .{ .TYPE = .SHARED },
-            file.handle,
-            0,
-        );
-        errdefer std.posix.munmap(map);
+        const map = try platform.mapFixedSize(file, coord_size);
+        errdefer platform.unmap(map);
 
         const magic = std.mem.readInt(u64, map[off_magic..][0..8], .little);
         if (magic != coord_magic) {
@@ -98,7 +82,7 @@ pub const Coord = struct {
     }
 
     pub fn deinit(self: *Coord) void {
-        std.posix.munmap(self.map);
+        platform.unmap(self.map);
         self.file.close(coordIo());
     }
 
@@ -137,27 +121,18 @@ pub const Coord = struct {
 
     /// Block until this process/thread holds an exclusive flock on the coord file.
     pub fn lockExclusive(self: *Coord) !void {
-        const rc = std.c.flock(self.file.handle, std.posix.LOCK.EX);
-        switch (std.c.errno(rc)) {
-            .SUCCESS => {},
-            else => |e| return std.posix.unexpectedErrno(e),
-        }
+        _ = try platform.lockFileExclusive(self.file, true);
     }
 
     /// Non-blocking exclusive flock attempt.
     /// Returns error.WouldBlock immediately if another holder holds the lock.
     pub fn tryLockExclusive(self: *Coord) !void {
-        const rc = std.c.flock(self.file.handle, std.posix.LOCK.EX | std.posix.LOCK.NB);
-        switch (std.c.errno(rc)) {
-            .SUCCESS => {},
-            .AGAIN => return error.WouldBlock,
-            else => |e| return std.posix.unexpectedErrno(e),
-        }
+        if (!try platform.lockFileExclusive(self.file, false)) return error.WouldBlock;
     }
 
     /// Release the flock held by this file description.
     pub fn unlock(self: *Coord) void {
-        _ = std.c.flock(self.file.handle, std.posix.LOCK.UN);
+        platform.unlockFile(self.file);
     }
 
     fn slotPidPtr(self: *Coord, idx: usize) *u32 {

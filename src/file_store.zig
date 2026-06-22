@@ -18,6 +18,7 @@
 const std = @import("std");
 const testing = std.testing;
 const Io = std.Io;
+const platform = @import("platform.zig");
 const Syncer = @import("syncer.zig").Syncer;
 const RealSyncer = @import("syncer.zig").RealSyncer;
 
@@ -49,10 +50,10 @@ pub const Header = struct {
 pub const FileStore = struct {
     allocator: std.mem.Allocator, // reserved for future allocations (buffer pool, catalog pages)
     file: Io.File,
-    /// File-backed prefix of the reservation: reserved.ptr[0..file_len].
+    /// File-backed prefix of the reservation: mapping.current() (== mapping.map).
     map: []align(std.heap.page_size_min) u8,
-    /// The full 1 GiB virtual reservation; munmap'd once in deinit.
-    reserved: []align(std.heap.page_size_min) u8,
+    /// The growable, base-stable mapping; unmapped once in deinit.
+    mapping: platform.Mapping,
     header: Header,
     syncer: Syncer,
     /// True when the header CRC32 matches the stored checksum at [28..32].
@@ -61,12 +62,9 @@ pub const FileStore = struct {
     header_checksum_ok: bool,
 
     const initial_capacity: usize = default_page_size * 256;
-    /// Virtual address reservation, and so the per-open maximum file size. It is never
-    /// backed by physical pages beyond what the file actually covers (PROT_NONE reservation;
-    /// the file mapping is demand-paged), and the base pointer never moves after creation.
-    /// 64-bit hosts reserve 1 TiB (negligible against a ~128 TiB address space). 32-bit hosts
-    /// reserve 1 GiB (a quarter of their ~4 GiB address space).
-    pub const max_reserved: usize = if (@bitSizeOf(usize) >= 64) (1 << 40) else (1 << 30);
+    /// Per-open maximum file size; the size of the virtual address reservation backing
+    /// the mapping. See `platform.max_reserved` for the rationale and host-size split.
+    pub const max_reserved: usize = platform.max_reserved;
 
     /// Returns the blocking Io instance used for all file operations.
     /// This is always initialized (compile-time constant vtable), so it
@@ -74,24 +72,6 @@ pub const FileStore = struct {
     // Phase 1 single-process/single-thread only. Phase 4 (multi-process/threaded) must replace this global Io.
     inline fn sysIo() Io {
         return std.Io.Threaded.global_single_threaded.io();
-    }
-
-    /// Reserve-then-commit helper: map `fd` at `reserved_ptr` with MAP_FIXED.
-    /// The caller must have already obtained `reserved_ptr` from an anonymous
-    /// PROT_NONE reservation large enough to hold `len` bytes.
-    fn mapFileOver(
-        reserved_ptr: [*]align(std.heap.page_size_min) u8,
-        fd: std.posix.fd_t,
-        len: usize,
-    ) ![]align(std.heap.page_size_min) u8 {
-        return std.posix.mmap(
-            reserved_ptr,
-            len,
-            .{ .READ = true, .WRITE = true },
-            .{ .TYPE = .SHARED, .FIXED = true },
-            fd,
-            0,
-        );
     }
 
     /// Create a new database file at the given absolute path, truncating any
@@ -110,26 +90,16 @@ pub const FileStore = struct {
 
         try file.setLength(io, initial_capacity);
 
-        // Step 1: reserve a contiguous 1 GiB virtual range with PROT_NONE so the
+        // Reserve a contiguous virtual range and map the file over its start, so the
         // base address is fixed for the lifetime of this FileStore.
-        const reserved = try std.posix.mmap(
-            null,
-            max_reserved,
-            .{},
-            .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
-            -1,
-            0,
-        );
-        errdefer std.posix.munmap(reserved);
-
-        // Step 2: map the file over the start of the reservation with MAP_FIXED.
-        const map = try mapFileOver(reserved.ptr, file.handle, initial_capacity);
+        var mapping = try platform.mapFile(file, initial_capacity, max_reserved);
+        errdefer mapping.deinit();
 
         var fs = FileStore{
             .allocator = allocator,
             .file = file,
-            .map = map,
-            .reserved = reserved,
+            .map = mapping.current(),
+            .mapping = mapping,
             .header = .{
                 .magic = airdb_magic,
                 .page_size = default_page_size,
@@ -160,25 +130,15 @@ pub const FileStore = struct {
         const file_len = try file.length(io);
         if (file_len < default_page_size) return error.Corrupt;
 
-        // Step 1: reserve 1 GiB virtual range with PROT_NONE.
-        const reserved = try std.posix.mmap(
-            null,
-            max_reserved,
-            .{},
-            .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
-            -1,
-            0,
-        );
-        errdefer std.posix.munmap(reserved);
-
-        // Step 2: map the file over the start of the reservation with MAP_FIXED.
-        const map = try mapFileOver(reserved.ptr, file.handle, @intCast(file_len));
+        // Reserve a contiguous virtual range and map the file over its start.
+        var mapping = try platform.mapFile(file, @intCast(file_len), max_reserved);
+        errdefer mapping.deinit();
 
         var fs = FileStore{
             .allocator = allocator,
             .file = file,
-            .map = map,
-            .reserved = reserved,
+            .map = mapping.current(),
+            .mapping = mapping,
             .header = undefined,
             .syncer = syncer,
             .header_checksum_ok = false, // set by readHeader below
@@ -190,7 +150,7 @@ pub const FileStore = struct {
     /// Unmap and close the file.
     /// Unmapping the full reservation also unmaps the file-backed prefix at its start.
     pub fn deinit(self: *FileStore) void {
-        std.posix.munmap(self.reserved);
+        self.mapping.deinit();
         self.file.close(sysIo());
     }
 
@@ -271,7 +231,8 @@ pub const FileStore = struct {
         if (new_len > max_reserved) return error.FileTooLarge;
         if (new_len <= self.map.len) return;
         try self.file.setLength(sysIo(), new_len);
-        self.map = try mapFileOver(self.reserved.ptr, self.file.handle, new_len);
+        try self.mapping.grow(self.file, new_len);
+        self.map = self.mapping.current();
     }
 
     /// Return the current on-disk file length in bytes.
