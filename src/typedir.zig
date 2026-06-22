@@ -292,7 +292,7 @@ pub fn deleteNullifyX(txn: *WriteTxn, dir: Ref, type_id: u16, pk: u64, expected_
     var buf: [256]u64 = undefined;
     const ver = (try Objects.getByPk(txn, cat0, pk, buf[0..pc])) orelse return .not_found;
     if (ver != expected_version) return .{ .conflict = .{ .current_version = ver } };
-    const okey = (try catalog.resolveProp(txn, cat0, pk, 0)).?.row;
+    const okey = (try catalog.pkToOkey(txn, cat0, pk)).?;
 
     // BLOCK check (top-level only): refuse if any block-rule link points at it.
     const tc = try typeCount(txn, dir);
@@ -933,6 +933,56 @@ test "deleting the owner cascades to the embedded child" {
     try testing.expectEqual(@as(u64, 0), try liveCount(&w, dir, 1));
     w.deinit();
 }
+
+test "directory delete works after relocating the target" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tdTmpPath(testing.allocator, &tmp, "reloc_del.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    const PD = catalog.PropDef;
+    const schema = [_][]const PD{
+        &.{ .{ .kind = .int }, .{ .kind = .blob } }, // 0: Author
+        &.{ .{ .kind = .int }, .{ .kind = .link, .link_target = 0 } }, // 1: Book.author -> Author
+    };
+    var dir = try createWithDefs(&w, &schema);
+
+    // A throwaway author opens a dead slot for the real author to move into.
+    const throwaway = try insert(&w, dir, 0, &.{ .{ .int = 99 }, .{ .bytes = "tmp" } });
+    dir = throwaway.dir;
+    const throwaway_okey = throwaway.row;
+
+    const author = try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .bytes = "Ada" } });
+    dir = author.dir;
+    const author_okey = author.row;
+
+    // A book links the real author by its stable okey.
+    dir = (try insert(&w, dir, 1, &.{ .{ .int = 1 }, .{ .link = author_okey } })).dir;
+    try testing.expectEqual(@as(?u64, author_okey), try getLink(&w, dir, 1, 1, 1));
+
+    // Free the throwaway's physical slot, then relocate the author into it.
+    const author_cat = try catalogRef(&w, dir, 0);
+    const dead_row = (try catalog.okeyToRow(&w, author_cat, throwaway_okey)).?;
+    var vbuf: [2]Value = undefined;
+    const tv = (try get(&w, dir, 0, 99, &vbuf)).?;
+    const dthrow = try delete(&w, dir, 0, 99, tv);
+    dir = dthrow.ok;
+    const relocated = try relocation.relocateRow(&w, try catalogRef(&w, dir, 0), author_okey, dead_row);
+    dir = try setCatalogRef(&w, dir, 0, relocated);
+
+    // Deleting the author must nullify the book's link, proving the delete used
+    // the object key rather than a stale physical row.
+    var abuf: [2]Value = undefined;
+    const author_ver = (try get(&w, dir, 0, 1, &abuf)).?;
+    const dres = try deleteNullifyX(&w, dir, 0, 1, author_ver);
+    dir = dres.ok;
+    try testing.expectEqual(@as(?u64, null), try getLink(&w, dir, 1, 1, 1));
+    w.deinit();
+}
+
+const relocation = @import("relocation.zig");
 
 test "cascade is cycle-safe" {
     var tmp = testing.tmpDir(.{});

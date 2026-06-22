@@ -175,12 +175,18 @@ pub fn delete(txn: *WriteTxn, cat: Ref, pk: u64, expected_version: u64) !DeleteR
     var live_ref = v.live_col_ref;
     var ver_ref = v.version_col_ref;
     var idx_ref = v.pk_index_ref;
+    var keyrow_ref = v.keyrow_index_ref;
 
     live_ref = try Column.set(txn, live_ref, row, 0); // tombstone
     ver_ref = try Column.set(txn, ver_ref, row, txn.new_version); // bump version stamp
     idx_ref = try Index.remove(txn, idx_ref, pk); // remove pk from the index
+    // Drop the object key from the key->row index. Copy-on-write keeps the old
+    // index version intact for any reader pinned to the prior snapshot, so this
+    // is MVCC-safe; it prevents a stale key from aliasing a row a later
+    // relocation reuses.
+    keyrow_ref = try Index.remove(txn, keyrow_ref, okey);
 
-    const new_cat = try writeCatalog(txn, pc, next_row, v.keyrow_index_ref, v.next_key, idx_ref, ver_ref, live_ref, prop_refs[0..pc], kinds[0..pc], elems_buf[0..pc], bl_buf[0..pc], targets_buf[0..pc], rules_buf[0..pc]);
+    const new_cat = try writeCatalog(txn, pc, next_row, keyrow_ref, v.next_key, idx_ref, ver_ref, live_ref, prop_refs[0..pc], kinds[0..pc], elems_buf[0..pc], bl_buf[0..pc], targets_buf[0..pc], rules_buf[0..pc]);
     return .{ .ok = new_cat };
 }
 

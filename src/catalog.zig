@@ -244,6 +244,13 @@ pub fn okeyToRow(txn: anytype, cat: Ref, okey: u64) !?u64 {
     return Index.get(txn, v.keyrow_index_ref, okey);
 }
 
+// Resolve a primary key to its stable object key via the pk index.
+// Returns null if the pk has no mapping.
+pub fn pkToOkey(txn: anytype, cat: Ref, pk: u64) !?u64 {
+    const v = try loadCatalog(txn, cat);
+    return Index.get(txn, v.pk_index_ref, pk);
+}
+
 // Resolve (cat, pk, prop) to the property column ref and the row;
 // null if pk absent or row tombstoned. The pk index maps pk -> okey, and the
 // keyrow index maps okey -> physical row.

@@ -358,6 +358,30 @@ pub fn forEachKey(
     }
 }
 
+// Visit every key/value pair in ascending key order, calling
+// onEntry(ctx, key, value) for each. Same traversal as forEachKey, but also
+// surfaces the value stored alongside each key in the leaf.
+pub fn forEachEntry(
+    txn: anytype,
+    root: Ref,
+    ctx: anytype,
+    comptime onEntry: fn (@TypeOf(ctx), u64, u64) anyerror!void,
+) !void {
+    const bytes = try derefNode(txn, root);
+    if (bytes[0] == kind_leaf) {
+        const leaf = try parseLeaf(bytes);
+        var i: usize = 0;
+        while (i < leaf.count) : (i += 1) try onEntry(ctx, leaf.key(i), leaf.value(i));
+        return;
+    }
+    const inner = try parseInner(bytes);
+    var i: usize = 0;
+    while (i < inner.child_count) : (i += 1) {
+        const child_ref: Ref = inner.childRef(i);
+        try forEachEntry(txn, child_ref, ctx, onEntry);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -523,6 +547,46 @@ test "forEachKey visits all keys in ascending order" {
     var first = true;
     for (seen.items) |k| {
         if (!first) try testing.expect(k > prev);
+        prev = k;
+        first = false;
+    }
+    w.deinit();
+}
+
+test "forEachEntry visits key/value pairs in ascending key order" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try idxTmpPath(testing.allocator, &tmp, "iter_entry.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var root = try create(&w);
+    var i: u64 = 0;
+    while (i < 200) : (i += 1) {
+        const k = (i *% 2654435761) % 100_003; // scrambled insertion order
+        root = try insert(&w, root, k, k * 7 + 1);
+    }
+    const Collector = struct {
+        keys: *std.ArrayList(u64),
+        vals: *std.ArrayList(u64),
+        fn onEntry(self: @This(), key: u64, val: u64) !void {
+            try self.keys.append(testing.allocator, key);
+            try self.vals.append(testing.allocator, val);
+        }
+    };
+    var keys = std.ArrayList(u64).empty;
+    defer keys.deinit(testing.allocator);
+    var vals = std.ArrayList(u64).empty;
+    defer vals.deinit(testing.allocator);
+    try forEachEntry(&w, root, Collector{ .keys = &keys, .vals = &vals }, Collector.onEntry);
+    try testing.expectEqual(try count(&w, root), @as(u64, keys.items.len));
+    try testing.expectEqual(keys.items.len, vals.items.len);
+    var prev: u64 = 0;
+    var first = true;
+    for (keys.items, vals.items) |k, val| {
+        if (!first) try testing.expect(k > prev);
+        try testing.expectEqual(k * 7 + 1, val);
         prev = k;
         first = false;
     }
