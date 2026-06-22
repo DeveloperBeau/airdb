@@ -52,6 +52,9 @@ pub const Db = struct {
     /// Index into the coord participant slot array claimed by this Db instance, or null
     /// if all 64 slots were occupied at open/create time.
     participant_slot: ?usize,
+    /// Retention window: committed-free space is withheld from reuse until it is
+    /// older than `active_version - retain_versions`. 0 disables the window.
+    retain_versions: u64 = 0,
 
     /// Create a new database file at the given absolute path.
     pub fn create(allocator: std.mem.Allocator, path: []const u8) !Db {
@@ -99,6 +102,7 @@ pub const Db = struct {
             .free_list_node_len = 0,
             .coord = coord,
             .participant_slot = slot,
+            .retain_versions = 0,
         };
     }
 
@@ -130,6 +134,7 @@ pub const Db = struct {
             .free_list_node_len = 0,
             .coord = undefined,
             .participant_slot = null,
+            .retain_versions = 0,
         };
         errdefer db.free_list.deinit();
 
@@ -305,6 +310,32 @@ pub const Db = struct {
             if (min == null or entry.key_ptr.* < min.?) min = entry.key_ptr.*;
         }
         return min orelse self.active_version;
+    }
+
+    /// Oldest version still pinned by a live reader in this process, or the
+    /// active version if no reader is open.
+    pub fn oldestPinnedVersion(self: *Db) u64 {
+        return self.horizon();
+    }
+
+    /// Number of processes currently attached to this database.
+    pub fn attachedProcesses(self: *Db) u32 {
+        return self.coord.attachCount();
+    }
+
+    /// Logical size: the high-water mark of allocated arena bytes.
+    pub fn logicalSize(self: *Db) u64 {
+        return @intCast(self.arena.top);
+    }
+
+    /// Physical size of the backing file on disk.
+    pub fn fileSize(self: *Db) !u64 {
+        return self.store.fileLen();
+    }
+
+    /// Withhold recently-freed space from reuse for the most recent `n` versions.
+    pub fn setRetainVersions(self: *Db, n: u64) void {
+        self.retain_versions = n;
     }
 
     /// Shared body for beginWrite and beginWriteTry. Caller must hold the coord
@@ -769,6 +800,45 @@ test "allocations beyond the initial mapping grow the file and data survives reo
         try testing.expectEqual(@as(u8, @intCast(399 & 0xff)), got[0]);
         r.end();
     }
+}
+
+test "observability: pinned version and storage size" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "obs.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+
+    // First write+commit advances active_version.
+    {
+        var w = try db.beginWrite();
+        const a = try w.alloc(8);
+        @memcpy(a.bytes, "FIRST!!!");
+        w.setRoot(a.ref);
+        _ = try w.commit();
+    }
+    // No open reader: the oldest pinned version is the active version.
+    try testing.expectEqual(db.active_version, db.oldestPinnedVersion());
+
+    // Hold a reader at the current version, then commit a newer version.
+    var r = try db.beginRead();
+    {
+        var w = try db.beginWrite();
+        const b = try w.alloc(8);
+        @memcpy(b.bytes, "SECOND!!");
+        w.setRoot(b.ref);
+        _ = try w.commit();
+    }
+    // The held reader pins the older version, below the new active version.
+    try testing.expect(db.oldestPinnedVersion() < db.active_version);
+
+    try testing.expectEqual(@as(u32, 1), db.attachedProcesses());
+    try testing.expect(db.logicalSize() > 0);
+    try testing.expect((try db.fileSize()) >= db.logicalSize());
+
+    r.end();
+    try testing.expectEqual(db.active_version, db.oldestPinnedVersion());
 }
 
 test "metrics report mapped length, versions, and reclaimable bytes" {

@@ -448,6 +448,19 @@ fn deleteAbsoluteIgnoreMissing(io: Io, abs_path: []const u8) void {
     Io.Dir.deleteFileAbsolute(io, abs_path) catch {};
 }
 
+// Make the directory ENTRY for `path` durable by fsync'ing its parent directory.
+// Uses libc fsync directly on the directory fd, which is the portable POSIX way:
+// the std.Io File sync wrapper panics with BADF on a directory handle on Linux.
+// Best-effort -- errors are swallowed. No-op on Windows.
+fn syncParentDir(path: []const u8) void {
+    if (@import("builtin").os.tag == .windows) return;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const dir_path = std.fs.path.dirname(path) orelse return;
+    var dir = std.Io.Dir.openDirAbsolute(io, dir_path, .{}) catch return;
+    defer dir.close(io);
+    _ = std.c.fsync(dir.handle);
+}
+
 // Compact a database file in place, crash-safely.
 //
 // The live data is first compacted into a sibling temp file "<path>.compacting"
@@ -486,11 +499,13 @@ pub fn compactInPlace(allocator: std.mem.Allocator, path: []const u8) !void {
     deleteAbsoluteIgnoreMissing(io, path_coord); // old coord (now describes replaced data)
     deleteAbsoluteIgnoreMissing(io, tmp_coord); // compaction's coord (orphaned by the rename)
 
-    // NOTE: the data file is F_FULLFSYNC'd by compactToNewFile and the rename is
-    // atomic, so the publish (which file `path` names) is crash-safe. Making the
-    // directory ENTRY itself durable across power loss would need a portable
-    // directory fsync; std.Io's file sync panics on a directory handle on Linux,
-    // so that hardening is deferred rather than done non-portably here.
+    // 4) Make the rename durable across power loss by fsync'ing the parent
+    //    directory. The data file is F_FULLFSYNC'd by compactToNewFile and the
+    //    rename is atomic; this dir fsync hardens the directory ENTRY itself.
+    //    Restored portably via libc fsync on the directory fd (the std.Io File
+    //    sync wrapper panics with BADF on a directory handle on Linux).
+    //    Best-effort: a failure here cannot un-publish the already-renamed file.
+    syncParentDir(path);
 }
 
 // ---------------------------------------------------------------------------
