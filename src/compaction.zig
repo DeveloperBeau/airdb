@@ -4,6 +4,10 @@ const Ref = @import("ref.zig").Ref;
 const Column = @import("column.zig");
 const Index = @import("index.zig");
 const catalog = @import("catalog.zig");
+const blob = @import("blob.zig");
+const links = @import("links.zig");
+const typedir = @import("typedir.zig");
+const objects = @import("objects.zig");
 
 const max_prop_count = catalog.max_prop_count;
 
@@ -91,14 +95,355 @@ pub fn compactType(txn: *WriteTxn, cat: Ref) !Ref {
     return catalog.writeCatalog(txn, pc, new_row, new_keyrow, next_key, pk_index_ref, new_ver, new_live, new_prop[0..pc], kinds[0..pc], elems[0..pc], bl[0..pc], targets[0..pc], rules[0..pc]);
 }
 
+// Deep-copy a single property value from the source db into the destination db.
+// kind/elem describe the property. Returns the destination-local raw u64.
+fn copyValue(src: anytype, dst: *WriteTxn, kind: catalog.PropKind, elem: catalog.ElemKind, src_raw: u64) !u64 {
+    return switch (kind) {
+        .int, .link => src_raw, // verbatim (a link stores an object key, preserved)
+        .blob => if (src_raw == 0) 0 else try blob.put(dst, try blob.get(src, src_raw)),
+        .list => blk: {
+            var newc = try Column.create(dst);
+            const n = try Column.len(src, src_raw);
+            var i: u64 = 0;
+            while (i < n) : (i += 1) {
+                const el = try Column.get(src, src_raw, i);
+                const dv = if (elem == .blob) (if (el == 0) @as(u64, 0) else try blob.put(dst, try blob.get(src, el))) else el;
+                newc = try Column.append(dst, newc, dv);
+            }
+            break :blk newc;
+        },
+        .set, .link_set => blk: {
+            var newi = try Index.create(dst);
+            const Sink = struct {
+                idx: *Ref,
+                dstp: *WriteTxn,
+                fn onKey(self: @This(), key: u64) !void {
+                    self.idx.* = try Index.insert(self.dstp, self.idx.*, key, 1);
+                }
+            };
+            try Index.forEachKey(src, src_raw, Sink{ .idx = &newi, .dstp = dst }, Sink.onKey);
+            break :blk newi;
+        },
+    };
+}
+
+// Copy all live rows of `src_cat` (in the source db) into a fresh catalog in the
+// destination db, preserving object keys, primary keys, and next_key. Backlink
+// indexes are created empty (rebuild with rebuildBacklinks afterward). Returns
+// the new destination catalog ref.
+pub fn copyTypeRows(src: anytype, src_cat: Ref, dst: *WriteTxn) !Ref {
+    const sv = try catalog.loadCatalog(src, src_cat);
+    const pc = sv.prop_count;
+    const next_key = sv.next_key;
+    var s_prop: [catalog.max_prop_count]Ref = undefined;
+    var kinds: [catalog.max_prop_count]catalog.PropKind = undefined;
+    var elems: [catalog.max_prop_count]catalog.ElemKind = undefined;
+    var targets: [catalog.max_prop_count]u16 = undefined;
+    var rules: [catalog.max_prop_count]catalog.DeletionRule = undefined;
+    {
+        var j: usize = 0;
+        while (j < pc) : (j += 1) {
+            s_prop[j] = sv.propColRef(j);
+            kinds[j] = sv.kind(j);
+            elems[j] = sv.elemKind(j);
+            targets[j] = sv.linkTarget(j);
+            rules[j] = sv.delRule(j);
+        }
+    }
+    const s_ver = sv.version_col_ref;
+    const s_live = sv.live_col_ref;
+    const s_keyrow = sv.keyrow_index_ref;
+
+    // Collect live (okey, src_row) pairs.
+    const alloc = dst.db.store.allocator;
+    var pairs = std.ArrayList(Pair).empty;
+    defer pairs.deinit(alloc);
+    const Collector = struct {
+        list: *std.ArrayList(Pair),
+        a: std.mem.Allocator,
+        fn onEntry(self: @This(), k: u64, val: u64) !void {
+            try self.list.append(self.a, .{ .okey = k, .row = val });
+        }
+    };
+    try Index.forEachEntry(src, s_keyrow, Collector{ .list = &pairs, .a = alloc }, Collector.onEntry);
+
+    // Fresh destination structures.
+    var d_prop: [catalog.max_prop_count]Ref = undefined;
+    var d_bl: [catalog.max_prop_count]Ref = undefined;
+    {
+        var j: usize = 0;
+        while (j < pc) : (j += 1) {
+            d_prop[j] = try Column.create(dst);
+            d_bl[j] = if (kinds[j] == .link or kinds[j] == .link_set) try Index.create(dst) else 0;
+        }
+    }
+    var d_ver = try Column.create(dst);
+    var d_live = try Column.create(dst);
+    var d_keyrow = try Index.create(dst);
+    var d_pk = try Index.create(dst);
+
+    var d_row: u64 = 0;
+    for (pairs.items) |pr| {
+        if ((try Column.get(src, s_live, pr.row)) == 0) continue; // defensive
+        var j: usize = 0;
+        while (j < pc) : (j += 1) {
+            const sraw = try Column.get(src, s_prop[j], pr.row);
+            const draw = try copyValue(src, dst, kinds[j], elems[j], sraw);
+            d_prop[j] = try Column.append(dst, d_prop[j], draw);
+        }
+        const ver = try Column.get(src, s_ver, pr.row);
+        d_ver = try Column.append(dst, d_ver, ver);
+        d_live = try Column.append(dst, d_live, 1);
+        d_keyrow = try Index.insert(dst, d_keyrow, pr.okey, d_row);
+        const pk = try Column.get(src, s_prop[0], pr.row);
+        d_pk = try Index.insert(dst, d_pk, pk, pr.okey);
+        d_row += 1;
+    }
+
+    return catalog.writeCatalog(dst, pc, d_row, d_keyrow, next_key, d_pk, d_ver, d_live, d_prop[0..pc], kinds[0..pc], elems[0..pc], d_bl[0..pc], targets[0..pc], rules[0..pc]);
+}
+
+// Rebuild backlink indexes for `cat` (in dst) from its copied forward links.
+pub fn rebuildBacklinks(dst: *WriteTxn, cat: Ref) !Ref {
+    var cur = cat;
+    const v0 = try catalog.loadCatalog(dst, cat);
+    const pc = v0.prop_count;
+    const alloc = dst.db.store.allocator;
+    var p: usize = 0;
+    while (p < pc) : (p += 1) {
+        const k = (try catalog.loadCatalog(dst, cur)).kind(p);
+        if (k != .link and k != .link_set) continue;
+        // collect (okey,row) of cur
+        var pairs = std.ArrayList(Pair).empty;
+        defer pairs.deinit(alloc);
+        const C = struct {
+            list: *std.ArrayList(Pair),
+            a: std.mem.Allocator,
+            fn onEntry(self: @This(), kk: u64, vv: u64) !void {
+                try self.list.append(self.a, .{ .okey = kk, .row = vv });
+            }
+        };
+        {
+            const vv = try catalog.loadCatalog(dst, cur);
+            try Index.forEachEntry(dst, vv.keyrow_index_ref, C{ .list = &pairs, .a = alloc }, C.onEntry);
+        }
+        for (pairs.items) |pr| {
+            const vv = try catalog.loadCatalog(dst, cur);
+            const col = vv.propColRef(p);
+            const raw = try Column.get(dst, col, pr.row);
+            if (k == .link) {
+                if (raw != 0) cur = try links.addBacklink(dst, cur, p, raw - 1, pr.okey);
+            } else {
+                // link_set: the column holds a set-root of target okeys
+                var members = std.ArrayList(u64).empty;
+                defer members.deinit(alloc);
+                const M = struct {
+                    list: *std.ArrayList(u64),
+                    a: std.mem.Allocator,
+                    fn onKey(self: @This(), key: u64) !void {
+                        try self.list.append(self.a, key);
+                    }
+                };
+                try Index.forEachKey(dst, raw, M{ .list = &members, .a = alloc }, M.onKey);
+                for (members.items) |t| cur = try links.addBacklink(dst, cur, p, t, pr.okey);
+            }
+        }
+    }
+    return cur;
+}
+
+// ---------------------------------------------------------------------------
+// Full-file compaction with a verify-before-swap equivalence gate.
+// ---------------------------------------------------------------------------
+
+pub const CompactionError = error{CompactionMismatch};
+
+// Order-independent 64-bit mix of a primary key, folded with XOR so the running
+// accumulator does not depend on traversal order.
+inline fn mixPk(pk: u64) u64 {
+    return std.hash.Wyhash.hash(0, std.mem.asBytes(&pk));
+}
+
+// Walk a catalog's key->row index, reading each live row's primary key (prop 0),
+// and fold the pk set into `fold` (XOR of mixed pks) while counting rows. The
+// fold is identity-preserving and order-independent.
+fn foldPks(allocator: std.mem.Allocator, txn: anytype, cat: Ref, fold: *u64, count: *u64) !void {
+    const v = try catalog.loadCatalog(txn, cat);
+    const keyrow = v.keyrow_index_ref;
+    const prop0 = v.propColRef(0);
+    var pairs = std.ArrayList(Pair).empty;
+    defer pairs.deinit(allocator);
+    const C = struct {
+        list: *std.ArrayList(Pair),
+        a: std.mem.Allocator,
+        fn onEntry(self: @This(), k: u64, val: u64) !void {
+            try self.list.append(self.a, .{ .okey = k, .row = val });
+        }
+    };
+    try Index.forEachEntry(txn, keyrow, C{ .list = &pairs, .a = allocator }, C.onEntry);
+    for (pairs.items) |pr| {
+        const pk = try Column.get(txn, prop0, pr.row);
+        fold.* ^= mixPk(pk);
+        count.* += 1;
+    }
+}
+
+// Fold SRC's pk set (like foldPks) AND, for every live source object, prove that
+// the destination preserves it: (a) the object is readable in dst by its
+// original object key, and (b) every to-one link property holds the same raw
+// target in dst as in src. Returns error.CompactionMismatch on any failure.
+fn foldPksAndCheck(allocator: std.mem.Allocator, src: anytype, sc: Ref, dst: anytype, dc: Ref, fold: *u64, count: *u64) !void {
+    const sv = try catalog.loadCatalog(src, sc);
+    const dv = try catalog.loadCatalog(dst, dc);
+    const pc = sv.prop_count;
+    if (dv.prop_count != pc) return error.CompactionMismatch;
+
+    // Snapshot column refs and per-prop kinds for both sides up front.
+    var s_prop: [max_prop_count]Ref = undefined;
+    var d_prop: [max_prop_count]Ref = undefined;
+    var kinds: [max_prop_count]catalog.PropKind = undefined;
+    {
+        var j: usize = 0;
+        while (j < pc) : (j += 1) {
+            s_prop[j] = sv.propColRef(j);
+            d_prop[j] = dv.propColRef(j);
+            kinds[j] = sv.kind(j);
+            if (dv.kind(j) != kinds[j]) return error.CompactionMismatch;
+        }
+    }
+    const s_prop0 = s_prop[0];
+
+    // Collect SRC's live (okey, row) pairs.
+    var pairs = std.ArrayList(Pair).empty;
+    defer pairs.deinit(allocator);
+    const C = struct {
+        list: *std.ArrayList(Pair),
+        a: std.mem.Allocator,
+        fn onEntry(self: @This(), k: u64, val: u64) !void {
+            try self.list.append(self.a, .{ .okey = k, .row = val });
+        }
+    };
+    try Index.forEachEntry(src, sv.keyrow_index_ref, C{ .list = &pairs, .a = allocator }, C.onEntry);
+
+    var out: [max_prop_count]catalog.Value = undefined;
+    for (pairs.items) |pr| {
+        // pk fold over the source.
+        const pk = try Column.get(src, s_prop0, pr.row);
+        fold.* ^= mixPk(pk);
+        count.* += 1;
+
+        // (a) readability: the same object key must decode in dst.
+        if ((try objects.getTypedByOkey(dst, dc, pr.okey, out[0..pc])) == null) return error.CompactionMismatch;
+
+        // (b) to-one forward links must carry the identical raw target in dst.
+        const drow = (try catalog.okeyToRow(dst, dc, pr.okey)) orelse return error.CompactionMismatch;
+        var p: usize = 0;
+        while (p < pc) : (p += 1) {
+            if (kinds[p] != .link) continue;
+            const s_raw = try Column.get(src, s_prop[p], pr.row);
+            const d_raw = try Column.get(dst, d_prop[p], drow);
+            if (s_raw != d_raw) return error.CompactionMismatch;
+        }
+    }
+}
+
+// Verify the destination is equivalent to the source before it is published.
+// Proves, per type: identical type count, identical live count, identical pk set
+// (order-independent fold), every source object readable in dst by its original
+// key, and identical to-one forward links. Any divergence aborts the compaction.
+fn verifyEquivalent(allocator: std.mem.Allocator, src: anytype, src_dir: Ref, dst: anytype, dst_dir: Ref) !void {
+    const tc = try typedir.typeCount(src, src_dir);
+    if ((try typedir.typeCount(dst, dst_dir)) != tc) return error.CompactionMismatch;
+    var t: u16 = 0;
+    while (t < tc) : (t += 1) {
+        const sc = try typedir.catalogRef(src, src_dir, t);
+        const dc = try typedir.catalogRef(dst, dst_dir, t);
+
+        // 1. live count.
+        if ((try liveCount(src, sc)) != (try liveCount(dst, dc))) return error.CompactionMismatch;
+
+        // 2. pk-set fold + readability + forward-link match.
+        var src_fold: u64 = 0;
+        var src_n: u64 = 0;
+        try foldPksAndCheck(allocator, src, sc, dst, dc, &src_fold, &src_n);
+        var dst_fold: u64 = 0;
+        var dst_n: u64 = 0;
+        try foldPks(allocator, dst, dc, &dst_fold, &dst_n);
+        if (src_fold != dst_fold or src_n != dst_n) return error.CompactionMismatch;
+    }
+}
+
+// Copy a database's live data into a brand-new file (an on-disk shrink),
+// preserving object keys, primary keys, links, and backlinks. Before the new
+// file is published (committed) it is verified equivalent to the source; on any
+// mismatch the destination is discarded uncommitted and the error propagates.
+pub fn compactToNewFile(allocator: std.mem.Allocator, src_path: []const u8, dst_path: []const u8) !void {
+    var src_db = try @import("db.zig").Db.open(allocator, src_path);
+    defer src_db.deinit();
+    var src_r = try src_db.beginRead();
+    defer src_r.end();
+    const src_dir = src_r.root();
+    const tc = try typedir.typeCount(&src_r, src_dir);
+
+    var dst_db = try @import("db.zig").Db.create(allocator, dst_path);
+    var dst_db_alive = true;
+    defer if (dst_db_alive) dst_db.deinit();
+    var dst_w = try dst_db.beginWrite();
+    var dst_committed = false;
+    defer if (!dst_committed) dst_w.deinit();
+
+    // Reconstruct the schema (PropDefs per type) + embedded flags from the source.
+    var schema = std.ArrayList([]catalog.PropDef).empty;
+    defer {
+        for (schema.items) |s| allocator.free(s);
+        schema.deinit(allocator);
+    }
+    var embedded = std.ArrayList(bool).empty;
+    defer embedded.deinit(allocator);
+    {
+        var t: u16 = 0;
+        while (t < tc) : (t += 1) {
+            const sc = try typedir.catalogRef(&src_r, src_dir, t);
+            const v = try catalog.loadCatalog(&src_r, sc);
+            const defs = try allocator.alloc(catalog.PropDef, v.prop_count);
+            var j: usize = 0;
+            while (j < v.prop_count) : (j += 1) {
+                defs[j] = .{ .kind = v.kind(j), .elem = v.elemKind(j), .link_target = v.linkTarget(j), .del_rule = v.delRule(j) };
+            }
+            try schema.append(allocator, defs);
+            try embedded.append(allocator, try typedir.isEmbedded(&src_r, src_dir, t));
+        }
+    }
+    var dst_dir = try typedir.createTypes(&dst_w, schema.items, embedded.items);
+
+    // Copy each type's live rows, then rebuild its backlinks.
+    {
+        var t: u16 = 0;
+        while (t < tc) : (t += 1) {
+            const sc = try typedir.catalogRef(&src_r, src_dir, t);
+            var dc = try copyTypeRows(&src_r, sc, &dst_w);
+            dc = try rebuildBacklinks(&dst_w, dc);
+            dst_dir = try typedir.setCatalogRef(&dst_w, dst_dir, t, dc);
+        }
+    }
+
+    // VERIFY before publishing. On any mismatch, abort (no commit) -> dst discarded.
+    try verifyEquivalent(allocator, &src_r, src_dir, &dst_w, dst_dir);
+
+    dst_w.setRoot(dst_dir);
+    _ = try dst_w.commit();
+    dst_committed = true;
+    dst_db.deinit();
+    dst_db_alive = false;
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
 const Db = @import("db.zig").Db;
-const objects = @import("objects.zig");
-const links = @import("links.zig");
+const collections = @import("collections.zig");
 
 fn cmpTmpPath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const u8) ![]const u8 {
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
@@ -260,4 +605,209 @@ test "compaction reclaims under churn (scale)" {
     try testing.expect((try objects.getByPk(&w, cat, 100_001, &out)) != null);
     try testing.expectEqual(@as(u64, 100_001), out[1]);
     try testing.expect((try objects.getByPk(&w, cat, 2, &out)) == null);
+}
+
+test "all value kinds deep-copy across databases preserving keys" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const src_path = try cmpTmpPath(testing.allocator, &tmp, "src.airdb");
+    defer testing.allocator.free(src_path);
+    const dst_path = try cmpTmpPath(testing.allocator, &tmp, "dst.airdb");
+    defer testing.allocator.free(dst_path);
+
+    var src_db = try Db.create(testing.allocator, src_path);
+    defer src_db.deinit();
+    var dst_db = try Db.create(testing.allocator, dst_path);
+    defer dst_db.deinit();
+
+    var pk1_okey: u64 = undefined;
+    var src_next_key: u64 = undefined;
+
+    // Build the source database: 3 rows across every value kind, then delete one.
+    {
+        var w = try src_db.beginWrite();
+        var cat = try catalog.createDefs(&w, &.{
+            .{ .kind = .int },
+            .{ .kind = .blob },
+            .{ .kind = .list, .elem = .int },
+            .{ .kind = .set, .elem = .int },
+            .{ .kind = .link, .link_target = 0 },
+        });
+        const r1 = try objects.insertTyped(&w, cat, &.{
+            .{ .int = 1 }, .{ .bytes = "a" }, .{ .list_int = &.{ 10, 20 } }, .{ .set_int = &.{ 5, 6 } }, .{ .link = null },
+        });
+        cat = r1.cat;
+        pk1_okey = r1.row;
+        const r2 = try objects.insertTyped(&w, cat, &.{
+            .{ .int = 2 }, .{ .bytes = "bb" }, .{ .list_int = &.{} }, .{ .set_int = &.{7} }, .{ .link = pk1_okey },
+        });
+        cat = r2.cat;
+        const r3 = try objects.insertTyped(&w, cat, &.{
+            .{ .int = 3 }, .{ .bytes = "ccc" }, .{ .list_int = &.{ 1, 2, 3 } }, .{ .set_int = &.{} }, .{ .link = null },
+        });
+        cat = r3.cat;
+
+        // Delete pk 3 -- leaves a gap in the source.
+        var dout: [5]catalog.Value = undefined;
+        const v3 = (try objects.getTyped(&w, cat, 3, &dout)).?;
+        cat = (try objects.deleteTyped(&w, cat, 3, v3)).ok;
+
+        src_next_key = (try catalog.loadCatalog(&w, cat)).next_key;
+        w.setRoot(cat);
+        _ = try w.commit();
+    }
+
+    // Deep-copy the live rows into the destination database.
+    {
+        var src_read = try src_db.beginRead();
+        const src_cat = src_read.root();
+        var dst_w = try dst_db.beginWrite();
+        var dst_cat = try copyTypeRows(&src_read, src_cat, &dst_w);
+        dst_cat = try rebuildBacklinks(&dst_w, dst_cat);
+        dst_w.setRoot(dst_cat);
+        _ = try dst_w.commit();
+        src_read.end();
+    }
+
+    // Reopen the destination and verify every value kind round-tripped.
+    {
+        var ddb = try Db.open(testing.allocator, dst_path);
+        defer ddb.deinit();
+        var r = try ddb.beginRead();
+        defer r.end();
+        const cat = r.root();
+
+        // pk 1 and pk 2 readable with identical int + blob.
+        var o1: [5]catalog.Value = undefined;
+        try testing.expect((try objects.getTyped(&r, cat, 1, &o1)) != null);
+        try testing.expectEqual(@as(u64, 1), o1[0].int);
+        try testing.expectEqualStrings("a", o1[1].bytes);
+        var o2: [5]catalog.Value = undefined;
+        try testing.expect((try objects.getTyped(&r, cat, 2, &o2)) != null);
+        try testing.expectEqual(@as(u64, 2), o2[0].int);
+        try testing.expectEqualStrings("bb", o2[1].bytes);
+
+        // list/set contents match.
+        try testing.expectEqual(@as(?u64, 2), try collections.listLen(&r, cat, 1, 2));
+        try testing.expectEqual(@as(u64, 10), try collections.listGetInt(&r, cat, 1, 2, 0));
+        try testing.expectEqual(@as(u64, 20), try collections.listGetInt(&r, cat, 1, 2, 1));
+        try testing.expectEqual(@as(?u64, 2), try collections.setCountInt(&r, cat, 1, 3));
+        try testing.expect(try collections.setContainsInt(&r, cat, 1, 3, 5));
+        try testing.expect(try collections.setContainsInt(&r, cat, 1, 3, 6));
+        try testing.expectEqual(@as(?u64, 0), try collections.listLen(&r, cat, 2, 2));
+        try testing.expectEqual(@as(?u64, 1), try collections.setCountInt(&r, cat, 2, 3));
+        try testing.expect(try collections.setContainsInt(&r, cat, 2, 3, 7));
+
+        // The link on pk 2 still equals pk 1's original object key and resolves to pk 1.
+        try testing.expectEqual(@as(?u64, pk1_okey), try links.getLink(&r, cat, 2, 4));
+        var ob: [5]u64 = undefined;
+        try testing.expect((try objects.getByObjectKey(&r, cat, pk1_okey, &ob)) != null);
+        try testing.expectEqual(@as(u64, 1), ob[0]);
+
+        // Backlink rebuilt from the copied forward link.
+        try testing.expectEqual(@as(u64, 1), try links.backlinkCount(&r, cat, 4, pk1_okey));
+
+        // pk 3 was dead in the source and must be absent.
+        var o3: [5]catalog.Value = undefined;
+        try testing.expect((try objects.getTyped(&r, cat, 3, &o3)) == null);
+
+        // next_key preserved across the copy.
+        try testing.expectEqual(src_next_key, (try catalog.loadCatalog(&r, cat)).next_key);
+    }
+}
+
+test "compactToNewFile produces a verified, smaller, equivalent file" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const src_path = try cmpTmpPath(testing.allocator, &tmp, "fullsrc.airdb");
+    defer testing.allocator.free(src_path);
+    const dst_path = try cmpTmpPath(testing.allocator, &tmp, "fulldst.airdb");
+    defer testing.allocator.free(dst_path);
+
+    const PD = catalog.PropDef;
+    var author_okeys: [300]u64 = undefined;
+
+    // Build the source: two types, ~300 authors + ~300 books, delete ~100 books.
+    {
+        var db = try Db.create(testing.allocator, src_path);
+        defer db.deinit();
+        var w = try db.beginWrite();
+        const schema = [_][]const PD{
+            &.{ .{ .kind = .int }, .{ .kind = .blob } }, // 0: Author{int pk, blob name}
+            &.{ .{ .kind = .int }, .{ .kind = .link, .link_target = 0 }, .{ .kind = .set, .elem = .int } }, // 1: Book{int pk, link author, set tags}
+        };
+        var dir = try typedir.createTypes(&w, &schema, &.{ false, false });
+
+        var i: u64 = 0;
+        var nbuf: [32]u8 = undefined;
+        while (i < 300) : (i += 1) {
+            const s = try std.fmt.bufPrint(&nbuf, "author-{d}", .{i});
+            const r = try typedir.insert(&w, dir, 0, &.{ .{ .int = i }, .{ .bytes = s } });
+            dir = r.dir;
+            author_okeys[@intCast(i)] = r.row;
+        }
+        i = 0;
+        while (i < 300) : (i += 1) {
+            const a_okey = author_okeys[@intCast(i % 300)];
+            const r = try typedir.insert(&w, dir, 1, &.{ .{ .int = i }, .{ .link = a_okey }, .{ .set_int = &.{ i, i + 1000 } } });
+            dir = r.dir;
+        }
+        // Delete every third book (~100): pks 0,3,...,297.
+        i = 0;
+        while (i < 300) : (i += 3) {
+            var out: [3]catalog.Value = undefined;
+            const ver = (try typedir.get(&w, dir, 1, i, &out)).?;
+            const dres = try typedir.deleteNullifyX(&w, dir, 1, i, ver);
+            dir = dres.ok;
+        }
+        w.setRoot(dir);
+        _ = try w.commit();
+    }
+
+    // Full-file compaction (opens src, writes + verifies + commits dst).
+    try compactToNewFile(testing.allocator, src_path, dst_path);
+
+    // The fresh file holds no garbage, so its live data footprint must be smaller
+    // than the churned source's. Compare logical size (high-water of live bytes),
+    // since the physical file length floors at the 1MB initial mmap for both.
+    var src_size: u64 = undefined;
+    var dst_size: u64 = undefined;
+    {
+        var sdb = try Db.open(testing.allocator, src_path);
+        src_size = sdb.arena.top;
+        sdb.deinit();
+        var ddb = try Db.open(testing.allocator, dst_path);
+        dst_size = ddb.arena.top;
+        ddb.deinit();
+    }
+    try testing.expect(dst_size < src_size);
+
+    // The destination is published; verify equivalence on the live data.
+    var ddb = try Db.open(testing.allocator, dst_path);
+    defer ddb.deinit();
+    var r = try ddb.beginRead();
+    defer r.end();
+    const dir = r.root();
+
+    try testing.expectEqual(@as(u64, 300), try typedir.liveCount(&r, dir, 0));
+    try testing.expectEqual(@as(u64, 200), try typedir.liveCount(&r, dir, 1));
+
+    // A surviving author reads back with identical values.
+    var ao: [2]catalog.Value = undefined;
+    _ = (try typedir.get(&r, dir, 0, 42, &ao)).?;
+    try testing.expectEqual(@as(u64, 42), ao[0].int);
+    try testing.expectEqualStrings("author-42", ao[1].bytes);
+
+    // A surviving book (pk 1, not divisible by 3) keeps its author link, and the
+    // link resolves to the same author object.
+    var bo: [3]catalog.Value = undefined;
+    _ = (try typedir.get(&r, dir, 1, 1, &bo)).?;
+    try testing.expectEqual(@as(?u64, author_okeys[1]), try typedir.getLink(&r, dir, 1, 1, 1));
+    var la: [2]catalog.Value = undefined;
+    _ = (try typedir.getLinked(&r, dir, 1, 1, 1, &la)).?;
+    try testing.expectEqual(@as(u64, 1), la[0].int);
+
+    // A deleted book (pk 3) is absent.
+    var b3: [3]catalog.Value = undefined;
+    try testing.expectEqual(@as(?u64, null), try typedir.get(&r, dir, 1, 3, &b3));
 }
