@@ -196,6 +196,41 @@ pub fn set(txn: *WriteTxn, root: Ref, index: u64, value: u64) !Ref {
     return setInto(txn, root, index, value);
 }
 
+/// Recursively free every node in the subtree rooted at node_ref. Leaves and inner
+/// nodes are freed at their respective on-disk sizes so the space becomes reclaimable.
+fn freeTree(txn: *WriteTxn, node_ref: Ref) !void {
+    const bytes = try derefNode(txn, node_ref);
+    if (bytes[0] == kind_leaf) {
+        try txn.free(node_ref, leaf_node_size);
+    } else {
+        const view = try parseInner(bytes);
+        var i: u16 = 0;
+        // Capture child refs before freeing: parsing reads from the mmap, which we do
+        // not mutate here, so the view stays valid for the duration of the loop.
+        while (i < view.child_count) : (i += 1) try freeTree(txn, view.childRef(i));
+        try txn.free(node_ref, inner_node_size);
+    }
+}
+
+/// Shrink the column to new_len entries, dropping all trailing entries and freeing
+/// every node of the old tree so the space becomes reclaimable. Returns the new root
+/// Ref. new_len must be <= the current length.
+///
+/// Implemented by rebuilding: a fresh empty column is appended with entries 0..new_len
+/// copied from the old column, then the old tree is freed. O(new_len); trimming only the
+/// trailing nodes in place (instead of a full rebuild) is a deferred optimization.
+pub fn truncate(txn: *WriteTxn, root: Ref, new_len: u64) !Ref {
+    std.debug.assert(new_len <= try len(txn, root));
+    var new_root = try create(txn);
+    var i: u64 = 0;
+    while (i < new_len) : (i += 1) {
+        const value = try get(txn, root, i);
+        new_root = try append(txn, new_root, value);
+    }
+    try freeTree(txn, root);
+    return new_root;
+}
+
 /// Test-only helper: allocate an inner node over the given children and return its Ref.
 pub fn makeInnerForTest(txn: *WriteTxn, children: []const struct { ref: u64, count: u64 }) !Ref {
     std.debug.assert(children.len <= FANOUT);
@@ -324,6 +359,47 @@ test "set on a multi-level column leaves the old root snapshot unchanged" {
     // a few other indices match between old and new (shared subtrees)
     try testing.expectEqual(try get(&w, old_root, 0), try get(&w, new_root, 0));
     try testing.expectEqual(try get(&w, old_root, 999), try get(&w, new_root, 999));
+    w.deinit();
+}
+
+test "Column.truncate shrinks length and preserves head values" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try colTmpPath(testing.allocator, &tmp, "coltrunc1.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var root = try create(&w);
+    const N: u64 = 1000;
+    var i: u64 = 0;
+    while (i < N) : (i += 1) root = try append(&w, root, i * 7);
+    const M: u64 = 300;
+    root = try truncate(&w, root, M);
+    try testing.expectEqual(M, try len(&w, root));
+    var k: u64 = 0;
+    while (k < M) : (k += 1) try testing.expectEqual(k * 7, try get(&w, root, k));
+    try testing.expectError(error.IndexOutOfBounds, get(&w, root, M));
+    w.deinit();
+}
+
+test "Column.truncate to zero empties the column" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try colTmpPath(testing.allocator, &tmp, "coltrunc0.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var root = try create(&w);
+    var i: u64 = 0;
+    while (i < 1000) : (i += 1) root = try append(&w, root, i);
+    root = try truncate(&w, root, 0);
+    try testing.expectEqual(@as(u64, 0), try len(&w, root));
+    // Reclamation note: truncate frees every dropped node via txn.free, which routes
+    // them onto the transaction-private pool / committed free list (see WriteTxn.free).
+    // column.zig exposes no in-transaction free-list hook, so reclamation is covered by
+    // that mechanism rather than asserted here.
     w.deinit();
 }
 
