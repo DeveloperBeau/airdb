@@ -248,8 +248,9 @@ pub fn insertTyped(txn: *WriteTxn, cat: Ref, values: []const Value) !struct { ca
             },
             .set => switch (elems[i]) {
                 .int => try collections.buildSetInt(txn, values[i].set_int),
-                .blob => unreachable, // set of blob out of scope this phase
+                .blob => try collections.buildSetBlob(txn, values[i].set_blob),
             },
+            .dict => try collections.buildDict(txn, values[i].dict_int),
             .link => if (values[i].link) |k| k + 1 else 0,
             .link_set => try collections.buildSetInt(txn, values[i].link_set),
         };
@@ -299,7 +300,7 @@ pub fn getTyped(txn: anytype, cat: Ref, pk: u64, out: []Value) !?u64 {
         out[i] = switch (kinds[i]) {
             .int => .{ .int = raw[i] },
             .blob => .{ .bytes = try blob.get(txn, raw[i]) },
-            .list, .set, .link_set => .{ .coll_root = raw[i] },
+            .list, .set, .dict, .link_set => .{ .coll_root = raw[i] },
             .link => .{ .link = if (raw[i] == 0) null else raw[i] - 1 },
         };
     }
@@ -324,7 +325,7 @@ pub fn getTypedByOkey(txn: anytype, cat: Ref, okey: u64, out: []Value) !?u64 {
         out[i] = switch (kinds[i]) {
             .int => .{ .int = raw[i] },
             .blob => .{ .bytes = try blob.get(txn, raw[i]) },
-            .list, .set, .link_set => .{ .coll_root = raw[i] },
+            .list, .set, .dict, .link_set => .{ .coll_root = raw[i] },
             .link => .{ .link = if (raw[i] == 0) null else raw[i] - 1 },
         };
     }
@@ -379,7 +380,7 @@ pub fn updateTyped(
                 try blob.free(txn, cur_raw[i]);
                 break :blk try blob.put(txn, values[i].bytes);
             },
-            .list, .set, .link_set => unreachable, // collection update not yet implemented
+            .list, .set, .dict, .link_set => unreachable, // collection update not yet implemented
             .link => if (values[i].link) |k| k + 1 else 0,
         };
     }

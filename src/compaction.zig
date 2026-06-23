@@ -8,6 +8,7 @@ const blob = @import("blob.zig");
 const links = @import("links.zig");
 const typedir = @import("typedir.zig");
 const objects = @import("objects.zig");
+const bindex = @import("bindex.zig");
 
 const max_prop_count = catalog.max_prop_count;
 
@@ -112,7 +113,23 @@ fn copyValue(src: anytype, dst: *WriteTxn, kind: catalog.PropKind, elem: catalog
             }
             break :blk newc;
         },
-        .set, .link_set => blk: {
+        .set => switch (elem) {
+            .blob => try copyBindex(src, dst, src_raw), // byte-keyed set -> bindex deep-copy
+            else => blk: {
+                // int-keyed set: a u64-keyed Index.
+                var newi = try Index.create(dst);
+                const Sink = struct {
+                    idx: *Ref,
+                    dstp: *WriteTxn,
+                    fn onKey(self: @This(), key: u64) !void {
+                        self.idx.* = try Index.insert(self.dstp, self.idx.*, key, 1);
+                    }
+                };
+                try Index.forEachKey(src, src_raw, Sink{ .idx = &newi, .dstp = dst }, Sink.onKey);
+                break :blk newi;
+            },
+        },
+        .link_set => blk: {
             var newi = try Index.create(dst);
             const Sink = struct {
                 idx: *Ref,
@@ -124,7 +141,27 @@ fn copyValue(src: anytype, dst: *WriteTxn, kind: catalog.PropKind, elem: catalog
             try Index.forEachKey(src, src_raw, Sink{ .idx = &newi, .dstp = dst }, Sink.onKey);
             break :blk newi;
         },
+        .dict => try copyBindex(src, dst, src_raw), // byte-keyed dict -> bindex deep-copy
     };
+}
+
+// Deep-copy a bindex root (dict or byte-keyed set) from `src` into `dst` by
+// iterating the source tree and re-inserting each entry. bindex.insert re-puts
+// the key into the destination's blob heap, so this is a correct cross-database
+// deep-copy. forEachEntry hands the callback a key slice into the SOURCE mapping;
+// bindex.insert grows only the DST arena (a different mapping), so the source key
+// stays valid for the duration of the insert -- keep the insert inside onEntry.
+fn copyBindex(src: anytype, dst: *WriteTxn, src_root: u64) !u64 {
+    var newr = try bindex.create(dst);
+    const Sink = struct {
+        dstp: *WriteTxn,
+        root: *u64,
+        fn onEntry(self: @This(), key: []const u8, val: u64) !void {
+            self.root.* = try bindex.insert(self.dstp, self.root.*, key, val);
+        }
+    };
+    try bindex.forEachEntry(src, src_root, Sink{ .dstp = dst, .root = &newr }, Sink.onEntry);
+    return newr;
 }
 
 // Copy all live rows of `src_cat` (in the source db) into a fresh catalog in the
@@ -881,6 +918,82 @@ test "compactToNewFile produces a verified, smaller, equivalent file" {
     // A deleted book (pk 3) is absent.
     var b3: [3]catalog.Value = undefined;
     try testing.expectEqual(@as(?u64, null), try typedir.get(&r, dir, 1, 3, &b3));
+}
+
+test "compaction preserves dict and set-of-blob" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const src_path = try cmpTmpPath(testing.allocator, &tmp, "bindexsrc.airdb");
+    defer testing.allocator.free(src_path);
+    const dst_path = try cmpTmpPath(testing.allocator, &tmp, "bindexdst.airdb");
+    defer testing.allocator.free(dst_path);
+
+    const PD = catalog.PropDef;
+
+    // Build the source: a type with {int pk, dict, set(elem=blob)}, two rows with
+    // dict entries + blob-set members, then delete one row to leave a gap.
+    {
+        var db = try Db.create(testing.allocator, src_path);
+        defer db.deinit();
+        var w = try db.beginWrite();
+        const schema = [_][]const PD{
+            &.{ .{ .kind = .int }, .{ .kind = .dict }, .{ .kind = .set, .elem = .blob } },
+        };
+        var dir = try typedir.createTypes(&w, &schema, &.{false});
+
+        const r1 = try typedir.insert(&w, dir, 0, &.{
+            .{ .int = 1 },
+            .{ .dict_int = &.{ .{ .key = "a", .val = 1 }, .{ .key = "b", .val = 2 } } },
+            .{ .set_blob = &.{ "x", "yy" } },
+        });
+        dir = r1.dir;
+        const r2 = try typedir.insert(&w, dir, 0, &.{
+            .{ .int = 2 },
+            .{ .dict_int = &.{.{ .key = "c", .val = 3 }} },
+            .{ .set_blob = &.{"zzz"} },
+        });
+        dir = r2.dir;
+
+        // Delete pk 2 -- leaves a gap in the source.
+        var out: [3]catalog.Value = undefined;
+        const ver = (try typedir.get(&w, dir, 0, 2, &out)).?;
+        const dres = try typedir.deleteNullifyX(&w, dir, 0, 2, ver);
+        dir = dres.ok;
+
+        w.setRoot(dir);
+        _ = try w.commit();
+    }
+
+    // Full-file compaction: opens src, deep-copies live rows, verifies, commits dst.
+    try compactToNewFile(testing.allocator, src_path, dst_path);
+
+    // Reopen the destination and verify the surviving row's dict + blob-set survived.
+    {
+        var ddb = try Db.open(testing.allocator, dst_path);
+        defer ddb.deinit();
+        var r = try ddb.beginRead();
+        defer r.end();
+        const dir = r.root();
+        const cat = try typedir.catalogRef(&r, dir, 0);
+
+        try testing.expectEqual(@as(u64, 1), try typedir.liveCount(&r, dir, 0));
+
+        // Surviving row pk 1: dict entries preserved.
+        try testing.expectEqual(@as(?u64, 2), try collections.dictCount(&r, cat, 1, 1));
+        try testing.expectEqual(@as(?u64, 1), try collections.dictGet(&r, cat, 1, 1, "a"));
+        try testing.expectEqual(@as(?u64, 2), try collections.dictGet(&r, cat, 1, 1, "b"));
+        try testing.expectEqual(@as(?u64, null), try collections.dictGet(&r, cat, 1, 1, "c"));
+
+        // Surviving row pk 1: blob-set members preserved.
+        try testing.expectEqual(@as(?u64, 2), try collections.setCountBlob(&r, cat, 1, 2));
+        try testing.expect(try collections.setContainsBlob(&r, cat, 1, 2, "x"));
+        try testing.expect(try collections.setContainsBlob(&r, cat, 1, 2, "yy"));
+        try testing.expect(!(try collections.setContainsBlob(&r, cat, 1, 2, "zzz")));
+
+        // Deleted row pk 2 is absent.
+        var o2: [3]catalog.Value = undefined;
+        try testing.expectEqual(@as(?u64, null), try typedir.get(&r, dir, 0, 2, &o2));
+    }
 }
 
 test "compactInPlace shrinks and preserves data" {
