@@ -24,6 +24,17 @@ const coord_mod = @import("coord.zig");
 const slot_a_off: usize = 64;
 const slot_b_off: usize = 128;
 
+// Version->root ring log, in the reserved header page (page 0, [0, default_page_size)).
+// The arena's data starts at default_page_size, so the header page has free room past
+// the FileStore header ([0,32)) and the two commit slots (A: [64,100), B: [128,164)).
+//   ring_head_off: u32 LE, monotonically increasing count of entries ever written.
+//                  The live head index is ring_head % ring_capacity.
+//   ring_off:      ring_capacity entries, each 16 bytes [version u64 LE][root_ref u64 LE].
+// End of ring = ring_off + ring_capacity*16 = 1024 + 128*16 = 3072 < 4096. No overlap.
+pub const ring_head_off: usize = 1016;
+pub const ring_off: usize = 1024;
+pub const ring_capacity: u32 = 128;
+
 // ---------------------------------------------------------------------------
 // Db
 // ---------------------------------------------------------------------------
@@ -76,6 +87,10 @@ pub const Db = struct {
         };
         initial.encode(store.map[slot_a_off..][0..Slot.size]);
         store.header.active_slot = 0;
+        // Zero the version->root ring region so head starts at 0 and all entries are
+        // empty. The ring is left empty; the first real commit populates it. A fresh
+        // file is already zero-filled, but zero explicitly so create is self-contained.
+        @memset(store.map[ring_head_off .. ring_off + @as(usize, ring_capacity) * 16], 0);
         store.persistHeader();
         try store.syncer.flush(store.file);
 
@@ -340,6 +355,42 @@ pub const Db = struct {
     /// Withhold recently-freed space from reuse for the most recent `n` versions.
     pub fn setRetainVersions(self: *Db, n: u64) void {
         self.retain_versions = n;
+    }
+
+    /// Root ref for a committed version, or null if not retained / not yet committed.
+    /// The `version > active_version` guard rejects a ring entry written during a
+    /// commit that crashed/aborted before publishing (the slot flip never happened),
+    /// so a recorded-but-unpublished pair is never trusted.
+    pub fn versionRoot(self: *Db, version: u64) ?u64 {
+        if (version > self.active_version) return null;
+        const map = self.store.map;
+        const head = std.mem.readInt(u32, map[ring_head_off..][0..4], .little);
+        const n = @min(head, ring_capacity);
+        var i: u32 = 0;
+        while (i < n) : (i += 1) {
+            const e = ring_off + @as(usize, i) * 16;
+            const v = std.mem.readInt(u64, map[e..][0..8], .little);
+            if (v == version) return std.mem.readInt(u64, map[e + 8 ..][0..8], .little);
+        }
+        return null;
+    }
+
+    /// Oldest version still recorded in the ring, or active_version if the ring is
+    /// empty. As the ring wraps, the recovery window's lower bound advances. Entries
+    /// above active_version (an unpublished/aborted commit) are ignored.
+    pub fn oldestRetainedVersion(self: *Db) u64 {
+        const map = self.store.map;
+        const head = std.mem.readInt(u32, map[ring_head_off..][0..4], .little);
+        const n = @min(head, ring_capacity);
+        var min: ?u64 = null;
+        var i: u32 = 0;
+        while (i < n) : (i += 1) {
+            const e = ring_off + @as(usize, i) * 16;
+            const v = std.mem.readInt(u64, map[e..][0..8], .little);
+            if (v > self.active_version) continue;
+            if (min == null or v < min.?) min = v;
+        }
+        return min orelse self.active_version;
     }
 
     /// Shared body for beginWrite and beginWriteTry. Caller must hold the coord
@@ -882,4 +933,85 @@ test "metrics report mapped length, versions, and reclaimable bytes" {
     try testing.expect(m.free_extent_count >= 1);
     try testing.expect(m.reclaimable_bytes >= 8);
     try testing.expectEqual(db.active_version, m.oldest_pinned_version); // no readers
+}
+
+test "version->root ring records committed versions" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "ring.airdb");
+    defer testing.allocator.free(path);
+
+    const k: u64 = 5;
+    {
+        var db = try Db.create(testing.allocator, path);
+        defer db.deinit();
+        // Version 1 (the initial slot) was never written into the ring.
+        try testing.expectEqual(@as(?u64, null), db.versionRoot(1));
+
+        var i: u64 = 0;
+        while (i < k) : (i += 1) {
+            var w = try db.beginWrite();
+            const a = try w.alloc(8);
+            @memcpy(a.bytes, "RINGDATA");
+            w.setRoot(a.ref);
+            _ = try w.commit();
+        }
+
+        // Each committed version (2..active_version) maps to a non-zero root.
+        var v: u64 = 2;
+        while (v <= db.active_version) : (v += 1) {
+            const r = db.versionRoot(v) orelse return error.TestUnexpectedNull;
+            try testing.expect(r != 0);
+        }
+        // A version that was never committed yet is null.
+        try testing.expectEqual(@as(?u64, null), db.versionRoot(db.active_version + 1));
+    }
+
+    // The ring lives in the durable header page, so it survives reopen.
+    {
+        var db = try Db.open(testing.allocator, path);
+        defer db.deinit();
+        try testing.expectEqual(@as(u64, 1 + k), db.active_version);
+        var v: u64 = 2;
+        while (v <= db.active_version) : (v += 1) {
+            const r = db.versionRoot(v) orelse return error.TestUnexpectedNull;
+            try testing.expect(r != 0);
+        }
+    }
+}
+
+test "ring wraps after capacity" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "ringwrap.airdb");
+    defer testing.allocator.free(path);
+
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+
+    // Commit more than ring_capacity times so the ring wraps and evicts old entries.
+    const total: u64 = @as(u64, ring_capacity) + 12;
+    var i: u64 = 0;
+    while (i < total) : (i += 1) {
+        var w = try db.beginWrite();
+        const a = try w.alloc(8);
+        @memcpy(a.bytes, "WRAPDATA");
+        w.setRoot(a.ref);
+        _ = try w.commit();
+    }
+
+    const newest = db.active_version; // 1 + total
+    const oldest_live = newest - @as(u64, ring_capacity) + 1;
+
+    // The most recent ring_capacity versions are all present.
+    try testing.expectEqual(oldest_live, db.oldestRetainedVersion());
+    var v: u64 = oldest_live;
+    while (v <= newest) : (v += 1) {
+        const r = db.versionRoot(v) orelse return error.TestUnexpectedNull;
+        try testing.expect(r != 0);
+    }
+
+    // Versions older than the live window were evicted.
+    try testing.expectEqual(@as(?u64, null), db.versionRoot(oldest_live - 1));
+    try testing.expectEqual(@as(?u64, null), db.versionRoot(2));
 }
