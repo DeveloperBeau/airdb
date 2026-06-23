@@ -101,14 +101,14 @@ pub fn compactType(txn: *WriteTxn, cat: Ref) !Ref {
 fn copyValue(src: anytype, dst: *WriteTxn, kind: catalog.PropKind, elem: catalog.ElemKind, src_raw: u64) !u64 {
     return switch (kind) {
         .int, .link => src_raw, // verbatim (a link stores an object key, preserved)
-        .blob => if (src_raw == 0) 0 else try blob.put(dst, try blob.get(src, src_raw)),
+        .blob => try blob.copyInto(src, dst, src_raw),
         .list => blk: {
             var newc = try Column.create(dst);
             const n = try Column.len(src, src_raw);
             var i: u64 = 0;
             while (i < n) : (i += 1) {
                 const el = try Column.get(src, src_raw, i);
-                const dv = if (elem == .blob) (if (el == 0) @as(u64, 0) else try blob.put(dst, try blob.get(src, el))) else el;
+                const dv = if (elem == .blob) try blob.copyInto(src, dst, el) else el;
                 newc = try Column.append(dst, newc, dv);
             }
             break :blk newc;
@@ -993,6 +993,64 @@ test "compaction preserves dict and set-of-blob" {
         // Deleted row pk 2 is absent.
         var o2: [3]catalog.Value = undefined;
         try testing.expectEqual(@as(?u64, null), try typedir.get(&r, dir, 0, 2, &o2));
+    }
+}
+
+test "compaction preserves a large (chunked) blob" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const src_path = try cmpTmpPath(testing.allocator, &tmp, "bigblobsrc.airdb");
+    defer testing.allocator.free(src_path);
+    const dst_path = try cmpTmpPath(testing.allocator, &tmp, "bigblobdst.airdb");
+    defer testing.allocator.free(dst_path);
+
+    const PD = catalog.PropDef;
+
+    // A blob well past the inline cap (section_size is 16 MiB) is stored chunked.
+    const n: usize = 20 * 1024 * 1024;
+    const big = try testing.allocator.alloc(u8, n);
+    defer testing.allocator.free(big);
+    for (big, 0..) |*b, i| b.* = @intCast((i * 7 + 3) % 251);
+
+    // Build the source: a type {int pk, blob}, one large blob and one small.
+    {
+        var db = try Db.create(testing.allocator, src_path);
+        defer db.deinit();
+        var w = try db.beginWrite();
+        const schema = [_][]const PD{
+            &.{ .{ .kind = .int }, .{ .kind = .blob } },
+        };
+        var dir = try typedir.createTypes(&w, &schema, &.{false});
+        dir = (try typedir.insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .bytes = big } })).dir;
+        dir = (try typedir.insert(&w, dir, 0, &.{ .{ .int = 2 }, .{ .bytes = "small" } })).dir;
+        w.setRoot(dir);
+        _ = try w.commit();
+    }
+
+    // Full-file compaction: deep-copies live rows (incl. the chunked blob), verifies, commits.
+    try compactToNewFile(testing.allocator, src_path, dst_path);
+
+    // Reopen the destination and verify both blobs survived.
+    {
+        var ddb = try Db.open(testing.allocator, dst_path);
+        defer ddb.deinit();
+        var r = try ddb.beginRead();
+        defer r.end();
+        const dir = r.root();
+
+        // The large blob materializes byte-identical via its ref.
+        var o1: [2]catalog.Value = undefined;
+        try testing.expect((try typedir.get(&r, dir, 0, 1, &o1)) != null);
+        try testing.expect(o1[1] == .blob_ref);
+        const got = try blob.getAlloc(&r, o1[1].blob_ref, testing.allocator);
+        defer testing.allocator.free(got);
+        try testing.expectEqualSlices(u8, big, got);
+
+        // The small blob still reads via a zero-copy slice.
+        var o2: [2]catalog.Value = undefined;
+        try testing.expect((try typedir.get(&r, dir, 0, 2, &o2)) != null);
+        try testing.expect(o2[1] == .bytes);
+        try testing.expectEqualStrings("small", o2[1].bytes);
     }
 }
 

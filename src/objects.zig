@@ -280,7 +280,9 @@ pub fn insertTyped(txn: *WriteTxn, cat: Ref, values: []const Value) !struct { ca
 }
 
 // getTyped reads a row by primary key and decodes each property into a Value.
-// .blob properties are zero-copy slices into the mapped storage.
+// A small .blob property decodes to a zero-copy .bytes slice into the mapped
+// storage; a blob larger than the inline cap (stored chunked) decodes to a
+// .blob_ref the caller materializes with blob.getAlloc.
 // Returns the row version, or null when the key is not found.
 pub fn getTyped(txn: anytype, cat: Ref, pk: u64, out: []Value) !?u64 {
     const v = try loadCatalog(txn, cat);
@@ -299,7 +301,10 @@ pub fn getTyped(txn: anytype, cat: Ref, pk: u64, out: []Value) !?u64 {
     while (i < pc) : (i += 1) {
         out[i] = switch (kinds[i]) {
             .int => .{ .int = raw[i] },
-            .blob => .{ .bytes = try blob.get(txn, raw[i]) },
+            .blob => if (blob.get(txn, raw[i])) |slice| .{ .bytes = slice } else |err| switch (err) {
+                error.BlobChunked => .{ .blob_ref = raw[i] },
+                else => |e| return e,
+            },
             .list, .set, .dict, .link_set => .{ .coll_root = raw[i] },
             .link => .{ .link = if (raw[i] == 0) null else raw[i] - 1 },
         };
@@ -324,7 +329,10 @@ pub fn getTypedByOkey(txn: anytype, cat: Ref, okey: u64, out: []Value) !?u64 {
     while (i < pc) : (i += 1) {
         out[i] = switch (kinds[i]) {
             .int => .{ .int = raw[i] },
-            .blob => .{ .bytes = try blob.get(txn, raw[i]) },
+            .blob => if (blob.get(txn, raw[i])) |slice| .{ .bytes = slice } else |err| switch (err) {
+                error.BlobChunked => .{ .blob_ref = raw[i] },
+                else => |e| return e,
+            },
             .list, .set, .dict, .link_set => .{ .coll_root = raw[i] },
             .link => .{ .link = if (raw[i] == 0) null else raw[i] - 1 },
         };
@@ -811,6 +819,46 @@ test "strings persist across reopen" {
         try testing.expectEqualStrings("name-321", out[1].bytes);
         r.end();
     }
+}
+
+test "a large blob property decodes to a ref and materializes; small stays inline" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "bigblob.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var cat = try createTyped(&w, &.{ .int, .blob });
+
+    // A blob well past the inline cap (section_size is 16 MiB) forces chunking.
+    const n: usize = 20 * 1024 * 1024;
+    const big = try testing.allocator.alloc(u8, n);
+    defer testing.allocator.free(big);
+    for (big, 0..) |*b, i| b.* = @intCast(i % 251);
+
+    cat = (try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .bytes = big } })).cat;
+    cat = (try insertTyped(&w, cat, &.{ .{ .int = 2 }, .{ .bytes = "small" } })).cat;
+
+    // The large blob decodes to a ref, not an inline slice.
+    var out: [2]Value = undefined;
+    try testing.expect((try getTyped(&w, cat, 1, &out)) != null);
+    try testing.expect(out[1] == .blob_ref);
+
+    // Materialize it and verify length + sampled offsets + first/last KB.
+    const got = try blob.getAlloc(&w, out[1].blob_ref, testing.allocator);
+    defer testing.allocator.free(got);
+    try testing.expectEqual(n, got.len);
+    try testing.expectEqualSlices(u8, big[0..1024], got[0..1024]);
+    try testing.expectEqualSlices(u8, big[n - 1024 ..], got[n - 1024 ..]);
+    try testing.expectEqual(big[n / 2], got[n / 2]);
+    try testing.expectEqual(big[12_345_678], got[12_345_678]);
+
+    // A small blob in the same property still decodes to a zero-copy slice.
+    try testing.expect((try getTyped(&w, cat, 2, &out)) != null);
+    try testing.expect(out[1] == .bytes);
+    try testing.expectEqualStrings("small", out[1].bytes);
+    w.deinit();
 }
 
 test "getByObjectKey reads a row by its stable object key" {
