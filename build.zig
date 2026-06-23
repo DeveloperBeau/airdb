@@ -56,19 +56,23 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(lib);
 
     // C smoke test: compile tests/ffi_smoke.c against include/airdb.h, link the
-    // static library, and run it. Proves the C ABI is callable end to end.
-    const c_smoke_mod = b.createModule(.{
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    c_smoke_mod.addCSourceFile(.{ .file = b.path("tests/ffi_smoke.c") });
-    c_smoke_mod.addIncludePath(b.path("include"));
-    c_smoke_mod.linkLibrary(lib);
-    const c_smoke = b.addExecutable(.{
-        .name = "ffi_smoke",
-        .root_module = c_smoke_mod,
-    });
-    const run_c_smoke = b.addRunArtifact(c_smoke);
-    test_step.dependOn(&run_c_smoke.step);
+    // static library, and run it. Proves the C ABI is callable end to end. Its
+    // fixed "/tmp/..." path is POSIX-only, so the run is skipped on Windows (the
+    // ABI logic it exercises is platform-neutral).
+    if (target.result.os.tag != .windows) {
+        const c_smoke_mod = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        c_smoke_mod.addCSourceFile(.{ .file = b.path("tests/ffi_smoke.c") });
+        c_smoke_mod.addIncludePath(b.path("include"));
+        c_smoke_mod.linkLibrary(lib);
+        const c_smoke = b.addExecutable(.{
+            .name = "ffi_smoke",
+            .root_module = c_smoke_mod,
+        });
+        const run_c_smoke = b.addRunArtifact(c_smoke);
+        test_step.dependOn(&run_c_smoke.step);
+    }
 }
