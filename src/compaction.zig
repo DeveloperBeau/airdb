@@ -9,6 +9,7 @@ const links = @import("links.zig");
 const typedir = @import("typedir.zig");
 const objects = @import("objects.zig");
 const bindex = @import("bindex.zig");
+const relocateRow = @import("relocation.zig").relocateRow;
 
 const max_prop_count = catalog.max_prop_count;
 
@@ -94,6 +95,118 @@ pub fn compactType(txn: *WriteTxn, cat: Ref) !Ref {
     }
 
     return catalog.writeCatalog(txn, pc, new_row, new_keyrow, next_key, pk_index_ref, new_ver, new_live, new_prop[0..pc], kinds[0..pc], elems[0..pc], bl[0..pc], targets[0..pc], rules[0..pc]);
+}
+
+// Truncate a fully-packed type's columns down to `new_len` rows and publish a
+// catalog with next_row == new_len. All live rows must already lie in
+// [0, new_len); the dead tail is dropped. Object key/pk/backlink indexes are
+// preserved unchanged. Returns the new catalog ref.
+fn truncatePacked(txn: *WriteTxn, cat: Ref, new_len: u64) !Ref {
+    const v = try catalog.loadCatalog(txn, cat);
+    const pc = v.prop_count;
+    const next_key = v.next_key;
+    const keyrow = v.keyrow_index_ref;
+    const pk_index_ref = v.pk_index_ref;
+    // Snapshot all view-backed values before truncating: Column.truncate can grow
+    // the file and invalidate the bytes backing the CatalogView.
+    var prop: [max_prop_count]Ref = undefined;
+    var kinds: [max_prop_count]catalog.PropKind = undefined;
+    var elems: [max_prop_count]catalog.ElemKind = undefined;
+    var bl: [max_prop_count]Ref = undefined;
+    var targets: [max_prop_count]u16 = undefined;
+    var rules: [max_prop_count]catalog.DeletionRule = undefined;
+    {
+        var j: usize = 0;
+        while (j < pc) : (j += 1) {
+            prop[j] = v.propColRef(j);
+            kinds[j] = v.kind(j);
+            elems[j] = v.elemKind(j);
+            bl[j] = v.backlinkRef(j);
+            targets[j] = v.linkTarget(j);
+            rules[j] = v.delRule(j);
+        }
+    }
+    var ver = v.version_col_ref;
+    var live = v.live_col_ref;
+
+    {
+        var j: usize = 0;
+        while (j < pc) : (j += 1) prop[j] = try Column.truncate(txn, prop[j], new_len);
+    }
+    ver = try Column.truncate(txn, ver, new_len);
+    live = try Column.truncate(txn, live, new_len);
+
+    return catalog.writeCatalog(txn, pc, new_len, keyrow, next_key, pk_index_ref, ver, live, prop[0..pc], kinds[0..pc], elems[0..pc], bl[0..pc], targets[0..pc], rules[0..pc]);
+}
+
+// Incrementally pack a type toward dense storage, doing at most `budget`
+// relocations per call. Each call moves up to `budget` "high" live rows (those
+// at physical index >= live_count) down into "holes" (dead slots below
+// live_count), then -- once no high live rows remain -- truncates the dead tail
+// so next_row == live_count. `done` is true when the type is fully packed and
+// truncated; call again with the returned cat until `done`. Returns the updated
+// catalog ref, the number of rows moved this call, and whether packing finished.
+pub fn compactStep(txn: *WriteTxn, cat: Ref, budget: usize) !struct { cat: Ref, moved: usize, done: bool } {
+    var cur = cat;
+    const lc = try liveCount(txn, cur);
+    const alloc = txn.db.store.allocator;
+
+    // Already packed (no live row above live_count): just ensure the tail is
+    // truncated so next_row == live_count, and report done.
+    if ((try catalog.loadCatalog(txn, cur)).next_row == lc) {
+        return .{ .cat = cur, .moved = 0, .done = true };
+    }
+
+    // One pass over the key->row index: collect the high live rows (row >= lc)
+    // and mark which slots in [0, lc) are occupied. Unmarked slots are holes.
+    var high = std.ArrayList(Pair).empty;
+    defer high.deinit(alloc);
+    const occ = try alloc.alloc(bool, @intCast(lc));
+    defer alloc.free(occ);
+    @memset(occ, false);
+
+    const Collector = struct {
+        high: *std.ArrayList(Pair),
+        occ: []bool,
+        a: std.mem.Allocator,
+        lc: u64,
+        fn onEntry(self: @This(), okey: u64, row: u64) !void {
+            if (row >= self.lc) {
+                try self.high.append(self.a, .{ .okey = okey, .row = row });
+            } else {
+                self.occ[@intCast(row)] = true;
+            }
+        }
+    };
+    {
+        const v = try catalog.loadCatalog(txn, cur);
+        try Index.forEachEntry(txn, v.keyrow_index_ref, Collector{ .high = &high, .occ = occ, .a = alloc, .lc = lc }, Collector.onEntry);
+    }
+
+    // Holes are the unmarked indices in [0, lc). By construction their count
+    // equals high.len (total live rows == lc), but we min over both to be safe.
+    var holes = std.ArrayList(u64).empty;
+    defer holes.deinit(alloc);
+    {
+        var i: u64 = 0;
+        while (i < lc) : (i += 1) if (!occ[@intCast(i)]) try holes.append(alloc, i);
+    }
+
+    // Relocate high rows into holes, up to the budget.
+    const limit = @min(budget, @min(high.items.len, holes.items.len));
+    var moved: usize = 0;
+    while (moved < limit) : (moved += 1) {
+        cur = try relocateRow(txn, cur, high.items[moved].okey, holes.items[moved]);
+    }
+
+    // Each relocation consumes one high row; if any remain, budget is exhausted
+    // and we are not done. Otherwise every live row is now packed in [0, lc):
+    // truncate the dead tail and finish.
+    if (high.items.len - moved == 0) {
+        cur = try truncatePacked(txn, cur, lc);
+        return .{ .cat = cur, .moved = moved, .done = true };
+    }
+    return .{ .cat = cur, .moved = moved, .done = false };
 }
 
 // Deep-copy a single property value from the source db into the destination db.
@@ -1053,6 +1166,146 @@ test "compaction preserves a large (chunked) blob" {
         try testing.expectEqualStrings("small", o2[1].bytes);
     }
 }
+
+test "compactStep packs a delete-heavy type across several small steps" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try cmpTmpPath(testing.allocator, &tmp, "step1.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    defer w.deinit();
+
+    var cat = try catalog.create(&w, 2);
+    var okeys: [12]u64 = undefined;
+    var pk: u64 = 0;
+    while (pk < 12) : (pk += 1) {
+        const r = try objects.insert(&w, cat, &.{ pk, pk * 100 });
+        cat = r.cat;
+        okeys[@intCast(pk)] = r.row;
+    }
+
+    const dels = [_]u64{ 0, 2, 3, 5, 7, 8, 11 };
+    for (dels) |dpk| {
+        var out: [2]u64 = undefined;
+        const ver = (try objects.getByPk(&w, cat, dpk, &out)).?;
+        cat = switch (try objects.delete(&w, cat, dpk, ver)) {
+            .ok => |c| c,
+            else => unreachable,
+        };
+    }
+
+    // Pack in small budgeted steps until done.
+    var guard: usize = 0;
+    while (true) {
+        const res = try compactStep(&w, cat, 2);
+        cat = res.cat;
+        try testing.expect(res.moved <= 2);
+        if (res.done) break;
+        guard += 1;
+        try testing.expect(guard < 100);
+    }
+
+    // Fully packed: next_row == live count.
+    try testing.expectEqual(try liveCount(&w, cat), (try catalog.loadCatalog(&w, cat)).next_row);
+
+    // Every survivor reads back its exact values; deleted keys are gone.
+    pk = 0;
+    while (pk < 12) : (pk += 1) {
+        const is_del = blk: {
+            for (dels) |d| if (d == pk) break :blk true;
+            break :blk false;
+        };
+        var out: [2]catalog.Value = undefined;
+        const got = try objects.getTypedByOkey(&w, cat, okeys[@intCast(pk)], &out);
+        if (is_del) {
+            try testing.expect(got == null);
+        } else {
+            try testing.expect(got != null);
+            try testing.expectEqual(pk, out[0].int);
+            try testing.expectEqual(pk * 100, out[1].int);
+        }
+    }
+}
+
+test "compactStep on an all-dead type truncates to zero" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try cmpTmpPath(testing.allocator, &tmp, "step2.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    defer w.deinit();
+
+    var cat = try catalog.create(&w, 2);
+    var pk: u64 = 0;
+    while (pk < 6) : (pk += 1) {
+        const r = try objects.insert(&w, cat, &.{ pk, pk });
+        cat = r.cat;
+    }
+    pk = 0;
+    while (pk < 6) : (pk += 1) {
+        var out: [2]u64 = undefined;
+        const ver = (try objects.getByPk(&w, cat, pk, &out)).?;
+        cat = switch (try objects.delete(&w, cat, pk, ver)) {
+            .ok => |c| c,
+            else => unreachable,
+        };
+    }
+
+    var guard: usize = 0;
+    while (true) {
+        const res = try compactStep(&w, cat, 2);
+        cat = res.cat;
+        if (res.done) break;
+        guard += 1;
+        try testing.expect(guard < 100);
+    }
+
+    try testing.expectEqual(@as(u64, 0), (try catalog.loadCatalog(&w, cat)).next_row);
+    try testing.expectEqual(@as(u64, 0), try liveCount(&w, cat));
+}
+
+test "compactStep is a no-op on an already-packed type" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try cmpTmpPath(testing.allocator, &tmp, "step3.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    defer w.deinit();
+
+    var cat = try catalog.create(&w, 2);
+    var okeys: [5]u64 = undefined;
+    var pk: u64 = 0;
+    while (pk < 5) : (pk += 1) {
+        const r = try objects.insert(&w, cat, &.{ pk, pk * 7 });
+        cat = r.cat;
+        okeys[@intCast(pk)] = r.row;
+    }
+
+    const res = try compactStep(&w, cat, 4);
+    cat = res.cat;
+    try testing.expect(res.done);
+    try testing.expectEqual(@as(usize, 0), res.moved);
+
+    pk = 0;
+    while (pk < 5) : (pk += 1) {
+        var out: [2]catalog.Value = undefined;
+        const got = try objects.getTypedByOkey(&w, cat, okeys[@intCast(pk)], &out);
+        try testing.expect(got != null);
+        try testing.expectEqual(pk, out[0].int);
+        try testing.expectEqual(pk * 7, out[1].int);
+    }
+}
+
+// NOTE: link/backlink survival across a relocation is covered directly by
+// relocation.zig's tests ("a same-type link to a relocated object still
+// resolves"); compactStep only sequences relocateRow calls, so wiring links
+// into these tests would duplicate that coverage without exercising new paths.
 
 test "compactInPlace shrinks and preserves data" {
     var tmp = testing.tmpDir(.{});
