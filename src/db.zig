@@ -20,6 +20,8 @@ const FreeExtent = @import("freelist.zig").FreeExtent;
 const FreeList = @import("freelist.zig").FreeList;
 const Coord = @import("coord.zig").Coord;
 const coord_mod = @import("coord.zig");
+const typedir = @import("typedir.zig");
+const compaction = @import("compaction.zig");
 
 const slot_a_off: usize = 64;
 const slot_b_off: usize = 128;
@@ -67,6 +69,8 @@ pub const Db = struct {
     /// Retention window: committed-free space is withheld from reuse until it is
     /// older than `active_version - retain_versions`. 0 disables the window.
     retain_versions: u64 = 0,
+    /// Opt-in: when set, the caller drives `maybeCompactStep` to amortize compaction.
+    auto_compact: bool = false,
 
     /// Create a new database file at the given absolute path.
     pub fn create(allocator: std.mem.Allocator, path: []const u8) !Db {
@@ -119,6 +123,7 @@ pub const Db = struct {
             .coord = coord,
             .participant_slot = slot,
             .retain_versions = 0,
+            .auto_compact = false,
         };
     }
 
@@ -153,6 +158,7 @@ pub const Db = struct {
             .coord = undefined,
             .participant_slot = null,
             .retain_versions = 0,
+            .auto_compact = false,
         };
         errdefer db.free_list.deinit();
 
@@ -380,6 +386,30 @@ pub const Db = struct {
     /// Withhold recently-freed space from reuse for the most recent `n` versions.
     pub fn setRetainVersions(self: *Db, n: u64) void {
         self.retain_versions = n;
+    }
+
+    /// Perform at most one budgeted incremental-compaction step on `type_id`,
+    /// committing the result in its own write transaction. Returns `ran = false`
+    /// (a no-op) when the type does not yet warrant compaction; otherwise reports
+    /// the rows moved this step and whether the type is now fully packed.
+    ///
+    /// Advisory and opt-in: this is never invoked from `commit` or any hot path.
+    /// The `auto_compact` flag is consulted by callers to decide whether to drive
+    /// this loop; the method itself does not check it.
+    pub fn maybeCompactStep(self: *Db, type_id: u16, budget: usize) !struct { ran: bool, moved: usize, done: bool } {
+        var w = try self.beginWrite();
+        errdefer w.deinit();
+        const dir = self.active_root;
+        const cat = try typedir.catalogRef(&w, dir, type_id);
+        if (!try compaction.shouldCompact(&w, cat)) {
+            w.deinit();
+            return .{ .ran = false, .moved = 0, .done = false };
+        }
+        const step = try compaction.compactStep(&w, cat, budget);
+        const new_dir = try typedir.setCatalogRef(&w, dir, type_id, step.cat);
+        w.setRoot(new_dir);
+        _ = try w.commit();
+        return .{ .ran = true, .moved = step.moved, .done = step.done };
     }
 
     /// Root ref for a committed version, or null if not retained / not yet committed.
@@ -1052,7 +1082,6 @@ test "ring wraps after capacity" {
 test "beginReadAt opens a past version within the retention window" {
     const objects = @import("objects.zig");
     const catalog = @import("catalog.zig");
-    const compaction = @import("compaction.zig");
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try tmpFilePath(testing.allocator, &tmp, "pit.airdb");
@@ -1137,4 +1166,134 @@ test "beginReadAt rejects a version aged out of the retention window" {
     // v_a is older than active - retain_versions(0) -> aged out.
     try testing.expectError(error.VersionUnavailable, db.beginReadAt(va));
     try testing.expect(db.oldestReadableVersion() == db.active_version);
+}
+
+// Churn a single int-pk type at `path` with a steady live set: seed `live`
+// rows, then on each iteration insert `live` fresh rows and delete the `live`
+// oldest live rows (net-zero live count). Dead rows accumulate, so next_row
+// grows without bound unless compaction reclaims it. When `auto` is set, the
+// caller drives maybeCompactStep after each iteration until the type is packed.
+// Returns the final next_row (physical row high-water) and live count.
+fn churnNetZero(path: []const u8, live: u64, iters: u64, auto: bool) !struct { next_row: u64, live: u64 } {
+    const catalog = @import("catalog.zig");
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    db.auto_compact = auto;
+    const tid: u16 = 0;
+
+    // Single type: int pk + one int prop.
+    {
+        var w = try db.beginWrite();
+        const dir = try typedir.createTypes(&w, &.{&.{ .{ .kind = .int }, .{ .kind = .int } }}, &.{false});
+        w.setRoot(dir);
+        _ = try w.commit();
+    }
+
+    // Seed the live set (pks [0, live)).
+    var hi: u64 = 0;
+    {
+        var w = try db.beginWrite();
+        var dir = db.active_root;
+        while (hi < live) : (hi += 1) {
+            dir = (try typedir.insert(&w, dir, tid, &.{ .{ .int = hi }, .{ .int = hi } })).dir;
+        }
+        w.setRoot(dir);
+        _ = try w.commit();
+    }
+
+    var lo: u64 = 0;
+    var iter: u64 = 0;
+    while (iter < iters) : (iter += 1) {
+        {
+            var w = try db.beginWrite();
+            var dir = db.active_root;
+            // Insert `live` fresh rows.
+            var k: u64 = 0;
+            while (k < live) : (k += 1) {
+                dir = (try typedir.insert(&w, dir, tid, &.{ .{ .int = hi }, .{ .int = hi } })).dir;
+                hi += 1;
+            }
+            // Delete the `live` oldest live rows.
+            k = 0;
+            while (k < live) : (k += 1) {
+                var out: [2]catalog.Value = undefined;
+                const ver = (try typedir.get(&w, dir, tid, lo, &out)).?;
+                dir = switch (try typedir.delete(&w, dir, tid, lo, ver)) {
+                    .ok => |d| d,
+                    else => unreachable,
+                };
+                lo += 1;
+            }
+            w.setRoot(dir);
+            _ = try w.commit();
+        }
+        // Opt-in: drive the incremental step loop so the type stays packed.
+        if (db.auto_compact) {
+            while (true) {
+                const res = try db.maybeCompactStep(tid, 4);
+                if (!res.ran or res.done) break;
+            }
+        }
+    }
+
+    var r = try db.beginRead();
+    defer r.end();
+    const cat = try typedir.catalogRef(&r, r.root(), tid);
+    return .{
+        .next_row = (try catalog.loadCatalog(&r, cat)).next_row,
+        .live = try compaction.liveCount(&r, cat),
+    };
+}
+
+test "maybeCompactStep bounds dead rows under churn" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const off_path = try tmpFilePath(testing.allocator, &tmp, "churnoff.airdb");
+    defer testing.allocator.free(off_path);
+    const on_path = try tmpFilePath(testing.allocator, &tmp, "churnon.airdb");
+    defer testing.allocator.free(on_path);
+
+    // Identical churn, run twice: without auto-compaction, then with it.
+    const without = try churnNetZero(off_path, 10, 40, false);
+    const with = try churnNetZero(on_path, 10, 40, true);
+
+    // Live data is preserved identically in both runs.
+    try testing.expectEqual(without.live, with.live);
+    // Compaction reclaims the dead-row space: the physical high-water is strictly
+    // smaller when the step loop runs.
+    try testing.expect(with.next_row < without.next_row);
+}
+
+test "maybeCompactStep is a no-op when nothing to compact" {
+    const catalog = @import("catalog.zig");
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "nocompact.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+
+    const tid: u16 = 0;
+    {
+        var w = try db.beginWrite();
+        var dir = try typedir.createTypes(&w, &.{&.{ .{ .kind = .int }, .{ .kind = .int } }}, &.{false});
+        var pk: u64 = 0;
+        while (pk < 3) : (pk += 1) {
+            dir = (try typedir.insert(&w, dir, tid, &.{ .{ .int = pk }, .{ .int = pk } })).dir;
+        }
+        w.setRoot(dir);
+        _ = try w.commit();
+    }
+
+    const res = try db.maybeCompactStep(tid, 4);
+    try testing.expect(!res.ran);
+    try testing.expectEqual(@as(usize, 0), res.moved);
+    try testing.expect(!res.done);
+
+    // The type is untouched: all three rows remain live and packed.
+    var r = try db.beginRead();
+    defer r.end();
+    const cat = try typedir.catalogRef(&r, r.root(), tid);
+    try testing.expectEqual(@as(u64, 3), try compaction.liveCount(&r, cat));
+    try testing.expectEqual(@as(u64, 3), (try catalog.loadCatalog(&r, cat)).next_row);
 }
