@@ -20,24 +20,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: mlugg/setup-zig@v2
-        with:
-          version: 0.16.0
-      - name: Build and run tests
-        run: zig build test --summary all
-
-  # Windows is not supported yet: the storage engine is POSIX-only (mmap with a
-  # fixed base, flock, fcntl(F_FULLFSYNC), getpid/kill). This job is expected to
-  # fail until a Windows platform layer lands. It is non-blocking
-  # (continue-on-error) so it tracks progress without gating merges; flip the
-  # flag off once Windows passes.
-  test-windows:
-    name: test (windows-latest, allowed to fail)
-    runs-on: windows-latest
-    continue-on-error: true
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
