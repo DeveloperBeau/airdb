@@ -14,7 +14,15 @@ pub const PropDef = struct { kind: PropKind, elem: ElemKind = .int, link_target:
 pub const DictEntry = struct { key: []const u8, val: u64 };
 pub const Value = union(enum) {
     int: u64,
+    // A blob property decodes to one of two read-side shapes:
+    //   .bytes    -- a small blob (<= inline cap): a zero-copy slice into the
+    //                mapped storage, valid for the lifetime of the transaction.
+    //   .blob_ref -- a blob larger than the inline cap, stored chunked and thus
+    //                without a single contiguous slice. The caller materializes
+    //                it with `blob.getAlloc(txn, ref, allocator)` and frees the
+    //                returned buffer.
     bytes: []const u8,
+    blob_ref: Ref,
     list_int: []const u64,
     list_blob: []const []const u8,
     set_int: []const u64,

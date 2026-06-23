@@ -152,6 +152,18 @@ pub fn getAlloc(txn: anytype, ref: Ref, allocator: std.mem.Allocator) ![]u8 {
     return buf;
 }
 
+/// Copy the blob at `src_ref` (inline OR chunked) from a source db into `dst`,
+/// returning its new Ref in the destination. The null ref (0) copies to 0.
+/// Materializes the blob in RAM during the copy (acceptable for a maintenance
+/// op); a future optimization could stream chunks without buffering the whole
+/// blob. Accepts any source transaction exposing `deref(ref, len) ![]const u8`.
+pub fn copyInto(src: anytype, dst: *WriteTxn, src_ref: Ref) !Ref {
+    if (src_ref == 0) return 0;
+    const buf = try getAlloc(src, src_ref, dst.db.store.allocator);
+    defer dst.db.store.allocator.free(buf);
+    return try put(dst, buf);
+}
+
 /// Release the blob at `ref` back to the storage engine.
 /// Freeing the null ref (0) is a no-op. For a chunked blob, frees every chunk
 /// node and then the index node.
