@@ -124,6 +124,7 @@ fn copyValue(src: anytype, dst: *WriteTxn, kind: catalog.PropKind, elem: catalog
             try Index.forEachKey(src, src_raw, Sink{ .idx = &newi, .dstp = dst }, Sink.onKey);
             break :blk newi;
         },
+        .dict => unreachable, // bindex-backed deep-copy is a separate follow-up
     };
 }
 

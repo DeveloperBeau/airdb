@@ -5,17 +5,22 @@ const Column = @import("column.zig");
 const Index = @import("index.zig");
 
 pub const PropCount = u16;
-pub const PropKind = enum(u8) { int = 0, blob = 1, list = 2, set = 3, link = 4, link_set = 5 };
+pub const PropKind = enum(u8) { int = 0, blob = 1, list = 2, set = 3, link = 4, link_set = 5, dict = 6 };
 pub const ElemKind = enum(u8) { int = 0, blob = 1 };
 pub const DeletionRule = enum(u8) { nullify = 0, cascade = 1, block = 2 };
 pub const PropDef = struct { kind: PropKind, elem: ElemKind = .int, link_target: u16 = 0, del_rule: DeletionRule = .nullify };
+// A single byte-keyed dictionary entry: a byte-string key mapped to a u64 value
+// (an int, or an object key for a "dict of links" -- u64 covers both).
+pub const DictEntry = struct { key: []const u8, val: u64 };
 pub const Value = union(enum) {
     int: u64,
     bytes: []const u8,
     list_int: []const u64,
     list_blob: []const []const u8,
     set_int: []const u64,
-    coll_root: Ref, // read side: getTyped returns this for list/set/link_set properties
+    set_blob: []const []const u8,
+    dict_int: []const DictEntry,
+    coll_root: Ref, // read side: getTyped returns this for list/set/dict/link_set properties
     link: ?u64,
     link_set: []const u64, // to-many: initial set of target okeys
 };
