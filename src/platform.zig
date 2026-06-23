@@ -18,12 +18,22 @@ const is_windows = builtin.os.tag == .windows;
 /// for mmap return pointers.
 const page = std.heap.page_size_min;
 
-/// Virtual address reservation, and so the per-open maximum file size for a growable
-/// mapping. On POSIX it is never backed by physical pages beyond what the file covers
-/// (PROT_NONE reservation; demand-paged) and the base never moves. On Windows there is
-/// no reserve-and-grow-in-place, so this is only the per-open size cap.
+/// Per-open maximum file size. The file is mapped as a list of fixed-size sections;
+/// this caps how many sections may be created (max_sections = max_reserved / section_size),
+/// keeping the section array bounded.
 /// 64-bit: 1 TiB. 32-bit: 1 GiB.
 pub const max_reserved: usize = if (@bitSizeOf(usize) >= 64) (1 << 40) else (1 << 30);
+
+/// The file is mapped in fixed-size sections. A ref (an absolute byte offset into the
+/// logical arena) is translated to a pointer via the section it falls in:
+///   section_index   = ref >> section_shift
+///   offset_in_section = ref & section_mask
+/// Existing sections are never remapped or moved on growth (growth only ADDS sections),
+/// so every live pointer stays valid. No single allocation may cross a section boundary,
+/// which also makes section_size the maximum single allocation size.
+pub const section_shift: u6 = 24;
+pub const section_size: usize = 1 << section_shift; // 16 MiB
+pub const section_mask: usize = section_size - 1;
 
 // Windows API bindings, declared locally so the module is self-contained. Gated so
 // the .winapi externs are only present when compiling for Windows.
@@ -70,93 +80,50 @@ const win = if (is_windows) struct {
 // Memory mapping
 // ---------------------------------------------------------------------------
 
-/// Reserve-then-commit helper (POSIX): map `fd` at `reserved_ptr` with MAP_FIXED.
-fn mapFileOver(reserved_ptr: [*]align(page) u8, fd: std.posix.fd_t, len: usize) ![]align(page) u8 {
-    return std.posix.mmap(
-        reserved_ptr,
-        len,
-        .{ .READ = true, .WRITE = true },
-        .{ .TYPE = .SHARED, .FIXED = true },
-        fd,
-        0,
-    );
-}
-
-// Windows: create a file mapping covering the file and map a `len`-byte view.
-fn winMapView(file: std.Io.File, len: usize) !struct { map: []align(page) u8, handle: win.HANDLE } {
-    const h = win.CreateFileMappingW(file.handle, null, win.PAGE_READWRITE, 0, 0, null) orelse return error.MapFailed;
-    errdefer _ = win.CloseHandle(h);
-    const ptr = win.MapViewOfFile(h, win.FILE_MAP_READ | win.FILE_MAP_WRITE, 0, 0, len) orelse return error.MapFailed;
-    const base: [*]align(page) u8 = @ptrCast(@alignCast(ptr));
-    return .{ .map = base[0..len], .handle = h };
-}
-
-/// A growable, file-backed shared mapping.
-///
-/// On POSIX: an anonymous PROT_NONE reservation (`reserved`) with the file mapped over
-/// its start with MAP_FIXED (`map`); `grow` re-maps a longer prefix in place at the same
-/// base, so existing pointers stay valid.
-/// On Windows: a file-mapping `handle` plus a mapped view (`map`); `grow` unmaps, closes,
-/// and recreates a larger view (the base may move, which is fine: airdb refs are offsets
-/// and the caller re-reads `current()` after a grow).
-pub const Mapping = struct {
+/// One file-backed shared mapping covering a single fixed-size section of the file.
+/// The section's base address never moves for the section's lifetime; growth happens by
+/// creating additional Sections, never by remapping or moving an existing one.
+pub const Section = struct {
     map: []align(page) u8,
-    reserved: if (is_windows) void else []align(page) u8,
     handle: if (is_windows) win.HANDLE else void,
 
-    /// The live, file-backed `[0, len)` slice.
-    pub fn current(self: *const Mapping) []align(page) u8 {
-        return self.map;
-    }
-
-    /// Re-map the file for `new_len` bytes, updating `self.map`. The caller must have
-    /// already extended the file to at least `new_len`.
-    pub fn grow(self: *Mapping, file: std.Io.File, new_len: usize) !void {
-        if (is_windows) {
-            _ = win.UnmapViewOfFile(self.map.ptr);
-            _ = win.CloseHandle(self.handle);
-            const v = try winMapView(file, new_len);
-            self.map = v.map;
-            self.handle = v.handle;
-        } else {
-            self.map = try mapFileOver(self.reserved.ptr, file.handle, new_len);
-        }
-    }
-
-    /// Release the mapping.
-    pub fn deinit(self: *Mapping) void {
+    /// Release this section's mapping.
+    pub fn unmap(self: *Section) void {
         if (is_windows) {
             _ = win.UnmapViewOfFile(self.map.ptr);
             _ = win.CloseHandle(self.handle);
         } else {
-            std.posix.munmap(self.reserved);
+            std.posix.munmap(self.map);
         }
     }
 };
 
-/// Create a growable mapping: on POSIX reserve `max_reserved_len` bytes of address space
-/// then map `file` for `len` over its start; on Windows map a `len`-byte view (the size
-/// cap is enforced by the caller against `max_reserved`).
-pub fn mapFile(file: std.Io.File, len: usize, max_reserved_len: usize) !Mapping {
+/// Map `[file_offset, file_offset + len)` of `file` as a shared, read/write section.
+/// The caller guarantees the file is at least `file_offset + len` bytes long and that
+/// `file_offset` is a multiple of the OS allocation granularity (it is: every caller
+/// passes a multiple of `section_size`, which is 16 MiB).
+pub fn mapSection(file: std.Io.File, file_offset: u64, len: usize) !Section {
     if (is_windows) {
-        const v = try winMapView(file, len);
-        return Mapping{ .map = v.map, .reserved = {}, .handle = v.handle };
+        // One file-mapping object per section. Passing max-size 0 makes the object track
+        // the current file size; the view starts at the section's file offset. The file
+        // has already been extended to cover this section, so the view is fully backed.
+        const h = win.CreateFileMappingW(file.handle, null, win.PAGE_READWRITE, 0, 0, null) orelse return error.MapFailed;
+        errdefer _ = win.CloseHandle(h);
+        const off_high: win.DWORD = @intCast(file_offset >> 32);
+        const off_low: win.DWORD = @intCast(file_offset & 0xFFFFFFFF);
+        const ptr = win.MapViewOfFile(h, win.FILE_MAP_READ | win.FILE_MAP_WRITE, off_high, off_low, len) orelse return error.MapFailed;
+        const base: [*]align(page) u8 = @ptrCast(@alignCast(ptr));
+        return .{ .map = base[0..len], .handle = h };
     } else {
-        // Step 1: reserve a contiguous virtual range with PROT_NONE so the base
-        // address is fixed for the lifetime of this mapping.
-        const reserved = try std.posix.mmap(
+        const m = try std.posix.mmap(
             null,
-            max_reserved_len,
-            .{},
-            .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
-            -1,
-            0,
+            len,
+            .{ .READ = true, .WRITE = true },
+            .{ .TYPE = .SHARED },
+            file.handle,
+            file_offset,
         );
-        errdefer std.posix.munmap(reserved);
-
-        // Step 2: map the file over the start of the reservation with MAP_FIXED.
-        const map = try mapFileOver(reserved.ptr, file.handle, len);
-        return Mapping{ .map = map, .reserved = reserved, .handle = {} };
+        return .{ .map = m, .handle = {} };
     }
 }
 

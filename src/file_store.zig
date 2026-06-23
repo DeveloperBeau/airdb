@@ -50,10 +50,12 @@ pub const Header = struct {
 pub const FileStore = struct {
     allocator: std.mem.Allocator, // reserved for future allocations (buffer pool, catalog pages)
     file: Io.File,
-    /// File-backed prefix of the reservation: mapping.current() (== mapping.map).
+    /// Always points at section 0's mapping. The header and the two commit slots live in
+    /// section 0, so every `store.map[...]` access (header, slots) stays correct.
     map: []align(std.heap.page_size_min) u8,
-    /// The growable, base-stable mapping; unmapped once in deinit.
-    mapping: platform.Mapping,
+    /// Append-only list of fixed-size sections covering the file. Existing entries are
+    /// never remapped or moved on growth; growth only appends. Unmapped in deinit.
+    sections: std.ArrayList(platform.Section),
     header: Header,
     syncer: Syncer,
     /// True when the header CRC32 matches the stored checksum at [28..32].
@@ -61,9 +63,8 @@ pub const FileStore = struct {
     /// Recovery in db.zig openWith reads this to decide whether to trust active_slot.
     header_checksum_ok: bool,
 
-    const initial_capacity: usize = default_page_size * 256;
-    /// Per-open maximum file size; the size of the virtual address reservation backing
-    /// the mapping. See `platform.max_reserved` for the rationale and host-size split.
+    /// Per-open maximum file size; caps the number of sections (max_sections =
+    /// max_reserved / section_size). See `platform.max_reserved` for the host-size split.
     pub const max_reserved: usize = platform.max_reserved;
 
     /// Returns the blocking Io instance used for all file operations.
@@ -75,7 +76,7 @@ pub const FileStore = struct {
     }
 
     /// Create a new database file at the given absolute path, truncating any
-    /// existing file. Maps initial_capacity bytes and writes the header.
+    /// existing file. Maps section 0 and writes the header.
     pub fn create(
         allocator: std.mem.Allocator,
         path: []const u8,
@@ -88,18 +89,11 @@ pub const FileStore = struct {
         });
         errdefer file.close(io);
 
-        try file.setLength(io, initial_capacity);
-
-        // Reserve a contiguous virtual range and map the file over its start, so the
-        // base address is fixed for the lifetime of this FileStore.
-        var mapping = try platform.mapFile(file, initial_capacity, max_reserved);
-        errdefer mapping.deinit();
-
         var fs = FileStore{
             .allocator = allocator,
             .file = file,
-            .map = mapping.current(),
-            .mapping = mapping,
+            .map = undefined, // set by ensureMapped below
+            .sections = .empty,
             .header = .{
                 .magic = airdb_magic,
                 .page_size = default_page_size,
@@ -110,6 +104,14 @@ pub const FileStore = struct {
             .syncer = syncer,
             .header_checksum_ok = false, // set to true after writeHeader below
         };
+        errdefer {
+            for (fs.sections.items) |*s| s.unmap();
+            fs.sections.deinit(allocator);
+        }
+
+        // Extend the file to one section and map it; header + commit slots live here.
+        try fs.ensureMapped(platform.section_size);
+
         fs.writeHeader();
         fs.header_checksum_ok = true;
         try fs.syncer.flush(fs.file);
@@ -130,27 +132,33 @@ pub const FileStore = struct {
         const file_len = try file.length(io);
         if (file_len < default_page_size) return error.Corrupt;
 
-        // Reserve a contiguous virtual range and map the file over its start.
-        var mapping = try platform.mapFile(file, @intCast(file_len), max_reserved);
-        errdefer mapping.deinit();
-
         var fs = FileStore{
             .allocator = allocator,
             .file = file,
-            .map = mapping.current(),
-            .mapping = mapping,
+            .map = undefined, // set by ensureMapped below
+            .sections = .empty,
             .header = undefined,
             .syncer = syncer,
             .header_checksum_ok = false, // set by readHeader below
         };
+        errdefer {
+            for (fs.sections.items) |*s| s.unmap();
+            fs.sections.deinit(allocator);
+        }
+
+        // Map all sections covering the existing file. ensureMapped rounds the file up to
+        // a whole-section multiple first (an old file whose length is not a section
+        // multiple is extended via setLength before mapping), so every section is fully
+        // backed before any deref.
+        try fs.ensureMapped(@intCast(file_len));
         try fs.readHeader();
         return fs;
     }
 
-    /// Unmap and close the file.
-    /// Unmapping the full reservation also unmaps the file-backed prefix at its start.
+    /// Unmap every section and close the file.
     pub fn deinit(self: *FileStore) void {
-        self.mapping.deinit();
+        for (self.sections.items) |*s| s.unmap();
+        self.sections.deinit(self.allocator);
         self.file.close(sysIo());
     }
 
@@ -222,22 +230,45 @@ pub const FileStore = struct {
         };
     }
 
-    /// Grow the file and its mapping to at least `min_len` bytes.
-    /// The base pointer of `map` never changes; pointers into the existing
-    /// mapping remain valid across the call.
-    /// Returns `error.FileTooLarge` if `min_len` exceeds the 1 GiB reservation.
-    pub fn grow(self: *FileStore, min_len: usize) !void {
-        const new_len = std.mem.alignForward(usize, min_len, default_page_size);
-        if (new_len > max_reserved) return error.FileTooLarge;
-        if (new_len <= self.map.len) return;
-        try self.file.setLength(sysIo(), new_len);
-        try self.mapping.grow(self.file, new_len);
-        self.map = self.mapping.current();
+    /// Ensure the file is mapped by enough sections to cover `byte_len` bytes.
+    /// Extends the file to a whole-section multiple, then maps each not-yet-mapped
+    /// section. Existing sections are never remapped or moved, so live pointers stay
+    /// valid. `self.map` is (re)pointed at section 0 afterwards.
+    /// Returns `error.FileTooLarge` if the required size exceeds `max_reserved`.
+    pub fn ensureMapped(self: *FileStore, byte_len: usize) !void {
+        const max_sections = max_reserved >> platform.section_shift;
+        const needed = @max((byte_len + platform.section_size - 1) >> platform.section_shift, 1);
+        if (needed > max_sections) return error.FileTooLarge;
+
+        const want_bytes: u64 = @as(u64, needed) << platform.section_shift;
+        if (try self.file.length(sysIo()) < want_bytes) {
+            try self.file.setLength(sysIo(), want_bytes);
+        }
+
+        var i: usize = self.sections.items.len;
+        while (i < needed) : (i += 1) {
+            const s = try platform.mapSection(self.file, @as(u64, i) << platform.section_shift, platform.section_size);
+            try self.sections.append(self.allocator, s);
+        }
+        self.map = self.sections.items[0].map;
     }
 
-    /// Return the current on-disk file length in bytes.
+    /// Grow the file and its mapping to cover at least `min_len` bytes by appending
+    /// sections. Existing section base pointers never change; live pointers remain valid.
+    /// Returns `error.FileTooLarge` if `min_len` exceeds `max_reserved`.
+    pub fn grow(self: *FileStore, min_len: usize) !void {
+        if (min_len <= self.sections.items.len * platform.section_size) return;
+        try self.ensureMapped(min_len);
+    }
+
+    /// Return the current on-disk file length in bytes (a whole-section multiple).
     pub fn fileLen(self: *FileStore) !u64 {
         return self.file.length(sysIo());
+    }
+
+    /// The live section table, for the arena's ref translation.
+    pub fn sectionsView(self: *FileStore) []const platform.Section {
+        return self.sections.items;
     }
 
     /// Re-encode header fields into the mmap'd page (does not flush).
@@ -319,7 +350,7 @@ test "create writes a header that reopen reads back" {
     }
 }
 
-test "grow extends the mapping in place, base stable, existing bytes preserved" {
+test "grow adds sections, section 0 base stable, existing bytes preserved" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
@@ -328,11 +359,13 @@ test "grow extends the mapping in place, base stable, existing bytes preserved" 
     defer testing.allocator.free(fpath);
     var fs = try FileStore.create(testing.allocator, fpath, RealSyncer.any());
     defer fs.deinit();
-    const initial_len = fs.map.len;
+    const sections_before = fs.sections.items.len;
     const base_before = @intFromPtr(fs.map.ptr);
     fs.map[4096] = 0xAB;
-    try fs.grow(initial_len + 4096 * 10);
-    try testing.expect(fs.map.len >= initial_len + 4096 * 10);
+    // Cross into a second section.
+    try fs.grow(platform.section_size + 4096 * 10);
+    try testing.expect(fs.sections.items.len > sections_before);
+    // Section 0 (where `map` points) is never remapped or moved.
     try testing.expectEqual(base_before, @intFromPtr(fs.map.ptr));
     try testing.expectEqual(@as(u8, 0xAB), fs.map[4096]);
 }

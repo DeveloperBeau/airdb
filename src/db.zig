@@ -7,6 +7,7 @@
 const std = @import("std");
 const testing = std.testing;
 const Io = std.Io;
+const platform = @import("platform.zig");
 const FileStore = @import("file_store.zig").FileStore;
 const RealSyncer = @import("syncer.zig").RealSyncer;
 const Syncer = @import("syncer.zig").Syncer;
@@ -93,7 +94,7 @@ pub const Db = struct {
 
         return Db{
             .store = store,
-            .arena = Arena.init(store.map, default_page_size),
+            .arena = Arena.init(store.sectionsView(), default_page_size),
             .active_version = 1,
             .active_root = 0,
             .pins = std.AutoHashMap(u64, u32).init(allocator),
@@ -115,8 +116,10 @@ pub const Db = struct {
     pub fn openWith(allocator: std.mem.Allocator, path: []const u8, syncer: Syncer) !Db {
         var store = try FileStore.open(allocator, path, syncer);
         errdefer store.deinit();
-        // Capture the map slice before store is copied into the partial Db below.
-        const store_map = store.map;
+        // Capture the section table before store is copied into the partial Db below.
+        // The slice points at heap memory owned by store.sections, which survives the
+        // by-value move of store into db.store.
+        const store_sections = store.sectionsView();
 
         // Build a partial Db so we can call selectActiveSlot and loadFreeList.
         // coord is left undefined; it is set at the very end.
@@ -125,7 +128,7 @@ pub const Db = struct {
         // db.pins is always empty here (no allocation), so it is safe to drop.
         var db: Db = .{
             .store = store,
-            .arena = Arena.init(store_map, default_page_size),
+            .arena = Arena.init(store_sections, default_page_size),
             .active_version = 0,
             .active_root = 0,
             .pins = std.AutoHashMap(u64, u32).init(allocator),
@@ -253,12 +256,13 @@ pub const Db = struct {
         const lv = self.coord.latestVersion(); // acquire-load of the published version
         if (lv <= self.active_version) return; // nothing newer has been published
         try self.store.readHeader(); // refresh header_checksum_ok / mapping view (for integrity use elsewhere)
-        // If another process extended the file, grow our mapping before dereferencing
+        // If another process extended the file, map the new sections before dereferencing
         // slot descriptors or free-list nodes that may live in the grown region.
         const flen = try self.store.fileLen();
-        if (flen > self.store.map.len) {
-            try self.store.grow(flen);
-            self.arena.map = self.store.map;
+        const mapped = self.store.sectionsView().len * platform.section_size;
+        if (flen > mapped) {
+            try self.store.grow(@intCast(flen));
+            self.arena.sections = self.store.sectionsView();
         }
         const published = self.selectPublishedSlot(lv) orelse return; // no qualifying published slot visible yet
         if (published.version <= self.active_version) return;
@@ -380,16 +384,23 @@ pub const Db = struct {
         return self.beginWriteLocked();
     }
 
-    /// Bump-allocate `size` bytes, growing the file if the arena is full.
-    /// After any grow, re-syncs arena.map to the new (larger) mapping slice.
+    /// Bump-allocate `size` bytes, mapping additional sections if the arena is full.
+    /// `error.AllocTooLarge` (size > section_size) is propagated; `error.OutOfSpace`
+    /// maps one more section and retries. Each retry adds exactly one section, which is
+    /// always enough: a single allocation never crosses more than one section boundary.
     pub fn bumpGrowing(self: *Db, size: usize) !Allocation {
-        return self.arena.alloc(size) catch {
-            const needed = self.arena.top + std.mem.alignForward(usize, size, 8);
-            const target = @max(needed, self.store.map.len * 2);
-            try self.store.grow(target);
-            self.arena.map = self.store.map;
-            return self.arena.alloc(size);
-        };
+        while (true) {
+            if (self.arena.alloc(size)) |a| {
+                return a;
+            } else |e| switch (e) {
+                error.AllocTooLarge => return e,
+                error.OutOfSpace => {
+                    const target = (self.store.sectionsView().len + 1) << platform.section_shift;
+                    try self.store.ensureMapped(target);
+                    self.arena.sections = self.store.sectionsView();
+                },
+            }
+        }
     }
 
     /// Test-only accessor: number of extents in the committed free list.
@@ -409,7 +420,7 @@ pub const Db = struct {
         var reclaimable: u64 = 0;
         for (self.free_list.extents.items) |e| reclaimable += e.len;
         return .{
-            .mapped_len = @intCast(self.store.map.len),
+            .mapped_len = @intCast(self.store.sectionsView().len * platform.section_size),
             .latest_version = self.active_version,
             .oldest_pinned_version = self.horizon(),
             .free_extent_count = self.free_list.extents.items.len,
@@ -424,7 +435,7 @@ pub const Db = struct {
         const b_ok = Slot.decode(self.store.map[slot_b_off .. slot_b_off + Slot.size]) catch null;
         if (a_ok == null and b_ok == null) return error.SlotCorrupt;
 
-        const limit = self.store.map.len;
+        const limit = self.store.sectionsView().len * platform.section_size;
 
         if (self.active_root != 0) {
             const r: usize = @intCast(self.active_root);

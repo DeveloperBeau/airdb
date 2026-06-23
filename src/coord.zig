@@ -47,7 +47,7 @@ fn pidAlive(pid: u32) bool {
 
 pub const Coord = struct {
     file: std.Io.File,
-    mapping: platform.Mapping,
+    section: platform.Section,
     map: []align(std.heap.page_size_min) u8,
 
     /// Open an existing coord file or create one if it does not exist.
@@ -68,10 +68,10 @@ pub const Coord = struct {
         const len = try file.length(io);
         if (len < coord_size) try file.setLength(io, coord_size);
 
-        // Fixed-size shared map (max_reserved_len == len: no growth headroom).
-        var mapping = try platform.mapFile(file, coord_size, coord_size);
-        errdefer mapping.deinit();
-        const map = mapping.current();
+        // Fixed-size coord file: a single section covering the whole page. No growth.
+        var section = try platform.mapSection(file, 0, coord_size);
+        errdefer section.unmap();
+        const map = section.map;
 
         const magic = std.mem.readInt(u64, map[off_magic..][0..8], .little);
         if (magic != coord_magic) {
@@ -81,11 +81,11 @@ pub const Coord = struct {
         }
         // Existing file with correct magic: leave all fields as-is.
 
-        return Coord{ .file = file, .mapping = mapping, .map = map };
+        return Coord{ .file = file, .section = section, .map = map };
     }
 
     pub fn deinit(self: *Coord) void {
-        self.mapping.deinit();
+        self.section.unmap();
         self.file.close(coordIo());
     }
 
