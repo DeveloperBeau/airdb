@@ -12,6 +12,9 @@ const Slot = @import("slots.zig").Slot;
 const FreeExtent = @import("freelist.zig").FreeExtent;
 const FreeList = @import("freelist.zig").FreeList;
 const Db = @import("db.zig").Db;
+const ring_head_off = @import("db.zig").ring_head_off;
+const ring_off = @import("db.zig").ring_off;
+const ring_capacity = @import("db.zig").ring_capacity;
 
 const slot_a_off: usize = 64;
 const slot_b_off: usize = 128;
@@ -175,6 +178,19 @@ pub const WriteTxn = struct {
             .logical_size = @intCast(db.arena.top),
         };
         new_slot.encode(db.store.map[inactive_off..][0..Slot.size]);
+
+        // Record (new_version, new_root) in the version->root ring, in the header page.
+        // This lives in section 0 and is made durable by the Step 3 + Step 4 flushes, so
+        // it is part of the same fsync barrier as the new slot. On a revert/failure path
+        // the entry is harmless: its version was never published (active_slot not flipped),
+        // so versionRoot's `version > active_version` guard ignores it. The ring is bounded
+        // and self-overwriting, so we never revert it.
+        const head = std.mem.readInt(u32, db.store.map[ring_head_off..][0..4], .little);
+        const idx = head % ring_capacity;
+        const e = ring_off + @as(usize, idx) * 16;
+        std.mem.writeInt(u64, db.store.map[e..][0..8], self.new_version, .little);
+        std.mem.writeInt(u64, db.store.map[e + 8 ..][0..8], self.new_root, .little);
+        std.mem.writeInt(u32, db.store.map[ring_head_off..][0..4], head + 1, .little);
 
         // Step 3: flush new data + inactive slot to durable storage.
         // Failure here: old active slot is still valid; no in-memory state changed.

@@ -24,6 +24,17 @@ const coord_mod = @import("coord.zig");
 const slot_a_off: usize = 64;
 const slot_b_off: usize = 128;
 
+// Version->root ring log, in the reserved header page (page 0, [0, default_page_size)).
+// The arena's data starts at default_page_size, so the header page has free room past
+// the FileStore header ([0,32)) and the two commit slots (A: [64,100), B: [128,164)).
+//   ring_head_off: u32 LE, monotonically increasing count of entries ever written.
+//                  The live head index is ring_head % ring_capacity.
+//   ring_off:      ring_capacity entries, each 16 bytes [version u64 LE][root_ref u64 LE].
+// End of ring = ring_off + ring_capacity*16 = 1024 + 128*16 = 3072 < 4096. No overlap.
+pub const ring_head_off: usize = 1016;
+pub const ring_off: usize = 1024;
+pub const ring_capacity: u32 = 128;
+
 // ---------------------------------------------------------------------------
 // Db
 // ---------------------------------------------------------------------------
@@ -76,6 +87,10 @@ pub const Db = struct {
         };
         initial.encode(store.map[slot_a_off..][0..Slot.size]);
         store.header.active_slot = 0;
+        // Zero the version->root ring region so head starts at 0 and all entries are
+        // empty. The ring is left empty; the first real commit populates it. A fresh
+        // file is already zero-filled, but zero explicitly so create is self-contained.
+        @memset(store.map[ring_head_off .. ring_off + @as(usize, ring_capacity) * 16], 0);
         store.persistHeader();
         try store.syncer.flush(store.file);
 
@@ -306,6 +321,31 @@ pub const Db = struct {
         return ReadTxn{ .db = self, .root_ref = self.active_root, .version = v };
     }
 
+    /// Open a read snapshot at a past committed `version`. Returns
+    /// error.VersionUnavailable if the version is not in the durable ring or has
+    /// aged out of the retention window (its nodes may have been reclaimed).
+    /// Pins the version so its nodes are held for the life of the read.
+    pub fn beginReadAt(self: *Db, version: u64) !ReadTxn {
+        try self.refreshToLatest();
+        if (version > self.active_version) return error.VersionUnavailable;
+        // Must be inside the retention window: older versions' nodes may already
+        // be reclaimed. maxInt retain_versions means "retain everything".
+        if (self.retain_versions != std.math.maxInt(u64)) {
+            if (version < self.active_version -| self.retain_versions) return error.VersionUnavailable;
+        }
+        const root = if (version == self.active_version)
+            self.active_root
+        else
+            (self.versionRoot(version) orelse return error.VersionUnavailable);
+        if (self.pins.getPtr(version)) |ptr| {
+            ptr.* += 1;
+        } else {
+            try self.pins.put(version, 1);
+        }
+        self.publishPins();
+        return ReadTxn{ .db = self, .root_ref = root, .version = version };
+    }
+
     pub fn horizon(self: *Db) u64 {
         var min: ?u64 = null;
         var it = self.pins.iterator();
@@ -340,6 +380,50 @@ pub const Db = struct {
     /// Withhold recently-freed space from reuse for the most recent `n` versions.
     pub fn setRetainVersions(self: *Db, n: u64) void {
         self.retain_versions = n;
+    }
+
+    /// Root ref for a committed version, or null if not retained / not yet committed.
+    /// The `version > active_version` guard rejects a ring entry written during a
+    /// commit that crashed/aborted before publishing (the slot flip never happened),
+    /// so a recorded-but-unpublished pair is never trusted.
+    pub fn versionRoot(self: *Db, version: u64) ?u64 {
+        if (version > self.active_version) return null;
+        const map = self.store.map;
+        const head = std.mem.readInt(u32, map[ring_head_off..][0..4], .little);
+        const n = @min(head, ring_capacity);
+        var i: u32 = 0;
+        while (i < n) : (i += 1) {
+            const e = ring_off + @as(usize, i) * 16;
+            const v = std.mem.readInt(u64, map[e..][0..8], .little);
+            if (v == version) return std.mem.readInt(u64, map[e + 8 ..][0..8], .little);
+        }
+        return null;
+    }
+
+    /// Oldest version still recorded in the ring, or active_version if the ring is
+    /// empty. As the ring wraps, the recovery window's lower bound advances. Entries
+    /// above active_version (an unpublished/aborted commit) are ignored.
+    pub fn oldestRetainedVersion(self: *Db) u64 {
+        const map = self.store.map;
+        const head = std.mem.readInt(u32, map[ring_head_off..][0..4], .little);
+        const n = @min(head, ring_capacity);
+        var min: ?u64 = null;
+        var i: u32 = 0;
+        while (i < n) : (i += 1) {
+            const e = ring_off + @as(usize, i) * 16;
+            const v = std.mem.readInt(u64, map[e..][0..8], .little);
+            if (v > self.active_version) continue;
+            if (min == null or v < min.?) min = v;
+        }
+        return min orelse self.active_version;
+    }
+
+    /// Oldest version `beginReadAt` can open: the later of the oldest ring entry
+    /// and the retention-window floor. Versions in [this, active_version] open.
+    pub fn oldestReadableVersion(self: *Db) u64 {
+        const ring_floor = self.oldestRetainedVersion();
+        if (self.retain_versions == std.math.maxInt(u64)) return ring_floor;
+        return @max(ring_floor, self.active_version -| self.retain_versions);
     }
 
     /// Shared body for beginWrite and beginWriteTry. Caller must hold the coord
@@ -882,4 +966,175 @@ test "metrics report mapped length, versions, and reclaimable bytes" {
     try testing.expect(m.free_extent_count >= 1);
     try testing.expect(m.reclaimable_bytes >= 8);
     try testing.expectEqual(db.active_version, m.oldest_pinned_version); // no readers
+}
+
+test "version->root ring records committed versions" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "ring.airdb");
+    defer testing.allocator.free(path);
+
+    const k: u64 = 5;
+    {
+        var db = try Db.create(testing.allocator, path);
+        defer db.deinit();
+        // Version 1 (the initial slot) was never written into the ring.
+        try testing.expectEqual(@as(?u64, null), db.versionRoot(1));
+
+        var i: u64 = 0;
+        while (i < k) : (i += 1) {
+            var w = try db.beginWrite();
+            const a = try w.alloc(8);
+            @memcpy(a.bytes, "RINGDATA");
+            w.setRoot(a.ref);
+            _ = try w.commit();
+        }
+
+        // Each committed version (2..active_version) maps to a non-zero root.
+        var v: u64 = 2;
+        while (v <= db.active_version) : (v += 1) {
+            const r = db.versionRoot(v) orelse return error.TestUnexpectedNull;
+            try testing.expect(r != 0);
+        }
+        // A version that was never committed yet is null.
+        try testing.expectEqual(@as(?u64, null), db.versionRoot(db.active_version + 1));
+    }
+
+    // The ring lives in the durable header page, so it survives reopen.
+    {
+        var db = try Db.open(testing.allocator, path);
+        defer db.deinit();
+        try testing.expectEqual(@as(u64, 1 + k), db.active_version);
+        var v: u64 = 2;
+        while (v <= db.active_version) : (v += 1) {
+            const r = db.versionRoot(v) orelse return error.TestUnexpectedNull;
+            try testing.expect(r != 0);
+        }
+    }
+}
+
+test "ring wraps after capacity" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "ringwrap.airdb");
+    defer testing.allocator.free(path);
+
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+
+    // Commit more than ring_capacity times so the ring wraps and evicts old entries.
+    const total: u64 = @as(u64, ring_capacity) + 12;
+    var i: u64 = 0;
+    while (i < total) : (i += 1) {
+        var w = try db.beginWrite();
+        const a = try w.alloc(8);
+        @memcpy(a.bytes, "WRAPDATA");
+        w.setRoot(a.ref);
+        _ = try w.commit();
+    }
+
+    const newest = db.active_version; // 1 + total
+    const oldest_live = newest - @as(u64, ring_capacity) + 1;
+
+    // The most recent ring_capacity versions are all present.
+    try testing.expectEqual(oldest_live, db.oldestRetainedVersion());
+    var v: u64 = oldest_live;
+    while (v <= newest) : (v += 1) {
+        const r = db.versionRoot(v) orelse return error.TestUnexpectedNull;
+        try testing.expect(r != 0);
+    }
+
+    // Versions older than the live window were evicted.
+    try testing.expectEqual(@as(?u64, null), db.versionRoot(oldest_live - 1));
+    try testing.expectEqual(@as(?u64, null), db.versionRoot(2));
+}
+
+test "beginReadAt opens a past version within the retention window" {
+    const objects = @import("objects.zig");
+    const catalog = @import("catalog.zig");
+    const compaction = @import("compaction.zig");
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "pit.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    db.setRetainVersions(std.math.maxInt(u64)); // retain everything
+
+    // v_a: pk 1 ; v_b: + pk 2 ; v_c: + pk 3 (additive, so each version's live set differs)
+    var va: u64 = undefined;
+    var vb: u64 = undefined;
+    var vc: u64 = undefined;
+    {
+        var w = try db.beginWrite();
+        var cat = try catalog.create(&w, 2);
+        cat = (try objects.insert(&w, cat, &.{ 1, 100 })).cat;
+        w.setRoot(cat);
+        va = try w.commit();
+    }
+    {
+        var w = try db.beginWrite();
+        const cat = (try objects.insert(&w, w.new_root, &.{ 2, 200 })).cat;
+        w.setRoot(cat);
+        vb = try w.commit();
+    }
+    {
+        var w = try db.beginWrite();
+        const cat = (try objects.insert(&w, w.new_root, &.{ 3, 300 })).cat;
+        w.setRoot(cat);
+        vc = try w.commit();
+    }
+
+    var out: [2]u64 = undefined;
+    // Past snapshot at v_a: only pk 1 exists.
+    {
+        var r = try db.beginReadAt(va);
+        defer r.end();
+        try testing.expectEqual(@as(u64, 1), try compaction.liveCount(&r, r.root()));
+        try testing.expect((try objects.getByPk(&r, r.root(), 1, &out)) != null);
+        try testing.expectEqual(@as(?u64, null), try objects.getByPk(&r, r.root(), 2, &out));
+    }
+    // Past snapshot at v_b: pk 1 and 2.
+    {
+        var r = try db.beginReadAt(vb);
+        defer r.end();
+        try testing.expectEqual(@as(u64, 2), try compaction.liveCount(&r, r.root()));
+    }
+    // Latest: all three.
+    {
+        var r = try db.beginRead();
+        defer r.end();
+        try testing.expectEqual(@as(u64, 3), try compaction.liveCount(&r, r.root()));
+    }
+    // A future version is unavailable.
+    try testing.expectError(error.VersionUnavailable, db.beginReadAt(vc + 5));
+}
+
+test "beginReadAt rejects a version aged out of the retention window" {
+    const objects = @import("objects.zig");
+    const catalog = @import("catalog.zig");
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "pit2.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    // retain_versions defaults to 0: only the active version is readable.
+    var va: u64 = undefined;
+    {
+        var w = try db.beginWrite();
+        var cat = try catalog.create(&w, 2);
+        cat = (try objects.insert(&w, cat, &.{ 1, 100 })).cat;
+        w.setRoot(cat);
+        va = try w.commit();
+    }
+    {
+        var w = try db.beginWrite();
+        const cat = (try objects.insert(&w, w.new_root, &.{ 2, 200 })).cat;
+        w.setRoot(cat);
+        _ = try w.commit();
+    }
+    // v_a is older than active - retain_versions(0) -> aged out.
+    try testing.expectError(error.VersionUnavailable, db.beginReadAt(va));
+    try testing.expect(db.oldestReadableVersion() == db.active_version);
 }
