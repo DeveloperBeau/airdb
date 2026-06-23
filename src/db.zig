@@ -321,6 +321,31 @@ pub const Db = struct {
         return ReadTxn{ .db = self, .root_ref = self.active_root, .version = v };
     }
 
+    /// Open a read snapshot at a past committed `version`. Returns
+    /// error.VersionUnavailable if the version is not in the durable ring or has
+    /// aged out of the retention window (its nodes may have been reclaimed).
+    /// Pins the version so its nodes are held for the life of the read.
+    pub fn beginReadAt(self: *Db, version: u64) !ReadTxn {
+        try self.refreshToLatest();
+        if (version > self.active_version) return error.VersionUnavailable;
+        // Must be inside the retention window: older versions' nodes may already
+        // be reclaimed. maxInt retain_versions means "retain everything".
+        if (self.retain_versions != std.math.maxInt(u64)) {
+            if (version < self.active_version -| self.retain_versions) return error.VersionUnavailable;
+        }
+        const root = if (version == self.active_version)
+            self.active_root
+        else
+            (self.versionRoot(version) orelse return error.VersionUnavailable);
+        if (self.pins.getPtr(version)) |ptr| {
+            ptr.* += 1;
+        } else {
+            try self.pins.put(version, 1);
+        }
+        self.publishPins();
+        return ReadTxn{ .db = self, .root_ref = root, .version = version };
+    }
+
     pub fn horizon(self: *Db) u64 {
         var min: ?u64 = null;
         var it = self.pins.iterator();
@@ -391,6 +416,14 @@ pub const Db = struct {
             if (min == null or v < min.?) min = v;
         }
         return min orelse self.active_version;
+    }
+
+    /// Oldest version `beginReadAt` can open: the later of the oldest ring entry
+    /// and the retention-window floor. Versions in [this, active_version] open.
+    pub fn oldestReadableVersion(self: *Db) u64 {
+        const ring_floor = self.oldestRetainedVersion();
+        if (self.retain_versions == std.math.maxInt(u64)) return ring_floor;
+        return @max(ring_floor, self.active_version -| self.retain_versions);
     }
 
     /// Shared body for beginWrite and beginWriteTry. Caller must hold the coord
@@ -1014,4 +1047,94 @@ test "ring wraps after capacity" {
     // Versions older than the live window were evicted.
     try testing.expectEqual(@as(?u64, null), db.versionRoot(oldest_live - 1));
     try testing.expectEqual(@as(?u64, null), db.versionRoot(2));
+}
+
+test "beginReadAt opens a past version within the retention window" {
+    const objects = @import("objects.zig");
+    const catalog = @import("catalog.zig");
+    const compaction = @import("compaction.zig");
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "pit.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    db.setRetainVersions(std.math.maxInt(u64)); // retain everything
+
+    // v_a: pk 1 ; v_b: + pk 2 ; v_c: + pk 3 (additive, so each version's live set differs)
+    var va: u64 = undefined;
+    var vb: u64 = undefined;
+    var vc: u64 = undefined;
+    {
+        var w = try db.beginWrite();
+        var cat = try catalog.create(&w, 2);
+        cat = (try objects.insert(&w, cat, &.{ 1, 100 })).cat;
+        w.setRoot(cat);
+        va = try w.commit();
+    }
+    {
+        var w = try db.beginWrite();
+        const cat = (try objects.insert(&w, w.new_root, &.{ 2, 200 })).cat;
+        w.setRoot(cat);
+        vb = try w.commit();
+    }
+    {
+        var w = try db.beginWrite();
+        const cat = (try objects.insert(&w, w.new_root, &.{ 3, 300 })).cat;
+        w.setRoot(cat);
+        vc = try w.commit();
+    }
+
+    var out: [2]u64 = undefined;
+    // Past snapshot at v_a: only pk 1 exists.
+    {
+        var r = try db.beginReadAt(va);
+        defer r.end();
+        try testing.expectEqual(@as(u64, 1), try compaction.liveCount(&r, r.root()));
+        try testing.expect((try objects.getByPk(&r, r.root(), 1, &out)) != null);
+        try testing.expectEqual(@as(?u64, null), try objects.getByPk(&r, r.root(), 2, &out));
+    }
+    // Past snapshot at v_b: pk 1 and 2.
+    {
+        var r = try db.beginReadAt(vb);
+        defer r.end();
+        try testing.expectEqual(@as(u64, 2), try compaction.liveCount(&r, r.root()));
+    }
+    // Latest: all three.
+    {
+        var r = try db.beginRead();
+        defer r.end();
+        try testing.expectEqual(@as(u64, 3), try compaction.liveCount(&r, r.root()));
+    }
+    // A future version is unavailable.
+    try testing.expectError(error.VersionUnavailable, db.beginReadAt(vc + 5));
+}
+
+test "beginReadAt rejects a version aged out of the retention window" {
+    const objects = @import("objects.zig");
+    const catalog = @import("catalog.zig");
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "pit2.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    // retain_versions defaults to 0: only the active version is readable.
+    var va: u64 = undefined;
+    {
+        var w = try db.beginWrite();
+        var cat = try catalog.create(&w, 2);
+        cat = (try objects.insert(&w, cat, &.{ 1, 100 })).cat;
+        w.setRoot(cat);
+        va = try w.commit();
+    }
+    {
+        var w = try db.beginWrite();
+        const cat = (try objects.insert(&w, w.new_root, &.{ 2, 200 })).cat;
+        w.setRoot(cat);
+        _ = try w.commit();
+    }
+    // v_a is older than active - retain_versions(0) -> aged out.
+    try testing.expectError(error.VersionUnavailable, db.beginReadAt(va));
+    try testing.expect(db.oldestReadableVersion() == db.active_version);
 }
