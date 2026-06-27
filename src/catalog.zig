@@ -379,6 +379,39 @@ pub fn setBacklinkRef(txn: *WriteTxn, cat: Ref, p: usize, new_bl: Ref) !Ref {
     return writeCatalog(txn, pc, next_row, v.keyrow_index_ref, v.next_key, idx_ref, ver_ref, live_ref, prop_refs[0..pc], kinds[0..pc], elems[0..pc], bl[0..pc], targets_buf[0..pc], rules_buf[0..pc], vidx_buf[0..pc], idxf_buf[0..pc]);
 }
 
+// Write a new value-index ref into property `p`, preserving everything else.
+pub fn setValueIndexRef(txn: *WriteTxn, cat: Ref, p: usize, new_vi: Ref) !Ref {
+    const v = try loadCatalog(txn, cat);
+    const pc = v.prop_count;
+    const next_row = v.next_row;
+    const idx_ref = v.pk_index_ref;
+    const ver_ref = v.version_col_ref;
+    const live_ref = v.live_col_ref;
+    var prop_refs: [max_prop_count]Ref = undefined;
+    var kinds: [max_prop_count]PropKind = undefined;
+    var elems: [max_prop_count]ElemKind = undefined;
+    var bl: [max_prop_count]Ref = undefined;
+    var targets_buf: [max_prop_count]u16 = undefined;
+    var rules_buf: [max_prop_count]DeletionRule = undefined;
+    var vidx_buf: [max_prop_count]Ref = undefined;
+    var idxf_buf: [max_prop_count]bool = undefined;
+    {
+        var j: usize = 0;
+        while (j < pc) : (j += 1) {
+            prop_refs[j] = v.propColRef(j);
+            kinds[j] = v.kind(j);
+            elems[j] = v.elemKind(j);
+            bl[j] = v.backlinkRef(j);
+            targets_buf[j] = v.linkTarget(j);
+            rules_buf[j] = v.delRule(j);
+            vidx_buf[j] = v.valueIndexRef(j);
+            idxf_buf[j] = v.indexed(j);
+        }
+    }
+    vidx_buf[p] = new_vi;
+    return writeCatalog(txn, pc, next_row, v.keyrow_index_ref, v.next_key, idx_ref, ver_ref, live_ref, prop_refs[0..pc], kinds[0..pc], elems[0..pc], bl[0..pc], targets_buf[0..pc], rules_buf[0..pc], vidx_buf[0..pc], idxf_buf[0..pc]);
+}
+
 // Write a new column ref into property `p`, preserving everything else.
 pub fn setPropColRef(txn: *WriteTxn, cat: Ref, p: usize, new_col: Ref) !Ref {
     const v = try loadCatalog(txn, cat);

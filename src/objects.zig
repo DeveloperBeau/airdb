@@ -20,6 +20,46 @@ const max_prop_count = catalog.max_prop_count;
 const loadCatalog = catalog.loadCatalog;
 const writeCatalog = catalog.writeCatalog;
 
+// ---------------------------------------------------------------------------
+// Per-property value index maintenance.
+//
+// A value index has the same shape as a backlink index: value -> set_root,
+// where set_root is an index of okey -> 1. It is kept transactionally in sync
+// with the base row on every insert, update, and delete of an indexed property,
+// so an equality/range query reads from a view that can never diverge from the
+// rows. These helpers mirror the backlink add/remove path in links.zig.
+// ---------------------------------------------------------------------------
+
+// Add `okey` to the value-index inner set for `value`, returning the new index ref.
+fn viAdd(txn: *WriteTxn, vi_ref: Ref, value: u64, okey: u64) !Ref {
+    const existing = try Index.get(txn, vi_ref, value);
+    var set_root = existing orelse try Index.create(txn);
+    set_root = try Index.insert(txn, set_root, okey, 1);
+    return try Index.insert(txn, vi_ref, value, set_root);
+}
+
+// Remove `okey` from the value-index inner set for `value`. No-op if absent.
+fn viRemove(txn: *WriteTxn, vi_ref: Ref, value: u64, okey: u64) !Ref {
+    const existing = try Index.get(txn, vi_ref, value);
+    const set_root = existing orelse return vi_ref;
+    const new_set = try Index.remove(txn, set_root, okey);
+    return try Index.insert(txn, vi_ref, value, new_set);
+}
+
+// Add okey->value to indexed property p's value index. Returns the new catalog.
+fn addValueIndex(txn: *WriteTxn, cat: Ref, p: usize, value: u64, okey: u64) !Ref {
+    const v = try loadCatalog(txn, cat);
+    const new_vi = try viAdd(txn, v.valueIndexRef(p), value, okey);
+    return try catalog.setValueIndexRef(txn, cat, p, new_vi);
+}
+
+// Remove okey from indexed property p's value-index set for `value`.
+fn removeValueIndex(txn: *WriteTxn, cat: Ref, p: usize, value: u64, okey: u64) !Ref {
+    const v = try loadCatalog(txn, cat);
+    const new_vi = try viRemove(txn, v.valueIndexRef(p), value, okey);
+    return try catalog.setValueIndexRef(txn, cat, p, new_vi);
+}
+
 // insert appends a new row to all columns and updates the pk index.
 // values.len must equal the prop_count stored in the catalog.
 // Returns error.DuplicateKey if values[0] (the primary key) already exists.
@@ -94,7 +134,16 @@ pub fn insert(txn: *WriteTxn, cat: Ref, values: []const u64) !struct { cat: Ref,
         old_vidx[0..prop_count],
         old_idxf[0..prop_count],
     );
-    return .{ .cat = new_cat, .row = okey };
+    // Maintain the value index for each indexed property: add this row's okey to
+    // the inner set at its stored value, in the same transaction as the row.
+    var cat_out = new_cat;
+    {
+        var p: usize = 0;
+        while (p < prop_count) : (p += 1) {
+            if (old_idxf[p]) cat_out = try addValueIndex(txn, cat_out, p, values[p], okey);
+        }
+    }
+    return .{ .cat = cat_out, .row = okey };
 }
 
 pub const Conflict = struct { current_version: u64 };
@@ -147,12 +196,33 @@ pub fn update(txn: *WriteTxn, cat: Ref, pk: u64, values: []const u64, expected_v
     }
     var ver_ref = v.version_col_ref;
 
+    // Snapshot the current value of each indexed property before overwriting the
+    // column, so the value index can move the okey from its old to its new value.
+    var old_vals: [max_prop_count]u64 = undefined;
+    {
+        var j: usize = 0;
+        while (j < pc) : (j += 1) {
+            if (idxf_buf[j]) old_vals[j] = try Column.get(txn, prop_refs[j], row);
+        }
+    }
+
     var i: usize = 0;
     while (i < pc) : (i += 1) prop_refs[i] = try Column.set(txn, prop_refs[i], row, values[i]);
     ver_ref = try Column.set(txn, ver_ref, row, txn.new_version);
 
     const new_cat = try writeCatalog(txn, pc, next_row, v.keyrow_index_ref, v.next_key, idx_ref, ver_ref, live_ref, prop_refs[0..pc], kinds[0..pc], elems_buf[0..pc], bl_buf[0..pc], targets_buf[0..pc], rules_buf[0..pc], vidx_buf[0..pc], idxf_buf[0..pc]);
-    return .{ .ok = .{ .cat = new_cat, .version = txn.new_version } };
+    // Re-point the value index for any indexed property whose value changed.
+    var cat_out = new_cat;
+    {
+        var p: usize = 0;
+        while (p < pc) : (p += 1) {
+            if (idxf_buf[p] and old_vals[p] != values[p]) {
+                cat_out = try removeValueIndex(txn, cat_out, p, old_vals[p], okey);
+                cat_out = try addValueIndex(txn, cat_out, p, values[p], okey);
+            }
+        }
+    }
+    return .{ .ok = .{ .cat = cat_out, .version = txn.new_version } };
 }
 
 pub fn delete(txn: *WriteTxn, cat: Ref, pk: u64, expected_version: u64) !DeleteResult {
@@ -191,6 +261,17 @@ pub fn delete(txn: *WriteTxn, cat: Ref, pk: u64, expected_version: u64) !DeleteR
     var idx_ref = v.pk_index_ref;
     var keyrow_ref = v.keyrow_index_ref;
 
+    // Read the value of each indexed property while the row is still readable,
+    // so its okey can be dropped from the value index. Property columns are not
+    // mutated by delete, so prop_refs still address the row's current values.
+    var old_vals: [max_prop_count]u64 = undefined;
+    {
+        var j: usize = 0;
+        while (j < pc) : (j += 1) {
+            if (idxf_buf[j]) old_vals[j] = try Column.get(txn, prop_refs[j], row);
+        }
+    }
+
     live_ref = try Column.set(txn, live_ref, row, 0); // tombstone
     ver_ref = try Column.set(txn, ver_ref, row, txn.new_version); // bump version stamp
     idx_ref = try Index.remove(txn, idx_ref, pk); // remove pk from the index
@@ -201,7 +282,15 @@ pub fn delete(txn: *WriteTxn, cat: Ref, pk: u64, expected_version: u64) !DeleteR
     keyrow_ref = try Index.remove(txn, keyrow_ref, okey);
 
     const new_cat = try writeCatalog(txn, pc, next_row, keyrow_ref, v.next_key, idx_ref, ver_ref, live_ref, prop_refs[0..pc], kinds[0..pc], elems_buf[0..pc], bl_buf[0..pc], targets_buf[0..pc], rules_buf[0..pc], vidx_buf[0..pc], idxf_buf[0..pc]);
-    return .{ .ok = new_cat };
+    // Drop this row's okey from the value index for every indexed property.
+    var cat_out = new_cat;
+    {
+        var p: usize = 0;
+        while (p < pc) : (p += 1) {
+            if (idxf_buf[p]) cat_out = try removeValueIndex(txn, cat_out, p, old_vals[p], okey);
+        }
+    }
+    return .{ .ok = cat_out };
 }
 
 pub fn getByPk(txn: anytype, cat: Ref, pk: u64, out: []u64) !?u64 {
@@ -923,6 +1012,139 @@ test "getByObjectKey resolves through the key-to-row index" {
     try testing.expectEqual(@as(u64, 8), out[1]);
     // An object key with no mapping resolves to null.
     try testing.expectEqual(@as(?u64, null), try getByObjectKey(&w, cat, 999, &out));
+    w.deinit();
+}
+
+// Collect, in ascending order, the object keys held in the value index's inner
+// set for (cat, prop, value). Empty/absent yields an empty list.
+fn collectIndexOkeys(
+    txn: anytype,
+    cat: Ref,
+    prop: usize,
+    value: u64,
+    out: *std.ArrayList(u64),
+    allocator: std.mem.Allocator,
+) !void {
+    const v = try loadCatalog(txn, cat);
+    const vi = v.valueIndexRef(prop);
+    const inner = (try Index.get(txn, vi, value)) orelse return;
+    const Sink = struct {
+        list: *std.ArrayList(u64),
+        alloc: std.mem.Allocator,
+        fn onKey(self: @This(), key: u64) !void {
+            try self.list.append(self.alloc, key);
+        }
+    };
+    try Index.forEachKey(txn, inner, Sink{ .list = out, .alloc = allocator }, Sink.onKey);
+}
+
+fn expectIndexOkeys(
+    txn: anytype,
+    cat: Ref,
+    prop: usize,
+    value: u64,
+    expected: []const u64,
+) !void {
+    var got = std.ArrayList(u64).empty;
+    defer got.deinit(testing.allocator);
+    try collectIndexOkeys(txn, cat, prop, value, &got, testing.allocator);
+    try testing.expectEqualSlices(u64, expected, got.items);
+}
+
+test "value index tracks inserts" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "vidx_insert.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .int, .indexed = true } });
+    const o0 = try insert(&w, cat, &.{ 1, 10 });
+    cat = o0.cat;
+    const o1 = try insert(&w, cat, &.{ 2, 20 });
+    cat = o1.cat;
+    const o2 = try insert(&w, cat, &.{ 3, 10 });
+    cat = o2.cat;
+    const o3 = try insert(&w, cat, &.{ 4, 30 });
+    cat = o3.cat;
+    try expectIndexOkeys(&w, cat, 1, 10, &.{ o0.row, o2.row });
+    try expectIndexOkeys(&w, cat, 1, 20, &.{o1.row});
+    try expectIndexOkeys(&w, cat, 1, 30, &.{o3.row});
+    w.deinit();
+}
+
+test "value index tracks updates" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "vidx_update.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .int, .indexed = true } });
+    const o0 = try insert(&w, cat, &.{ 1, 10 });
+    cat = o0.cat;
+    const o1 = try insert(&w, cat, &.{ 2, 20 });
+    cat = o1.cat;
+    const o2 = try insert(&w, cat, &.{ 3, 10 });
+    cat = o2.cat;
+    // Move o1's indexed prop from 20 to 10.
+    var out: [2]u64 = undefined;
+    const ver = (try getByPk(&w, cat, 2, &out)).?;
+    const res = try update(&w, cat, 2, &.{ 2, 10 }, ver);
+    try testing.expect(res == .ok);
+    cat = res.ok.cat;
+    try expectIndexOkeys(&w, cat, 1, 10, &.{ o0.row, o1.row, o2.row });
+    // The 20 entry is now empty.
+    try expectIndexOkeys(&w, cat, 1, 20, &.{});
+    w.deinit();
+}
+
+test "value index tracks deletes" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "vidx_delete.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .int, .indexed = true } });
+    const o0 = try insert(&w, cat, &.{ 1, 10 });
+    cat = o0.cat;
+    const o1 = try insert(&w, cat, &.{ 2, 20 });
+    cat = o1.cat;
+    const o2 = try insert(&w, cat, &.{ 3, 10 });
+    cat = o2.cat;
+    try expectIndexOkeys(&w, cat, 1, 10, &.{ o0.row, o2.row });
+    // Delete o0 (value 10); only o2 should remain under 10.
+    var out: [2]u64 = undefined;
+    const ver = (try getByPk(&w, cat, 1, &out)).?;
+    cat = (try delete(&w, cat, 1, ver)).ok;
+    try expectIndexOkeys(&w, cat, 1, 10, &.{o2.row});
+    try expectIndexOkeys(&w, cat, 1, 20, &.{o1.row});
+    w.deinit();
+}
+
+test "non-indexed prop has no index" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "vidx_none.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .int } });
+    const r0 = try insert(&w, cat, &.{ 1, 100 });
+    cat = r0.cat;
+    var out: [2]u64 = undefined;
+    const ver = (try getByPk(&w, cat, 1, &out)).?;
+    cat = (try update(&w, cat, 1, &.{ 1, 200 }, ver)).ok.cat;
+    const ver2 = (try getByPk(&w, cat, 1, &out)).?;
+    cat = (try delete(&w, cat, 1, ver2)).ok;
+    const v = try loadCatalog(&w, cat);
+    var i: usize = 0;
+    while (i < v.prop_count) : (i += 1) try testing.expectEqual(@as(Ref, 0), v.valueIndexRef(i));
     w.deinit();
 }
 
