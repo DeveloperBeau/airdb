@@ -74,7 +74,32 @@ const win = if (is_windows) struct {
     extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) DWORD;
     extern "kernel32" fn OpenProcess(access: DWORD, inherit: BOOL, pid: DWORD) callconv(.winapi) ?HANDLE;
     extern "kernel32" fn WaitForSingleObject(h: HANDLE, ms: DWORD) callconv(.winapi) DWORD;
+    extern "kernel32" fn GetCurrentProcess() callconv(.winapi) HANDLE;
+
+    // PROCESS_MEMORY_COUNTERS: SIZE_T fields are usize; cb/PageFaultCount are DWORD.
+    const PROCESS_MEMORY_COUNTERS = extern struct {
+        cb: DWORD,
+        PageFaultCount: DWORD,
+        PeakWorkingSetSize: usize,
+        WorkingSetSize: usize,
+        QuotaPeakPagedPoolUsage: usize,
+        QuotaPagedPoolUsage: usize,
+        QuotaPeakNonPagedPoolUsage: usize,
+        QuotaNonPagedPoolUsage: usize,
+        PagefileUsage: usize,
+        PeakPagefileUsage: usize,
+    };
+    extern "psapi" fn GetProcessMemoryInfo(process: HANDLE, counters: *PROCESS_MEMORY_COUNTERS, cb: DWORD) callconv(.winapi) BOOL;
 } else struct {};
+
+/// Windows peak working set size in bytes, from GetProcessMemoryInfo. Returns 0 if
+/// the query fails (the caller treats that as "no signal").
+fn windowsPeakWorkingSet() usize {
+    var counters = std.mem.zeroes(win.PROCESS_MEMORY_COUNTERS);
+    counters.cb = @sizeOf(win.PROCESS_MEMORY_COUNTERS);
+    if (win.GetProcessMemoryInfo(win.GetCurrentProcess(), &counters, counters.cb) == 0) return 0;
+    return counters.PeakWorkingSetSize;
+}
 
 // ---------------------------------------------------------------------------
 // Memory mapping
@@ -200,4 +225,23 @@ pub fn processAlive(pid: u32) bool {
         };
         return true;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Memory
+// ---------------------------------------------------------------------------
+
+// Peak resident set size of the current process, in bytes. The bench harness
+// uses this as its memory signal. getrusage reports ru_maxrss in KiB on Linux
+// and in bytes on Darwin; Windows reports PeakWorkingSetSize in bytes.
+pub fn peakResidentBytes() usize {
+    if (is_windows) return windowsPeakWorkingSet();
+    const usage = std.posix.getrusage(std.posix.rusage.SELF);
+    const maxrss: usize = @intCast(usage.maxrss);
+    return if (builtin.os.tag == .macos) maxrss else maxrss * 1024;
+}
+
+test "peakResidentBytes returns a plausible nonzero value" {
+    const rss = peakResidentBytes();
+    try std.testing.expect(rss > 64 * 1024);
 }
