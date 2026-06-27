@@ -382,6 +382,40 @@ pub fn forEachEntry(
     }
 }
 
+// Visit every key/value pair whose key lies in [lo, hi] in ascending key
+// order, calling onEntry(ctx, key, value) for each. Same recursive descent as
+// forEachEntry, but routes into the child holding lo via childIndexForKey and
+// starts each leaf at lowerBound(lo), stopping as soon as a key exceeds hi so
+// no leaf outside the range is visited. Read-only: no COW.
+pub fn forEachEntryInRange(
+    txn: anytype,
+    root: Ref,
+    lo: u64,
+    hi: u64,
+    ctx: anytype,
+    comptime onEntry: fn (@TypeOf(ctx), u64, u64) anyerror!void,
+) !void {
+    if (root == 0 or lo > hi) return;
+    const bytes = try derefNode(txn, root);
+    if (bytes[0] == kind_leaf) {
+        const leaf = try parseLeaf(bytes);
+        var i: usize = leaf.lowerBound(lo);
+        while (i < leaf.count) : (i += 1) {
+            const k = leaf.key(i);
+            if (k > hi) return;
+            try onEntry(ctx, k, leaf.value(i));
+        }
+        return;
+    }
+    const inner = try parseInner(bytes);
+    var i: usize = childIndexForKey(inner, lo);
+    while (i < inner.child_count) : (i += 1) {
+        if (inner.lowKey(i) > hi) return;
+        const child_ref: Ref = inner.childRef(i);
+        try forEachEntryInRange(txn, child_ref, lo, hi, ctx, onEntry);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -587,6 +621,149 @@ test "forEachEntry visits key/value pairs in ascending key order" {
     for (keys.items, vals.items) |k, val| {
         if (!first) try testing.expect(k > prev);
         try testing.expectEqual(k * 7 + 1, val);
+        prev = k;
+        first = false;
+    }
+    w.deinit();
+}
+
+// Build a tree holding keys 0..=1000 (each once) inserted in scrambled order,
+// with value == key*10. 397 is coprime to 1001 (=7*11*13), so (i*397)%1001
+// visits every residue exactly once.
+fn buildScrambled0to1000(w: *WriteTxn) !Ref {
+    var root = try create(w);
+    var i: u64 = 0;
+    while (i <= 1000) : (i += 1) {
+        const k = (i * 397) % 1001;
+        root = try insert(w, root, k, k * 10);
+    }
+    return root;
+}
+
+const RangeCollector = struct {
+    keys: *std.ArrayList(u64),
+    vals: *std.ArrayList(u64),
+    fn onEntry(self: @This(), key: u64, val: u64) !void {
+        try self.keys.append(testing.allocator, key);
+        try self.vals.append(testing.allocator, val);
+    }
+};
+
+test "forEachEntryInRange visits only [lo,hi] ascending" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try idxTmpPath(testing.allocator, &tmp, "range1.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    const root = try buildScrambled0to1000(&w);
+
+    var keys = std.ArrayList(u64).empty;
+    defer keys.deinit(testing.allocator);
+    var vals = std.ArrayList(u64).empty;
+    defer vals.deinit(testing.allocator);
+    try forEachEntryInRange(&w, root, 200, 300, RangeCollector{ .keys = &keys, .vals = &vals }, RangeCollector.onEntry);
+
+    try testing.expectEqual(@as(usize, 101), keys.items.len);
+    try testing.expectEqual(keys.items.len, vals.items.len);
+    var expected: u64 = 200;
+    var prev: u64 = 0;
+    var first = true;
+    for (keys.items, vals.items) |k, val| {
+        try testing.expectEqual(expected, k); // strictly ascending 200..300
+        try testing.expectEqual(k * 10, val);
+        try testing.expect(k >= 200 and k <= 300); // nothing outside
+        if (!first) try testing.expect(k > prev);
+        prev = k;
+        first = false;
+        expected += 1;
+    }
+    try testing.expectEqual(@as(u64, 200), keys.items[0]);
+    try testing.expectEqual(@as(u64, 300), keys.items[keys.items.len - 1]);
+    w.deinit();
+}
+
+test "forEachEntryInRange empty range" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try idxTmpPath(testing.allocator, &tmp, "range2.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    const root = try buildScrambled0to1000(&w);
+
+    var keys = std.ArrayList(u64).empty;
+    defer keys.deinit(testing.allocator);
+    var vals = std.ArrayList(u64).empty;
+    defer vals.deinit(testing.allocator);
+
+    // lo above the max key -> nothing.
+    try forEachEntryInRange(&w, root, 1001, 2000, RangeCollector{ .keys = &keys, .vals = &vals }, RangeCollector.onEntry);
+    try testing.expectEqual(@as(usize, 0), keys.items.len);
+
+    // lo > hi -> nothing.
+    try forEachEntryInRange(&w, root, 300, 200, RangeCollector{ .keys = &keys, .vals = &vals }, RangeCollector.onEntry);
+    try testing.expectEqual(@as(usize, 0), keys.items.len);
+    w.deinit();
+}
+
+test "forEachEntryInRange single key" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try idxTmpPath(testing.allocator, &tmp, "range3.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    const root = try buildScrambled0to1000(&w);
+
+    var keys = std.ArrayList(u64).empty;
+    defer keys.deinit(testing.allocator);
+    var vals = std.ArrayList(u64).empty;
+    defer vals.deinit(testing.allocator);
+
+    // Present single key.
+    try forEachEntryInRange(&w, root, 500, 500, RangeCollector{ .keys = &keys, .vals = &vals }, RangeCollector.onEntry);
+    try testing.expectEqual(@as(usize, 1), keys.items.len);
+    try testing.expectEqual(@as(u64, 500), keys.items[0]);
+    try testing.expectEqual(@as(u64, 5000), vals.items[0]);
+
+    // Absent single key.
+    keys.clearRetainingCapacity();
+    vals.clearRetainingCapacity();
+    try forEachEntryInRange(&w, root, 10001, 10001, RangeCollector{ .keys = &keys, .vals = &vals }, RangeCollector.onEntry);
+    try testing.expectEqual(@as(usize, 0), keys.items.len);
+    w.deinit();
+}
+
+test "forEachEntryInRange spans multiple leaves" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try idxTmpPath(testing.allocator, &tmp, "range4.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    const root = try buildScrambled0to1000(&w);
+
+    var keys = std.ArrayList(u64).empty;
+    defer keys.deinit(testing.allocator);
+    var vals = std.ArrayList(u64).empty;
+    defer vals.deinit(testing.allocator);
+
+    // [50,800] crosses many leaves (LEAF_CAP == 64).
+    try forEachEntryInRange(&w, root, 50, 800, RangeCollector{ .keys = &keys, .vals = &vals }, RangeCollector.onEntry);
+
+    try testing.expectEqual(@as(usize, 751), keys.items.len); // 800-50+1
+    try testing.expectEqual(@as(u64, 50), keys.items[0]);
+    try testing.expectEqual(@as(u64, 800), keys.items[keys.items.len - 1]);
+    var prev: u64 = 0;
+    var first = true;
+    for (keys.items, vals.items) |k, val| {
+        if (!first) try testing.expect(k == prev + 1); // no gaps or dupes
+        try testing.expectEqual(k * 10, val);
         prev = k;
         first = false;
     }
