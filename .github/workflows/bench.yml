@@ -1,0 +1,53 @@
+name: bench
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      scale:
+        description: "Scale tier (1m or 10m)"
+        default: "1m"
+  schedule:
+    - cron: "0 7 * * *"
+
+concurrency:
+  group: bench-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    name: bench
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Select scale
+        id: scale
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            echo "scale=10m" >> "$GITHUB_OUTPUT"
+          else
+            echo "scale=${{ github.event.inputs.scale || '1m' }}" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Run benchmarks
+        run: zig build bench -- --scale=${{ steps.scale.outputs.scale }} --json=bench-results.json
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results-${{ steps.scale.outputs.scale }}
+          path: bench-results.json
+      - name: Compare to baseline
+        run: |
+          echo "Committed baseline (bench/baseline-1m.json):"
+          cat bench/baseline-1m.json || true
+          echo
+          echo "This run:"
+          cat bench-results.json || true
