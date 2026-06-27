@@ -139,73 +139,123 @@ fn truncatePacked(txn: *WriteTxn, cat: Ref, new_len: u64) !Ref {
     return catalog.writeCatalog(txn, pc, new_len, keyrow, next_key, pk_index_ref, ver, live, prop[0..pc], kinds[0..pc], elems[0..pc], bl[0..pc], targets[0..pc], rules[0..pc]);
 }
 
+// Two-pointer packing cursor for one in-flight compaction run. live_count and
+// next_row pin the run to a specific catalog shape: if either changes between
+// steps (churn inserted/deleted/relocated rows), the stored cursor is stale and
+// must be discarded. hole_lo scans upward through [0, live_count) seeking dead
+// relocation targets; high_hi scans downward from next_row toward live_count
+// seeking live rows that must move down. Both advance monotonically across
+// steps so no slot is ever revisited (relocateRow is not idempotent).
+pub const CompactCursor = struct {
+    live_count: u64,
+    next_row: u64,
+    hole_lo: u64,
+    high_hi: u64,
+};
+
+// Map a physical row to its stable object key. There is no reverse key->row
+// index, so we go through the primary key: property 0 holds the pk, and the pk
+// index maps pk -> okey (the same association objects.insert builds and
+// resolveProp reads). Valid for any live row; the row's pk cell is preserved by
+// relocateRow, so this holds even after earlier relocations in the same run.
+fn rowToOkey(txn: anytype, v: catalog.CatalogView, row: u64) !u64 {
+    const pk = try Column.get(txn, v.propColRef(0), row);
+    return (try Index.get(txn, v.pk_index_ref, pk)).?;
+}
+
 // Incrementally pack a type toward dense storage, doing at most `budget`
-// relocations per call. Each call moves up to `budget` "high" live rows (those
-// at physical index >= live_count) down into "holes" (dead slots below
-// live_count), then -- once no high live rows remain -- truncates the dead tail
-// so next_row == live_count. `done` is true when the type is fully packed and
-// truncated; call again with the returned cat until `done`. Returns the updated
-// catalog ref, the number of rows moved this call, and whether packing finished.
+// relocations per call, using a budget-proportional two-pointer tail scan
+// instead of a full index walk.
+//
+// `hole_lo` advances upward through [0, live_count) to find dead slots
+// (relocation targets); `high_hi` advances downward from next_row toward
+// live_count to find live rows at physical index >= live_count (rows that must
+// move down). Each paired (hole, high row) is relocated via relocateRow, up to
+// `budget` times; both cursors then step past the consumed slots. The cursor is
+// persisted on the Db so the next call resumes where this one stopped.
+//
+// Reset rule (data-loss-critical): the cursor is only resumed when the freshly
+// loaded live_count AND next_row match the stored ones. Any mismatch -- or no
+// stored cursor -- restarts the scan from hole_lo=0, high_hi=next_row. This
+// guarantees a stale cursor (from churn between steps) can never be trusted.
+//
+// Truncation guard (the no-data-loss line): the dead tail [live_count, next_row)
+// is truncated, and `done` reported, ONLY when `high_hi <= live_count` -- i.e.
+// the downward cursor has examined the ENTIRE range above live_count and every
+// live row it found was relocated (relocating a high row flips it dead, then the
+// cursor steps past it). This is equivalent in safety to the old
+// "all collected high rows moved" guard: both certify that no live row remains
+// in [live_count, next_row) before the truncate. A debug-only bounded scan
+// asserts exactly that immediately before truncating. Returns the updated
+// catalog ref, the rows moved this call, and whether packing finished.
 pub fn compactStep(txn: *WriteTxn, cat: Ref, budget: usize) !struct { cat: Ref, moved: usize, done: bool } {
     var cur = cat;
     const lc = try liveCount(txn, cur);
-    const alloc = txn.db.store.allocator;
+    const next_row = (try catalog.loadCatalog(txn, cur)).next_row;
 
-    // Already packed (no live row above live_count): just ensure the tail is
-    // truncated so next_row == live_count, and report done.
-    if ((try catalog.loadCatalog(txn, cur)).next_row == lc) {
+    // Already packed (no live row above live_count). The dead tail is already
+    // gone (next_row == live_count), so there is nothing to truncate.
+    if (next_row == lc) {
+        txn.db.compact_cursor = null;
         return .{ .cat = cur, .moved = 0, .done = true };
     }
 
-    // One pass over the key->row index: collect the high live rows (row >= lc)
-    // and mark which slots in [0, lc) are occupied. Unmarked slots are holes.
-    var high = std.ArrayList(Pair).empty;
-    defer high.deinit(alloc);
-    const occ = try alloc.alloc(bool, @intCast(lc));
-    defer alloc.free(occ);
-    @memset(occ, false);
-
-    const Collector = struct {
-        high: *std.ArrayList(Pair),
-        occ: []bool,
-        a: std.mem.Allocator,
-        lc: u64,
-        fn onEntry(self: @This(), okey: u64, row: u64) !void {
-            if (row >= self.lc) {
-                try self.high.append(self.a, .{ .okey = okey, .row = row });
-            } else {
-                self.occ[@intCast(row)] = true;
-            }
+    // Resume the stored cursor only if it pins this exact catalog shape;
+    // otherwise (churn, or first step of a run) restart the scan.
+    var cursor: CompactCursor = blk: {
+        if (txn.db.compact_cursor) |c| {
+            if (c.live_count == lc and c.next_row == next_row) break :blk c;
         }
+        break :blk .{ .live_count = lc, .next_row = next_row, .hole_lo = 0, .high_hi = next_row };
     };
+
+    var moved: usize = 0;
+    while (moved < budget) {
+        // Advance hole_lo to the next dead slot (relocation target) in [0, lc).
+        {
+            const v = try catalog.loadCatalog(txn, cur);
+            while (cursor.hole_lo < lc and (try Column.get(txn, v.live_col_ref, cursor.hole_lo)) == 1) : (cursor.hole_lo += 1) {}
+        }
+        // Advance high_hi down past dead rows to the next live row at >= lc.
+        {
+            const v = try catalog.loadCatalog(txn, cur);
+            while (cursor.high_hi > lc and (try Column.get(txn, v.live_col_ref, cursor.high_hi - 1)) == 0) : (cursor.high_hi -= 1) {}
+        }
+        // No high live rows left to move, or (defensively) no holes to fill.
+        if (cursor.high_hi <= lc or cursor.hole_lo >= lc) break;
+
+        const high_row = cursor.high_hi - 1;
+        const okey = try rowToOkey(txn, try catalog.loadCatalog(txn, cur), high_row);
+        cur = try relocateRow(txn, cur, okey, cursor.hole_lo);
+        // The hole is now live and the high row now dead; step past both.
+        cursor.hole_lo += 1;
+        cursor.high_hi -= 1;
+        moved += 1;
+    }
+
+    // Skip any trailing dead rows the budget loop left unexamined so the guard
+    // sees the true frontier (lets `done` fire as early as it is provably safe).
     {
         const v = try catalog.loadCatalog(txn, cur);
-        try Index.forEachEntry(txn, v.keyrow_index_ref, Collector{ .high = &high, .occ = occ, .a = alloc, .lc = lc }, Collector.onEntry);
+        while (cursor.high_hi > lc and (try Column.get(txn, v.live_col_ref, cursor.high_hi - 1)) == 0) : (cursor.high_hi -= 1) {}
     }
 
-    // Holes are the unmarked indices in [0, lc). By construction their count
-    // equals high.len (total live rows == lc), but we min over both to be safe.
-    var holes = std.ArrayList(u64).empty;
-    defer holes.deinit(alloc);
-    {
-        var i: u64 = 0;
-        while (i < lc) : (i += 1) if (!occ[@intCast(i)]) try holes.append(alloc, i);
-    }
-
-    // Relocate high rows into holes, up to the budget.
-    const limit = @min(budget, @min(high.items.len, holes.items.len));
-    var moved: usize = 0;
-    while (moved < limit) : (moved += 1) {
-        cur = try relocateRow(txn, cur, high.items[moved].okey, holes.items[moved]);
-    }
-
-    // Each relocation consumes one high row; if any remain, budget is exhausted
-    // and we are not done. Otherwise every live row is now packed in [0, lc):
-    // truncate the dead tail and finish.
-    if (high.items.len - moved == 0) {
+    if (cursor.high_hi <= lc) {
+        // Hard safety check: no live row may survive in the tail we are about to
+        // drop. Bounded, runs only once per pack at the final step.
+        if (std.debug.runtime_safety) {
+            const v = try catalog.loadCatalog(txn, cur);
+            var r: u64 = lc;
+            while (r < next_row) : (r += 1) {
+                std.debug.assert((try Column.get(txn, v.live_col_ref, r)) == 0);
+            }
+        }
         cur = try truncatePacked(txn, cur, lc);
+        txn.db.compact_cursor = null;
         return .{ .cat = cur, .moved = moved, .done = true };
     }
+
+    txn.db.compact_cursor = cursor;
     return .{ .cat = cur, .moved = moved, .done = false };
 }
 
@@ -1300,6 +1350,194 @@ test "compactStep is a no-op on an already-packed type" {
         try testing.expectEqual(pk, out[0].int);
         try testing.expectEqual(pk * 7, out[1].int);
     }
+}
+
+test "compactStep cursor path packs identically to the scan path" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const step_path = try cmpTmpPath(testing.allocator, &tmp, "ident_step.airdb");
+    defer testing.allocator.free(step_path);
+    const ctrl_path = try cmpTmpPath(testing.allocator, &tmp, "ident_ctrl.airdb");
+    defer testing.allocator.free(ctrl_path);
+
+    // A scattered, delete-heavy pattern that strands live rows both below and
+    // above the live-count boundary.
+    const dels = [_]u64{ 0, 1, 4, 6, 7, 9, 12, 13, 15, 18, 19 };
+    const isDel = struct {
+        fn f(pk: u64) bool {
+            for (dels) |d| if (d == pk) return true;
+            return false;
+        }
+    }.f;
+
+    // Build the SAME data in two databases.
+    var step_db = try Db.create(testing.allocator, step_path);
+    defer step_db.deinit();
+    var ctrl_db = try Db.create(testing.allocator, ctrl_path);
+    defer ctrl_db.deinit();
+
+    var step_w = try step_db.beginWrite();
+    defer step_w.deinit();
+    var ctrl_w = try ctrl_db.beginWrite();
+    defer ctrl_w.deinit();
+
+    var step_cat = try catalog.create(&step_w, 2);
+    var ctrl_cat = try catalog.create(&ctrl_w, 2);
+    var step_okeys: [20]u64 = undefined;
+    var pk: u64 = 0;
+    while (pk < 20) : (pk += 1) {
+        const rs = try objects.insert(&step_w, step_cat, &.{ pk, pk * 100 });
+        step_cat = rs.cat;
+        step_okeys[@intCast(pk)] = rs.row;
+        const rc = try objects.insert(&ctrl_w, ctrl_cat, &.{ pk, pk * 100 });
+        ctrl_cat = rc.cat;
+    }
+    for (dels) |dpk| {
+        var out: [2]u64 = undefined;
+        const vs = (try objects.getByPk(&step_w, step_cat, dpk, &out)).?;
+        step_cat = (try objects.delete(&step_w, step_cat, dpk, vs)).ok;
+        const vc = (try objects.getByPk(&ctrl_w, ctrl_cat, dpk, &out)).?;
+        ctrl_cat = (try objects.delete(&ctrl_w, ctrl_cat, dpk, vc)).ok;
+    }
+
+    // Control: one full-pass compaction.
+    ctrl_cat = try compactType(&ctrl_w, ctrl_cat);
+
+    // Step path: budgeted cursor steps until done.
+    var guard: usize = 0;
+    while (true) {
+        const res = try compactStep(&step_w, step_cat, 3);
+        step_cat = res.cat;
+        try testing.expect(res.moved <= 3);
+        if (res.done) break;
+        guard += 1;
+        try testing.expect(guard < 100);
+    }
+
+    // Both fully packed to the same dense length.
+    const step_len = (try catalog.loadCatalog(&step_w, step_cat)).next_row;
+    try testing.expectEqual(try liveCount(&step_w, step_cat), step_len);
+    try testing.expectEqual((try catalog.loadCatalog(&ctrl_w, ctrl_cat)).next_row, step_len);
+    try testing.expectEqual(try liveCount(&ctrl_w, ctrl_cat), try liveCount(&step_w, step_cat));
+
+    // Every survivor reads its exact values via its stable object key in the
+    // stepped db; deleted keys are gone. Cross-check pk presence vs the control.
+    pk = 0;
+    while (pk < 20) : (pk += 1) {
+        var so: [2]catalog.Value = undefined;
+        const sg = try objects.getTypedByOkey(&step_w, step_cat, step_okeys[@intCast(pk)], &so);
+        var co: [2]u64 = undefined;
+        const cg = try objects.getByPk(&ctrl_w, ctrl_cat, pk, &co);
+        if (isDel(pk)) {
+            try testing.expect(sg == null);
+            try testing.expect(cg == null);
+        } else {
+            try testing.expect(sg != null);
+            try testing.expect(cg != null);
+            try testing.expectEqual(pk, so[0].int);
+            try testing.expectEqual(pk * 100, so[1].int);
+            // Same primary key reads back in the control (survivor sets match).
+            var sp: [2]u64 = undefined;
+            try testing.expect((try objects.getByPk(&step_w, step_cat, pk, &sp)) != null);
+            try testing.expectEqual(pk * 100, sp[1]);
+        }
+    }
+}
+
+test "compactStep truncation never drops a live row at the top" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try cmpTmpPath(testing.allocator, &tmp, "trunc_top.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    defer w.deinit();
+
+    // Insert 10 rows at physical 0..9, then delete the LOW pks (0..4). The five
+    // survivors (pks 5..9) all sit at physical rows >= live_count (=5): every
+    // live row is a "high" row that must be relocated downward before truncation.
+    var cat = try catalog.create(&w, 2);
+    var okeys: [10]u64 = undefined;
+    var pk: u64 = 0;
+    while (pk < 10) : (pk += 1) {
+        const r = try objects.insert(&w, cat, &.{ pk, pk * 1000 });
+        cat = r.cat;
+        okeys[@intCast(pk)] = r.row;
+    }
+    pk = 0;
+    while (pk < 5) : (pk += 1) {
+        var out: [2]u64 = undefined;
+        const ver = (try objects.getByPk(&w, cat, pk, &out)).?;
+        cat = (try objects.delete(&w, cat, pk, ver)).ok;
+    }
+    try testing.expectEqual(@as(u64, 5), try liveCount(&w, cat));
+
+    // Pack in tiny steps; the downward cursor must examine the entire top range.
+    var guard: usize = 0;
+    while (true) {
+        const res = try compactStep(&w, cat, 2);
+        cat = res.cat;
+        try testing.expect(res.moved <= 2);
+        if (res.done) break;
+        guard += 1;
+        try testing.expect(guard < 100);
+    }
+
+    try testing.expectEqual(@as(u64, 5), (try catalog.loadCatalog(&w, cat)).next_row);
+    // Every top-stranded survivor is intact with its exact values.
+    pk = 5;
+    while (pk < 10) : (pk += 1) {
+        var out: [2]catalog.Value = undefined;
+        const got = try objects.getTypedByOkey(&w, cat, okeys[@intCast(pk)], &out);
+        try testing.expect(got != null);
+        try testing.expectEqual(pk, out[0].int);
+        try testing.expectEqual(pk * 1000, out[1].int);
+    }
+}
+
+test "compactStep moves at most budget rows per call" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try cmpTmpPath(testing.allocator, &tmp, "budget.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    defer w.deinit();
+
+    // A large set with heavy churn so many high rows need relocating.
+    const n: u64 = 400;
+    var cat = try catalog.create(&w, 2);
+    var pk: u64 = 0;
+    while (pk < n) : (pk += 1) {
+        const r = try objects.insert(&w, cat, &.{ pk, pk });
+        cat = r.cat;
+    }
+    // Delete every even pk -> ~200 holes scattered through the low half.
+    pk = 0;
+    while (pk < n) : (pk += 2) {
+        cat = switch (try objects.delete(&w, cat, pk, w.new_version)) {
+            .ok => |c| c,
+            else => unreachable,
+        };
+    }
+
+    const budget: usize = 7;
+    var guard: usize = 0;
+    var saw_full_budget = false;
+    while (true) {
+        const res = try compactStep(&w, cat, budget);
+        cat = res.cat;
+        try testing.expect(res.moved <= budget);
+        if (res.moved == budget) saw_full_budget = true;
+        if (res.done) break;
+        guard += 1;
+        try testing.expect(guard < 1000);
+    }
+    // The set is large enough that at least one step hit the cap.
+    try testing.expect(saw_full_budget);
+    try testing.expectEqual(try liveCount(&w, cat), (try catalog.loadCatalog(&w, cat)).next_row);
 }
 
 // NOTE: link/backlink survival across a relocation is covered directly by
