@@ -308,9 +308,11 @@ pub fn runAll(alloc: Allocator, opts: Opts) !void {
     // scenarios registered here as they land
     const insert_recovery = @import("scenarios/insert_recovery.zig");
     const lookup_query = @import("scenarios/lookup_query.zig");
+    const churn_compaction = @import("scenarios/churn_compaction.zig");
     const scenarios = [_]Scenario{
         .{ .name = insert_recovery.name, .run = insert_recovery.run },
         .{ .name = lookup_query.name, .run = lookup_query.run },
+        .{ .name = churn_compaction.name, .run = churn_compaction.run },
     };
 
     var results: std.ArrayList(Result) = .empty;
