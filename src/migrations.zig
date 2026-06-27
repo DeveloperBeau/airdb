@@ -38,6 +38,8 @@ pub fn addProperty(txn: *WriteTxn, cat: Ref, def: PropDef, default_value: u64) !
     var bl: [max_prop_count]Ref = undefined;
     var targets: [max_prop_count]u16 = undefined;
     var rules: [max_prop_count]catalog.DeletionRule = undefined;
+    var vidx: [max_prop_count]Ref = undefined;
+    var idxf: [max_prop_count]bool = undefined;
     {
         var j: usize = 0;
         while (j < pc) : (j += 1) {
@@ -47,6 +49,8 @@ pub fn addProperty(txn: *WriteTxn, cat: Ref, def: PropDef, default_value: u64) !
             bl[j] = v.backlinkRef(j);
             targets[j] = v.linkTarget(j);
             rules[j] = v.delRule(j);
+            vidx[j] = v.valueIndexRef(j);
+            idxf[j] = v.indexed(j);
         }
     }
     // Build the new column, backfilled with the default for every existing row.
@@ -59,7 +63,9 @@ pub fn addProperty(txn: *WriteTxn, cat: Ref, def: PropDef, default_value: u64) !
     bl[pc] = if (def.kind == .link or def.kind == .link_set) try Index.create(txn) else 0;
     targets[pc] = def.link_target;
     rules[pc] = def.del_rule;
-    return catalog.writeCatalog(txn, pc + 1, next_row, v.keyrow_index_ref, v.next_key, idx_ref, ver_ref, live_ref, prop_refs[0 .. pc + 1], kinds[0 .. pc + 1], elems[0 .. pc + 1], bl[0 .. pc + 1], targets[0 .. pc + 1], rules[0 .. pc + 1]);
+    idxf[pc] = def.indexed;
+    vidx[pc] = if (def.indexed) try Index.create(txn) else 0;
+    return catalog.writeCatalog(txn, pc + 1, next_row, v.keyrow_index_ref, v.next_key, idx_ref, ver_ref, live_ref, prop_refs[0 .. pc + 1], kinds[0 .. pc + 1], elems[0 .. pc + 1], bl[0 .. pc + 1], targets[0 .. pc + 1], rules[0 .. pc + 1], vidx[0 .. pc + 1], idxf[0 .. pc + 1]);
 }
 
 // Remove property `prop` (must be >= 1; the primary key at 0 cannot be removed).
@@ -79,6 +85,8 @@ pub fn removeProperty(txn: *WriteTxn, cat: Ref, prop: usize) !Ref {
     var bl: [max_prop_count]Ref = undefined;
     var targets: [max_prop_count]u16 = undefined;
     var rules: [max_prop_count]catalog.DeletionRule = undefined;
+    var vidx: [max_prop_count]Ref = undefined;
+    var idxf: [max_prop_count]bool = undefined;
     var out: usize = 0;
     var j: usize = 0;
     while (j < pc) : (j += 1) {
@@ -89,9 +97,11 @@ pub fn removeProperty(txn: *WriteTxn, cat: Ref, prop: usize) !Ref {
         bl[out] = v.backlinkRef(j);
         targets[out] = v.linkTarget(j);
         rules[out] = v.delRule(j);
+        vidx[out] = v.valueIndexRef(j);
+        idxf[out] = v.indexed(j);
         out += 1;
     }
-    return catalog.writeCatalog(txn, pc - 1, next_row, v.keyrow_index_ref, v.next_key, idx_ref, ver_ref, live_ref, prop_refs[0..out], kinds[0..out], elems[0..out], bl[0..out], targets[0..out], rules[0..out]);
+    return catalog.writeCatalog(txn, pc - 1, next_row, v.keyrow_index_ref, v.next_key, idx_ref, ver_ref, live_ref, prop_refs[0..out], kinds[0..out], elems[0..out], bl[0..out], targets[0..out], rules[0..out], vidx[0..out], idxf[0..out]);
 }
 
 // ---------------------------------------------------------------------------
