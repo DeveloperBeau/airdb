@@ -39,6 +39,20 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_lib.step);
     test_step.dependOn(&run_int.step);
 
+    // Standalone performance harness. Not part of `test` so CI stays fast.
+    const bench_mod = b.createModule(.{
+        .root_source_file = b.path("bench/main.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .link_libc = true,
+        .imports = &.{.{ .name = "airdb", .module = mod }},
+    });
+    const bench_exe = b.addExecutable(.{ .name = "airdb-bench", .root_module = bench_mod });
+    const run_bench = b.addRunArtifact(bench_exe);
+    if (b.args) |args| run_bench.addArgs(args);
+    const bench_step = b.step("bench", "Run the performance benchmark suite");
+    bench_step.dependOn(&run_bench.step);
+
     // Static library exposing the C ABI for language bindings. The library's
     // root is ffi.zig so its top-level `export fn` symbols are emitted (they
     // would be tree-shaken if reached only through a re-export).
