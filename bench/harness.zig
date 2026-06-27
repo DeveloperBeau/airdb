@@ -306,7 +306,10 @@ pub fn runAll(alloc: Allocator, opts: Opts) !void {
     defer Io.Dir.cwd().deleteTree(io, scratch) catch {};
 
     // scenarios registered here as they land
-    const scenarios = [_]Scenario{};
+    const insert_recovery = @import("scenarios/insert_recovery.zig");
+    const scenarios = [_]Scenario{
+        .{ .name = insert_recovery.name, .run = insert_recovery.run },
+    };
 
     var results: std.ArrayList(Result) = .empty;
     defer results.deinit(alloc);
