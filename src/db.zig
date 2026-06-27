@@ -72,6 +72,15 @@ pub const Db = struct {
     /// Opt-in: when set, the caller drives `maybeCompactStep` to amortize compaction.
     auto_compact: bool = false,
 
+    /// Measurement-only counters accumulated since open. Updated by commit; never
+    /// affect behavior. fl_encode_ns is the total nanoseconds spent encoding the
+    /// persistent free list onto the arena (byteLen + bump alloc + encode), and
+    /// fl_extents_encoded is the sum of free-list extent counts encoded across all
+    /// commits. commit_count is the number of commits whose encode completed.
+    fl_encode_ns: u64 = 0,
+    fl_extents_encoded: u64 = 0,
+    commit_count: u64 = 0,
+
     /// Create a new database file at the given absolute path.
     pub fn create(allocator: std.mem.Allocator, path: []const u8) !Db {
         return createWith(allocator, path, RealSyncer.any());
@@ -528,6 +537,12 @@ pub const Db = struct {
         oldest_pinned_version: u64,
         free_extent_count: usize,
         reclaimable_bytes: u64,
+        // Measurement-only cost counters accumulated since open.
+        fl_encode_ns: u64,
+        fl_extents_encoded: u64,
+        commit_count: u64,
+        setlength_ns: u64,
+        setlength_calls: u64,
     };
 
     pub fn metrics(self: *Db) Metrics {
@@ -539,6 +554,11 @@ pub const Db = struct {
             .oldest_pinned_version = self.horizon(),
             .free_extent_count = self.free_list.extents.items.len,
             .reclaimable_bytes = reclaimable,
+            .fl_encode_ns = self.fl_encode_ns,
+            .fl_extents_encoded = self.fl_extents_encoded,
+            .commit_count = self.commit_count,
+            .setlength_ns = self.store.setlength_ns,
+            .setlength_calls = self.store.setlength_calls,
         };
     }
 

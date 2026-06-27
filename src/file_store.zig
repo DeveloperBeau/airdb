@@ -62,6 +62,11 @@ pub const FileStore = struct {
     /// Set by readHeader (open path) or to true after writeHeader (create/persistHeader path).
     /// Recovery in db.zig openWith reads this to decide whether to trust active_slot.
     header_checksum_ok: bool,
+    /// Measurement-only counters accumulated since open. Total nanoseconds spent in
+    /// blocking file.setLength (file growth) and the number of such calls. Read via
+    /// Db.metrics(); never affect behavior.
+    setlength_ns: u64 = 0,
+    setlength_calls: u64 = 0,
 
     /// Per-open maximum file size; caps the number of sections (max_sections =
     /// max_reserved / section_size). See `platform.max_reserved` for the host-size split.
@@ -242,7 +247,12 @@ pub const FileStore = struct {
 
         const want_bytes: u64 = @as(u64, needed) << platform.section_shift;
         if (try self.file.length(sysIo()) < want_bytes) {
-            try self.file.setLength(sysIo(), want_bytes);
+            // Measurement only: time the blocking setLength; no behavior change.
+            const io = sysIo();
+            const sl_start = Io.Clock.now(.awake, io).nanoseconds;
+            try self.file.setLength(io, want_bytes);
+            self.setlength_ns += @intCast(Io.Clock.now(.awake, io).nanoseconds - sl_start);
+            self.setlength_calls += 1;
         }
 
         var i: usize = self.sections.items.len;

@@ -158,9 +158,16 @@ pub const WriteTxn = struct {
         // 4. Encode the new free list onto the arena via a BUMP allocation (never
         //    reuse, to avoid recursion: the free-list node must not reference itself).
         //    Use bumpGrowing so the file is extended if the arena is full.
+        // Measurement only: time the free-list byteLen + bump alloc + encode that
+        // every commit pays. No behavior change; counters live on the Db.
+        const enc_io = std.Io.Threaded.global_single_threaded.io();
+        const enc_start = Io.Clock.now(.awake, enc_io).nanoseconds;
         const node_len = new_fl.byteLen();
         const node = try db.bumpGrowing(node_len);
         const written = new_fl.encode(node.bytes);
+        db.fl_encode_ns += @intCast(Io.Clock.now(.awake, enc_io).nanoseconds - enc_start);
+        db.fl_extents_encoded += new_fl.extents.items.len;
+        db.commit_count += 1;
         std.debug.assert(written == node_len);
 
         // --- Two-slot atomic durable commit ---
