@@ -38,6 +38,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     defer harness.removeScratch(ctx.*, path);
 
     // --- Insert phase --------------------------------------------------------
+    const pf_before = airdb.pageFaults();
     const insert_start = nowNs(io);
 
     var db = try airdb.Db.create(alloc, path);
@@ -69,6 +70,9 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     }
 
     const insert_ns: u64 = @intCast(nowNs(io) - insert_start);
+    const pf_after = airdb.pageFaults();
+    const minflt_delta = pf_after.minor - pf_before.minor;
+    const majflt_delta = pf_after.major - pf_before.major;
 
     // --- Recovery signal: close, reopen, first read --------------------------
     const file_bytes = try db.fileSize();
@@ -93,7 +97,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
 
     const note = try std.fmt.allocPrint(
         alloc,
-        "reopen={d}ms first_read={d}us fl_encode_ms={d} fl_extents_total={d} commits={d} setlength_ms={d} setlength_calls={d}",
+        "reopen={d}ms first_read={d}us fl_encode_ms={d} fl_extents_total={d} commits={d} setlength_ms={d} setlength_calls={d} fl_rebuild_ms={d} fl_clone_ms={d} minflt={d} majflt={d}",
         .{
             reopen_ns / std.time.ns_per_ms,
             first_read_ns / std.time.ns_per_us,
@@ -102,6 +106,10 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
             m.commit_count,
             m.setlength_ns / std.time.ns_per_ms,
             m.setlength_calls,
+            m.fl_rebuild_ns / std.time.ns_per_ms,
+            m.fl_clone_ns / std.time.ns_per_ms,
+            minflt_delta,
+            majflt_delta,
         },
     );
 

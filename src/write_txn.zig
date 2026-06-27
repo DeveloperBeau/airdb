@@ -132,6 +132,11 @@ pub const WriteTxn = struct {
         var new_fl = FreeList.init(db.store.allocator);
         errdefer new_fl.deinit();
 
+        // Measurement only: time the O(extent count) rebuild of the new persistent
+        // free list from work_freelist + in_flight_frees (+ reclaimed nodes). No
+        // behavior change; counter lives on the Db.
+        const rebuild_io = std.Io.Threaded.global_single_threaded.io();
+        const rebuild_start = Io.Clock.now(.awake, rebuild_io).nanoseconds;
         // 1. Copy extents that work_freelist still holds (i.e. not reused this txn).
         for (self.work_freelist.extents.items) |e| {
             try new_fl.add(e);
@@ -154,6 +159,7 @@ pub const WriteTxn = struct {
         for (self.txn_reuse.extents.items) |e| {
             try new_fl.add(.{ .offset = e.offset, .len = e.len, .freed_version = self.new_version });
         }
+        db.fl_rebuild_ns += @intCast(Io.Clock.now(.awake, rebuild_io).nanoseconds - rebuild_start);
 
         // 4. Encode the new free list onto the arena via a BUMP allocation (never
         //    reuse, to avoid recursion: the free-list node must not reference itself).

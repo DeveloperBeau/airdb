@@ -77,9 +77,15 @@ pub const Db = struct {
     /// persistent free list onto the arena (byteLen + bump alloc + encode), and
     /// fl_extents_encoded is the sum of free-list extent counts encoded across all
     /// commits. commit_count is the number of commits whose encode completed.
+    /// fl_rebuild_ns is the total nanoseconds spent rebuilding the new persistent
+    /// free list from work_freelist + in_flight_frees in commit (the O(extent count)
+    /// copy loops). fl_clone_ns is the total nanoseconds spent cloning the committed
+    /// free list into work_freelist in beginWriteLocked (also O(extent count)).
     fl_encode_ns: u64 = 0,
     fl_extents_encoded: u64 = 0,
     commit_count: u64 = 0,
+    fl_rebuild_ns: u64 = 0,
+    fl_clone_ns: u64 = 0,
 
     /// Create a new database file at the given absolute path.
     pub fn create(allocator: std.mem.Allocator, path: []const u8) !Db {
@@ -476,9 +482,14 @@ pub const Db = struct {
         // work_freelist is the mutable clone that reuse() shrinks.
         var work_freelist = FreeList.init(self.store.allocator);
         errdefer work_freelist.deinit();
+        // Measurement only: time the O(extent count) clone of the committed free
+        // list. No behavior change; counter lives on the Db.
+        const clone_io = std.Io.Threaded.global_single_threaded.io();
+        const clone_start = Io.Clock.now(.awake, clone_io).nanoseconds;
         for (self.free_list.extents.items) |e| {
             try work_freelist.add(e);
         }
+        self.fl_clone_ns += @intCast(Io.Clock.now(.awake, clone_io).nanoseconds - clone_start);
         return WriteTxn{
             .db = self,
             .new_root = self.active_root,
@@ -541,6 +552,8 @@ pub const Db = struct {
         fl_encode_ns: u64,
         fl_extents_encoded: u64,
         commit_count: u64,
+        fl_rebuild_ns: u64,
+        fl_clone_ns: u64,
         setlength_ns: u64,
         setlength_calls: u64,
     };
@@ -557,6 +570,8 @@ pub const Db = struct {
             .fl_encode_ns = self.fl_encode_ns,
             .fl_extents_encoded = self.fl_extents_encoded,
             .commit_count = self.commit_count,
+            .fl_rebuild_ns = self.fl_rebuild_ns,
+            .fl_clone_ns = self.fl_clone_ns,
             .setlength_ns = self.store.setlength_ns,
             .setlength_calls = self.store.setlength_calls,
         };
