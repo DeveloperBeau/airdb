@@ -20,6 +20,7 @@ pub const Ref = @import("ref.zig").Ref;
 pub const node = @import("node.zig");
 pub const file_store = @import("file_store.zig");
 pub const platform = @import("platform.zig");
+pub const peakResidentBytes = @import("platform.zig").peakResidentBytes;
 pub const syncer = @import("syncer.zig");
 pub const arena = @import("arena.zig");
 pub const slots = @import("slots.zig");
