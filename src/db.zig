@@ -71,6 +71,11 @@ pub const Db = struct {
     retain_versions: u64 = 0,
     /// Opt-in: when set, the caller drives `maybeCompactStep` to amortize compaction.
     auto_compact: bool = false,
+    /// In-flight cursor for budget-proportional packing. Holds the two-pointer
+    /// state for the type currently being compacted across successive
+    /// `compactStep` calls; null between runs (and reset on any churn that moves
+    /// the type's live_count/next_row). See `compaction.compactStep`.
+    compact_cursor: ?compaction.CompactCursor = null,
 
     /// Create a new database file at the given absolute path.
     pub fn create(allocator: std.mem.Allocator, path: []const u8) !Db {
