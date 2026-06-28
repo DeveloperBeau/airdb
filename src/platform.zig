@@ -245,3 +245,28 @@ test "peakResidentBytes returns a plausible nonzero value" {
     const rss = peakResidentBytes();
     try std.testing.expect(rss > 64 * 1024);
 }
+
+// Cumulative page-fault counts for the current process. `minor` is soft faults
+// served without disk I/O (ru_minflt); `major` is hard faults that required a
+// disk read (ru_majflt). The bench harness samples this before/after a phase and
+// reports the delta as a memory-latency signal. On Windows getrusage is not
+// available, so this reports the single PageFaultCount (which does not split
+// minor/major) as `minor` and 0 as `major`.
+pub fn pageFaults() struct { minor: u64, major: u64 } {
+    if (is_windows) {
+        var counters = std.mem.zeroes(win.PROCESS_MEMORY_COUNTERS);
+        counters.cb = @sizeOf(win.PROCESS_MEMORY_COUNTERS);
+        if (win.GetProcessMemoryInfo(win.GetCurrentProcess(), &counters, counters.cb) == 0) {
+            return .{ .minor = 0, .major = 0 };
+        }
+        return .{ .minor = @intCast(counters.PageFaultCount), .major = 0 };
+    }
+    const usage = std.posix.getrusage(std.posix.rusage.SELF);
+    return .{ .minor = @intCast(usage.minflt), .major = @intCast(usage.majflt) };
+}
+
+test "pageFaults returns plausible values" {
+    const pf = pageFaults();
+    // A running process has taken at least some minor faults to map its image.
+    try std.testing.expect(pf.minor > 0);
+}
