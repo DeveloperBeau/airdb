@@ -8,7 +8,7 @@ pub const PropCount = u16;
 pub const PropKind = enum(u8) { int = 0, blob = 1, list = 2, set = 3, link = 4, link_set = 5, dict = 6 };
 pub const ElemKind = enum(u8) { int = 0, blob = 1 };
 pub const DeletionRule = enum(u8) { nullify = 0, cascade = 1, block = 2 };
-pub const PropDef = struct { kind: PropKind, elem: ElemKind = .int, link_target: u16 = 0, del_rule: DeletionRule = .nullify };
+pub const PropDef = struct { kind: PropKind, elem: ElemKind = .int, link_target: u16 = 0, del_rule: DeletionRule = .nullify, indexed: bool = false };
 // A single byte-keyed dictionary entry: a byte-string key mapped to a u64 value
 // (an int, or an object key for a "dict of links" -- u64 covers both).
 pub const DictEntry = struct { key: []const u8, val: u64 };
@@ -37,6 +37,10 @@ pub const Value = union(enum) {
 // [prop_count u16][next_row u64][pk_index_ref u64][version_col_ref u64][live_col_ref u64]
 // [prop_count * (prop_col_ref u64)][prop_count * (kind u8)][prop_count * (elem u8)]
 // [prop_count * (backlink_ref u64)][prop_count * (link_target u16)][prop_count * (del_rule u8)]
+// [prop_count * (value_index_ref u64)][prop_count * (indexed u8)]
+//
+// The value-index ref and indexed flag arrays are appended last so the earlier
+// per-property arrays keep their existing offsets unchanged.
 const off_prop_count: usize = 0;
 const off_next_row: usize = 2;
 const off_pk_index_ref: usize = 10;
@@ -49,7 +53,7 @@ const off_prop_cols: usize = 50;
 pub const max_prop_count: usize = 256;
 
 fn catalogSize(pc: PropCount) usize {
-    return off_prop_cols + @as(usize, pc) * 8 + @as(usize, pc) * 2 + @as(usize, pc) * 8 + @as(usize, pc) * 2 + @as(usize, pc);
+    return off_prop_cols + @as(usize, pc) * 8 + @as(usize, pc) * 2 + @as(usize, pc) * 8 + @as(usize, pc) * 2 + @as(usize, pc) + @as(usize, pc) * 8 + @as(usize, pc);
 }
 
 fn kindsOffset(pc: PropCount) usize {
@@ -72,6 +76,14 @@ fn rulesOffset(pc: PropCount) usize {
     return targetsOffset(pc) + @as(usize, pc) * 2;
 }
 
+fn valueIndexRefsOffset(pc: PropCount) usize {
+    return rulesOffset(pc) + @as(usize, pc);
+}
+
+fn indexedFlagsOffset(pc: PropCount) usize {
+    return valueIndexRefsOffset(pc) + @as(usize, pc) * 8;
+}
+
 // Allocate and encode a fresh catalog node; return its ref.
 pub fn writeCatalog(
     txn: *WriteTxn,
@@ -88,6 +100,8 @@ pub fn writeCatalog(
     backlinks: []const Ref,
     targets: []const u16,
     rules: []const DeletionRule,
+    value_index_refs: []const Ref,
+    indexed_flags: []const bool,
 ) !Ref {
     const a = try txn.alloc(catalogSize(prop_count));
     std.mem.writeInt(u16, a.bytes[off_prop_count..][0..2], prop_count, .little);
@@ -112,6 +126,12 @@ pub fn writeCatalog(
     for (targets, 0..) |t, i| std.mem.writeInt(u16, a.bytes[to + i * 2 ..][0..2], t, .little);
     const ro = rulesOffset(prop_count);
     for (rules, 0..) |r, i| a.bytes[ro + i] = @intFromEnum(r);
+    const vio = valueIndexRefsOffset(prop_count);
+    for (value_index_refs, 0..) |vref, i| {
+        std.mem.writeInt(u64, a.bytes[vio + i * 8 ..][0..8], vref, .little);
+    }
+    const ifo = indexedFlagsOffset(prop_count);
+    for (indexed_flags, 0..) |flag, i| a.bytes[ifo + i] = @intFromBool(flag);
     return a.ref;
 }
 
@@ -127,6 +147,8 @@ pub fn createDefs(txn: *WriteTxn, defs: []const PropDef) !Ref {
     var backlinks: [max_prop_count]Ref = undefined;
     var targets: [max_prop_count]u16 = undefined;
     var rules: [max_prop_count]DeletionRule = undefined;
+    var value_index_refs: [max_prop_count]Ref = undefined;
+    var indexed_flags: [max_prop_count]bool = undefined;
     var i: usize = 0;
     while (i < prop_count) : (i += 1) {
         prop_col_refs[i] = try Column.create(txn);
@@ -135,6 +157,8 @@ pub fn createDefs(txn: *WriteTxn, defs: []const PropDef) !Ref {
         backlinks[i] = if (defs[i].kind == .link or defs[i].kind == .link_set) try Index.create(txn) else 0;
         targets[i] = defs[i].link_target;
         rules[i] = defs[i].del_rule;
+        indexed_flags[i] = defs[i].indexed;
+        value_index_refs[i] = if (defs[i].indexed) try Index.create(txn) else 0;
     }
     const version_col_ref = try Column.create(txn);
     const live_col_ref = try Column.create(txn);
@@ -155,6 +179,8 @@ pub fn createDefs(txn: *WriteTxn, defs: []const PropDef) !Ref {
         backlinks[0..prop_count],
         targets[0..prop_count],
         rules[0..prop_count],
+        value_index_refs[0..prop_count],
+        indexed_flags[0..prop_count],
     );
 }
 
@@ -216,6 +242,16 @@ pub const CatalogView = struct {
     pub fn delRule(self: CatalogView, i: usize) DeletionRule {
         const ro = off_prop_cols + @as(usize, self.prop_count) * 8 + @as(usize, self.prop_count) * 2 + @as(usize, self.prop_count) * 8 + @as(usize, self.prop_count) * 2;
         return @enumFromInt(self.bytes[ro + i]);
+    }
+
+    pub fn valueIndexRef(self: CatalogView, i: usize) Ref {
+        const vio = valueIndexRefsOffset(self.prop_count);
+        return std.mem.readInt(u64, self.bytes[vio + i * 8 ..][0..8], .little);
+    }
+
+    pub fn indexed(self: CatalogView, i: usize) bool {
+        const ifo = indexedFlagsOffset(self.prop_count);
+        return self.bytes[ifo + i] != 0;
     }
 };
 
@@ -289,6 +325,8 @@ pub fn replaceCollRoot(txn: *WriteTxn, cat: Ref, row: u64, prop: usize, new_root
     var bl: [max_prop_count]Ref = undefined;
     var targets_buf: [max_prop_count]u16 = undefined;
     var rules_buf: [max_prop_count]DeletionRule = undefined;
+    var vidx_buf: [max_prop_count]Ref = undefined;
+    var idxf_buf: [max_prop_count]bool = undefined;
     {
         var j: usize = 0;
         while (j < pc) : (j += 1) {
@@ -298,12 +336,14 @@ pub fn replaceCollRoot(txn: *WriteTxn, cat: Ref, row: u64, prop: usize, new_root
             bl[j] = v.backlinkRef(j);
             targets_buf[j] = v.linkTarget(j);
             rules_buf[j] = v.delRule(j);
+            vidx_buf[j] = v.valueIndexRef(j);
+            idxf_buf[j] = v.indexed(j);
         }
     }
     var ver_ref = v.version_col_ref;
     prop_refs[prop] = try Column.set(txn, prop_refs[prop], row, new_root);
     ver_ref = try Column.set(txn, ver_ref, row, txn.new_version);
-    return writeCatalog(txn, pc, next_row, v.keyrow_index_ref, v.next_key, idx_ref, ver_ref, live_ref, prop_refs[0..pc], kinds[0..pc], elems[0..pc], bl[0..pc], targets_buf[0..pc], rules_buf[0..pc]);
+    return writeCatalog(txn, pc, next_row, v.keyrow_index_ref, v.next_key, idx_ref, ver_ref, live_ref, prop_refs[0..pc], kinds[0..pc], elems[0..pc], bl[0..pc], targets_buf[0..pc], rules_buf[0..pc], vidx_buf[0..pc], idxf_buf[0..pc]);
 }
 
 // Write a new backlink ref into property `p`, preserving everything else.
@@ -320,6 +360,8 @@ pub fn setBacklinkRef(txn: *WriteTxn, cat: Ref, p: usize, new_bl: Ref) !Ref {
     var bl: [max_prop_count]Ref = undefined;
     var targets_buf: [max_prop_count]u16 = undefined;
     var rules_buf: [max_prop_count]DeletionRule = undefined;
+    var vidx_buf: [max_prop_count]Ref = undefined;
+    var idxf_buf: [max_prop_count]bool = undefined;
     {
         var j: usize = 0;
         while (j < pc) : (j += 1) {
@@ -329,10 +371,45 @@ pub fn setBacklinkRef(txn: *WriteTxn, cat: Ref, p: usize, new_bl: Ref) !Ref {
             bl[j] = v.backlinkRef(j);
             targets_buf[j] = v.linkTarget(j);
             rules_buf[j] = v.delRule(j);
+            vidx_buf[j] = v.valueIndexRef(j);
+            idxf_buf[j] = v.indexed(j);
         }
     }
     bl[p] = new_bl;
-    return writeCatalog(txn, pc, next_row, v.keyrow_index_ref, v.next_key, idx_ref, ver_ref, live_ref, prop_refs[0..pc], kinds[0..pc], elems[0..pc], bl[0..pc], targets_buf[0..pc], rules_buf[0..pc]);
+    return writeCatalog(txn, pc, next_row, v.keyrow_index_ref, v.next_key, idx_ref, ver_ref, live_ref, prop_refs[0..pc], kinds[0..pc], elems[0..pc], bl[0..pc], targets_buf[0..pc], rules_buf[0..pc], vidx_buf[0..pc], idxf_buf[0..pc]);
+}
+
+// Write a new value-index ref into property `p`, preserving everything else.
+pub fn setValueIndexRef(txn: *WriteTxn, cat: Ref, p: usize, new_vi: Ref) !Ref {
+    const v = try loadCatalog(txn, cat);
+    const pc = v.prop_count;
+    const next_row = v.next_row;
+    const idx_ref = v.pk_index_ref;
+    const ver_ref = v.version_col_ref;
+    const live_ref = v.live_col_ref;
+    var prop_refs: [max_prop_count]Ref = undefined;
+    var kinds: [max_prop_count]PropKind = undefined;
+    var elems: [max_prop_count]ElemKind = undefined;
+    var bl: [max_prop_count]Ref = undefined;
+    var targets_buf: [max_prop_count]u16 = undefined;
+    var rules_buf: [max_prop_count]DeletionRule = undefined;
+    var vidx_buf: [max_prop_count]Ref = undefined;
+    var idxf_buf: [max_prop_count]bool = undefined;
+    {
+        var j: usize = 0;
+        while (j < pc) : (j += 1) {
+            prop_refs[j] = v.propColRef(j);
+            kinds[j] = v.kind(j);
+            elems[j] = v.elemKind(j);
+            bl[j] = v.backlinkRef(j);
+            targets_buf[j] = v.linkTarget(j);
+            rules_buf[j] = v.delRule(j);
+            vidx_buf[j] = v.valueIndexRef(j);
+            idxf_buf[j] = v.indexed(j);
+        }
+    }
+    vidx_buf[p] = new_vi;
+    return writeCatalog(txn, pc, next_row, v.keyrow_index_ref, v.next_key, idx_ref, ver_ref, live_ref, prop_refs[0..pc], kinds[0..pc], elems[0..pc], bl[0..pc], targets_buf[0..pc], rules_buf[0..pc], vidx_buf[0..pc], idxf_buf[0..pc]);
 }
 
 // Write a new column ref into property `p`, preserving everything else.
@@ -349,6 +426,8 @@ pub fn setPropColRef(txn: *WriteTxn, cat: Ref, p: usize, new_col: Ref) !Ref {
     var bl: [max_prop_count]Ref = undefined;
     var targets_buf: [max_prop_count]u16 = undefined;
     var rules_buf: [max_prop_count]DeletionRule = undefined;
+    var vidx_buf: [max_prop_count]Ref = undefined;
+    var idxf_buf: [max_prop_count]bool = undefined;
     {
         var j: usize = 0;
         while (j < pc) : (j += 1) {
@@ -358,10 +437,12 @@ pub fn setPropColRef(txn: *WriteTxn, cat: Ref, p: usize, new_col: Ref) !Ref {
             bl[j] = v.backlinkRef(j);
             targets_buf[j] = v.linkTarget(j);
             rules_buf[j] = v.delRule(j);
+            vidx_buf[j] = v.valueIndexRef(j);
+            idxf_buf[j] = v.indexed(j);
         }
     }
     prop_refs[p] = new_col;
-    return writeCatalog(txn, pc, next_row, v.keyrow_index_ref, v.next_key, idx_ref, ver_ref, live_ref, prop_refs[0..pc], kinds[0..pc], elems[0..pc], bl[0..pc], targets_buf[0..pc], rules_buf[0..pc]);
+    return writeCatalog(txn, pc, next_row, v.keyrow_index_ref, v.next_key, idx_ref, ver_ref, live_ref, prop_refs[0..pc], kinds[0..pc], elems[0..pc], bl[0..pc], targets_buf[0..pc], rules_buf[0..pc], vidx_buf[0..pc], idxf_buf[0..pc]);
 }
 
 // ---------------------------------------------------------------------------
@@ -494,6 +575,77 @@ test "createDefs creates an empty key-to-row index and zero next_key" {
     const v = try loadCatalog(&w, cat);
     try testing.expect(v.keyrow_index_ref != 0);
     try testing.expectEqual(@as(u64, 0), v.next_key);
+    w.deinit();
+}
+
+test "catalog persists indexed flag and value index ref" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "vindex.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    const cat = try createDefs(&w, &.{
+        .{ .kind = .int },
+        .{ .kind = .int, .indexed = true },
+        .{ .kind = .int },
+    });
+    const v = try loadCatalog(&w, cat);
+    try testing.expect(v.indexed(1));
+    try testing.expect(!v.indexed(0));
+    try testing.expect(!v.indexed(2));
+    try testing.expect(v.valueIndexRef(1) != 0);
+    try testing.expectEqual(@as(Ref, 0), v.valueIndexRef(0));
+    try testing.expectEqual(@as(Ref, 0), v.valueIndexRef(2));
+    const vidx1 = v.valueIndexRef(1);
+    // Round-trip through a full catalog rebuild (setPropColRef rewrites every
+    // field) and assert both the flag and the value-index ref survive.
+    const cat2 = try setPropColRef(&w, cat, 2, v.propColRef(2));
+    const v2 = try loadCatalog(&w, cat2);
+    try testing.expect(v2.indexed(1));
+    try testing.expect(!v2.indexed(0));
+    try testing.expect(!v2.indexed(2));
+    try testing.expectEqual(vidx1, v2.valueIndexRef(1));
+    try testing.expectEqual(@as(Ref, 0), v2.valueIndexRef(0));
+    try testing.expectEqual(@as(Ref, 0), v2.valueIndexRef(2));
+    w.deinit();
+}
+
+test "non-indexed catalog: value index refs zero and existing fields intact" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "noindex.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    const cat = try createDefs(&w, &.{
+        .{ .kind = .int },
+        .{ .kind = .list, .elem = .blob },
+        .{ .kind = .link, .link_target = 4, .del_rule = .cascade },
+    });
+    const v = try loadCatalog(&w, cat);
+    var i: usize = 0;
+    while (i < v.prop_count) : (i += 1) {
+        try testing.expect(!v.indexed(i));
+        try testing.expectEqual(@as(Ref, 0), v.valueIndexRef(i));
+    }
+    // Every pre-existing accessor must still read the right field: this guards
+    // that appending the new arrays did not disturb the earlier offset math.
+    try testing.expectEqual(PropKind.int, v.kind(0));
+    try testing.expectEqual(PropKind.list, v.kind(1));
+    try testing.expectEqual(ElemKind.blob, v.elemKind(1));
+    try testing.expectEqual(PropKind.link, v.kind(2));
+    try testing.expect(v.propColRef(0) != 0);
+    try testing.expect(v.propColRef(1) != 0);
+    try testing.expect(v.backlinkRef(2) != 0); // link prop got a backlink index
+    try testing.expectEqual(@as(Ref, 0), v.backlinkRef(0));
+    try testing.expectEqual(@as(Ref, 0), v.backlinkRef(1));
+    try testing.expectEqual(@as(u16, 4), v.linkTarget(2));
+    try testing.expectEqual(@as(u16, 0), v.linkTarget(0));
+    try testing.expectEqual(DeletionRule.cascade, v.delRule(2));
+    try testing.expectEqual(DeletionRule.nullify, v.delRule(0));
     w.deinit();
 }
 

@@ -45,6 +45,8 @@ pub fn compactType(txn: *WriteTxn, cat: Ref) !Ref {
     var bl: [max_prop_count]Ref = undefined;
     var targets: [max_prop_count]u16 = undefined;
     var rules: [max_prop_count]catalog.DeletionRule = undefined;
+    var vidx: [max_prop_count]Ref = undefined;
+    var idxf: [max_prop_count]bool = undefined;
     {
         var j: usize = 0;
         while (j < pc) : (j += 1) {
@@ -54,6 +56,8 @@ pub fn compactType(txn: *WriteTxn, cat: Ref) !Ref {
             bl[j] = v.backlinkRef(j);
             targets[j] = v.linkTarget(j);
             rules[j] = v.delRule(j);
+            vidx[j] = v.valueIndexRef(j);
+            idxf[j] = v.indexed(j);
         }
     }
     const alloc = txn.db.store.allocator;
@@ -94,7 +98,7 @@ pub fn compactType(txn: *WriteTxn, cat: Ref) !Ref {
         new_row += 1;
     }
 
-    return catalog.writeCatalog(txn, pc, new_row, new_keyrow, next_key, pk_index_ref, new_ver, new_live, new_prop[0..pc], kinds[0..pc], elems[0..pc], bl[0..pc], targets[0..pc], rules[0..pc]);
+    return catalog.writeCatalog(txn, pc, new_row, new_keyrow, next_key, pk_index_ref, new_ver, new_live, new_prop[0..pc], kinds[0..pc], elems[0..pc], bl[0..pc], targets[0..pc], rules[0..pc], vidx[0..pc], idxf[0..pc]);
 }
 
 // Truncate a fully-packed type's columns down to `new_len` rows and publish a
@@ -115,6 +119,8 @@ fn truncatePacked(txn: *WriteTxn, cat: Ref, new_len: u64) !Ref {
     var bl: [max_prop_count]Ref = undefined;
     var targets: [max_prop_count]u16 = undefined;
     var rules: [max_prop_count]catalog.DeletionRule = undefined;
+    var vidx: [max_prop_count]Ref = undefined;
+    var idxf: [max_prop_count]bool = undefined;
     {
         var j: usize = 0;
         while (j < pc) : (j += 1) {
@@ -124,6 +130,8 @@ fn truncatePacked(txn: *WriteTxn, cat: Ref, new_len: u64) !Ref {
             bl[j] = v.backlinkRef(j);
             targets[j] = v.linkTarget(j);
             rules[j] = v.delRule(j);
+            vidx[j] = v.valueIndexRef(j);
+            idxf[j] = v.indexed(j);
         }
     }
     var ver = v.version_col_ref;
@@ -136,7 +144,7 @@ fn truncatePacked(txn: *WriteTxn, cat: Ref, new_len: u64) !Ref {
     ver = try Column.truncate(txn, ver, new_len);
     live = try Column.truncate(txn, live, new_len);
 
-    return catalog.writeCatalog(txn, pc, new_len, keyrow, next_key, pk_index_ref, ver, live, prop[0..pc], kinds[0..pc], elems[0..pc], bl[0..pc], targets[0..pc], rules[0..pc]);
+    return catalog.writeCatalog(txn, pc, new_len, keyrow, next_key, pk_index_ref, ver, live, prop[0..pc], kinds[0..pc], elems[0..pc], bl[0..pc], targets[0..pc], rules[0..pc], vidx[0..pc], idxf[0..pc]);
 }
 
 // Two-pointer packing cursor for one in-flight compaction run. live_count and
@@ -340,6 +348,7 @@ pub fn copyTypeRows(src: anytype, src_cat: Ref, dst: *WriteTxn) !Ref {
     var elems: [catalog.max_prop_count]catalog.ElemKind = undefined;
     var targets: [catalog.max_prop_count]u16 = undefined;
     var rules: [catalog.max_prop_count]catalog.DeletionRule = undefined;
+    var idxf: [catalog.max_prop_count]bool = undefined;
     {
         var j: usize = 0;
         while (j < pc) : (j += 1) {
@@ -348,6 +357,7 @@ pub fn copyTypeRows(src: anytype, src_cat: Ref, dst: *WriteTxn) !Ref {
             elems[j] = sv.elemKind(j);
             targets[j] = sv.linkTarget(j);
             rules[j] = sv.delRule(j);
+            idxf[j] = sv.indexed(j);
         }
     }
     const s_ver = sv.version_col_ref;
@@ -370,11 +380,16 @@ pub fn copyTypeRows(src: anytype, src_cat: Ref, dst: *WriteTxn) !Ref {
     // Fresh destination structures.
     var d_prop: [catalog.max_prop_count]Ref = undefined;
     var d_bl: [catalog.max_prop_count]Ref = undefined;
+    // Value indexes, like backlink indexes, are created empty in the destination
+    // db (the source ref lives in the source db's address space) and repopulated
+    // separately; the indexed flag itself is carried through.
+    var d_vidx: [catalog.max_prop_count]Ref = undefined;
     {
         var j: usize = 0;
         while (j < pc) : (j += 1) {
             d_prop[j] = try Column.create(dst);
             d_bl[j] = if (kinds[j] == .link or kinds[j] == .link_set) try Index.create(dst) else 0;
+            d_vidx[j] = if (idxf[j]) try Index.create(dst) else 0;
         }
     }
     var d_ver = try Column.create(dst);
@@ -400,7 +415,7 @@ pub fn copyTypeRows(src: anytype, src_cat: Ref, dst: *WriteTxn) !Ref {
         d_row += 1;
     }
 
-    return catalog.writeCatalog(dst, pc, d_row, d_keyrow, next_key, d_pk, d_ver, d_live, d_prop[0..pc], kinds[0..pc], elems[0..pc], d_bl[0..pc], targets[0..pc], rules[0..pc]);
+    return catalog.writeCatalog(dst, pc, d_row, d_keyrow, next_key, d_pk, d_ver, d_live, d_prop[0..pc], kinds[0..pc], elems[0..pc], d_bl[0..pc], targets[0..pc], rules[0..pc], d_vidx[0..pc], idxf[0..pc]);
 }
 
 // Rebuild backlink indexes for `cat` (in dst) from its copied forward links.

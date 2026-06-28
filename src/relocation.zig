@@ -33,6 +33,8 @@ pub fn relocateRow(txn: *WriteTxn, cat: Ref, okey: u64, new_row: u64) !Ref {
     var bl: [max_prop_count]Ref = undefined;
     var targets: [max_prop_count]u16 = undefined;
     var rules: [max_prop_count]catalog.DeletionRule = undefined;
+    var vidx: [max_prop_count]Ref = undefined;
+    var idxf: [max_prop_count]bool = undefined;
     {
         var j: usize = 0;
         while (j < pc) : (j += 1) {
@@ -42,6 +44,8 @@ pub fn relocateRow(txn: *WriteTxn, cat: Ref, okey: u64, new_row: u64) !Ref {
             bl[j] = v.backlinkRef(j);
             targets[j] = v.linkTarget(j);
             rules[j] = v.delRule(j);
+            vidx[j] = v.valueIndexRef(j);
+            idxf[j] = v.indexed(j);
         }
     }
     // Copy each property cell + the version cell from old_row to new_row.
@@ -71,6 +75,8 @@ pub fn relocateRow(txn: *WriteTxn, cat: Ref, okey: u64, new_row: u64) !Ref {
         bl[0..pc],
         targets[0..pc],
         rules[0..pc],
+        vidx[0..pc],
+        idxf[0..pc],
     );
 }
 

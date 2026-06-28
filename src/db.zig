@@ -22,6 +22,9 @@ const Coord = @import("coord.zig").Coord;
 const coord_mod = @import("coord.zig");
 const typedir = @import("typedir.zig");
 const compaction = @import("compaction.zig");
+const catalog = @import("catalog.zig");
+const Column = @import("column.zig");
+const Index = @import("index.zig");
 
 const slot_a_off: usize = 64;
 const slot_b_off: usize = 128;
@@ -47,6 +50,12 @@ pub const VerifyError = error{
     FreeListCorrupt,
     FreeExtentOutOfBounds,
     RootRefOutOfBounds,
+    // A live row's indexed property value is not reflected in that property's
+    // value index (forward direction of the value-index invariant).
+    ValueIndexMissingEntry,
+    // A value-index entry points at a dead/absent row, or at a live row whose
+    // property value differs from the indexed value (backward direction).
+    ValueIndexStaleEntry,
 };
 
 pub const Db = struct {
@@ -608,6 +617,40 @@ pub const Db = struct {
             const elen: usize = @intCast(e.len);
             if (eoff > limit or elen > limit - eoff) return error.FreeExtentOutOfBounds;
         }
+
+        try self.auditValueIndexes();
+    }
+
+    // Audit every value index against the live base rows. For each indexed
+    // property of each type, both directions of the invariant are checked:
+    //   * forward  -- every live row's value is present in the value index;
+    //   * backward -- every value-index entry resolves to a live row whose
+    //                 property value equals the indexed value.
+    // Any divergence is surfaced as a VerifyError rather than later showing up
+    // as a wrong query result.
+    //
+    // The root may legitimately not be a type directory (low-level callers
+    // commit raw blobs). A valid directory holds at most 256 types, so an
+    // implausible type count -- or any catalog that fails to load -- means the
+    // root is not a typed directory and there is nothing to audit.
+    fn auditValueIndexes(self: *Db) VerifyError!void {
+        if (self.active_root == 0) return;
+        var r = ReadTxn{ .db = self, .root_ref = self.active_root, .version = self.active_version };
+        const tc = typedir.typeCount(&r, self.active_root) catch return;
+        if (tc > 256) return;
+        var t: u16 = 0;
+        while (t < tc) : (t += 1) {
+            const cat = typedir.catalogRef(&r, self.active_root, t) catch return;
+            const cv = catalog.loadCatalog(&r, cat) catch return;
+            var p: usize = 0;
+            while (p < cv.prop_count) : (p += 1) {
+                if (!cv.indexed(p)) continue;
+                const vi_ref = cv.valueIndexRef(p);
+                const prop_col = cv.propColRef(p);
+                try auditValueIndexForward(&r, cv.keyrow_index_ref, vi_ref, prop_col, cv.live_col_ref);
+                try auditValueIndexBackward(&r, vi_ref, cv.keyrow_index_ref, prop_col, cv.live_col_ref);
+            }
+        }
     }
 };
 
@@ -618,6 +661,60 @@ pub const Db = struct {
 
 pub const ReadTxn = @import("read_txn.zig").ReadTxn;
 pub const WriteTxn = @import("write_txn.zig").WriteTxn;
+
+// Forward direction of the value-index invariant: walk the live rows (the
+// keyrow index maps okey->row for live rows only) and assert each row's indexed
+// value carries that okey in the value index's inner set. A live row that the
+// index does not cover is error.ValueIndexMissingEntry. Any structural failure
+// reading the index/columns of an established typed catalog is itself a
+// divergence and reported the same way.
+fn auditValueIndexForward(r: *ReadTxn, keyrow_ref: Ref, vi_ref: Ref, prop_col: Ref, live_col: Ref) VerifyError!void {
+    const Ctx = struct {
+        r: *ReadTxn,
+        vi_ref: Ref,
+        prop_col: Ref,
+        live_col: Ref,
+        fn onEntry(self: @This(), okey: u64, row: u64) anyerror!void {
+            if ((try Column.get(self.r, self.live_col, row)) == 0) return; // defensive: skip dead
+            const value = try Column.get(self.r, self.prop_col, row);
+            const inner = (try Index.get(self.r, self.vi_ref, value)) orelse return error.ValueIndexMissingEntry;
+            if ((try Index.get(self.r, inner, okey)) == null) return error.ValueIndexMissingEntry;
+        }
+    };
+    Index.forEachEntry(r, keyrow_ref, Ctx{ .r = r, .vi_ref = vi_ref, .prop_col = prop_col, .live_col = live_col }, Ctx.onEntry) catch return error.ValueIndexMissingEntry;
+}
+
+// Backward direction of the value-index invariant: walk every (value, inner-set)
+// entry of the value index and, for each okey in a non-empty inner set, assert it
+// resolves through the keyrow index to a live row whose property value equals
+// that value. A stale/dangling okey or a value mismatch is
+// error.ValueIndexStaleEntry. Empty inner sets are skipped: delete leaves them in
+// place (it does not free them), so an empty set is not a violation.
+fn auditValueIndexBackward(r: *ReadTxn, vi_ref: Ref, keyrow_ref: Ref, prop_col: Ref, live_col: Ref) VerifyError!void {
+    const Ctx = struct {
+        r: *ReadTxn,
+        keyrow_ref: Ref,
+        prop_col: Ref,
+        live_col: Ref,
+        fn onEntry(self: @This(), value: u64, inner_root: u64) anyerror!void {
+            if ((try Index.count(self.r, inner_root)) == 0) return; // empty set left by delete
+            const Inner = struct {
+                r: *ReadTxn,
+                keyrow_ref: Ref,
+                prop_col: Ref,
+                live_col: Ref,
+                value: u64,
+                fn onKey(inner: @This(), okey: u64) anyerror!void {
+                    const row = (try Index.get(inner.r, inner.keyrow_ref, okey)) orelse return error.ValueIndexStaleEntry;
+                    if ((try Column.get(inner.r, inner.live_col, row)) == 0) return error.ValueIndexStaleEntry;
+                    if ((try Column.get(inner.r, inner.prop_col, row)) != inner.value) return error.ValueIndexStaleEntry;
+                }
+            };
+            try Index.forEachKey(self.r, inner_root, Inner{ .r = self.r, .keyrow_ref = self.keyrow_ref, .prop_col = self.prop_col, .live_col = self.live_col, .value = value }, Inner.onKey);
+        }
+    };
+    Index.forEachEntry(r, vi_ref, Ctx{ .r = r, .keyrow_ref = keyrow_ref, .prop_col = prop_col, .live_col = live_col }, Ctx.onEntry) catch return error.ValueIndexStaleEntry;
+}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -833,6 +930,132 @@ test "verifyIntegrity detects a free extent out of bounds" {
     // Inject an extent whose offset is past the mapped region.
     try db.free_list.extents.append(db.store.allocator, .{ .offset = @intCast(db.store.map.len + 8), .len = 8, .freed_version = 1 });
     try testing.expectError(error.FreeExtentOutOfBounds, db.verifyIntegrity());
+}
+
+test "verifyIntegrity passes after churn on an indexed type" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "vi_idx_churn.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    const tid: u16 = 0;
+
+    // One type: int pk + one indexed int property.
+    {
+        var w = try db.beginWrite();
+        const dir = try typedir.createTypes(&w, &.{&.{ .{ .kind = .int }, .{ .kind = .int, .indexed = true } }}, &.{false});
+        w.setRoot(dir);
+        _ = try w.commit();
+    }
+
+    // Seed 200 rows; value = pk % 16 so many rows share each inner set.
+    {
+        var w = try db.beginWrite();
+        var dir = db.active_root;
+        var pk: u64 = 0;
+        while (pk < 200) : (pk += 1) {
+            dir = (try typedir.insert(&w, dir, tid, &.{ .{ .int = pk }, .{ .int = pk % 16 } })).dir;
+        }
+        w.setRoot(dir);
+        _ = try w.commit();
+    }
+
+    // Churn: update the value of every even pk, delete every 5th pk.
+    {
+        var w = try db.beginWrite();
+        var dir = db.active_root;
+        var pk: u64 = 0;
+        while (pk < 200) : (pk += 1) {
+            var out: [2]catalog.Value = undefined;
+            const ver = (try typedir.get(&w, dir, tid, pk, &out)).?;
+            if (pk % 5 == 0) {
+                dir = switch (try typedir.delete(&w, dir, tid, pk, ver)) {
+                    .ok => |d| d,
+                    else => unreachable,
+                };
+            } else if (pk % 2 == 0) {
+                const ur = try typedir.update(&w, dir, tid, pk, &.{ .{ .int = pk }, .{ .int = (pk + 7) % 16 } }, ver);
+                dir = ur.ok.dir;
+            }
+        }
+        // Insert a fresh batch with reused values.
+        while (pk < 260) : (pk += 1) {
+            dir = (try typedir.insert(&w, dir, tid, &.{ .{ .int = pk }, .{ .int = pk % 16 } })).dir;
+        }
+        w.setRoot(dir);
+        _ = try w.commit();
+    }
+
+    try db.verifyIntegrity(); // forward + backward audit must find no divergence
+}
+
+test "verifyIntegrity detects a corrupted value index" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "vi_idx_corrupt.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    const tid: u16 = 0;
+    const p: usize = 1; // the indexed property
+
+    {
+        var w = try db.beginWrite();
+        var dir = try typedir.createTypes(&w, &.{&.{ .{ .kind = .int }, .{ .kind = .int, .indexed = true } }}, &.{false});
+        var pk: u64 = 0;
+        while (pk < 8) : (pk += 1) {
+            dir = (try typedir.insert(&w, dir, tid, &.{ .{ .int = pk }, .{ .int = pk } })).dir;
+        }
+        w.setRoot(dir);
+        _ = try w.commit();
+    }
+    try db.verifyIntegrity(); // clean before corruption
+
+    // White-box corruption: register an existing live okey under a value that no
+    // row actually has. The forward direction still holds (every row stays
+    // covered), so this exercises the backward check: the bogus entry resolves to
+    // a live row whose property value differs from the indexed value.
+    {
+        var w = try db.beginWrite();
+        const dir = db.active_root;
+        const cat = try typedir.catalogRef(&w, dir, tid);
+        const cv = try catalog.loadCatalog(&w, cat);
+        const okey = (try catalog.pkToOkey(&w, cat, 0)).?; // row pk 0 has value 0
+        const bogus_value: u64 = 999_999; // no row carries this value
+        var set_root = try Index.create(&w);
+        set_root = try Index.insert(&w, set_root, okey, 1);
+        const new_vi = try Index.insert(&w, cv.valueIndexRef(p), bogus_value, set_root);
+        const new_cat = try catalog.setValueIndexRef(&w, cat, p, new_vi);
+        const new_dir = try typedir.setCatalogRef(&w, dir, tid, new_cat);
+        w.setRoot(new_dir);
+        _ = try w.commit();
+    }
+
+    try testing.expectError(error.ValueIndexStaleEntry, db.verifyIntegrity());
+}
+
+test "verifyIntegrity passes on a non-indexed type" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "vi_noidx.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    const tid: u16 = 0;
+
+    {
+        var w = try db.beginWrite();
+        var dir = try typedir.createTypes(&w, &.{&.{ .{ .kind = .int }, .{ .kind = .int } }}, &.{false});
+        var pk: u64 = 0;
+        while (pk < 50) : (pk += 1) {
+            dir = (try typedir.insert(&w, dir, tid, &.{ .{ .int = pk }, .{ .int = pk * 3 } })).dir;
+        }
+        w.setRoot(dir);
+        _ = try w.commit();
+    }
+
+    try db.verifyIntegrity(); // no indexed prop -> audit must not false-positive
 }
 
 test "two Db instances on one file share a coordination attach count" {
@@ -1121,7 +1344,6 @@ test "ring wraps after capacity" {
 
 test "beginReadAt opens a past version within the retention window" {
     const objects = @import("objects.zig");
-    const catalog = @import("catalog.zig");
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try tmpFilePath(testing.allocator, &tmp, "pit.airdb");
@@ -1181,7 +1403,6 @@ test "beginReadAt opens a past version within the retention window" {
 
 test "beginReadAt rejects a version aged out of the retention window" {
     const objects = @import("objects.zig");
-    const catalog = @import("catalog.zig");
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try tmpFilePath(testing.allocator, &tmp, "pit2.airdb");
@@ -1215,7 +1436,6 @@ test "beginReadAt rejects a version aged out of the retention window" {
 // caller drives maybeCompactStep after each iteration until the type is packed.
 // Returns the final next_row (physical row high-water) and live count.
 fn churnNetZero(path: []const u8, live: u64, iters: u64, auto: bool) !struct { next_row: u64, live: u64 } {
-    const catalog = @import("catalog.zig");
     var db = try Db.create(testing.allocator, path);
     defer db.deinit();
     db.auto_compact = auto;
@@ -1305,7 +1525,6 @@ test "maybeCompactStep bounds dead rows under churn" {
 }
 
 test "maybeCompactStep is a no-op when nothing to compact" {
-    const catalog = @import("catalog.zig");
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try tmpFilePath(testing.allocator, &tmp, "nocompact.airdb");
