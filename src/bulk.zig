@@ -75,6 +75,71 @@ pub fn bulkColumn(txn: *WriteTxn, values: []const u64) !Ref {
     return refs.items[0];
 }
 
+// An index B+tree node together with the low key (smallest key in its subtree)
+// its parent records for it. Used as the per-level work item by the bottom-up
+// index builders below.
+const SpineChild = struct { ref: u64, low: u64 };
+
+// Deref an index node, sizing the read by its kind byte (leaf vs inner).
+fn derefIdxNode(txn: *WriteTxn, ref: Ref) ![]const u8 {
+    const kb = try txn.deref(ref, 1);
+    if (kb[0] == inode.kind_leaf) return txn.deref(ref, inode.leaf_node_size);
+    return txn.deref(ref, inode.inner_node_size);
+}
+
+// Pack strictly-ascending (keys, vals) into leaves filled to LEAF_CAP in key
+// order. Returns the leaf level: one SpineChild per leaf, low == its first key.
+fn packIndexLeaves(
+    txn: *WriteTxn,
+    keys: []const u64,
+    vals: []const u64,
+    al: std.mem.Allocator,
+) !std.ArrayList(SpineChild) {
+    std.debug.assert(keys.len == vals.len);
+    var out = std.ArrayList(SpineChild).empty;
+    errdefer out.deinit(al);
+    const cap: usize = inode.LEAF_CAP;
+    var i: usize = 0;
+    while (i < keys.len) {
+        const end = @min(i + cap, keys.len);
+        const a = try txn.alloc(inode.leaf_node_size);
+        _ = inode.encodeLeaf(a.bytes, keys[i..end], vals[i..end]);
+        try out.append(al, .{ .ref = a.ref, .low = keys[i] });
+        i = end;
+    }
+    return out;
+}
+
+// Build one inner level over `children`, packed in runs of FANOUT. An index
+// inner node stores (child_ref, low_key); a parent's low key is the low key of
+// its first child, so each emitted node's low == children[run_start].low.
+fn stackIndexInner(
+    txn: *WriteTxn,
+    children: []const SpineChild,
+    al: std.mem.Allocator,
+) !std.ArrayList(SpineChild) {
+    var out = std.ArrayList(SpineChild).empty;
+    errdefer out.deinit(al);
+    const fan: usize = inode.FANOUT;
+    var refs: [inode.FANOUT]u64 = undefined;
+    var lows: [inode.FANOUT]u64 = undefined;
+    var j: usize = 0;
+    while (j < children.len) {
+        const end = @min(j + fan, children.len);
+        var k: usize = j;
+        while (k < end) : (k += 1) {
+            refs[k - j] = children[k].ref;
+            lows[k - j] = children[k].low;
+        }
+        const cnt = end - j;
+        const a = try txn.alloc(inode.inner_node_size);
+        _ = inode.encodeInner(a.bytes, refs[0..cnt], lows[0..cnt]);
+        try out.append(al, .{ .ref = a.ref, .low = children[j].low });
+        j = end;
+    }
+    return out;
+}
+
 /// Build a u64 index over strictly-ascending `keys` with parallel `vals`.
 /// Returns the root Ref. Equivalent to Index.create plus an insert per pair.
 pub fn bulkIndex(txn: *WriteTxn, keys: []const u64, vals: []const u64) !Ref {
@@ -85,46 +150,124 @@ pub fn bulkIndex(txn: *WriteTxn, keys: []const u64, vals: []const u64) !Ref {
     }
     if (keys.len == 0) return Index.create(txn);
     const al = txn.db.store.allocator;
-    const cap: usize = inode.LEAF_CAP;
-    const fan: usize = inode.FANOUT;
 
-    // Current level: child refs and the low key (first key) of each child.
-    var refs = std.ArrayList(u64).empty;
-    defer refs.deinit(al);
-    var lows = std.ArrayList(u64).empty;
-    defer lows.deinit(al);
-
-    // Pack leaves to capacity in key order.
-    var i: usize = 0;
-    while (i < keys.len) {
-        const end = @min(i + cap, keys.len);
-        const a = try txn.alloc(inode.leaf_node_size);
-        _ = inode.encodeLeaf(a.bytes, keys[i..end], vals[i..end]);
-        try refs.append(al, a.ref);
-        try lows.append(al, keys[i]);
-        i = end;
+    // Pack leaves, then stack inner levels until a single root remains.
+    var level = try packIndexLeaves(txn, keys, vals, al);
+    defer level.deinit(al);
+    while (level.items.len > 1) {
+        const next = try stackIndexInner(txn, level.items, al);
+        level.deinit(al);
+        level = next;
     }
+    return level.items[0].ref;
+}
 
-    // Stack inner levels. An index inner node stores (child_ref, low_key); the
-    // parent's own low key is the low key of its first child.
-    while (refs.items.len > 1) {
-        var next_refs = std.ArrayList(u64).empty;
-        var next_lows = std.ArrayList(u64).empty;
-        var j: usize = 0;
-        while (j < refs.items.len) {
-            const end = @min(j + fan, refs.items.len);
-            const a = try txn.alloc(inode.inner_node_size);
-            _ = inode.encodeInner(a.bytes, refs.items[j..end], lows.items[j..end]);
-            try next_refs.append(al, a.ref);
-            try next_lows.append(al, lows.items[j]);
-            j = end;
+/// Append a sorted run of (keys, vals) whose keys ALL exceed the tree's current
+/// max key to the RIGHT EDGE of the index rooted at `root`, returning the new
+/// root Ref. Only the rightmost root-to-leaf path is rebuilt; every left
+/// subtree is shared unchanged (copy-on-write: shared nodes are never mutated).
+/// The result is logically identical to inserting every pair via Index.insert.
+///
+/// Preconditions (asserted under runtime safety): keys.len == vals.len, keys are
+/// strictly ascending, and keys[0] is greater than the tree's current max key.
+/// An empty run returns `root` unchanged.
+pub fn indexAppendRun(txn: *WriteTxn, root: Ref, keys: []const u64, vals: []const u64) !Ref {
+    std.debug.assert(keys.len == vals.len);
+    if (keys.len == 0) return root;
+    if (std.debug.runtime_safety) {
+        var q: usize = 1;
+        while (q < keys.len) : (q += 1) std.debug.assert(keys[q] > keys[q - 1]);
+    }
+    const al = txn.db.store.allocator;
+
+    // 1. Descend the rightmost path, recording each inner node and the index of
+    //    its rightmost child. No allocation from the arena occurs here, so the
+    //    deref'd node bytes stay valid for the duration of each iteration.
+    var path_refs = std.ArrayList(Ref).empty;
+    defer path_refs.deinit(al);
+    var path_ridx = std.ArrayList(usize).empty;
+    defer path_ridx.deinit(al);
+    var cur: Ref = root;
+    var leaf_ref: Ref = root;
+    while (true) {
+        const nb = try derefIdxNode(txn, cur);
+        if (nb[0] == inode.kind_leaf) {
+            leaf_ref = cur;
+            break;
         }
-        refs.deinit(al);
-        lows.deinit(al);
-        refs = next_refs;
-        lows = next_lows;
+        const iv = try inode.parseInner(nb);
+        const ri: usize = iv.child_count - 1;
+        const child = iv.childRef(ri);
+        try path_refs.append(al, cur);
+        try path_ridx.append(al, ri);
+        cur = child;
     }
-    return refs.items[0];
+
+    // 2. Gather the rightmost leaf's existing pairs followed by the run into a
+    //    heap buffer (heap allocation never remaps the arena, so the leaf bytes
+    //    stay valid while we copy them out). Then pack the combined run into
+    //    leaves filled to LEAF_CAP: the first new leaf reuses the old leaf's
+    //    content topped up from the front of the run, the rest are full leaves.
+    const lv = try inode.parseLeaf(try derefIdxNode(txn, leaf_ref));
+    if (std.debug.runtime_safety and lv.count > 0) {
+        std.debug.assert(keys[0] > lv.key(lv.count - 1));
+    }
+    const total: usize = @as(usize, lv.count) + keys.len;
+    const ck = try al.alloc(u64, total);
+    defer al.free(ck);
+    const cv = try al.alloc(u64, total);
+    defer al.free(cv);
+    {
+        var t: usize = 0;
+        while (t < lv.count) : (t += 1) {
+            ck[t] = lv.key(t);
+            cv[t] = lv.value(t);
+        }
+        for (keys, vals) |key, val| {
+            ck[t] = key;
+            cv[t] = val;
+            t += 1;
+        }
+    }
+
+    var level = try packIndexLeaves(txn, ck, cv, al);
+    errdefer level.deinit(al);
+
+    // 3. Rebuild the rightmost inner spine bottom-up. At each inner level, the
+    //    shared LEFT children (all but the rightmost) are re-emitted unchanged
+    //    and the rightmost child is replaced by the level rebuilt below, which
+    //    may have grown into several nodes. Packing in runs of FANOUT splits
+    //    automatically when the child list overflows; the extra nodes propagate
+    //    up as additional children of the next level.
+    var i: usize = path_refs.items.len;
+    while (i > 0) {
+        i -= 1;
+        const iv = try inode.parseInner(try derefIdxNode(txn, path_refs.items[i]));
+        const ri = path_ridx.items[i];
+        var full = std.ArrayList(SpineChild).empty;
+        defer full.deinit(al);
+        var j: usize = 0;
+        while (j < ri) : (j += 1) {
+            try full.append(al, .{ .ref = iv.childRef(j), .low = iv.lowKey(j) });
+        }
+        for (level.items) |c| try full.append(al, c);
+        const next = try stackIndexInner(txn, full.items, al);
+        level.deinit(al);
+        level = next;
+    }
+
+    // 4. If the (rebuilt) root level overflowed FANOUT it is now several nodes;
+    //    stack further inner levels until a single root remains, growing the
+    //    tree height by one or more as needed.
+    while (level.items.len > 1) {
+        const next = try stackIndexInner(txn, level.items, al);
+        level.deinit(al);
+        level = next;
+    }
+
+    const result = level.items[0].ref;
+    level.deinit(al);
+    return result;
 }
 
 /// Build a value index (value -> inner okey-set) from `entries`, sorted by
@@ -785,4 +928,155 @@ test "bulkImport edge sizes: empty, single, LEAF_CAP" {
             try testing.expectEqual(last % 7, out[2]);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// indexAppendRun: right-edge run append, asserted equivalent to sequential
+// Index.insert of the same keys.
+// ---------------------------------------------------------------------------
+
+fn appendRunVal(k: u64) u64 {
+    return k *% 7 +% 3;
+}
+
+// Build a base tree of keys 0..base via sequential insert, append the run
+// base..base+run via indexAppendRun, and assert the result is logically
+// identical to inserting all keys 0..base+run sequentially.
+fn checkAppendEquiv(w: *WriteTxn, base: u64, run: u64) !void {
+    var base_root = try Index.create(w);
+    var k: u64 = 0;
+    while (k < base) : (k += 1) base_root = try Index.insert(w, base_root, k, appendRunVal(k));
+
+    const rk = try testing.allocator.alloc(u64, run);
+    defer testing.allocator.free(rk);
+    const rv = try testing.allocator.alloc(u64, run);
+    defer testing.allocator.free(rv);
+    var r: u64 = 0;
+    while (r < run) : (r += 1) {
+        rk[r] = base + r;
+        rv[r] = appendRunVal(base + r);
+    }
+
+    const appended = try indexAppendRun(w, base_root, rk, rv);
+
+    var expected = try Index.create(w);
+    k = 0;
+    while (k < base + run) : (k += 1) expected = try Index.insert(w, expected, k, appendRunVal(k));
+
+    const total = base + run;
+    try testing.expectEqual(total, try Index.count(w, appended));
+    try testing.expectEqual(try Index.count(w, expected), try Index.count(w, appended));
+
+    // Boundary + sampled get checks (compared against the sequential twin).
+    var samples = std.ArrayList(u64).empty;
+    defer samples.deinit(testing.allocator);
+    if (total > 0) {
+        try samples.append(testing.allocator, 0); // first key
+        try samples.append(testing.allocator, total - 1); // last key
+    }
+    if (base > 0) {
+        try samples.append(testing.allocator, base - 1); // seam: last base key
+        try samples.append(testing.allocator, base); // seam: first run key (== total when run == 0)
+    }
+    if (total > 4) {
+        try samples.append(testing.allocator, total / 4);
+        try samples.append(testing.allocator, total / 2);
+        try samples.append(testing.allocator, (3 * total) / 4);
+    }
+    for (samples.items) |sk| {
+        try testing.expectEqual(try Index.get(w, expected, sk), try Index.get(w, appended, sk));
+    }
+    // Beyond the max key is absent in both.
+    try testing.expectEqual(@as(?u64, null), try Index.get(w, appended, total));
+    try testing.expectEqual(try Index.get(w, expected, total), try Index.get(w, appended, total));
+
+    // Full ascending (key,val) sequence must match exactly.
+    var ak = std.ArrayList(u64).empty;
+    defer ak.deinit(testing.allocator);
+    var av = std.ArrayList(u64).empty;
+    defer av.deinit(testing.allocator);
+    var ek = std.ArrayList(u64).empty;
+    defer ek.deinit(testing.allocator);
+    var ev = std.ArrayList(u64).empty;
+    defer ev.deinit(testing.allocator);
+    try Index.forEachEntry(w, appended, IdxCollector{ .keys = &ak, .vals = &av }, IdxCollector.onEntry);
+    try Index.forEachEntry(w, expected, IdxCollector{ .keys = &ek, .vals = &ev }, IdxCollector.onEntry);
+    try testing.expectEqualSlices(u64, ek.items, ak.items);
+    try testing.expectEqualSlices(u64, ev.items, av.items);
+}
+
+fn appendTmpDb(tmp: *testing.TmpDir, name: []const u8) !Db {
+    const path = try bulkTmpPath(testing.allocator, tmp, name);
+    defer testing.allocator.free(path);
+    return Db.create(testing.allocator, path);
+}
+
+test "indexAppendRun partial last leaf then new leaves" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try appendTmpDb(&tmp, "append1.airdb");
+    defer db.deinit();
+    var w = try db.beginWrite();
+    try checkAppendEquiv(&w, 100, 200); // 100 % 64 == 36 in the last leaf
+    w.deinit();
+}
+
+test "indexAppendRun overflow rightmost inner node" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try appendTmpDb(&tmp, "append2.airdb");
+    defer db.deinit();
+    var w = try db.beginWrite();
+    // A multi-level base plus a run large enough that the new leaves alone
+    // exceed FANOUT, forcing a split at the leaf-parent (non-root) inner level.
+    try checkAppendEquiv(&w, 3000, 5000);
+    w.deinit();
+}
+
+test "indexAppendRun grows tree height by one" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try appendTmpDb(&tmp, "append3.airdb");
+    defer db.deinit();
+    var w = try db.beginWrite();
+    // Single-leaf base, run crossing FANOUT*LEAF_CAP (== 4096) so the result
+    // must be three levels tall.
+    try checkAppendEquiv(&w, 50, 4200);
+    w.deinit();
+}
+
+test "indexAppendRun single-leaf base tree" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try appendTmpDb(&tmp, "append4.airdb");
+    defer db.deinit();
+    var w = try db.beginWrite();
+    try checkAppendEquiv(&w, 40, 50); // base < LEAF_CAP
+    w.deinit();
+}
+
+test "indexAppendRun run far larger than base" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try appendTmpDb(&tmp, "append5.airdb");
+    defer db.deinit();
+    var w = try db.beginWrite();
+    try checkAppendEquiv(&w, 10, 5000);
+    w.deinit();
+}
+
+test "indexAppendRun empty run is a no-op" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try appendTmpDb(&tmp, "append6.airdb");
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var base_root = try Index.create(&w);
+    var k: u64 = 0;
+    while (k < 100) : (k += 1) base_root = try Index.insert(&w, base_root, k, appendRunVal(k));
+    const before = try Index.count(&w, base_root);
+    const appended = try indexAppendRun(&w, base_root, &.{}, &.{});
+    try testing.expectEqual(base_root, appended); // same ref, unchanged
+    try testing.expectEqual(before, try Index.count(&w, appended));
+    w.deinit();
 }
