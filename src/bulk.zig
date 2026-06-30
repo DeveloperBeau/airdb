@@ -6,6 +6,7 @@ const Index = @import("index.zig");
 const cnode = @import("column_node.zig");
 const inode = @import("index_node.zig");
 const catalog = @import("catalog.zig");
+const objects = @import("objects.zig");
 
 const PropKind = catalog.PropKind;
 const ElemKind = catalog.ElemKind;
@@ -626,12 +627,179 @@ fn buildPropValueIndex(
 }
 
 // ---------------------------------------------------------------------------
+// Bulk append orchestrator.
+//
+// bulkAppend fast-paths a batch of rows whose primary keys all land strictly to
+// the RIGHT of the type's current key space onto the right edge of every tree,
+// without touching any left subtree. The result is byte-identical to inserting
+// the same rows one at a time in ascending-pk order: each new row gets the next
+// physical row and object key in batch order, the version stamp matches
+// objects.insert (txn.new_version), live = 1, and the pk and key->row indexes
+// grow only along their rightmost path.
+//
+// A batch only qualifies when nothing about it would force a non-right-edge
+// write: no property is indexed and none is a link/link_set (those maintain
+// secondary structures keyed by value/target, not by row), the batch pks are
+// strictly ascending and unique, and the smallest batch pk is strictly greater
+// than the type's current max pk. Any other shape returns error.NotAppendable
+// with NOTHING written, so the caller's fallback can replay row-by-row.
+//
+// Crucially, every qualification check is read-only and runs BEFORE the first
+// node is allocated, so a NotAppendable return leaves the catalog and all trees
+// untouched. The CALLER commits.
+pub fn bulkAppend(txn: *WriteTxn, cat: Ref, rows: []const []const u64) !Ref {
+    const v = try catalog.loadCatalog(txn, cat);
+    const prop_count = v.prop_count;
+
+    // Validate row widths first: a single malformed row aborts before any work.
+    for (rows) |row| {
+        if (row.len != prop_count) return error.BadRow;
+    }
+    if (rows.len == 0) return cat;
+
+    // Capture every catalog field into locals before any allocation can grow the
+    // file and invalidate the CatalogView bytes slice. While here, qualify the
+    // schema: reject an indexed or link-bearing property -- both keep secondary
+    // structures that a pure right-edge append cannot maintain.
+    const old_next_row = v.next_row;
+    const old_next_key = v.next_key;
+    const old_keyrow = v.keyrow_index_ref;
+    const old_pk_index = v.pk_index_ref;
+    const old_version_col = v.version_col_ref;
+    const old_live_col = v.live_col_ref;
+    var prop_refs: [max_prop_count]Ref = undefined;
+    var kinds: [max_prop_count]PropKind = undefined;
+    var elems: [max_prop_count]ElemKind = undefined;
+    var backlinks: [max_prop_count]Ref = undefined;
+    var targets: [max_prop_count]u16 = undefined;
+    var rules: [max_prop_count]DeletionRule = undefined;
+    var vidx: [max_prop_count]Ref = undefined;
+    var idxf: [max_prop_count]bool = undefined;
+    {
+        var j: usize = 0;
+        while (j < prop_count) : (j += 1) {
+            const k = v.kind(j);
+            if (k == .link or k == .link_set) return error.NotAppendable;
+            if (v.indexed(j)) return error.NotAppendable;
+            prop_refs[j] = v.propColRef(j);
+            kinds[j] = k;
+            elems[j] = v.elemKind(j);
+            backlinks[j] = v.backlinkRef(j);
+            targets[j] = v.linkTarget(j);
+            rules[j] = v.delRule(j);
+            vidx[j] = v.valueIndexRef(j);
+            idxf[j] = v.indexed(j);
+        }
+    }
+
+    const n = rows.len;
+
+    // Batch pks must be strictly ascending and unique; any non-ascending or
+    // duplicate-in-batch shape is NotAppendable so the fallback handles it
+    // (including per-row duplicate detection against the existing rows).
+    {
+        var i: usize = 1;
+        while (i < n) : (i += 1) {
+            if (rows[i][0] <= rows[i - 1][0]) return error.NotAppendable;
+        }
+    }
+
+    // The smallest batch pk (rows[0][0], since ascending) must clear the current
+    // max pk in the type. An empty type (no max) admits any ascending batch.
+    if (try Index.maxKey(txn, old_pk_index)) |max_pk| {
+        if (rows[0][0] <= max_pk) return error.NotAppendable;
+    }
+
+    // --- Qualified. Nothing has been written yet; build the right-edge runs. ---
+    const al = txn.db.store.allocator;
+
+    // Object keys and physical rows are assigned in batch order from the type's
+    // current counters, exactly as sequential ascending-pk inserts would: the
+    // j-th row gets okey = next_key + j and physical row = next_row + j.
+    const pks = try al.alloc(u64, n);
+    defer al.free(pks);
+    const okeys = try al.alloc(u64, n);
+    defer al.free(okeys);
+    const phys_rows = try al.alloc(u64, n);
+    defer al.free(phys_rows);
+    for (rows, 0..) |row, j| {
+        pks[j] = row[0];
+        okeys[j] = old_next_key + @as(u64, @intCast(j));
+        phys_rows[j] = old_next_row + @as(u64, @intCast(j));
+    }
+
+    // Property columns: append each property's values in batch order.
+    var new_prop_refs: [max_prop_count]Ref = undefined;
+    {
+        const col_vals = try al.alloc(u64, n);
+        defer al.free(col_vals);
+        var p: usize = 0;
+        while (p < prop_count) : (p += 1) {
+            for (rows, 0..) |row, j| col_vals[j] = row[p];
+            new_prop_refs[p] = try columnAppendRun(txn, prop_refs[p], col_vals[0..n]);
+        }
+    }
+
+    // Version and live columns: one stamp per row, matching objects.insert.
+    const stamps = try al.alloc(u64, n);
+    defer al.free(stamps);
+    @memset(stamps, txn.new_version);
+    const new_version_col = try columnAppendRun(txn, old_version_col, stamps[0..n]);
+    @memset(stamps, 1);
+    const new_live_col = try columnAppendRun(txn, old_live_col, stamps[0..n]);
+
+    // pk index (pk -> okey) and key->row index (okey -> physical row). Both runs
+    // land on the right edge: batch pks are ascending and above the current max,
+    // and okeys are consecutive from next_key (thus above every existing okey).
+    const new_pk_index = try indexAppendRun(txn, old_pk_index, pks[0..n], okeys[0..n]);
+    const new_keyrow = try indexAppendRun(txn, old_keyrow, okeys[0..n], phys_rows[0..n]);
+
+    return catalog.writeCatalog(
+        txn,
+        prop_count,
+        old_next_row + @as(u64, @intCast(n)), // next_row
+        new_keyrow,
+        old_next_key + @as(u64, @intCast(n)), // next_key
+        new_pk_index,
+        new_version_col,
+        new_live_col,
+        new_prop_refs[0..prop_count],
+        kinds[0..prop_count],
+        elems[0..prop_count],
+        backlinks[0..prop_count],
+        targets[0..prop_count],
+        rules[0..prop_count],
+        vidx[0..prop_count],
+        idxf[0..prop_count],
+    );
+}
+
+// Try the right-edge fast path; on NotAppendable, fall back to row-by-row
+// objects.insert, which handles any schema and detects duplicate keys per row.
+pub fn bulkAppendOrInsert(txn: *WriteTxn, cat: Ref, rows: []const []const u64) !Ref {
+    return bulkAppend(txn, cat, rows) catch |e| switch (e) {
+        error.NotAppendable => fallbackInsert(txn, cat, rows),
+        else => e,
+    };
+}
+
+// Insert every row one at a time, threading the catalog ref. A DuplicateKey from
+// objects.insert propagates to the caller. Empty rows return cat unchanged.
+fn fallbackInsert(txn: *WriteTxn, cat: Ref, rows: []const []const u64) !Ref {
+    if (rows.len == 0) return cat;
+    var c = cat;
+    for (rows) |row| {
+        c = (try objects.insert(txn, c, row)).cat;
+    }
+    return c;
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
 const Db = @import("db.zig").Db;
-const objects = @import("objects.zig");
 const query = @import("query.zig");
 const typedir = @import("typedir.zig");
 
@@ -1301,5 +1469,303 @@ test "columnAppendRun empty run is a no-op" {
     const appended = try columnAppendRun(&w, base_root, &.{});
     try testing.expectEqual(base_root, appended); // same ref, unchanged
     try testing.expectEqual(before, try Column.len(&w, appended));
+    w.deinit();
+}
+
+// ---------------------------------------------------------------------------
+// bulkAppend / bulkAppendOrInsert: right-edge batch append with a row-by-row
+// fallback, asserted equivalent to sequential objects.insert.
+// ---------------------------------------------------------------------------
+
+// A no-index, no-link scalar schema: int pk, int value. Qualifies for append.
+const append_defs = [_]catalog.PropDef{ .{ .kind = .int }, .{ .kind = .int } };
+
+test "bulkAppend equals row-by-row for a contiguous monotonic batch" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path_a = try bulkTmpPath(testing.allocator, &tmp, "append_eq_a.airdb");
+    defer testing.allocator.free(path_a);
+    const path_b = try bulkTmpPath(testing.allocator, &tmp, "append_eq_b.airdb");
+    defer testing.allocator.free(path_b);
+
+    const BASE: u64 = 1000;
+    const APPEND: u64 = 500;
+    const TOTAL = BASE + APPEND;
+
+    // Batch rows: pks BASE..TOTAL, value = pk*3 (ascending, above the base max).
+    const storage = try testing.allocator.alloc([2]u64, APPEND);
+    defer testing.allocator.free(storage);
+    const batch = try testing.allocator.alloc([]const u64, APPEND);
+    defer testing.allocator.free(batch);
+    {
+        var j: usize = 0;
+        while (j < APPEND) : (j += 1) {
+            const pk = BASE + @as(u64, @intCast(j));
+            storage[j] = .{ pk, pk * 3 };
+            batch[j] = &storage[j];
+        }
+    }
+
+    // db A: base via row-by-row insert, then the batch via bulkAppend, inside a
+    // one-type directory so verifyIntegrity audits it.
+    {
+        var db = try Db.create(testing.allocator, path_a);
+        defer db.deinit();
+        var w = try db.beginWrite();
+        const dir = try typedir.createTypes(&w, &.{&append_defs}, &.{false});
+        var cat = try typedir.catalogRef(&w, dir, 0);
+        var pk: u64 = 0;
+        while (pk < BASE) : (pk += 1) cat = (try objects.insert(&w, cat, &.{ pk, pk * 3 })).cat;
+        const new_cat = try bulkAppend(&w, cat, batch);
+        const new_dir = try typedir.setCatalogRef(&w, dir, 0, new_cat);
+        w.setRoot(new_dir);
+        _ = try w.commit();
+        try db.verifyIntegrity();
+    }
+
+    // db B: every row inserted one at a time, in ascending-pk order.
+    {
+        var db = try Db.create(testing.allocator, path_b);
+        defer db.deinit();
+        var w = try db.beginWrite();
+        var cat = try catalog.createDefs(&w, &append_defs);
+        var pk: u64 = 0;
+        while (pk < TOTAL) : (pk += 1) cat = (try objects.insert(&w, cat, &.{ pk, pk * 3 })).cat;
+        w.setRoot(cat);
+        _ = try w.commit();
+    }
+
+    // Reopen A from disk (durability) and compare against B.
+    var da = try Db.open(testing.allocator, path_a);
+    defer da.deinit();
+    try da.verifyIntegrity(); // audit again after reopen
+    var dbb = try Db.open(testing.allocator, path_b);
+    defer dbb.deinit();
+
+    var ra = try da.beginRead();
+    defer ra.end();
+    var rb = try dbb.beginRead();
+    defer rb.end();
+
+    const cat_a = try typedir.catalogRef(&ra, ra.root(), 0);
+    const cat_b = rb.root();
+
+    // Counts equal.
+    try testing.expectEqual(TOTAL, try catalog.liveCount(&ra, cat_a));
+    try testing.expectEqual(try catalog.liveCount(&rb, cat_b), try catalog.liveCount(&ra, cat_a));
+
+    // Every pk lookup equal: property values AND row version.
+    var pk: u64 = 0;
+    while (pk < TOTAL) : (pk += 1) {
+        var oa: [2]u64 = undefined;
+        var ob: [2]u64 = undefined;
+        const va = try objects.getByPk(&ra, cat_a, pk, &oa);
+        const vb = try objects.getByPk(&rb, cat_b, pk, &ob);
+        try testing.expectEqual(vb, va);
+        try testing.expectEqualSlices(u64, &ob, &oa);
+    }
+
+    // Full-scan order equal (ascending okey for both).
+    {
+        var sa = std.ArrayList(u64).empty;
+        defer sa.deinit(testing.allocator);
+        var sb = std.ArrayList(u64).empty;
+        defer sb.deinit(testing.allocator);
+        try query.where(&ra, cat_a, &.{}, &sa, testing.allocator);
+        try query.where(&rb, cat_b, &.{}, &sb, testing.allocator);
+        try testing.expectEqualSlices(u64, sb.items, sa.items);
+    }
+}
+
+test "bulkAppend returns NotAppendable for a scattered batch" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try bulkTmpPath(testing.allocator, &tmp, "append_scatter.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var cat = try catalog.createDefs(&w, &append_defs);
+    var pk: u64 = 0;
+    while (pk < 100) : (pk += 1) cat = (try objects.insert(&w, cat, &.{ pk, pk * 3 })).cat;
+
+    const before = try catalog.liveCount(&w, cat);
+    var before_row: [2]u64 = undefined;
+    try testing.expect((try objects.getByPk(&w, cat, 50, &before_row)) != null);
+
+    // First batch pk (50) is <= the current max (99): not a right-edge append.
+    const batch = [_][]const u64{ &.{ 50, 150 }, &.{ 200, 600 }, &.{ 201, 603 } };
+    try testing.expectError(error.NotAppendable, bulkAppend(&w, cat, &batch));
+
+    // The type is byte-unchanged: same count, and the sampled row is intact.
+    try testing.expectEqual(before, try catalog.liveCount(&w, cat));
+    var after_row: [2]u64 = undefined;
+    try testing.expect((try objects.getByPk(&w, cat, 50, &after_row)) != null);
+    try testing.expectEqualSlices(u64, &before_row, &after_row);
+    w.deinit();
+}
+
+test "bulkAppend returns NotAppendable for an indexed type" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try bulkTmpPath(testing.allocator, &tmp, "append_indexed.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .int, .indexed = true } });
+    cat = (try objects.insert(&w, cat, &.{ 1, 10 })).cat;
+
+    // Even an ascending batch above the max is rejected: a pure right-edge append
+    // cannot maintain the value index.
+    const batch = [_][]const u64{ &.{ 100, 5 }, &.{ 101, 6 } };
+    try testing.expectError(error.NotAppendable, bulkAppend(&w, cat, &batch));
+    w.deinit();
+}
+
+test "bulkAppend returns NotAppendable for a link-bearing type" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try bulkTmpPath(testing.allocator, &tmp, "append_link.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link, .link_target = 0 } });
+    cat = (try objects.insert(&w, cat, &.{ 1, 0 })).cat;
+
+    const batch = [_][]const u64{ &.{ 100, 0 }, &.{ 101, 0 } };
+    try testing.expectError(error.NotAppendable, bulkAppend(&w, cat, &batch));
+    w.deinit();
+}
+
+test "bulkAppend returns NotAppendable for a non-ascending or duplicate batch" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try bulkTmpPath(testing.allocator, &tmp, "append_nonasc.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var cat = try catalog.createDefs(&w, &append_defs);
+    cat = (try objects.insert(&w, cat, &.{ 1, 3 })).cat;
+
+    // Non-ascending batch (both pks above the max, but out of order).
+    const desc = [_][]const u64{ &.{ 200, 600 }, &.{ 150, 450 } };
+    try testing.expectError(error.NotAppendable, bulkAppend(&w, cat, &desc));
+
+    // In-batch duplicate pk.
+    const dup = [_][]const u64{ &.{ 300, 900 }, &.{ 300, 901 } };
+    try testing.expectError(error.NotAppendable, bulkAppend(&w, cat, &dup));
+    w.deinit();
+}
+
+test "bulkAppendOrInsert falls back and equals row-by-row for a scattered batch" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path_a = try bulkTmpPath(testing.allocator, &tmp, "fallback_a.airdb");
+    defer testing.allocator.free(path_a);
+    const path_b = try bulkTmpPath(testing.allocator, &tmp, "fallback_b.airdb");
+    defer testing.allocator.free(path_b);
+
+    const BASE: u64 = 100;
+    // Scattered batch: all pks new (>= BASE) and distinct, but out of order, so
+    // bulkAppend rejects and the orchestrator falls back to row-by-row insert.
+    const scattered_pks = [_]u64{ 200, 100, 300, 150, 400, 250 };
+    const TOTAL = BASE + scattered_pks.len;
+
+    var storage: [scattered_pks.len][2]u64 = undefined;
+    var batch: [scattered_pks.len][]const u64 = undefined;
+    for (scattered_pks, 0..) |pk, j| {
+        storage[j] = .{ pk, pk * 3 };
+        batch[j] = &storage[j];
+    }
+
+    // db A: base via insert, then the scattered batch via bulkAppendOrInsert,
+    // inside a one-type directory so verifyIntegrity audits it.
+    {
+        var db = try Db.create(testing.allocator, path_a);
+        defer db.deinit();
+        var w = try db.beginWrite();
+        const dir = try typedir.createTypes(&w, &.{&append_defs}, &.{false});
+        var cat = try typedir.catalogRef(&w, dir, 0);
+        var pk: u64 = 0;
+        while (pk < BASE) : (pk += 1) cat = (try objects.insert(&w, cat, &.{ pk, pk * 3 })).cat;
+        const new_cat = try bulkAppendOrInsert(&w, cat, &batch);
+        const new_dir = try typedir.setCatalogRef(&w, dir, 0, new_cat);
+        w.setRoot(new_dir);
+        _ = try w.commit();
+        try db.verifyIntegrity();
+    }
+
+    // db B: base via insert, then the same scattered rows inserted one at a time
+    // in the SAME order the fallback uses.
+    {
+        var db = try Db.create(testing.allocator, path_b);
+        defer db.deinit();
+        var w = try db.beginWrite();
+        var cat = try catalog.createDefs(&w, &append_defs);
+        var pk: u64 = 0;
+        while (pk < BASE) : (pk += 1) cat = (try objects.insert(&w, cat, &.{ pk, pk * 3 })).cat;
+        for (scattered_pks) |spk| cat = (try objects.insert(&w, cat, &.{ spk, spk * 3 })).cat;
+        w.setRoot(cat);
+        _ = try w.commit();
+    }
+
+    var da = try Db.open(testing.allocator, path_a);
+    defer da.deinit();
+    try da.verifyIntegrity();
+    var dbb = try Db.open(testing.allocator, path_b);
+    defer dbb.deinit();
+
+    var ra = try da.beginRead();
+    defer ra.end();
+    var rb = try dbb.beginRead();
+    defer rb.end();
+
+    const cat_a = try typedir.catalogRef(&ra, ra.root(), 0);
+    const cat_b = rb.root();
+
+    try testing.expectEqual(@as(u64, TOTAL), try catalog.liveCount(&ra, cat_a));
+    try testing.expectEqual(try catalog.liveCount(&rb, cat_b), try catalog.liveCount(&ra, cat_a));
+
+    // Every pk over the union (and the absent gaps between) resolves identically.
+    var pk: u64 = 0;
+    while (pk <= 401) : (pk += 1) {
+        var oa: [2]u64 = undefined;
+        var ob: [2]u64 = undefined;
+        const va = try objects.getByPk(&ra, cat_a, pk, &oa);
+        const vb = try objects.getByPk(&rb, cat_b, pk, &ob);
+        try testing.expectEqual(vb, va);
+        if (vb != null) try testing.expectEqualSlices(u64, &ob, &oa);
+    }
+
+    // Full-scan order equal (ascending okey for both).
+    {
+        var sa = std.ArrayList(u64).empty;
+        defer sa.deinit(testing.allocator);
+        var sb = std.ArrayList(u64).empty;
+        defer sb.deinit(testing.allocator);
+        try query.where(&ra, cat_a, &.{}, &sa, testing.allocator);
+        try query.where(&rb, cat_b, &.{}, &sb, testing.allocator);
+        try testing.expectEqualSlices(u64, sb.items, sa.items);
+    }
+}
+
+test "bulkAppendOrInsert empty batch is a no-op" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try bulkTmpPath(testing.allocator, &tmp, "append_empty.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var cat = try catalog.createDefs(&w, &append_defs);
+    cat = (try objects.insert(&w, cat, &.{ 1, 3 })).cat;
+
+    const before = try catalog.liveCount(&w, cat);
+    const after = try bulkAppendOrInsert(&w, cat, &.{});
+    try testing.expectEqual(cat, after); // same ref, untouched
+    try testing.expectEqual(before, try catalog.liveCount(&w, after));
     w.deinit();
 }
