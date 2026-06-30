@@ -16,6 +16,7 @@ const WriteTxn = @import("db.zig").WriteTxn;
 const Ref = @import("ref.zig").Ref;
 const objects = @import("objects.zig");
 const catalog = @import("catalog.zig");
+const bulk = @import("bulk.zig");
 
 pub const AIRDB_OK: i64 = 0;
 pub const AIRDB_E_GENERIC: i64 = -1;
@@ -23,6 +24,8 @@ pub const AIRDB_E_NOT_FOUND: i64 = -2;
 pub const AIRDB_E_BAD_ARGS: i64 = -3;
 pub const AIRDB_E_CONFLICT: i64 = -4;
 pub const AIRDB_E_DUPLICATE: i64 = -5;
+pub const AIRDB_E_NOT_EMPTY: i64 = -6;
+pub const AIRDB_E_UNSUPPORTED: i64 = -7;
 
 const MAX_PROPS: usize = 256;
 
@@ -206,6 +209,45 @@ export fn airdb_delete(handle: ?*Database, pk: u64) i64 {
             return AIRDB_E_NOT_FOUND;
         },
     }
+}
+
+// Bulk-load `row_count` rows of `prop_count` u64 values each from the flat,
+// row-major buffer `rows_flat` (row i occupies rows_flat[i*prop_count ..][0..
+// prop_count]; element 0 of each row is the primary key) into an EMPTY type, in
+// a single durable commit. The whole import succeeds atomically or nothing
+// becomes durable. Returns the number of rows loaded on success, or a negative
+// error code: AIRDB_E_NOT_EMPTY if the type already holds rows, AIRDB_E_DUPLICATE
+// on a repeated primary key, AIRDB_E_UNSUPPORTED for a type bulk import cannot
+// build (e.g. links), AIRDB_E_BAD_ARGS on a prop_count mismatch. On every error
+// the write lock is released and nothing is made durable.
+export fn airdb_bulk_insert(handle: ?*Database, rows_flat: [*]const u64, row_count: usize, prop_count: usize) i64 {
+    const self = handle orelse return AIRDB_E_GENERIC;
+    if (prop_count != self.prop_count) return AIRDB_E_BAD_ARGS;
+
+    // Build a []const []const u64 view over the flat buffer: each row slice
+    // points at its prop_count-wide window. Freed regardless of outcome.
+    const rows_slices = alloc.alloc([]const u64, row_count) catch return AIRDB_E_GENERIC;
+    defer alloc.free(rows_slices);
+    for (rows_slices, 0..) |*row, i| {
+        row.* = rows_flat[i * prop_count ..][0..prop_count];
+    }
+
+    var w = self.db.beginWrite() catch return AIRDB_E_GENERIC;
+    const newcat = bulk.bulkImport(&w, w.new_root, rows_slices, .{}) catch |e| {
+        w.deinit(); // releases the write lock; nothing was made durable
+        return switch (e) {
+            error.TypeNotEmpty => AIRDB_E_NOT_EMPTY,
+            error.DuplicateKey => AIRDB_E_DUPLICATE,
+            error.UnsupportedForBulk => AIRDB_E_UNSUPPORTED,
+            error.BadRow => AIRDB_E_BAD_ARGS,
+            else => AIRDB_E_GENERIC,
+        };
+    };
+    w.setRoot(newcat);
+    // commit releases the lock on BOTH its success and its own error paths, so
+    // do not unlock again here.
+    _ = w.commit() catch return AIRDB_E_GENERIC;
+    return @intCast(row_count);
 }
 
 // ---------------------------------------------------------------------------
@@ -522,4 +564,93 @@ test "ffi txn: null handle is rejected, not crashed" {
     try testing.expectEqual(AIRDB_E_GENERIC, airdb_txn_delete(null, 1));
     try testing.expectEqual(AIRDB_E_GENERIC, airdb_commit(null));
     airdb_abort(null); // no-op, must not crash
+}
+
+test "airdb_bulk_insert loads a flat buffer in one commit" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try ffiTmpPathZ(testing.allocator, &tmp, "bulk_load.airdb");
+    defer testing.allocator.free(path);
+    {
+        const h = airdb_open(path.ptr, 2) orelse return error.OpenFailed;
+        defer airdb_close(h);
+
+        const flat = [_]u64{ 1, 10, 2, 20, 3, 30 };
+        try testing.expectEqual(@as(i64, 3), airdb_bulk_insert(h, &flat, 3, 2));
+        try testing.expectEqual(@as(i64, 3), airdb_count(h));
+
+        var out: [2]u64 = undefined;
+        try testing.expect(airdb_get(h, 1, &out, 2) >= 1);
+        try testing.expectEqual(@as(u64, 10), out[1]);
+        try testing.expect(airdb_get(h, 2, &out, 2) >= 1);
+        try testing.expectEqual(@as(u64, 20), out[1]);
+        try testing.expect(airdb_get(h, 3, &out, 2) >= 1);
+        try testing.expectEqual(@as(u64, 30), out[1]);
+    }
+    // Reopen from the same path: all rows persisted (durability).
+    const h2 = airdb_open(path.ptr, 2) orelse return error.OpenFailed;
+    defer airdb_close(h2);
+    try testing.expectEqual(@as(i64, 3), airdb_count(h2));
+    var out: [2]u64 = undefined;
+    try testing.expect(airdb_get(h2, 3, &out, 2) >= 1);
+    try testing.expectEqual(@as(u64, 30), out[1]);
+}
+
+test "airdb_bulk_insert on a non-empty type returns AIRDB_E_NOT_EMPTY" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try ffiTmpPathZ(testing.allocator, &tmp, "bulk_nonempty.airdb");
+    defer testing.allocator.free(path);
+    const h = airdb_open(path.ptr, 2) orelse return error.OpenFailed;
+    defer airdb_close(h);
+
+    // Seed one row so the type is non-empty.
+    try testing.expect(airdb_insert(h, &[_]u64{ 1, 10 }, 2) >= 0);
+
+    const flat = [_]u64{ 2, 20, 3, 30 };
+    try testing.expectEqual(AIRDB_E_NOT_EMPTY, airdb_bulk_insert(h, &flat, 2, 2));
+
+    // Existing data is intact.
+    try testing.expectEqual(@as(i64, 1), airdb_count(h));
+    var out: [2]u64 = undefined;
+    try testing.expect(airdb_get(h, 1, &out, 2) >= 1);
+    try testing.expectEqual(@as(u64, 10), out[1]);
+
+    // The write lock was released: a subsequent insert succeeds.
+    try testing.expect(airdb_insert(h, &[_]u64{ 4, 40 }, 2) >= 0);
+    try testing.expectEqual(@as(i64, 2), airdb_count(h));
+}
+
+test "airdb_bulk_insert wrong prop_count returns AIRDB_E_BAD_ARGS" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try ffiTmpPathZ(testing.allocator, &tmp, "bulk_badargs.airdb");
+    defer testing.allocator.free(path);
+    const h = airdb_open(path.ptr, 2) orelse return error.OpenFailed;
+    defer airdb_close(h);
+
+    const flat = [_]u64{ 1, 10, 100, 2, 20, 200 };
+    try testing.expectEqual(AIRDB_E_BAD_ARGS, airdb_bulk_insert(h, &flat, 2, 3));
+    // Nothing was written and the lock is free.
+    try testing.expectEqual(@as(i64, 0), airdb_count(h));
+    try testing.expect(airdb_insert(h, &[_]u64{ 1, 10 }, 2) >= 0);
+}
+
+test "airdb_bulk_insert duplicate pk returns AIRDB_E_DUPLICATE, type still empty, lock released" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try ffiTmpPathZ(testing.allocator, &tmp, "bulk_dup.airdb");
+    defer testing.allocator.free(path);
+    const h = airdb_open(path.ptr, 2) orelse return error.OpenFailed;
+    defer airdb_close(h);
+
+    const flat = [_]u64{ 5, 50, 6, 60, 5, 55 };
+    try testing.expectEqual(AIRDB_E_DUPLICATE, airdb_bulk_insert(h, &flat, 3, 2));
+
+    // Nothing was committed: the type is still empty.
+    try testing.expectEqual(@as(i64, 0), airdb_count(h));
+
+    // The write lock was released: a subsequent insert succeeds.
+    try testing.expect(airdb_insert(h, &[_]u64{ 1, 10 }, 2) >= 0);
+    try testing.expectEqual(@as(i64, 1), airdb_count(h));
 }
