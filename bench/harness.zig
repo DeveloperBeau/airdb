@@ -314,6 +314,7 @@ pub fn runAll(alloc: Allocator, opts: Opts) !void {
     const embedded_crud = @import("scenarios/embedded_crud.zig");
     const nested_embedded = @import("scenarios/nested_embedded.zig");
     const bulk_import = @import("scenarios/bulk_import.zig");
+    const bulk_append = @import("scenarios/bulk_append.zig");
     const scenarios = [_]Scenario{
         .{ .name = insert_recovery.name, .run = insert_recovery.run },
         .{ .name = lookup_query.name, .run = lookup_query.run },
@@ -323,6 +324,7 @@ pub fn runAll(alloc: Allocator, opts: Opts) !void {
         .{ .name = embedded_crud.name, .run = embedded_crud.run },
         .{ .name = nested_embedded.name, .run = nested_embedded.run },
         .{ .name = bulk_import.name, .run = bulk_import.run },
+        .{ .name = bulk_append.name, .run = bulk_append.run },
     };
 
     var results: std.ArrayList(Result) = .empty;
