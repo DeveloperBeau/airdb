@@ -13,6 +13,7 @@ pub const column = @import("column.zig");
 pub const column_node = @import("column_node.zig");
 pub const index = @import("index.zig");
 pub const index_node = @import("index_node.zig");
+pub const bulk = @import("bulk.zig");
 pub const bindex = @import("bindex.zig");
 pub const coord = @import("coord.zig");
 pub const freelist = @import("freelist.zig");
