@@ -25,54 +25,88 @@ const max_prop_count = catalog.max_prop_count;
 
 pub const ValueOkeys = struct { value: u64, okeys: []const u64 };
 
-/// Build a column tree holding `values` at row indices 0..values.len. Returns
-/// the root Ref. Equivalent to Column.create followed by an append per value.
-pub fn bulkColumn(txn: *WriteTxn, values: []const u64) !Ref {
-    if (values.len == 0) return Column.create(txn);
-    const al = txn.db.store.allocator;
+// A column tree node together with the value count of its subtree, which its
+// parent records alongside the child ref. Used as the per-level work item by the
+// bottom-up column builders below. Unlike the index's SpineChild (which carries a
+// low key), a column inner node stores (child_ref, subtree_count) and a parent's
+// own count is the SUM of its children's counts.
+const ColChild = struct { ref: u64, count: u64 };
+
+// Deref a column node, sizing the read by its kind byte (leaf vs inner).
+fn derefColNode(txn: *WriteTxn, ref: Ref) ![]const u8 {
+    const kb = try txn.deref(ref, 1);
+    if (kb[0] == cnode.kind_leaf) return txn.deref(ref, cnode.leaf_node_size);
+    return txn.deref(ref, cnode.inner_node_size);
+}
+
+// Pack `values` into leaves filled to LEAF_CAP in row order. Returns the leaf
+// level: one ColChild per leaf, count == the number of values in that leaf.
+fn packColumnLeaves(
+    txn: *WriteTxn,
+    values: []const u64,
+    al: std.mem.Allocator,
+) !std.ArrayList(ColChild) {
+    var out = std.ArrayList(ColChild).empty;
+    errdefer out.deinit(al);
     const cap: usize = cnode.LEAF_CAP;
-    const fan: usize = cnode.FANOUT;
-
-    // Current level: a list of child refs and the value count under each child.
-    var refs = std.ArrayList(u64).empty;
-    defer refs.deinit(al);
-    var counts = std.ArrayList(u64).empty;
-    defer counts.deinit(al);
-
-    // Pack leaves to capacity in row order.
     var i: usize = 0;
     while (i < values.len) {
         const end = @min(i + cap, values.len);
         const a = try txn.alloc(cnode.leaf_node_size);
         _ = cnode.encodeLeaf(a.bytes, values[i..end]);
-        try refs.append(al, a.ref);
-        try counts.append(al, @intCast(end - i));
+        try out.append(al, .{ .ref = a.ref, .count = @intCast(end - i) });
         i = end;
     }
+    return out;
+}
 
-    // Stack inner levels until a single root remains. A column inner node stores
-    // (child_ref, subtree_count); the parent's own count is the sum of its
-    // children's counts.
-    while (refs.items.len > 1) {
-        var next_refs = std.ArrayList(u64).empty;
-        var next_counts = std.ArrayList(u64).empty;
-        var j: usize = 0;
-        while (j < refs.items.len) {
-            const end = @min(j + fan, refs.items.len);
-            const a = try txn.alloc(cnode.inner_node_size);
-            _ = cnode.encodeInner(a.bytes, refs.items[j..end], counts.items[j..end]);
-            var total: u64 = 0;
-            for (counts.items[j..end]) |c| total += c;
-            try next_refs.append(al, a.ref);
-            try next_counts.append(al, total);
-            j = end;
+// Build one inner level over `children`, packed in runs of FANOUT. A column
+// inner node stores (child_ref, subtree_count); a parent's count is the SUM of
+// its children's counts, so each emitted node's count == the total of its run.
+fn stackColumnInner(
+    txn: *WriteTxn,
+    children: []const ColChild,
+    al: std.mem.Allocator,
+) !std.ArrayList(ColChild) {
+    var out = std.ArrayList(ColChild).empty;
+    errdefer out.deinit(al);
+    const fan: usize = cnode.FANOUT;
+    var refs: [cnode.FANOUT]u64 = undefined;
+    var counts: [cnode.FANOUT]u64 = undefined;
+    var j: usize = 0;
+    while (j < children.len) {
+        const end = @min(j + fan, children.len);
+        var total: u64 = 0;
+        var k: usize = j;
+        while (k < end) : (k += 1) {
+            refs[k - j] = children[k].ref;
+            counts[k - j] = children[k].count;
+            total += children[k].count;
         }
-        refs.deinit(al);
-        counts.deinit(al);
-        refs = next_refs;
-        counts = next_counts;
+        const cnt = end - j;
+        const a = try txn.alloc(cnode.inner_node_size);
+        _ = cnode.encodeInner(a.bytes, refs[0..cnt], counts[0..cnt]);
+        try out.append(al, .{ .ref = a.ref, .count = total });
+        j = end;
     }
-    return refs.items[0];
+    return out;
+}
+
+/// Build a column tree holding `values` at row indices 0..values.len. Returns
+/// the root Ref. Equivalent to Column.create followed by an append per value.
+pub fn bulkColumn(txn: *WriteTxn, values: []const u64) !Ref {
+    if (values.len == 0) return Column.create(txn);
+    const al = txn.db.store.allocator;
+
+    // Pack leaves, then stack inner levels until a single root remains.
+    var level = try packColumnLeaves(txn, values, al);
+    defer level.deinit(al);
+    while (level.items.len > 1) {
+        const next = try stackColumnInner(txn, level.items, al);
+        level.deinit(al);
+        level = next;
+    }
+    return level.items[0].ref;
 }
 
 // An index B+tree node together with the low key (smallest key in its subtree)
@@ -261,6 +295,97 @@ pub fn indexAppendRun(txn: *WriteTxn, root: Ref, keys: []const u64, vals: []cons
     //    tree height by one or more as needed.
     while (level.items.len > 1) {
         const next = try stackIndexInner(txn, level.items, al);
+        level.deinit(al);
+        level = next;
+    }
+
+    const result = level.items[0].ref;
+    level.deinit(al);
+    return result;
+}
+
+/// Append a run of `values` to the RIGHT EDGE of the column rooted at `root`,
+/// returning the new root Ref. Columns are keyed by row index, so a run always
+/// lands at the end. Only the rightmost root-to-leaf path is rebuilt; every left
+/// subtree is shared unchanged (copy-on-write: shared nodes are never mutated).
+/// The result is logically identical to appending every value via Column.append.
+/// An empty run returns `root` unchanged.
+pub fn columnAppendRun(txn: *WriteTxn, root: Ref, values: []const u64) !Ref {
+    if (values.len == 0) return root;
+    const al = txn.db.store.allocator;
+
+    // 1. Descend the rightmost path (always the last child), recording each inner
+    //    node and the index of its rightmost child. No allocation from the arena
+    //    occurs here, so the deref'd node bytes stay valid for each iteration.
+    var path_refs = std.ArrayList(Ref).empty;
+    defer path_refs.deinit(al);
+    var path_ridx = std.ArrayList(usize).empty;
+    defer path_ridx.deinit(al);
+    var cur: Ref = root;
+    var leaf_ref: Ref = root;
+    while (true) {
+        const nb = try derefColNode(txn, cur);
+        if (nb[0] == cnode.kind_leaf) {
+            leaf_ref = cur;
+            break;
+        }
+        const iv = try cnode.parseInner(nb);
+        const ri: usize = @as(usize, iv.child_count) - 1;
+        const child = iv.childRef(ri);
+        try path_refs.append(al, cur);
+        try path_ridx.append(al, ri);
+        cur = child;
+    }
+
+    // 2. Gather the rightmost leaf's existing values followed by the run into a
+    //    heap buffer (heap allocation never remaps the arena, so the leaf bytes
+    //    stay valid while we copy them out). Then pack the combined run into
+    //    leaves filled to LEAF_CAP: the first new leaf reuses the old leaf's
+    //    content topped up from the front of the run, the rest are full leaves.
+    const lv = try cnode.parseLeaf(try derefColNode(txn, leaf_ref));
+    const total: usize = @as(usize, lv.count) + values.len;
+    const cvals = try al.alloc(u64, total);
+    defer al.free(cvals);
+    {
+        var t: usize = 0;
+        while (t < lv.count) : (t += 1) cvals[t] = lv.value(t);
+        for (values) |v| {
+            cvals[t] = v;
+            t += 1;
+        }
+    }
+
+    var level = try packColumnLeaves(txn, cvals, al);
+    errdefer level.deinit(al);
+
+    // 3. Rebuild the rightmost inner spine bottom-up. At each inner level the
+    //    shared LEFT children (all but the rightmost) are re-emitted unchanged
+    //    with their (ref, subtree_count), and the rightmost child is replaced by
+    //    the level rebuilt below, which may have grown into several nodes.
+    //    Packing in runs of FANOUT splits automatically on overflow; the extra
+    //    nodes propagate up as additional children of the next level.
+    var i: usize = path_refs.items.len;
+    while (i > 0) {
+        i -= 1;
+        const iv = try cnode.parseInner(try derefColNode(txn, path_refs.items[i]));
+        const ri = path_ridx.items[i];
+        var full = std.ArrayList(ColChild).empty;
+        defer full.deinit(al);
+        var j: usize = 0;
+        while (j < ri) : (j += 1) {
+            try full.append(al, .{ .ref = iv.childRef(j), .count = iv.childCount(j) });
+        }
+        for (level.items) |c| try full.append(al, c);
+        const next = try stackColumnInner(txn, full.items, al);
+        level.deinit(al);
+        level = next;
+    }
+
+    // 4. If the (rebuilt) root level overflowed FANOUT it is now several nodes;
+    //    stack further inner levels until a single root remains, growing the
+    //    tree height by one or more as needed.
+    while (level.items.len > 1) {
+        const next = try stackColumnInner(txn, level.items, al);
         level.deinit(al);
         level = next;
     }
@@ -1078,5 +1203,103 @@ test "indexAppendRun empty run is a no-op" {
     const appended = try indexAppendRun(&w, base_root, &.{}, &.{});
     try testing.expectEqual(base_root, appended); // same ref, unchanged
     try testing.expectEqual(before, try Index.count(&w, appended));
+    w.deinit();
+}
+
+// ---------------------------------------------------------------------------
+// columnAppendRun: right-edge run append, asserted equivalent to sequential
+// Column.append of the same values.
+// ---------------------------------------------------------------------------
+
+fn appendColVal(i: u64) u64 {
+    return i *% 11 +% 5;
+}
+
+// Build a base column of `base` values via sequential append, append `run` more
+// values via columnAppendRun, and assert the result is logically identical to
+// appending all base+run values sequentially: same length, and get(i) matches
+// the sequential twin at every index.
+fn checkColAppendEquiv(w: *WriteTxn, base: u64, run: u64) !void {
+    var base_root = try Column.create(w);
+    var k: u64 = 0;
+    while (k < base) : (k += 1) base_root = try Column.append(w, base_root, appendColVal(k));
+
+    const rv = try testing.allocator.alloc(u64, run);
+    defer testing.allocator.free(rv);
+    var r: u64 = 0;
+    while (r < run) : (r += 1) rv[r] = appendColVal(base + r);
+
+    const appended = try columnAppendRun(w, base_root, rv);
+
+    var expected = try Column.create(w);
+    k = 0;
+    while (k < base + run) : (k += 1) expected = try Column.append(w, expected, appendColVal(k));
+
+    const total = base + run;
+    try testing.expectEqual(total, try Column.len(w, appended));
+    try testing.expectEqual(try Column.len(w, expected), try Column.len(w, appended));
+
+    var i: u64 = 0;
+    while (i < total) : (i += 1) {
+        try testing.expectEqual(try Column.get(w, expected, i), try Column.get(w, appended, i));
+    }
+    if (total > 0) try testing.expectError(error.IndexOutOfBounds, Column.get(w, appended, total));
+}
+
+test "columnAppendRun partial last leaf then new leaves" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try appendTmpDb(&tmp, "colappend1.airdb");
+    defer db.deinit();
+    var w = try db.beginWrite();
+    try checkColAppendEquiv(&w, 100, 200); // 100 % 64 == 36 in the last leaf
+    w.deinit();
+}
+
+test "columnAppendRun grows height" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try appendTmpDb(&tmp, "colappend2.airdb");
+    defer db.deinit();
+    var w = try db.beginWrite();
+    // Single-leaf base, run crossing FANOUT*LEAF_CAP (== 4096) so the result
+    // must be three levels tall.
+    try checkColAppendEquiv(&w, 50, 4200);
+    w.deinit();
+}
+
+test "columnAppendRun single-leaf base" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try appendTmpDb(&tmp, "colappend3.airdb");
+    defer db.deinit();
+    var w = try db.beginWrite();
+    try checkColAppendEquiv(&w, 40, 50); // base < LEAF_CAP
+    w.deinit();
+}
+
+test "columnAppendRun run far larger than base" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try appendTmpDb(&tmp, "colappend4.airdb");
+    defer db.deinit();
+    var w = try db.beginWrite();
+    try checkColAppendEquiv(&w, 10, 5000);
+    w.deinit();
+}
+
+test "columnAppendRun empty run is a no-op" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try appendTmpDb(&tmp, "colappend5.airdb");
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var base_root = try Column.create(&w);
+    var k: u64 = 0;
+    while (k < 100) : (k += 1) base_root = try Column.append(&w, base_root, appendColVal(k));
+    const before = try Column.len(&w, base_root);
+    const appended = try columnAppendRun(&w, base_root, &.{});
+    try testing.expectEqual(base_root, appended); // same ref, unchanged
+    try testing.expectEqual(before, try Column.len(&w, appended));
     w.deinit();
 }
