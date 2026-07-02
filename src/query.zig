@@ -73,10 +73,6 @@ fn openScan(txn: anytype, cat: Ref) !Scan {
 // object key from the key->row index, so the current snapshot's index never
 // holds a stale key that could alias a relocated row; the live check is the
 // only filter needed.
-fn rowLive(txn: anytype, s: *const Scan, pr: Pair) !bool {
-    return (try Column.get(txn, s.live_ref, pr.row)) != 0;
-}
-
 fn rowMatches(txn: anytype, s: *const Scan, row: u64, preds: []const Predicate) !bool {
     for (preds) |p| {
         const raw = try Column.get(txn, s.prop_refs[p.prop], row);
@@ -85,25 +81,14 @@ fn rowMatches(txn: anytype, s: *const Scan, row: u64, preds: []const Predicate) 
     return true;
 }
 
+// Full row evaluation: live check plus every predicate (logical AND).
+fn evalRow(txn: anytype, s: *const Scan, row: u64, preds: []const Predicate) !bool {
+    if ((try Column.get(txn, s.live_ref, row)) == 0) return false;
+    return rowMatches(txn, s, row, preds);
+}
+
 // (okey, physical row) pair, as surfaced by the key->row index.
 const Pair = struct { okey: u64, row: u64 };
-
-// forEachEntry's callback cannot receive the txn, so it only appends the raw
-// (okey, row) pairs; the live check and predicate evaluation happen afterward
-// with the txn in scope.
-const PairCollector = struct {
-    pairs: *std.ArrayList(Pair),
-    allocator: std.mem.Allocator,
-    fn onEntry(self: @This(), key: u64, val: u64) !void {
-        try self.pairs.append(self.allocator, .{ .okey = key, .row = val });
-    }
-};
-
-// Gather every (okey, row) pair from the key->row index into `pairs`, in
-// ascending okey order.
-fn collectAllPairs(txn: anytype, s: *const Scan, pairs: *std.ArrayList(Pair), allocator: std.mem.Allocator) !void {
-    try index.forEachEntry(txn, s.keyrow_index_ref, PairCollector{ .pairs = pairs, .allocator = allocator }, PairCollector.onEntry);
-}
 
 // ---------------------------------------------------------------------------
 // Query planner.
@@ -219,16 +204,38 @@ fn collectCandidatePairs(
     }.lt);
 }
 
-// Gather the (okey, row) pairs a query must evaluate: the index-driven candidate
-// set when a driving predicate exists, otherwise every pair via a full scan.
-// Either way the caller applies the live check and ALL predicates afterward, so
-// behavior is identical to the full scan.
-fn collectPairs(txn: anytype, s: *const Scan, preds: []const Predicate, pairs: *std.ArrayList(Pair), allocator: std.mem.Allocator) !void {
+// Run a query: stream every live matching (okey, row) into `onMatch(ctx, okey, row)`.
+// With a driving predicate the candidate set comes from that property's value
+// index (bounded by its selectivity, so a temporary pair buffer is fine); the
+// full-scan path streams the key->row index directly and evaluates each row
+// inside the traversal, so no O(live) buffer is ever materialized.
+fn runQuery(
+    txn: anytype,
+    s: *const Scan,
+    preds: []const Predicate,
+    allocator: std.mem.Allocator,
+    ctx: anytype,
+    comptime onMatch: fn (@TypeOf(ctx), u64, u64) anyerror!void,
+) !void {
     if (pickDriving(s, preds)) |di| {
-        try collectCandidatePairs(txn, s, preds[di], pairs, allocator);
-    } else {
-        try collectAllPairs(txn, s, pairs, allocator);
+        var pairs = std.ArrayList(Pair).empty;
+        defer pairs.deinit(allocator);
+        try collectCandidatePairs(txn, s, preds[di], &pairs, allocator);
+        for (pairs.items) |pr| {
+            if (try evalRow(txn, s, pr.row, preds)) try onMatch(ctx, pr.okey, pr.row);
+        }
+        return;
     }
+    const Stream = struct {
+        txn: @TypeOf(txn),
+        s: *const Scan,
+        preds: []const Predicate,
+        inner: @TypeOf(ctx),
+        fn onEntry(self: @This(), okey: u64, row: u64) anyerror!void {
+            if (try evalRow(self.txn, self.s, row, self.preds)) try onMatch(self.inner, okey, row);
+        }
+    };
+    try index.forEachEntry(txn, s.keyrow_index_ref, Stream{ .txn = txn, .s = s, .preds = preds, .inner = ctx }, Stream.onEntry);
 }
 
 // Test-only: expose the driving-predicate choice so equivalence tests can assert
@@ -248,26 +255,28 @@ pub fn where(
     allocator: std.mem.Allocator,
 ) !void {
     const s = try openScan(txn, cat);
-    var pairs = std.ArrayList(Pair).empty;
-    defer pairs.deinit(allocator);
-    try collectPairs(txn, &s, preds, &pairs, allocator);
-    for (pairs.items) |pr| {
-        if (!(try rowLive(txn, &s, pr))) continue;
-        if (try rowMatches(txn, &s, pr.row, preds)) try out.append(allocator, pr.okey);
-    }
+    const Sink = struct {
+        out: *std.ArrayList(u64),
+        allocator: std.mem.Allocator,
+        fn onMatch(self: @This(), okey: u64, _: u64) anyerror!void {
+            try self.out.append(self.allocator, okey);
+        }
+    };
+    try runQuery(txn, &s, preds, allocator, Sink{ .out = out, .allocator = allocator }, Sink.onMatch);
 }
 
-// Number of live rows satisfying all predicates.
+// Number of live rows satisfying all predicates. The full-scan path streams,
+// so this allocates nothing proportional to the table.
 pub fn countWhere(txn: anytype, cat: Ref, preds: []const Predicate, allocator: std.mem.Allocator) !u64 {
     const s = try openScan(txn, cat);
-    var pairs = std.ArrayList(Pair).empty;
-    defer pairs.deinit(allocator);
-    try collectPairs(txn, &s, preds, &pairs, allocator);
     var n: u64 = 0;
-    for (pairs.items) |pr| {
-        if (!(try rowLive(txn, &s, pr))) continue;
-        if (try rowMatches(txn, &s, pr.row, preds)) n += 1;
-    }
+    const Sink = struct {
+        n: *u64,
+        fn onMatch(self: @This(), _: u64, _: u64) anyerror!void {
+            self.n.* += 1;
+        }
+    };
+    try runQuery(txn, &s, preds, allocator, Sink{ .n = &n }, Sink.onMatch);
     return n;
 }
 
@@ -277,19 +286,21 @@ pub const Aggregate = struct { count: u64, sum: u64, min: ?u64, max: ?u64 };
 // `sum` wraps on overflow (wrapping add); min/max are null when no row matches.
 pub fn aggregateInt(txn: anytype, cat: Ref, prop: usize, preds: []const Predicate, allocator: std.mem.Allocator) !Aggregate {
     const s = try openScan(txn, cat);
-    var pairs = std.ArrayList(Pair).empty;
-    defer pairs.deinit(allocator);
-    try collectPairs(txn, &s, preds, &pairs, allocator);
     var agg = Aggregate{ .count = 0, .sum = 0, .min = null, .max = null };
-    for (pairs.items) |pr| {
-        if (!(try rowLive(txn, &s, pr))) continue;
-        if (!(try rowMatches(txn, &s, pr.row, preds))) continue;
-        const val = try Column.get(txn, s.prop_refs[prop], pr.row);
-        agg.count += 1;
-        agg.sum +%= val;
-        if (agg.min == null or val < agg.min.?) agg.min = val;
-        if (agg.max == null or val > agg.max.?) agg.max = val;
-    }
+    const Sink = struct {
+        txn: @TypeOf(txn),
+        s: *const Scan,
+        prop: usize,
+        agg: *Aggregate,
+        fn onMatch(self: @This(), _: u64, row: u64) anyerror!void {
+            const val = try Column.get(self.txn, self.s.prop_refs[self.prop], row);
+            self.agg.count += 1;
+            self.agg.sum +%= val;
+            if (self.agg.min == null or val < self.agg.min.?) self.agg.min = val;
+            if (self.agg.max == null or val > self.agg.max.?) self.agg.max = val;
+        }
+    };
+    try runQuery(txn, &s, preds, allocator, Sink{ .txn = txn, .s = &s, .prop = prop, .agg = &agg }, Sink.onMatch);
     return agg;
 }
 
@@ -391,6 +402,34 @@ test "where filters live rows by ANDed predicates" {
     try where(&w, cat, &.{.{ .prop = 1, .op = .eq, .value = 30 }}, &r3, testing.allocator);
     try testing.expectEqual(@as(usize, 1), r3.items.len);
     w.deinit();
+}
+
+test "streamed full scan agrees with where on count and aggregate" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try qTmpPath(testing.allocator, &tmp, "qstream.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    defer w.deinit();
+    var cat = try seed(&w, &.{ .{ 1, 20 }, .{ 2, 30 }, .{ 3, 40 }, .{ 4, 30 }, .{ 5, 25 } });
+    // Tombstone one matching row so the live filter is exercised mid-stream.
+    var out: [2]u64 = undefined;
+    const ver = (try objects.getByPk(&w, cat, 4, &out)).?;
+    cat = (try objects.delete(&w, cat, 4, ver)).ok;
+
+    const preds = [_]Predicate{.{ .prop = 1, .op = .ge, .value = 25 }};
+    var okeys = std.ArrayList(u64).empty;
+    defer okeys.deinit(testing.allocator);
+    try where(&w, cat, &preds, &okeys, testing.allocator);
+    try testing.expectEqual(@as(usize, 3), okeys.items.len); // pks 2, 3, 5
+    try testing.expectEqual(@as(u64, okeys.items.len), try countWhere(&w, cat, &preds, testing.allocator));
+    const agg = try aggregateInt(&w, cat, 1, &preds, testing.allocator);
+    try testing.expectEqual(@as(u64, 3), agg.count);
+    try testing.expectEqual(@as(u64, 30 + 40 + 25), agg.sum);
+    try testing.expectEqual(@as(?u64, 25), agg.min);
+    try testing.expectEqual(@as(?u64, 40), agg.max);
 }
 
 test "countWhere and aggregateInt" {
