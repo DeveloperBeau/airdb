@@ -86,6 +86,14 @@ pub const WriteTxn = struct {
     }
 
     pub fn deinit(self: *WriteTxn) void {
+        // Abort: hand the txn's bump region straight back. No committed version
+        // references any ref >= txn_start_top (they were allocated by this
+        // uncommitted transaction only), so rolling the bump pointer back is
+        // safe and prevents the aborted bytes from being folded into the next
+        // commit's logical_size as permanently unreclaimable garbage. Extents
+        // this txn reused from the committed pool stay recorded in db.free_list
+        // (untouched during the txn), so they remain free as before.
+        self.db.arena.top = @intCast(self.txn_start_top);
         self.in_flight_frees.deinit(self.db.store.allocator);
         self.work_freelist.deinit();
         self.txn_reuse.deinit();
@@ -299,6 +307,46 @@ fn churnLogicalSize(path: []const u8, retain: u64, n: u64) !u64 {
         }
     }
     return db.logicalSize();
+}
+
+test "an abandoned transaction's bump allocations are rolled back" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "abortspace.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+
+    // Commit a baseline so logical size is stable.
+    {
+        var w = try db.beginWrite();
+        const a = try w.alloc(8);
+        @memcpy(a.bytes, "BASELINE");
+        w.setRoot(a.ref);
+        _ = try w.commit();
+    }
+    const size_before = db.logicalSize();
+
+    // Abort a transaction that bump-allocated a lot.
+    {
+        var w = try db.beginWrite();
+        var i: usize = 0;
+        while (i < 200) : (i += 1) _ = try w.alloc(4096);
+        w.deinit(); // abort
+    }
+    try testing.expectEqual(size_before, db.logicalSize());
+
+    // The next commit must not durably absorb the aborted region either.
+    {
+        var w = try db.beginWrite();
+        const a = try w.alloc(8);
+        @memcpy(a.bytes, "AFTERAB_");
+        w.setRoot(a.ref);
+        _ = try w.commit();
+    }
+    // One 8-byte node plus the free-list node: logical size grows by well under
+    // the ~800 KiB the aborted transaction touched.
+    try testing.expect(db.logicalSize() - size_before < 4096);
 }
 
 test "retention window withholds recently freed space from reuse" {
