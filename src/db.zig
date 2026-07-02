@@ -770,8 +770,9 @@ fn auditValueIndexForward(r: *ReadTxn, keyrow_ref: Ref, vi_ref: Ref, prop_col: R
 // entry of the value index and, for each okey in a non-empty inner set, assert it
 // resolves through the keyrow index to a live row whose property value equals
 // that value. A stale/dangling okey or a value mismatch is
-// error.ValueIndexStaleEntry. Empty inner sets are skipped: delete leaves them in
-// place (it does not free them), so an empty set is not a violation.
+// error.ValueIndexStaleEntry. Empty inner sets are skipped defensively: current
+// maintenance removes an entry the moment its set empties, but tolerating one
+// keeps the audit usable on files written before that pruning existed.
 fn auditValueIndexBackward(r: *ReadTxn, vi_ref: Ref, keyrow_ref: Ref, prop_col: Ref, live_col: Ref) VerifyError!void {
     const Ctx = struct {
         r: *ReadTxn,

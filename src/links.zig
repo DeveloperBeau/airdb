@@ -31,10 +31,17 @@ fn blAdd(txn: *WriteTxn, bl_ref: Ref, target: u64, source: u64) !Ref {
 }
 
 // Remove `source` from the backlink set for `target`. No-op if absent.
+// When the set empties, its outer entry is removed and the set's nodes freed,
+// mirroring viRemove: link churn must not accumulate empty sets forever.
 fn blRemove(txn: *WriteTxn, bl_ref: Ref, target: u64, source: u64) !Ref {
     const existing = try Index.get(txn, bl_ref, target);
     const set_root = existing orelse return bl_ref;
     const new_set = try Index.remove(txn, set_root, source);
+    if ((try Index.count(txn, new_set)) == 0) {
+        const new_bl = try Index.remove(txn, bl_ref, target);
+        try Index.freeTree(txn, new_set);
+        return new_bl;
+    }
     return try Index.insert(txn, bl_ref, target, new_set);
 }
 
@@ -210,12 +217,16 @@ pub fn nullifyInboundInCatalog(txn: *WriteTxn, cat: Ref, okey: u64, target_type:
             };
             cur = try catalog.setPropColRef(txn, cur, p, new_col);
         }
-        // Drop the whole backlink set for okey (its inbound links are now clear).
+        // Drop the whole backlink set for okey (its inbound links are now
+        // clear): remove the outer entry and free the set's nodes, rather than
+        // inserting a fresh empty set and orphaning the old tree.
         {
             const vv = try catalog.loadCatalog(txn, cur);
-            const empty = try Index.create(txn);
-            const new_bl = try Index.insert(txn, vv.backlinkRef(p), okey, empty);
-            cur = try catalog.setBacklinkRef(txn, cur, p, new_bl);
+            if (try Index.get(txn, vv.backlinkRef(p), okey)) |set_root| {
+                const new_bl = try Index.remove(txn, vv.backlinkRef(p), okey);
+                try Index.freeTree(txn, set_root);
+                cur = try catalog.setBacklinkRef(txn, cur, p, new_bl);
+            }
         }
     }
     return cur;
@@ -355,6 +366,27 @@ test "setLink moves a link and updates both backlink sets" {
     try testing.expectEqual(@as(u64, 0), try backlinkCount(&w, cat, 1, a.row));
     try testing.expectEqual(@as(u64, 1), try backlinkCount(&w, cat, 1, b.row));
     w.deinit();
+}
+
+test "an emptied backlink set is pruned from the backlink index" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "bl_prune.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    defer w.deinit();
+    var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
+    const a = try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .link = null } });
+    cat = a.cat;
+    const b = try insertTyped(&w, cat, &.{ .{ .int = 2 }, .{ .link = a.row } });
+    cat = b.cat;
+    // Clearing the only inbound link must remove a's backlink entry entirely.
+    cat = try setLink(&w, cat, 2, 1, null);
+    const v = try catalog.loadCatalog(&w, cat);
+    try testing.expectEqual(@as(?u64, null), try Index.get(&w, v.backlinkRef(1), a.row));
+    try testing.expectEqual(@as(u64, 0), try backlinkCount(&w, cat, 1, a.row));
 }
 
 test "setLink clearing a link drops the backlink" {

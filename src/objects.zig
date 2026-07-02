@@ -39,10 +39,18 @@ fn viAdd(txn: *WriteTxn, vi_ref: Ref, value: u64, okey: u64) !Ref {
 }
 
 // Remove `okey` from the value-index inner set for `value`. No-op if absent.
+// When the inner set empties, its outer entry is removed and the set's nodes
+// freed: high-churn workloads would otherwise accumulate one empty set per
+// distinct value ever indexed, reclaimable only by a full file copy.
 fn viRemove(txn: *WriteTxn, vi_ref: Ref, value: u64, okey: u64) !Ref {
     const existing = try Index.get(txn, vi_ref, value);
     const set_root = existing orelse return vi_ref;
     const new_set = try Index.remove(txn, set_root, okey);
+    if ((try Index.count(txn, new_set)) == 0) {
+        const new_vi = try Index.remove(txn, vi_ref, value);
+        try Index.freeTree(txn, new_set);
+        return new_vi;
+    }
     return try Index.insert(txn, vi_ref, value, new_set);
 }
 
@@ -1066,6 +1074,31 @@ test "value index tracks deletes" {
     try expectIndexOkeys(&w, cat, 1, 10, &.{o2.row});
     try expectIndexOkeys(&w, cat, 1, 20, &.{o1.row});
     w.deinit();
+}
+
+test "an emptied value-index set is pruned from the outer index" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "vidx_prune.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    defer w.deinit();
+    var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .int, .indexed = true } });
+    cat = (try insert(&w, cat, &.{ 1, 10 })).cat;
+    cat = (try insert(&w, cat, &.{ 2, 10 })).cat;
+    // Delete both rows carrying value 10: the 10 entry must disappear entirely,
+    // not linger as an empty set.
+    var out: [2]u64 = undefined;
+    var pk: u64 = 1;
+    while (pk <= 2) : (pk += 1) {
+        const ver = (try getByPk(&w, cat, pk, &out)).?;
+        cat = (try delete(&w, cat, pk, ver)).ok;
+    }
+    const v = try loadCatalog(&w, cat);
+    try testing.expectEqual(@as(?u64, null), try Index.get(&w, v.valueIndexRef(1), 10));
+    try testing.expectEqual(@as(u64, 0), try Index.count(&w, v.valueIndexRef(1)));
 }
 
 test "non-indexed prop has no index" {
