@@ -262,17 +262,24 @@ pub const Db = struct {
         }
     }
 
-    /// Decode the persisted free-list node at free_list_ref into self.free_list.
-    /// Sets self.free_list_node_ref and self.free_list_node_len.
-    /// self.free_list must already be initialized (possibly empty).
-    fn loadFreeList(self: *Db, free_list_ref: Ref) !void {
+    /// Decode the persisted free-list node at free_list_ref into `out`,
+    /// returning the node's byte length. `out` must already be initialized.
+    fn decodeFreeListNode(self: *Db, free_list_ref: Ref, out: *FreeList) !usize {
         // First read the 4-byte count prefix to know the full node size.
         const count_bytes = try self.arena.deref(free_list_ref, 4);
         const count = std.mem.readInt(u32, count_bytes[0..4], .little);
         const node_len = 4 + @as(usize, count) * 24;
         // Now read the full node and decode it.
         const node_bytes = try self.arena.deref(free_list_ref, node_len);
-        try self.free_list.decode(node_bytes);
+        try out.decode(node_bytes);
+        return node_len;
+    }
+
+    /// Decode the persisted free-list node at free_list_ref into self.free_list.
+    /// Sets self.free_list_node_ref and self.free_list_node_len.
+    /// self.free_list must already be initialized (possibly empty).
+    fn loadFreeList(self: *Db, free_list_ref: Ref) !void {
+        const node_len = try self.decodeFreeListNode(free_list_ref, &self.free_list);
         self.free_list_node_ref = free_list_ref;
         self.free_list_node_len = node_len;
     }
@@ -316,14 +323,25 @@ pub const Db = struct {
         }
         const published = self.selectPublishedSlot(lv) orelse return; // no qualifying published slot visible yet
         if (published.version <= self.active_version) return;
+        // Decode the published free list into a temporary FIRST. A decode
+        // failure must leave this instance's committed state (version, root,
+        // top, free list) fully intact: advancing the version with an empty
+        // free list would make the next commit durably persist that empty list
+        // and permanently drop every reclaimable-extent record.
+        var new_fl = FreeList.init(self.store.allocator);
+        errdefer new_fl.deinit();
+        var node_len: usize = 0;
+        if (published.free_list_ref != 0) {
+            node_len = try self.decodeFreeListNode(published.free_list_ref, &new_fl);
+        }
+        // All decoding succeeded: install everything together.
         self.active_version = published.version;
         self.active_root = published.root_ref;
         self.arena.top = @intCast(published.logical_size);
         self.free_list.deinit();
-        self.free_list = FreeList.init(self.store.allocator);
-        self.free_list_node_ref = 0;
-        self.free_list_node_len = 0;
-        if (published.free_list_ref != 0) try self.loadFreeList(published.free_list_ref);
+        self.free_list = new_fl;
+        self.free_list_node_ref = published.free_list_ref;
+        self.free_list_node_len = node_len;
     }
 
     /// Returns the minimum pinned version among all active readers, or sentinel_max if none.
@@ -1347,6 +1365,52 @@ test "ring wraps after capacity" {
     // Versions older than the live window were evicted.
     try testing.expectEqual(@as(?u64, null), db.versionRoot(oldest_live - 1));
     try testing.expectEqual(@as(?u64, null), db.versionRoot(2));
+}
+
+test "a failed refresh leaves version and free list untouched" {
+    // Regression: refreshToLatest must be all-or-nothing. If the published
+    // free-list node cannot be decoded, the instance keeps its old version AND
+    // its old free list; previously it advanced with an empty list, which the
+    // next commit would persist, durably dropping every reclaimable extent.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "refresh_atomic.airdb");
+    defer testing.allocator.free(path);
+
+    var a = try Db.create(testing.allocator, path);
+    defer a.deinit();
+    {
+        var w = try a.beginWrite();
+        const x = try w.alloc(8);
+        @memcpy(x.bytes, "VERSION2");
+        w.setRoot(x.ref);
+        _ = try w.commit();
+    }
+
+    var b = try Db.open(testing.allocator, path);
+    defer b.deinit();
+    const b_version = b.active_version;
+    const b_fl_len = b.freeListLenForTest();
+
+    // a commits a version with a non-empty free list, then its node is
+    // corrupted in the shared mapping so b's refresh decode must fail.
+    {
+        var w = try a.beginWrite();
+        const old_root = a.active_root;
+        const x = try w.alloc(8);
+        @memcpy(x.bytes, "VERSION3");
+        try w.free(old_root, 8);
+        w.setRoot(x.ref);
+        _ = try w.commit();
+    }
+    try testing.expect(a.free_list_node_ref != 0);
+    const node_off: usize = @intCast(a.free_list_node_ref);
+    // An absurd extent count makes the node length exceed the mapping.
+    std.mem.writeInt(u32, a.store.map[node_off..][0..4], 0xFFFF_FFFF, .little);
+
+    try testing.expectError(error.BadRef, b.beginRead());
+    try testing.expectEqual(b_version, b.active_version);
+    try testing.expectEqual(b_fl_len, b.freeListLenForTest());
 }
 
 test "a retried commit's ring entry wins over the aborted duplicate" {
