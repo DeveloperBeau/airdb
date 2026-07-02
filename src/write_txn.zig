@@ -169,6 +169,12 @@ pub const WriteTxn = struct {
         for (self.txn_reuse.extents.items) |e| {
             try new_fl.add(.{ .offset = e.offset, .len = e.len, .freed_version = self.new_version });
         }
+        // 3c. Merge adjacent extents. Bounds extent-count growth under churn,
+        //     which in turn bounds the O(extent count) clone/rebuild/encode
+        //     every transaction pays. Merged blocks keep the newest
+        //     freed_version of their parts and stay reusable for smaller
+        //     requests through the carve fallback.
+        try new_fl.coalesce();
         db.fl_rebuild_ns += @intCast(Io.Clock.now(.awake, rebuild_io).nanoseconds - rebuild_start);
 
         // 4. Encode the new free list onto the arena via a BUMP allocation (never
