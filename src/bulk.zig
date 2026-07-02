@@ -6,6 +6,7 @@ const Index = @import("index.zig");
 const cnode = @import("column_node.zig");
 const inode = @import("index_node.zig");
 const catalog = @import("catalog.zig");
+const objects = @import("objects.zig");
 
 const PropKind = catalog.PropKind;
 const ElemKind = catalog.ElemKind;
@@ -25,54 +26,153 @@ const max_prop_count = catalog.max_prop_count;
 
 pub const ValueOkeys = struct { value: u64, okeys: []const u64 };
 
-/// Build a column tree holding `values` at row indices 0..values.len. Returns
-/// the root Ref. Equivalent to Column.create followed by an append per value.
-pub fn bulkColumn(txn: *WriteTxn, values: []const u64) !Ref {
-    if (values.len == 0) return Column.create(txn);
-    const al = txn.db.store.allocator;
+// A column tree node together with the value count of its subtree, which its
+// parent records alongside the child ref. Used as the per-level work item by the
+// bottom-up column builders below. Unlike the index's SpineChild (which carries a
+// low key), a column inner node stores (child_ref, subtree_count) and a parent's
+// own count is the SUM of its children's counts.
+const ColChild = struct { ref: u64, count: u64 };
+
+// Deref a column node, sizing the read by its kind byte (leaf vs inner).
+fn derefColNode(txn: *WriteTxn, ref: Ref) ![]const u8 {
+    const kb = try txn.deref(ref, 1);
+    if (kb[0] == cnode.kind_leaf) return txn.deref(ref, cnode.leaf_node_size);
+    return txn.deref(ref, cnode.inner_node_size);
+}
+
+// Pack `values` into leaves filled to LEAF_CAP in row order. Returns the leaf
+// level: one ColChild per leaf, count == the number of values in that leaf.
+fn packColumnLeaves(
+    txn: *WriteTxn,
+    values: []const u64,
+    al: std.mem.Allocator,
+) !std.ArrayList(ColChild) {
+    var out = std.ArrayList(ColChild).empty;
+    errdefer out.deinit(al);
     const cap: usize = cnode.LEAF_CAP;
-    const fan: usize = cnode.FANOUT;
-
-    // Current level: a list of child refs and the value count under each child.
-    var refs = std.ArrayList(u64).empty;
-    defer refs.deinit(al);
-    var counts = std.ArrayList(u64).empty;
-    defer counts.deinit(al);
-
-    // Pack leaves to capacity in row order.
     var i: usize = 0;
     while (i < values.len) {
         const end = @min(i + cap, values.len);
         const a = try txn.alloc(cnode.leaf_node_size);
         _ = cnode.encodeLeaf(a.bytes, values[i..end]);
-        try refs.append(al, a.ref);
-        try counts.append(al, @intCast(end - i));
+        try out.append(al, .{ .ref = a.ref, .count = @intCast(end - i) });
         i = end;
     }
+    return out;
+}
 
-    // Stack inner levels until a single root remains. A column inner node stores
-    // (child_ref, subtree_count); the parent's own count is the sum of its
-    // children's counts.
-    while (refs.items.len > 1) {
-        var next_refs = std.ArrayList(u64).empty;
-        var next_counts = std.ArrayList(u64).empty;
-        var j: usize = 0;
-        while (j < refs.items.len) {
-            const end = @min(j + fan, refs.items.len);
-            const a = try txn.alloc(cnode.inner_node_size);
-            _ = cnode.encodeInner(a.bytes, refs.items[j..end], counts.items[j..end]);
-            var total: u64 = 0;
-            for (counts.items[j..end]) |c| total += c;
-            try next_refs.append(al, a.ref);
-            try next_counts.append(al, total);
-            j = end;
+// Build one inner level over `children`, packed in runs of FANOUT. A column
+// inner node stores (child_ref, subtree_count); a parent's count is the SUM of
+// its children's counts, so each emitted node's count == the total of its run.
+fn stackColumnInner(
+    txn: *WriteTxn,
+    children: []const ColChild,
+    al: std.mem.Allocator,
+) !std.ArrayList(ColChild) {
+    var out = std.ArrayList(ColChild).empty;
+    errdefer out.deinit(al);
+    const fan: usize = cnode.FANOUT;
+    var refs: [cnode.FANOUT]u64 = undefined;
+    var counts: [cnode.FANOUT]u64 = undefined;
+    var j: usize = 0;
+    while (j < children.len) {
+        const end = @min(j + fan, children.len);
+        var total: u64 = 0;
+        var k: usize = j;
+        while (k < end) : (k += 1) {
+            refs[k - j] = children[k].ref;
+            counts[k - j] = children[k].count;
+            total += children[k].count;
         }
-        refs.deinit(al);
-        counts.deinit(al);
-        refs = next_refs;
-        counts = next_counts;
+        const cnt = end - j;
+        const a = try txn.alloc(cnode.inner_node_size);
+        _ = cnode.encodeInner(a.bytes, refs[0..cnt], counts[0..cnt]);
+        try out.append(al, .{ .ref = a.ref, .count = total });
+        j = end;
     }
-    return refs.items[0];
+    return out;
+}
+
+/// Build a column tree holding `values` at row indices 0..values.len. Returns
+/// the root Ref. Equivalent to Column.create followed by an append per value.
+pub fn bulkColumn(txn: *WriteTxn, values: []const u64) !Ref {
+    if (values.len == 0) return Column.create(txn);
+    const al = txn.db.store.allocator;
+
+    // Pack leaves, then stack inner levels until a single root remains.
+    var level = try packColumnLeaves(txn, values, al);
+    defer level.deinit(al);
+    while (level.items.len > 1) {
+        const next = try stackColumnInner(txn, level.items, al);
+        level.deinit(al);
+        level = next;
+    }
+    return level.items[0].ref;
+}
+
+// An index B+tree node together with the low key (smallest key in its subtree)
+// its parent records for it. Used as the per-level work item by the bottom-up
+// index builders below.
+const SpineChild = struct { ref: u64, low: u64 };
+
+// Deref an index node, sizing the read by its kind byte (leaf vs inner).
+fn derefIdxNode(txn: *WriteTxn, ref: Ref) ![]const u8 {
+    const kb = try txn.deref(ref, 1);
+    if (kb[0] == inode.kind_leaf) return txn.deref(ref, inode.leaf_node_size);
+    return txn.deref(ref, inode.inner_node_size);
+}
+
+// Pack strictly-ascending (keys, vals) into leaves filled to LEAF_CAP in key
+// order. Returns the leaf level: one SpineChild per leaf, low == its first key.
+fn packIndexLeaves(
+    txn: *WriteTxn,
+    keys: []const u64,
+    vals: []const u64,
+    al: std.mem.Allocator,
+) !std.ArrayList(SpineChild) {
+    std.debug.assert(keys.len == vals.len);
+    var out = std.ArrayList(SpineChild).empty;
+    errdefer out.deinit(al);
+    const cap: usize = inode.LEAF_CAP;
+    var i: usize = 0;
+    while (i < keys.len) {
+        const end = @min(i + cap, keys.len);
+        const a = try txn.alloc(inode.leaf_node_size);
+        _ = inode.encodeLeaf(a.bytes, keys[i..end], vals[i..end]);
+        try out.append(al, .{ .ref = a.ref, .low = keys[i] });
+        i = end;
+    }
+    return out;
+}
+
+// Build one inner level over `children`, packed in runs of FANOUT. An index
+// inner node stores (child_ref, low_key); a parent's low key is the low key of
+// its first child, so each emitted node's low == children[run_start].low.
+fn stackIndexInner(
+    txn: *WriteTxn,
+    children: []const SpineChild,
+    al: std.mem.Allocator,
+) !std.ArrayList(SpineChild) {
+    var out = std.ArrayList(SpineChild).empty;
+    errdefer out.deinit(al);
+    const fan: usize = inode.FANOUT;
+    var refs: [inode.FANOUT]u64 = undefined;
+    var lows: [inode.FANOUT]u64 = undefined;
+    var j: usize = 0;
+    while (j < children.len) {
+        const end = @min(j + fan, children.len);
+        var k: usize = j;
+        while (k < end) : (k += 1) {
+            refs[k - j] = children[k].ref;
+            lows[k - j] = children[k].low;
+        }
+        const cnt = end - j;
+        const a = try txn.alloc(inode.inner_node_size);
+        _ = inode.encodeInner(a.bytes, refs[0..cnt], lows[0..cnt]);
+        try out.append(al, .{ .ref = a.ref, .low = children[j].low });
+        j = end;
+    }
+    return out;
 }
 
 /// Build a u64 index over strictly-ascending `keys` with parallel `vals`.
@@ -85,46 +185,215 @@ pub fn bulkIndex(txn: *WriteTxn, keys: []const u64, vals: []const u64) !Ref {
     }
     if (keys.len == 0) return Index.create(txn);
     const al = txn.db.store.allocator;
-    const cap: usize = inode.LEAF_CAP;
-    const fan: usize = inode.FANOUT;
 
-    // Current level: child refs and the low key (first key) of each child.
-    var refs = std.ArrayList(u64).empty;
-    defer refs.deinit(al);
-    var lows = std.ArrayList(u64).empty;
-    defer lows.deinit(al);
-
-    // Pack leaves to capacity in key order.
-    var i: usize = 0;
-    while (i < keys.len) {
-        const end = @min(i + cap, keys.len);
-        const a = try txn.alloc(inode.leaf_node_size);
-        _ = inode.encodeLeaf(a.bytes, keys[i..end], vals[i..end]);
-        try refs.append(al, a.ref);
-        try lows.append(al, keys[i]);
-        i = end;
+    // Pack leaves, then stack inner levels until a single root remains.
+    var level = try packIndexLeaves(txn, keys, vals, al);
+    defer level.deinit(al);
+    while (level.items.len > 1) {
+        const next = try stackIndexInner(txn, level.items, al);
+        level.deinit(al);
+        level = next;
     }
+    return level.items[0].ref;
+}
 
-    // Stack inner levels. An index inner node stores (child_ref, low_key); the
-    // parent's own low key is the low key of its first child.
-    while (refs.items.len > 1) {
-        var next_refs = std.ArrayList(u64).empty;
-        var next_lows = std.ArrayList(u64).empty;
-        var j: usize = 0;
-        while (j < refs.items.len) {
-            const end = @min(j + fan, refs.items.len);
-            const a = try txn.alloc(inode.inner_node_size);
-            _ = inode.encodeInner(a.bytes, refs.items[j..end], lows.items[j..end]);
-            try next_refs.append(al, a.ref);
-            try next_lows.append(al, lows.items[j]);
-            j = end;
+/// Append a sorted run of (keys, vals) whose keys ALL exceed the tree's current
+/// max key to the RIGHT EDGE of the index rooted at `root`, returning the new
+/// root Ref. Only the rightmost root-to-leaf path is rebuilt; every left
+/// subtree is shared unchanged (copy-on-write: shared nodes are never mutated).
+/// The result is logically identical to inserting every pair via Index.insert.
+///
+/// Preconditions (asserted under runtime safety): keys.len == vals.len, keys are
+/// strictly ascending, and keys[0] is greater than the tree's current max key.
+/// An empty run returns `root` unchanged.
+pub fn indexAppendRun(txn: *WriteTxn, root: Ref, keys: []const u64, vals: []const u64) !Ref {
+    std.debug.assert(keys.len == vals.len);
+    if (keys.len == 0) return root;
+    if (std.debug.runtime_safety) {
+        var q: usize = 1;
+        while (q < keys.len) : (q += 1) std.debug.assert(keys[q] > keys[q - 1]);
+    }
+    const al = txn.db.store.allocator;
+
+    // 1. Descend the rightmost path, recording each inner node and the index of
+    //    its rightmost child. No allocation from the arena occurs here, so the
+    //    deref'd node bytes stay valid for the duration of each iteration.
+    var path_refs = std.ArrayList(Ref).empty;
+    defer path_refs.deinit(al);
+    var path_ridx = std.ArrayList(usize).empty;
+    defer path_ridx.deinit(al);
+    var cur: Ref = root;
+    var leaf_ref: Ref = root;
+    while (true) {
+        const nb = try derefIdxNode(txn, cur);
+        if (nb[0] == inode.kind_leaf) {
+            leaf_ref = cur;
+            break;
         }
-        refs.deinit(al);
-        lows.deinit(al);
-        refs = next_refs;
-        lows = next_lows;
+        const iv = try inode.parseInner(nb);
+        const ri: usize = iv.child_count - 1;
+        const child = iv.childRef(ri);
+        try path_refs.append(al, cur);
+        try path_ridx.append(al, ri);
+        cur = child;
     }
-    return refs.items[0];
+
+    // 2. Gather the rightmost leaf's existing pairs followed by the run into a
+    //    heap buffer (heap allocation never remaps the arena, so the leaf bytes
+    //    stay valid while we copy them out). Then pack the combined run into
+    //    leaves filled to LEAF_CAP: the first new leaf reuses the old leaf's
+    //    content topped up from the front of the run, the rest are full leaves.
+    const lv = try inode.parseLeaf(try derefIdxNode(txn, leaf_ref));
+    if (std.debug.runtime_safety and lv.count > 0) {
+        std.debug.assert(keys[0] > lv.key(lv.count - 1));
+    }
+    const total: usize = @as(usize, lv.count) + keys.len;
+    const ck = try al.alloc(u64, total);
+    defer al.free(ck);
+    const cv = try al.alloc(u64, total);
+    defer al.free(cv);
+    {
+        var t: usize = 0;
+        while (t < lv.count) : (t += 1) {
+            ck[t] = lv.key(t);
+            cv[t] = lv.value(t);
+        }
+        for (keys, vals) |key, val| {
+            ck[t] = key;
+            cv[t] = val;
+            t += 1;
+        }
+    }
+
+    var level = try packIndexLeaves(txn, ck, cv, al);
+    errdefer level.deinit(al);
+
+    // 3. Rebuild the rightmost inner spine bottom-up. At each inner level, the
+    //    shared LEFT children (all but the rightmost) are re-emitted unchanged
+    //    and the rightmost child is replaced by the level rebuilt below, which
+    //    may have grown into several nodes. Packing in runs of FANOUT splits
+    //    automatically when the child list overflows; the extra nodes propagate
+    //    up as additional children of the next level.
+    var i: usize = path_refs.items.len;
+    while (i > 0) {
+        i -= 1;
+        const iv = try inode.parseInner(try derefIdxNode(txn, path_refs.items[i]));
+        const ri = path_ridx.items[i];
+        var full = std.ArrayList(SpineChild).empty;
+        defer full.deinit(al);
+        var j: usize = 0;
+        while (j < ri) : (j += 1) {
+            try full.append(al, .{ .ref = iv.childRef(j), .low = iv.lowKey(j) });
+        }
+        for (level.items) |c| try full.append(al, c);
+        const next = try stackIndexInner(txn, full.items, al);
+        level.deinit(al);
+        level = next;
+    }
+
+    // 4. If the (rebuilt) root level overflowed FANOUT it is now several nodes;
+    //    stack further inner levels until a single root remains, growing the
+    //    tree height by one or more as needed.
+    while (level.items.len > 1) {
+        const next = try stackIndexInner(txn, level.items, al);
+        level.deinit(al);
+        level = next;
+    }
+
+    const result = level.items[0].ref;
+    level.deinit(al);
+    return result;
+}
+
+/// Append a run of `values` to the RIGHT EDGE of the column rooted at `root`,
+/// returning the new root Ref. Columns are keyed by row index, so a run always
+/// lands at the end. Only the rightmost root-to-leaf path is rebuilt; every left
+/// subtree is shared unchanged (copy-on-write: shared nodes are never mutated).
+/// The result is logically identical to appending every value via Column.append.
+/// An empty run returns `root` unchanged.
+pub fn columnAppendRun(txn: *WriteTxn, root: Ref, values: []const u64) !Ref {
+    if (values.len == 0) return root;
+    const al = txn.db.store.allocator;
+
+    // 1. Descend the rightmost path (always the last child), recording each inner
+    //    node and the index of its rightmost child. No allocation from the arena
+    //    occurs here, so the deref'd node bytes stay valid for each iteration.
+    var path_refs = std.ArrayList(Ref).empty;
+    defer path_refs.deinit(al);
+    var path_ridx = std.ArrayList(usize).empty;
+    defer path_ridx.deinit(al);
+    var cur: Ref = root;
+    var leaf_ref: Ref = root;
+    while (true) {
+        const nb = try derefColNode(txn, cur);
+        if (nb[0] == cnode.kind_leaf) {
+            leaf_ref = cur;
+            break;
+        }
+        const iv = try cnode.parseInner(nb);
+        const ri: usize = @as(usize, iv.child_count) - 1;
+        const child = iv.childRef(ri);
+        try path_refs.append(al, cur);
+        try path_ridx.append(al, ri);
+        cur = child;
+    }
+
+    // 2. Gather the rightmost leaf's existing values followed by the run into a
+    //    heap buffer (heap allocation never remaps the arena, so the leaf bytes
+    //    stay valid while we copy them out). Then pack the combined run into
+    //    leaves filled to LEAF_CAP: the first new leaf reuses the old leaf's
+    //    content topped up from the front of the run, the rest are full leaves.
+    const lv = try cnode.parseLeaf(try derefColNode(txn, leaf_ref));
+    const total: usize = @as(usize, lv.count) + values.len;
+    const cvals = try al.alloc(u64, total);
+    defer al.free(cvals);
+    {
+        var t: usize = 0;
+        while (t < lv.count) : (t += 1) cvals[t] = lv.value(t);
+        for (values) |v| {
+            cvals[t] = v;
+            t += 1;
+        }
+    }
+
+    var level = try packColumnLeaves(txn, cvals, al);
+    errdefer level.deinit(al);
+
+    // 3. Rebuild the rightmost inner spine bottom-up. At each inner level the
+    //    shared LEFT children (all but the rightmost) are re-emitted unchanged
+    //    with their (ref, subtree_count), and the rightmost child is replaced by
+    //    the level rebuilt below, which may have grown into several nodes.
+    //    Packing in runs of FANOUT splits automatically on overflow; the extra
+    //    nodes propagate up as additional children of the next level.
+    var i: usize = path_refs.items.len;
+    while (i > 0) {
+        i -= 1;
+        const iv = try cnode.parseInner(try derefColNode(txn, path_refs.items[i]));
+        const ri = path_ridx.items[i];
+        var full = std.ArrayList(ColChild).empty;
+        defer full.deinit(al);
+        var j: usize = 0;
+        while (j < ri) : (j += 1) {
+            try full.append(al, .{ .ref = iv.childRef(j), .count = iv.childCount(j) });
+        }
+        for (level.items) |c| try full.append(al, c);
+        const next = try stackColumnInner(txn, full.items, al);
+        level.deinit(al);
+        level = next;
+    }
+
+    // 4. If the (rebuilt) root level overflowed FANOUT it is now several nodes;
+    //    stack further inner levels until a single root remains, growing the
+    //    tree height by one or more as needed.
+    while (level.items.len > 1) {
+        const next = try stackColumnInner(txn, level.items, al);
+        level.deinit(al);
+        level = next;
+    }
+
+    const result = level.items[0].ref;
+    level.deinit(al);
+    return result;
 }
 
 /// Build a value index (value -> inner okey-set) from `entries`, sorted by
@@ -358,12 +627,179 @@ fn buildPropValueIndex(
 }
 
 // ---------------------------------------------------------------------------
+// Bulk append orchestrator.
+//
+// bulkAppend fast-paths a batch of rows whose primary keys all land strictly to
+// the RIGHT of the type's current key space onto the right edge of every tree,
+// without touching any left subtree. The result is byte-identical to inserting
+// the same rows one at a time in ascending-pk order: each new row gets the next
+// physical row and object key in batch order, the version stamp matches
+// objects.insert (txn.new_version), live = 1, and the pk and key->row indexes
+// grow only along their rightmost path.
+//
+// A batch only qualifies when nothing about it would force a non-right-edge
+// write: no property is indexed and none is a link/link_set (those maintain
+// secondary structures keyed by value/target, not by row), the batch pks are
+// strictly ascending and unique, and the smallest batch pk is strictly greater
+// than the type's current max pk. Any other shape returns error.NotAppendable
+// with NOTHING written, so the caller's fallback can replay row-by-row.
+//
+// Crucially, every qualification check is read-only and runs BEFORE the first
+// node is allocated, so a NotAppendable return leaves the catalog and all trees
+// untouched. The CALLER commits.
+pub fn bulkAppend(txn: *WriteTxn, cat: Ref, rows: []const []const u64) !Ref {
+    const v = try catalog.loadCatalog(txn, cat);
+    const prop_count = v.prop_count;
+
+    // Validate row widths first: a single malformed row aborts before any work.
+    for (rows) |row| {
+        if (row.len != prop_count) return error.BadRow;
+    }
+    if (rows.len == 0) return cat;
+
+    // Capture every catalog field into locals before any allocation can grow the
+    // file and invalidate the CatalogView bytes slice. While here, qualify the
+    // schema: reject an indexed or link-bearing property -- both keep secondary
+    // structures that a pure right-edge append cannot maintain.
+    const old_next_row = v.next_row;
+    const old_next_key = v.next_key;
+    const old_keyrow = v.keyrow_index_ref;
+    const old_pk_index = v.pk_index_ref;
+    const old_version_col = v.version_col_ref;
+    const old_live_col = v.live_col_ref;
+    var prop_refs: [max_prop_count]Ref = undefined;
+    var kinds: [max_prop_count]PropKind = undefined;
+    var elems: [max_prop_count]ElemKind = undefined;
+    var backlinks: [max_prop_count]Ref = undefined;
+    var targets: [max_prop_count]u16 = undefined;
+    var rules: [max_prop_count]DeletionRule = undefined;
+    var vidx: [max_prop_count]Ref = undefined;
+    var idxf: [max_prop_count]bool = undefined;
+    {
+        var j: usize = 0;
+        while (j < prop_count) : (j += 1) {
+            const k = v.kind(j);
+            if (k == .link or k == .link_set) return error.NotAppendable;
+            if (v.indexed(j)) return error.NotAppendable;
+            prop_refs[j] = v.propColRef(j);
+            kinds[j] = k;
+            elems[j] = v.elemKind(j);
+            backlinks[j] = v.backlinkRef(j);
+            targets[j] = v.linkTarget(j);
+            rules[j] = v.delRule(j);
+            vidx[j] = v.valueIndexRef(j);
+            idxf[j] = v.indexed(j);
+        }
+    }
+
+    const n = rows.len;
+
+    // Batch pks must be strictly ascending and unique; any non-ascending or
+    // duplicate-in-batch shape is NotAppendable so the fallback handles it
+    // (including per-row duplicate detection against the existing rows).
+    {
+        var i: usize = 1;
+        while (i < n) : (i += 1) {
+            if (rows[i][0] <= rows[i - 1][0]) return error.NotAppendable;
+        }
+    }
+
+    // The smallest batch pk (rows[0][0], since ascending) must clear the current
+    // max pk in the type. An empty type (no max) admits any ascending batch.
+    if (try Index.maxKey(txn, old_pk_index)) |max_pk| {
+        if (rows[0][0] <= max_pk) return error.NotAppendable;
+    }
+
+    // --- Qualified. Nothing has been written yet; build the right-edge runs. ---
+    const al = txn.db.store.allocator;
+
+    // Object keys and physical rows are assigned in batch order from the type's
+    // current counters, exactly as sequential ascending-pk inserts would: the
+    // j-th row gets okey = next_key + j and physical row = next_row + j.
+    const pks = try al.alloc(u64, n);
+    defer al.free(pks);
+    const okeys = try al.alloc(u64, n);
+    defer al.free(okeys);
+    const phys_rows = try al.alloc(u64, n);
+    defer al.free(phys_rows);
+    for (rows, 0..) |row, j| {
+        pks[j] = row[0];
+        okeys[j] = old_next_key + @as(u64, @intCast(j));
+        phys_rows[j] = old_next_row + @as(u64, @intCast(j));
+    }
+
+    // Property columns: append each property's values in batch order.
+    var new_prop_refs: [max_prop_count]Ref = undefined;
+    {
+        const col_vals = try al.alloc(u64, n);
+        defer al.free(col_vals);
+        var p: usize = 0;
+        while (p < prop_count) : (p += 1) {
+            for (rows, 0..) |row, j| col_vals[j] = row[p];
+            new_prop_refs[p] = try columnAppendRun(txn, prop_refs[p], col_vals[0..n]);
+        }
+    }
+
+    // Version and live columns: one stamp per row, matching objects.insert.
+    const stamps = try al.alloc(u64, n);
+    defer al.free(stamps);
+    @memset(stamps, txn.new_version);
+    const new_version_col = try columnAppendRun(txn, old_version_col, stamps[0..n]);
+    @memset(stamps, 1);
+    const new_live_col = try columnAppendRun(txn, old_live_col, stamps[0..n]);
+
+    // pk index (pk -> okey) and key->row index (okey -> physical row). Both runs
+    // land on the right edge: batch pks are ascending and above the current max,
+    // and okeys are consecutive from next_key (thus above every existing okey).
+    const new_pk_index = try indexAppendRun(txn, old_pk_index, pks[0..n], okeys[0..n]);
+    const new_keyrow = try indexAppendRun(txn, old_keyrow, okeys[0..n], phys_rows[0..n]);
+
+    return catalog.writeCatalog(
+        txn,
+        prop_count,
+        old_next_row + @as(u64, @intCast(n)), // next_row
+        new_keyrow,
+        old_next_key + @as(u64, @intCast(n)), // next_key
+        new_pk_index,
+        new_version_col,
+        new_live_col,
+        new_prop_refs[0..prop_count],
+        kinds[0..prop_count],
+        elems[0..prop_count],
+        backlinks[0..prop_count],
+        targets[0..prop_count],
+        rules[0..prop_count],
+        vidx[0..prop_count],
+        idxf[0..prop_count],
+    );
+}
+
+// Try the right-edge fast path; on NotAppendable, fall back to row-by-row
+// objects.insert, which handles any schema and detects duplicate keys per row.
+pub fn bulkAppendOrInsert(txn: *WriteTxn, cat: Ref, rows: []const []const u64) !Ref {
+    return bulkAppend(txn, cat, rows) catch |e| switch (e) {
+        error.NotAppendable => fallbackInsert(txn, cat, rows),
+        else => e,
+    };
+}
+
+// Insert every row one at a time, threading the catalog ref. A DuplicateKey from
+// objects.insert propagates to the caller. Empty rows return cat unchanged.
+fn fallbackInsert(txn: *WriteTxn, cat: Ref, rows: []const []const u64) !Ref {
+    if (rows.len == 0) return cat;
+    var c = cat;
+    for (rows) |row| {
+        c = (try objects.insert(txn, c, row)).cat;
+    }
+    return c;
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
 const Db = @import("db.zig").Db;
-const objects = @import("objects.zig");
 const query = @import("query.zig");
 const typedir = @import("typedir.zig");
 
@@ -785,4 +1221,551 @@ test "bulkImport edge sizes: empty, single, LEAF_CAP" {
             try testing.expectEqual(last % 7, out[2]);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// indexAppendRun: right-edge run append, asserted equivalent to sequential
+// Index.insert of the same keys.
+// ---------------------------------------------------------------------------
+
+fn appendRunVal(k: u64) u64 {
+    return k *% 7 +% 3;
+}
+
+// Build a base tree of keys 0..base via sequential insert, append the run
+// base..base+run via indexAppendRun, and assert the result is logically
+// identical to inserting all keys 0..base+run sequentially.
+fn checkAppendEquiv(w: *WriteTxn, base: u64, run: u64) !void {
+    var base_root = try Index.create(w);
+    var k: u64 = 0;
+    while (k < base) : (k += 1) base_root = try Index.insert(w, base_root, k, appendRunVal(k));
+
+    const rk = try testing.allocator.alloc(u64, run);
+    defer testing.allocator.free(rk);
+    const rv = try testing.allocator.alloc(u64, run);
+    defer testing.allocator.free(rv);
+    var r: u64 = 0;
+    while (r < run) : (r += 1) {
+        rk[r] = base + r;
+        rv[r] = appendRunVal(base + r);
+    }
+
+    const appended = try indexAppendRun(w, base_root, rk, rv);
+
+    var expected = try Index.create(w);
+    k = 0;
+    while (k < base + run) : (k += 1) expected = try Index.insert(w, expected, k, appendRunVal(k));
+
+    const total = base + run;
+    try testing.expectEqual(total, try Index.count(w, appended));
+    try testing.expectEqual(try Index.count(w, expected), try Index.count(w, appended));
+
+    // Boundary + sampled get checks (compared against the sequential twin).
+    var samples = std.ArrayList(u64).empty;
+    defer samples.deinit(testing.allocator);
+    if (total > 0) {
+        try samples.append(testing.allocator, 0); // first key
+        try samples.append(testing.allocator, total - 1); // last key
+    }
+    if (base > 0) {
+        try samples.append(testing.allocator, base - 1); // seam: last base key
+        try samples.append(testing.allocator, base); // seam: first run key (== total when run == 0)
+    }
+    if (total > 4) {
+        try samples.append(testing.allocator, total / 4);
+        try samples.append(testing.allocator, total / 2);
+        try samples.append(testing.allocator, (3 * total) / 4);
+    }
+    for (samples.items) |sk| {
+        try testing.expectEqual(try Index.get(w, expected, sk), try Index.get(w, appended, sk));
+    }
+    // Beyond the max key is absent in both.
+    try testing.expectEqual(@as(?u64, null), try Index.get(w, appended, total));
+    try testing.expectEqual(try Index.get(w, expected, total), try Index.get(w, appended, total));
+
+    // Full ascending (key,val) sequence must match exactly.
+    var ak = std.ArrayList(u64).empty;
+    defer ak.deinit(testing.allocator);
+    var av = std.ArrayList(u64).empty;
+    defer av.deinit(testing.allocator);
+    var ek = std.ArrayList(u64).empty;
+    defer ek.deinit(testing.allocator);
+    var ev = std.ArrayList(u64).empty;
+    defer ev.deinit(testing.allocator);
+    try Index.forEachEntry(w, appended, IdxCollector{ .keys = &ak, .vals = &av }, IdxCollector.onEntry);
+    try Index.forEachEntry(w, expected, IdxCollector{ .keys = &ek, .vals = &ev }, IdxCollector.onEntry);
+    try testing.expectEqualSlices(u64, ek.items, ak.items);
+    try testing.expectEqualSlices(u64, ev.items, av.items);
+}
+
+fn appendTmpDb(tmp: *testing.TmpDir, name: []const u8) !Db {
+    const path = try bulkTmpPath(testing.allocator, tmp, name);
+    defer testing.allocator.free(path);
+    return Db.create(testing.allocator, path);
+}
+
+test "indexAppendRun partial last leaf then new leaves" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try appendTmpDb(&tmp, "append1.airdb");
+    defer db.deinit();
+    var w = try db.beginWrite();
+    try checkAppendEquiv(&w, 100, 200); // 100 % 64 == 36 in the last leaf
+    w.deinit();
+}
+
+test "indexAppendRun overflow rightmost inner node" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try appendTmpDb(&tmp, "append2.airdb");
+    defer db.deinit();
+    var w = try db.beginWrite();
+    // A multi-level base plus a run large enough that the new leaves alone
+    // exceed FANOUT, forcing a split at the leaf-parent (non-root) inner level.
+    try checkAppendEquiv(&w, 3000, 5000);
+    w.deinit();
+}
+
+test "indexAppendRun grows tree height by one" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try appendTmpDb(&tmp, "append3.airdb");
+    defer db.deinit();
+    var w = try db.beginWrite();
+    // Single-leaf base, run crossing FANOUT*LEAF_CAP (== 4096) so the result
+    // must be three levels tall.
+    try checkAppendEquiv(&w, 50, 4200);
+    w.deinit();
+}
+
+test "indexAppendRun single-leaf base tree" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try appendTmpDb(&tmp, "append4.airdb");
+    defer db.deinit();
+    var w = try db.beginWrite();
+    try checkAppendEquiv(&w, 40, 50); // base < LEAF_CAP
+    w.deinit();
+}
+
+test "indexAppendRun run far larger than base" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try appendTmpDb(&tmp, "append5.airdb");
+    defer db.deinit();
+    var w = try db.beginWrite();
+    try checkAppendEquiv(&w, 10, 5000);
+    w.deinit();
+}
+
+test "indexAppendRun empty run is a no-op" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try appendTmpDb(&tmp, "append6.airdb");
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var base_root = try Index.create(&w);
+    var k: u64 = 0;
+    while (k < 100) : (k += 1) base_root = try Index.insert(&w, base_root, k, appendRunVal(k));
+    const before = try Index.count(&w, base_root);
+    const appended = try indexAppendRun(&w, base_root, &.{}, &.{});
+    try testing.expectEqual(base_root, appended); // same ref, unchanged
+    try testing.expectEqual(before, try Index.count(&w, appended));
+    w.deinit();
+}
+
+// ---------------------------------------------------------------------------
+// columnAppendRun: right-edge run append, asserted equivalent to sequential
+// Column.append of the same values.
+// ---------------------------------------------------------------------------
+
+fn appendColVal(i: u64) u64 {
+    return i *% 11 +% 5;
+}
+
+// Build a base column of `base` values via sequential append, append `run` more
+// values via columnAppendRun, and assert the result is logically identical to
+// appending all base+run values sequentially: same length, and get(i) matches
+// the sequential twin at every index.
+fn checkColAppendEquiv(w: *WriteTxn, base: u64, run: u64) !void {
+    var base_root = try Column.create(w);
+    var k: u64 = 0;
+    while (k < base) : (k += 1) base_root = try Column.append(w, base_root, appendColVal(k));
+
+    const rv = try testing.allocator.alloc(u64, run);
+    defer testing.allocator.free(rv);
+    var r: u64 = 0;
+    while (r < run) : (r += 1) rv[r] = appendColVal(base + r);
+
+    const appended = try columnAppendRun(w, base_root, rv);
+
+    var expected = try Column.create(w);
+    k = 0;
+    while (k < base + run) : (k += 1) expected = try Column.append(w, expected, appendColVal(k));
+
+    const total = base + run;
+    try testing.expectEqual(total, try Column.len(w, appended));
+    try testing.expectEqual(try Column.len(w, expected), try Column.len(w, appended));
+
+    var i: u64 = 0;
+    while (i < total) : (i += 1) {
+        try testing.expectEqual(try Column.get(w, expected, i), try Column.get(w, appended, i));
+    }
+    if (total > 0) try testing.expectError(error.IndexOutOfBounds, Column.get(w, appended, total));
+}
+
+test "columnAppendRun partial last leaf then new leaves" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try appendTmpDb(&tmp, "colappend1.airdb");
+    defer db.deinit();
+    var w = try db.beginWrite();
+    try checkColAppendEquiv(&w, 100, 200); // 100 % 64 == 36 in the last leaf
+    w.deinit();
+}
+
+test "columnAppendRun grows height" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try appendTmpDb(&tmp, "colappend2.airdb");
+    defer db.deinit();
+    var w = try db.beginWrite();
+    // Single-leaf base, run crossing FANOUT*LEAF_CAP (== 4096) so the result
+    // must be three levels tall.
+    try checkColAppendEquiv(&w, 50, 4200);
+    w.deinit();
+}
+
+test "columnAppendRun single-leaf base" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try appendTmpDb(&tmp, "colappend3.airdb");
+    defer db.deinit();
+    var w = try db.beginWrite();
+    try checkColAppendEquiv(&w, 40, 50); // base < LEAF_CAP
+    w.deinit();
+}
+
+test "columnAppendRun run far larger than base" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try appendTmpDb(&tmp, "colappend4.airdb");
+    defer db.deinit();
+    var w = try db.beginWrite();
+    try checkColAppendEquiv(&w, 10, 5000);
+    w.deinit();
+}
+
+test "columnAppendRun empty run is a no-op" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try appendTmpDb(&tmp, "colappend5.airdb");
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var base_root = try Column.create(&w);
+    var k: u64 = 0;
+    while (k < 100) : (k += 1) base_root = try Column.append(&w, base_root, appendColVal(k));
+    const before = try Column.len(&w, base_root);
+    const appended = try columnAppendRun(&w, base_root, &.{});
+    try testing.expectEqual(base_root, appended); // same ref, unchanged
+    try testing.expectEqual(before, try Column.len(&w, appended));
+    w.deinit();
+}
+
+// ---------------------------------------------------------------------------
+// bulkAppend / bulkAppendOrInsert: right-edge batch append with a row-by-row
+// fallback, asserted equivalent to sequential objects.insert.
+// ---------------------------------------------------------------------------
+
+// A no-index, no-link scalar schema: int pk, int value. Qualifies for append.
+const append_defs = [_]catalog.PropDef{ .{ .kind = .int }, .{ .kind = .int } };
+
+test "bulkAppend equals row-by-row for a contiguous monotonic batch" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path_a = try bulkTmpPath(testing.allocator, &tmp, "append_eq_a.airdb");
+    defer testing.allocator.free(path_a);
+    const path_b = try bulkTmpPath(testing.allocator, &tmp, "append_eq_b.airdb");
+    defer testing.allocator.free(path_b);
+
+    const BASE: u64 = 1000;
+    const APPEND: u64 = 500;
+    const TOTAL = BASE + APPEND;
+
+    // Batch rows: pks BASE..TOTAL, value = pk*3 (ascending, above the base max).
+    const storage = try testing.allocator.alloc([2]u64, APPEND);
+    defer testing.allocator.free(storage);
+    const batch = try testing.allocator.alloc([]const u64, APPEND);
+    defer testing.allocator.free(batch);
+    {
+        var j: usize = 0;
+        while (j < APPEND) : (j += 1) {
+            const pk = BASE + @as(u64, @intCast(j));
+            storage[j] = .{ pk, pk * 3 };
+            batch[j] = &storage[j];
+        }
+    }
+
+    // db A: base via row-by-row insert, then the batch via bulkAppend, inside a
+    // one-type directory so verifyIntegrity audits it.
+    {
+        var db = try Db.create(testing.allocator, path_a);
+        defer db.deinit();
+        var w = try db.beginWrite();
+        const dir = try typedir.createTypes(&w, &.{&append_defs}, &.{false});
+        var cat = try typedir.catalogRef(&w, dir, 0);
+        var pk: u64 = 0;
+        while (pk < BASE) : (pk += 1) cat = (try objects.insert(&w, cat, &.{ pk, pk * 3 })).cat;
+        const new_cat = try bulkAppend(&w, cat, batch);
+        const new_dir = try typedir.setCatalogRef(&w, dir, 0, new_cat);
+        w.setRoot(new_dir);
+        _ = try w.commit();
+        try db.verifyIntegrity();
+    }
+
+    // db B: every row inserted one at a time, in ascending-pk order.
+    {
+        var db = try Db.create(testing.allocator, path_b);
+        defer db.deinit();
+        var w = try db.beginWrite();
+        var cat = try catalog.createDefs(&w, &append_defs);
+        var pk: u64 = 0;
+        while (pk < TOTAL) : (pk += 1) cat = (try objects.insert(&w, cat, &.{ pk, pk * 3 })).cat;
+        w.setRoot(cat);
+        _ = try w.commit();
+    }
+
+    // Reopen A from disk (durability) and compare against B.
+    var da = try Db.open(testing.allocator, path_a);
+    defer da.deinit();
+    try da.verifyIntegrity(); // audit again after reopen
+    var dbb = try Db.open(testing.allocator, path_b);
+    defer dbb.deinit();
+
+    var ra = try da.beginRead();
+    defer ra.end();
+    var rb = try dbb.beginRead();
+    defer rb.end();
+
+    const cat_a = try typedir.catalogRef(&ra, ra.root(), 0);
+    const cat_b = rb.root();
+
+    // Counts equal.
+    try testing.expectEqual(TOTAL, try catalog.liveCount(&ra, cat_a));
+    try testing.expectEqual(try catalog.liveCount(&rb, cat_b), try catalog.liveCount(&ra, cat_a));
+
+    // Every pk lookup equal: property values AND row version.
+    var pk: u64 = 0;
+    while (pk < TOTAL) : (pk += 1) {
+        var oa: [2]u64 = undefined;
+        var ob: [2]u64 = undefined;
+        const va = try objects.getByPk(&ra, cat_a, pk, &oa);
+        const vb = try objects.getByPk(&rb, cat_b, pk, &ob);
+        try testing.expectEqual(vb, va);
+        try testing.expectEqualSlices(u64, &ob, &oa);
+    }
+
+    // Full-scan order equal (ascending okey for both).
+    {
+        var sa = std.ArrayList(u64).empty;
+        defer sa.deinit(testing.allocator);
+        var sb = std.ArrayList(u64).empty;
+        defer sb.deinit(testing.allocator);
+        try query.where(&ra, cat_a, &.{}, &sa, testing.allocator);
+        try query.where(&rb, cat_b, &.{}, &sb, testing.allocator);
+        try testing.expectEqualSlices(u64, sb.items, sa.items);
+    }
+}
+
+test "bulkAppend returns NotAppendable for a scattered batch" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try bulkTmpPath(testing.allocator, &tmp, "append_scatter.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var cat = try catalog.createDefs(&w, &append_defs);
+    var pk: u64 = 0;
+    while (pk < 100) : (pk += 1) cat = (try objects.insert(&w, cat, &.{ pk, pk * 3 })).cat;
+
+    const before = try catalog.liveCount(&w, cat);
+    var before_row: [2]u64 = undefined;
+    try testing.expect((try objects.getByPk(&w, cat, 50, &before_row)) != null);
+
+    // First batch pk (50) is <= the current max (99): not a right-edge append.
+    const batch = [_][]const u64{ &.{ 50, 150 }, &.{ 200, 600 }, &.{ 201, 603 } };
+    try testing.expectError(error.NotAppendable, bulkAppend(&w, cat, &batch));
+
+    // The type is byte-unchanged: same count, and the sampled row is intact.
+    try testing.expectEqual(before, try catalog.liveCount(&w, cat));
+    var after_row: [2]u64 = undefined;
+    try testing.expect((try objects.getByPk(&w, cat, 50, &after_row)) != null);
+    try testing.expectEqualSlices(u64, &before_row, &after_row);
+    w.deinit();
+}
+
+test "bulkAppend returns NotAppendable for an indexed type" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try bulkTmpPath(testing.allocator, &tmp, "append_indexed.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .int, .indexed = true } });
+    cat = (try objects.insert(&w, cat, &.{ 1, 10 })).cat;
+
+    // Even an ascending batch above the max is rejected: a pure right-edge append
+    // cannot maintain the value index.
+    const batch = [_][]const u64{ &.{ 100, 5 }, &.{ 101, 6 } };
+    try testing.expectError(error.NotAppendable, bulkAppend(&w, cat, &batch));
+    w.deinit();
+}
+
+test "bulkAppend returns NotAppendable for a link-bearing type" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try bulkTmpPath(testing.allocator, &tmp, "append_link.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link, .link_target = 0 } });
+    cat = (try objects.insert(&w, cat, &.{ 1, 0 })).cat;
+
+    const batch = [_][]const u64{ &.{ 100, 0 }, &.{ 101, 0 } };
+    try testing.expectError(error.NotAppendable, bulkAppend(&w, cat, &batch));
+    w.deinit();
+}
+
+test "bulkAppend returns NotAppendable for a non-ascending or duplicate batch" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try bulkTmpPath(testing.allocator, &tmp, "append_nonasc.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var cat = try catalog.createDefs(&w, &append_defs);
+    cat = (try objects.insert(&w, cat, &.{ 1, 3 })).cat;
+
+    // Non-ascending batch (both pks above the max, but out of order).
+    const desc = [_][]const u64{ &.{ 200, 600 }, &.{ 150, 450 } };
+    try testing.expectError(error.NotAppendable, bulkAppend(&w, cat, &desc));
+
+    // In-batch duplicate pk.
+    const dup = [_][]const u64{ &.{ 300, 900 }, &.{ 300, 901 } };
+    try testing.expectError(error.NotAppendable, bulkAppend(&w, cat, &dup));
+    w.deinit();
+}
+
+test "bulkAppendOrInsert falls back and equals row-by-row for a scattered batch" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path_a = try bulkTmpPath(testing.allocator, &tmp, "fallback_a.airdb");
+    defer testing.allocator.free(path_a);
+    const path_b = try bulkTmpPath(testing.allocator, &tmp, "fallback_b.airdb");
+    defer testing.allocator.free(path_b);
+
+    const BASE: u64 = 100;
+    // Scattered batch: all pks new (>= BASE) and distinct, but out of order, so
+    // bulkAppend rejects and the orchestrator falls back to row-by-row insert.
+    const scattered_pks = [_]u64{ 200, 100, 300, 150, 400, 250 };
+    const TOTAL = BASE + scattered_pks.len;
+
+    var storage: [scattered_pks.len][2]u64 = undefined;
+    var batch: [scattered_pks.len][]const u64 = undefined;
+    for (scattered_pks, 0..) |pk, j| {
+        storage[j] = .{ pk, pk * 3 };
+        batch[j] = &storage[j];
+    }
+
+    // db A: base via insert, then the scattered batch via bulkAppendOrInsert,
+    // inside a one-type directory so verifyIntegrity audits it.
+    {
+        var db = try Db.create(testing.allocator, path_a);
+        defer db.deinit();
+        var w = try db.beginWrite();
+        const dir = try typedir.createTypes(&w, &.{&append_defs}, &.{false});
+        var cat = try typedir.catalogRef(&w, dir, 0);
+        var pk: u64 = 0;
+        while (pk < BASE) : (pk += 1) cat = (try objects.insert(&w, cat, &.{ pk, pk * 3 })).cat;
+        const new_cat = try bulkAppendOrInsert(&w, cat, &batch);
+        const new_dir = try typedir.setCatalogRef(&w, dir, 0, new_cat);
+        w.setRoot(new_dir);
+        _ = try w.commit();
+        try db.verifyIntegrity();
+    }
+
+    // db B: base via insert, then the same scattered rows inserted one at a time
+    // in the SAME order the fallback uses.
+    {
+        var db = try Db.create(testing.allocator, path_b);
+        defer db.deinit();
+        var w = try db.beginWrite();
+        var cat = try catalog.createDefs(&w, &append_defs);
+        var pk: u64 = 0;
+        while (pk < BASE) : (pk += 1) cat = (try objects.insert(&w, cat, &.{ pk, pk * 3 })).cat;
+        for (scattered_pks) |spk| cat = (try objects.insert(&w, cat, &.{ spk, spk * 3 })).cat;
+        w.setRoot(cat);
+        _ = try w.commit();
+    }
+
+    var da = try Db.open(testing.allocator, path_a);
+    defer da.deinit();
+    try da.verifyIntegrity();
+    var dbb = try Db.open(testing.allocator, path_b);
+    defer dbb.deinit();
+
+    var ra = try da.beginRead();
+    defer ra.end();
+    var rb = try dbb.beginRead();
+    defer rb.end();
+
+    const cat_a = try typedir.catalogRef(&ra, ra.root(), 0);
+    const cat_b = rb.root();
+
+    try testing.expectEqual(@as(u64, TOTAL), try catalog.liveCount(&ra, cat_a));
+    try testing.expectEqual(try catalog.liveCount(&rb, cat_b), try catalog.liveCount(&ra, cat_a));
+
+    // Every pk over the union (and the absent gaps between) resolves identically.
+    var pk: u64 = 0;
+    while (pk <= 401) : (pk += 1) {
+        var oa: [2]u64 = undefined;
+        var ob: [2]u64 = undefined;
+        const va = try objects.getByPk(&ra, cat_a, pk, &oa);
+        const vb = try objects.getByPk(&rb, cat_b, pk, &ob);
+        try testing.expectEqual(vb, va);
+        if (vb != null) try testing.expectEqualSlices(u64, &ob, &oa);
+    }
+
+    // Full-scan order equal (ascending okey for both).
+    {
+        var sa = std.ArrayList(u64).empty;
+        defer sa.deinit(testing.allocator);
+        var sb = std.ArrayList(u64).empty;
+        defer sb.deinit(testing.allocator);
+        try query.where(&ra, cat_a, &.{}, &sa, testing.allocator);
+        try query.where(&rb, cat_b, &.{}, &sb, testing.allocator);
+        try testing.expectEqualSlices(u64, sb.items, sa.items);
+    }
+}
+
+test "bulkAppendOrInsert empty batch is a no-op" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try bulkTmpPath(testing.allocator, &tmp, "append_empty.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var cat = try catalog.createDefs(&w, &append_defs);
+    cat = (try objects.insert(&w, cat, &.{ 1, 3 })).cat;
+
+    const before = try catalog.liveCount(&w, cat);
+    const after = try bulkAppendOrInsert(&w, cat, &.{});
+    try testing.expectEqual(cat, after); // same ref, untouched
+    try testing.expectEqual(before, try catalog.liveCount(&w, after));
+    w.deinit();
 }

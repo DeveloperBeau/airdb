@@ -112,6 +112,22 @@ pub fn get(txn: anytype, root: Ref, key: u64) !?u64 {
     return get(txn, child_ref, key);
 }
 
+/// Return the largest key in the tree rooted at root, or null if the tree is
+/// empty. Descends the rightmost root-to-leaf path; read-only, O(height).
+pub fn maxKey(txn: anytype, root: Ref) !?u64 {
+    var cur: Ref = root;
+    while (true) {
+        const bytes = try derefNode(txn, cur);
+        if (bytes[0] == kind_leaf) {
+            const v = try parseLeaf(bytes);
+            if (v.count == 0) return null;
+            return v.key(v.count - 1);
+        }
+        const v = try parseInner(bytes);
+        cur = v.childRef(v.child_count - 1);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // B+tree insert with leaf/inner split and height growth (Task 4)
 // ---------------------------------------------------------------------------

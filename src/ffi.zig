@@ -250,6 +250,45 @@ export fn airdb_bulk_insert(handle: ?*Database, rows_flat: [*]const u64, row_cou
     return @intCast(row_count);
 }
 
+// Append `row_count` rows of `prop_count` u64 values each from the flat,
+// row-major buffer `rows_flat` (row i occupies rows_flat[i*prop_count ..][0..
+// prop_count]; element 0 of each row is the primary key) to a POPULATED type in
+// a single durable commit. A batch whose primary keys are strictly ascending and
+// all clear the type's current max key lands on the right edge via the fast path;
+// any other shape falls back to a row-by-row insert. The whole batch becomes
+// durable atomically or nothing does. Returns the number of rows appended on
+// success, or a negative error code: AIRDB_E_DUPLICATE on a repeated primary key
+// (from the fallback), AIRDB_E_BAD_ARGS on a prop_count mismatch. On every error
+// the write lock is released and nothing is made durable. A row_count of 0 is a
+// no-op that commits no change and returns 0.
+export fn airdb_bulk_append(handle: ?*Database, rows_flat: [*]const u64, row_count: usize, prop_count: usize) i64 {
+    const self = handle orelse return AIRDB_E_GENERIC;
+    if (prop_count != self.prop_count) return AIRDB_E_BAD_ARGS;
+
+    // Build a []const []const u64 view over the flat buffer: each row slice
+    // points at its prop_count-wide window. Freed regardless of outcome.
+    const rows_slices = alloc.alloc([]const u64, row_count) catch return AIRDB_E_GENERIC;
+    defer alloc.free(rows_slices);
+    for (rows_slices, 0..) |*row, i| {
+        row.* = rows_flat[i * prop_count ..][0..prop_count];
+    }
+
+    var w = self.db.beginWrite() catch return AIRDB_E_GENERIC;
+    const newcat = bulk.bulkAppendOrInsert(&w, w.new_root, rows_slices) catch |e| {
+        w.deinit(); // releases the write lock; nothing was made durable
+        return switch (e) {
+            error.BadRow => AIRDB_E_BAD_ARGS,
+            error.DuplicateKey => AIRDB_E_DUPLICATE,
+            else => AIRDB_E_GENERIC,
+        };
+    };
+    w.setRoot(newcat);
+    // commit releases the lock on BOTH its success and its own error paths, so
+    // do not unlock again here.
+    _ = w.commit() catch return AIRDB_E_GENERIC;
+    return @intCast(row_count);
+}
+
 // ---------------------------------------------------------------------------
 // Explicit multi-operation write transactions.
 //
@@ -653,4 +692,88 @@ test "airdb_bulk_insert duplicate pk returns AIRDB_E_DUPLICATE, type still empty
     // The write lock was released: a subsequent insert succeeds.
     try testing.expect(airdb_insert(h, &[_]u64{ 1, 10 }, 2) >= 0);
     try testing.expectEqual(@as(i64, 1), airdb_count(h));
+}
+
+test "airdb_bulk_append appends a contiguous batch in one commit" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try ffiTmpPathZ(testing.allocator, &tmp, "bulk_append.airdb");
+    defer testing.allocator.free(path);
+    {
+        const h = airdb_open(path.ptr, 2) orelse return error.OpenFailed;
+        defer airdb_close(h);
+
+        // Seed a populated type with pks 0,1,2.
+        const seed = [_]u64{ 0, 0, 1, 10, 2, 20 };
+        try testing.expectEqual(@as(i64, 3), airdb_bulk_insert(h, &seed, 3, 2));
+
+        // Append a contiguous, strictly-ascending batch above the current max pk.
+        const batch = [_]u64{ 3, 30, 4, 40, 5, 50 };
+        try testing.expectEqual(@as(i64, 3), airdb_bulk_append(h, &batch, 3, 2));
+        try testing.expectEqual(@as(i64, 6), airdb_count(h));
+
+        var out: [2]u64 = undefined;
+        try testing.expect(airdb_get(h, 3, &out, 2) >= 1);
+        try testing.expectEqual(@as(u64, 30), out[1]);
+        try testing.expect(airdb_get(h, 4, &out, 2) >= 1);
+        try testing.expectEqual(@as(u64, 40), out[1]);
+        try testing.expect(airdb_get(h, 5, &out, 2) >= 1);
+        try testing.expectEqual(@as(u64, 50), out[1]);
+    }
+    // Reopen: the appended rows persisted (durability).
+    const h2 = airdb_open(path.ptr, 2) orelse return error.OpenFailed;
+    defer airdb_close(h2);
+    try testing.expectEqual(@as(i64, 6), airdb_count(h2));
+    var out: [2]u64 = undefined;
+    try testing.expect(airdb_get(h2, 5, &out, 2) >= 1);
+    try testing.expectEqual(@as(u64, 50), out[1]);
+}
+
+test "airdb_bulk_append falls back for a scattered batch" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try ffiTmpPathZ(testing.allocator, &tmp, "bulk_append_scatter.airdb");
+    defer testing.allocator.free(path);
+    const h = airdb_open(path.ptr, 2) orelse return error.OpenFailed;
+    defer airdb_close(h);
+
+    // Seed pks 0,1,2 (current max pk is 2).
+    const seed = [_]u64{ 0, 0, 1, 10, 2, 20 };
+    try testing.expectEqual(@as(i64, 3), airdb_bulk_insert(h, &seed, 3, 2));
+
+    // A descending batch does not qualify for the right-edge fast path, but both
+    // pks are fresh, so the row-by-row fallback inserts them successfully.
+    const scattered = [_]u64{ 5, 50, 4, 40 };
+    try testing.expectEqual(@as(i64, 2), airdb_bulk_append(h, &scattered, 2, 2));
+    try testing.expectEqual(@as(i64, 5), airdb_count(h));
+    var out: [2]u64 = undefined;
+    try testing.expect(airdb_get(h, 4, &out, 2) >= 1);
+    try testing.expectEqual(@as(u64, 40), out[1]);
+    try testing.expect(airdb_get(h, 5, &out, 2) >= 1);
+    try testing.expectEqual(@as(u64, 50), out[1]);
+
+    // A non-qualifying batch carrying an existing pk surfaces the fallback's
+    // DuplicateKey as AIRDB_E_DUPLICATE; nothing is made durable.
+    const dup = [_]u64{ 6, 60, 1, 11 };
+    try testing.expectEqual(AIRDB_E_DUPLICATE, airdb_bulk_append(h, &dup, 2, 2));
+    try testing.expectEqual(@as(i64, 5), airdb_count(h));
+
+    // The write lock was released: a subsequent insert succeeds.
+    try testing.expect(airdb_insert(h, &[_]u64{ 7, 70 }, 2) >= 0);
+    try testing.expectEqual(@as(i64, 6), airdb_count(h));
+}
+
+test "airdb_bulk_append wrong prop_count returns AIRDB_E_BAD_ARGS" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try ffiTmpPathZ(testing.allocator, &tmp, "bulk_append_badargs.airdb");
+    defer testing.allocator.free(path);
+    const h = airdb_open(path.ptr, 2) orelse return error.OpenFailed;
+    defer airdb_close(h);
+
+    const flat = [_]u64{ 1, 10, 100, 2, 20, 200 };
+    try testing.expectEqual(AIRDB_E_BAD_ARGS, airdb_bulk_append(h, &flat, 2, 3));
+    // Nothing was written and the lock is free.
+    try testing.expectEqual(@as(i64, 0), airdb_count(h));
+    try testing.expect(airdb_insert(h, &[_]u64{ 1, 10 }, 2) >= 0);
 }
