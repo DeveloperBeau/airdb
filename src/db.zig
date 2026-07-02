@@ -445,14 +445,21 @@ pub const Db = struct {
     /// The `version > active_version` guard rejects a ring entry written during a
     /// commit that crashed/aborted before publishing (the slot flip never happened),
     /// so a recorded-but-unpublished pair is never trusted.
+    ///
+    /// The ring is scanned newest-to-oldest. A commit that failed its durability
+    /// barrier leaves its (version, root) entry behind, and the retry commit --
+    /// which reuses the same version number -- writes a second entry for that
+    /// version. The retry's entry is always written later, so the newest match is
+    /// the committed root and the aborted duplicate is never returned.
     pub fn versionRoot(self: *Db, version: u64) ?u64 {
         if (version > self.active_version) return null;
         const map = self.store.map;
         const head = std.mem.readInt(u32, map[ring_head_off..][0..4], .little);
         const n = @min(head, ring_capacity);
-        var i: u32 = 0;
-        while (i < n) : (i += 1) {
-            const e = ring_off + @as(usize, i) * 16;
+        var j: u32 = 0;
+        while (j < n) : (j += 1) {
+            const slot_idx = (head - 1 - j) % ring_capacity;
+            const e = ring_off + @as(usize, slot_idx) * 16;
             const v = std.mem.readInt(u64, map[e..][0..8], .little);
             if (v == version) return std.mem.readInt(u64, map[e + 8 ..][0..8], .little);
         }
@@ -1340,6 +1347,57 @@ test "ring wraps after capacity" {
     // Versions older than the live window were evicted.
     try testing.expectEqual(@as(?u64, null), db.versionRoot(oldest_live - 1));
     try testing.expectEqual(@as(?u64, null), db.versionRoot(2));
+}
+
+test "a retried commit's ring entry wins over the aborted duplicate" {
+    // A commit that fails its data barrier leaves its (version, root) ring entry
+    // behind; the retry reuses the same version number and appends a second
+    // entry. versionRoot must return the retry's root (the committed one), not
+    // the aborted duplicate, or beginReadAt would expose never-committed data.
+    const FailingSyncer = @import("syncer.zig").FailingSyncer;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "ringdup.airdb");
+    defer testing.allocator.free(path);
+
+    // Flush sequence: create=2 flushes, first commit=2, so the second commit's
+    // data barrier is flush #5.
+    var fsync = FailingSyncer{ .fail_on = 5 };
+    var db = try Db.createWith(testing.allocator, path, fsync.any());
+    defer db.deinit();
+    db.setRetainVersions(std.math.maxInt(u64));
+
+    {
+        var w = try db.beginWrite();
+        const a = try w.alloc(8);
+        @memcpy(a.bytes, "BASELINE");
+        w.setRoot(a.ref);
+        _ = try w.commit();
+    }
+    const v_target = db.active_version + 1;
+
+    // Aborted attempt at v_target: the ring entry lands, the flush fails.
+    {
+        var w = try db.beginWrite();
+        const a = try w.alloc(8);
+        @memcpy(a.bytes, "ABORTED!");
+        w.setRoot(a.ref);
+        try testing.expectError(error.Durability, w.commit());
+    }
+
+    // Retry commits v_target for real with different data.
+    {
+        var w = try db.beginWrite();
+        const a = try w.alloc(8);
+        @memcpy(a.bytes, "REALDATA");
+        w.setRoot(a.ref);
+        try testing.expectEqual(v_target, try w.commit());
+    }
+
+    // The past-version read must resolve to the committed root.
+    var r = try db.beginReadAt(v_target);
+    defer r.end();
+    try testing.expectEqualStrings("REALDATA", try r.deref(r.root(), 8));
 }
 
 test "beginReadAt opens a past version within the retention window" {
