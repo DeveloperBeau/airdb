@@ -164,7 +164,9 @@ pub fn update(txn: *WriteTxn, cat: Ref, pk: u64, values: []const u64, expected_v
     std.debug.assert(values.len == v.prop_count);
     std.debug.assert(values[0] == pk); // pk is identity, must not change
     const okey = (try Index.get(txn, v.pk_index_ref, pk)) orelse return .not_found;
-    const row = (try catalog.okeyToRow(txn, cat, okey)).?;
+    // The pk index resolved but the key->row index did not: treat the divergence
+    // as absent rather than crashing on corrupt data.
+    const row = (try catalog.okeyToRow(txn, cat, okey)) orelse return .not_found;
     const cur = try Column.get(txn, v.version_col_ref, row);
     if (cur != expected_version) return .{ .conflict = .{ .current_version = cur } };
 
@@ -234,7 +236,7 @@ pub fn update(txn: *WriteTxn, cat: Ref, pk: u64, values: []const u64, expected_v
 pub fn delete(txn: *WriteTxn, cat: Ref, pk: u64, expected_version: u64) !DeleteResult {
     const v = try loadCatalog(txn, cat);
     const okey = (try Index.get(txn, v.pk_index_ref, pk)) orelse return .not_found;
-    const row = (try catalog.okeyToRow(txn, cat, okey)).?;
+    const row = (try catalog.okeyToRow(txn, cat, okey)) orelse return .not_found;
     const cur = try Column.get(txn, v.version_col_ref, row);
     if (cur != expected_version) return .{ .conflict = .{ .current_version = cur } };
 
@@ -454,7 +456,7 @@ pub fn getTypedByOkey(txn: anytype, cat: Ref, okey: u64, out: []Value) !?u64 {
 pub fn deleteAndNullify(txn: *WriteTxn, cat: Ref, pk: u64, expected_version: u64) !DeleteResult {
     const v = try loadCatalog(txn, cat);
     const okey = (try Index.get(txn, v.pk_index_ref, pk)) orelse return .not_found;
-    const row = (try catalog.okeyToRow(txn, cat, okey)).?;
+    const row = (try catalog.okeyToRow(txn, cat, okey)) orelse return .not_found;
     const cur_ver = try Column.get(txn, v.version_col_ref, row);
     if (cur_ver != expected_version) return .{ .conflict = .{ .current_version = cur_ver } };
     const fixed = try links.fixBacklinksForDelete(txn, cat, okey);

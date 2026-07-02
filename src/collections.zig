@@ -43,34 +43,34 @@ pub fn listLen(txn: anytype, cat: Ref, pk: u64, prop: usize) !?u64 {
 }
 
 pub fn listGetInt(txn: anytype, cat: Ref, pk: u64, prop: usize, index: u64) !u64 {
-    const r = (try catalog.resolveProp(txn, cat, pk, prop)).?;
+    const r = (try catalog.resolveProp(txn, cat, pk, prop)) orelse return error.NotFound;
     const list_root = try Column.get(txn, r.prop_col, r.row);
     return try Column.get(txn, list_root, index);
 }
 
 pub fn listGetBlob(txn: anytype, cat: Ref, pk: u64, prop: usize, index: u64) ![]const u8 {
-    const r = (try catalog.resolveProp(txn, cat, pk, prop)).?;
+    const r = (try catalog.resolveProp(txn, cat, pk, prop)) orelse return error.NotFound;
     const list_root = try Column.get(txn, r.prop_col, r.row);
     const bref = try Column.get(txn, list_root, index);
     return try blob.get(txn, bref);
 }
 
 pub fn listAppendInt(txn: *WriteTxn, cat: Ref, pk: u64, prop: usize, value: u64) !Ref {
-    const r = (try catalog.resolveProp(txn, cat, pk, prop)).?;
+    const r = (try catalog.resolveProp(txn, cat, pk, prop)) orelse return error.NotFound;
     const old_root = try Column.get(txn, r.prop_col, r.row);
     const new_root = try Column.append(txn, old_root, value);
     return catalog.replaceCollRoot(txn, cat, r.row, prop, new_root);
 }
 
 pub fn listSetInt(txn: *WriteTxn, cat: Ref, pk: u64, prop: usize, index: u64, value: u64) !Ref {
-    const r = (try catalog.resolveProp(txn, cat, pk, prop)).?;
+    const r = (try catalog.resolveProp(txn, cat, pk, prop)) orelse return error.NotFound;
     const old_root = try Column.get(txn, r.prop_col, r.row);
     const new_root = try Column.set(txn, old_root, index, value);
     return catalog.replaceCollRoot(txn, cat, r.row, prop, new_root);
 }
 
 pub fn listAppendBlob(txn: *WriteTxn, cat: Ref, pk: u64, prop: usize, bytes: []const u8) !Ref {
-    const r = (try catalog.resolveProp(txn, cat, pk, prop)).?;
+    const r = (try catalog.resolveProp(txn, cat, pk, prop)) orelse return error.NotFound;
     const old_root = try Column.get(txn, r.prop_col, r.row);
     const bref = try blob.put(txn, bytes);
     const new_root = try Column.append(txn, old_root, bref);
@@ -84,13 +84,13 @@ pub fn setCountInt(txn: anytype, cat: Ref, pk: u64, prop: usize) !?u64 {
 }
 
 pub fn setContainsInt(txn: anytype, cat: Ref, pk: u64, prop: usize, key: u64) !bool {
-    const r = (try catalog.resolveProp(txn, cat, pk, prop)).?;
+    const r = (try catalog.resolveProp(txn, cat, pk, prop)) orelse return error.NotFound;
     const set_root = try Column.get(txn, r.prop_col, r.row);
     return (try Index.get(txn, set_root, key)) != null;
 }
 
 pub fn setAddInt(txn: *WriteTxn, cat: Ref, pk: u64, prop: usize, key: u64) !Ref {
-    const r = (try catalog.resolveProp(txn, cat, pk, prop)).?;
+    const r = (try catalog.resolveProp(txn, cat, pk, prop)) orelse return error.NotFound;
     const old_root = try Column.get(txn, r.prop_col, r.row);
     if ((try Index.get(txn, old_root, key)) != null) return cat; // already a member, no version bump
     const new_root = try Index.insert(txn, old_root, key, 1);
@@ -98,7 +98,7 @@ pub fn setAddInt(txn: *WriteTxn, cat: Ref, pk: u64, prop: usize, key: u64) !Ref 
 }
 
 pub fn setRemoveInt(txn: *WriteTxn, cat: Ref, pk: u64, prop: usize, key: u64) !Ref {
-    const r = (try catalog.resolveProp(txn, cat, pk, prop)).?;
+    const r = (try catalog.resolveProp(txn, cat, pk, prop)) orelse return error.NotFound;
     const old_root = try Column.get(txn, r.prop_col, r.row);
     if ((try Index.get(txn, old_root, key)) == null) return cat; // not a member, no version bump
     const new_root = try Index.remove(txn, old_root, key);
@@ -113,7 +113,7 @@ pub fn setCollectInt(
     out: *std.ArrayList(u64),
     allocator: std.mem.Allocator,
 ) !void {
-    const r = (try catalog.resolveProp(txn, cat, pk, prop)).?;
+    const r = (try catalog.resolveProp(txn, cat, pk, prop)) orelse return error.NotFound;
     const set_root = try Column.get(txn, r.prop_col, r.row);
     const Sink = struct {
         list: *std.ArrayList(u64),
@@ -144,13 +144,13 @@ pub fn setCountBlob(txn: anytype, cat: Ref, pk: u64, prop: usize) !?u64 {
 }
 
 pub fn setContainsBlob(txn: anytype, cat: Ref, pk: u64, prop: usize, member: []const u8) !bool {
-    const r = (try catalog.resolveProp(txn, cat, pk, prop)).?;
+    const r = (try catalog.resolveProp(txn, cat, pk, prop)) orelse return error.NotFound;
     const set_root = try Column.get(txn, r.prop_col, r.row);
     return (try bindex.get(txn, set_root, member)) != null;
 }
 
 pub fn setAddBlob(txn: *WriteTxn, cat: Ref, pk: u64, prop: usize, member: []const u8) !Ref {
-    const r = (try catalog.resolveProp(txn, cat, pk, prop)).?;
+    const r = (try catalog.resolveProp(txn, cat, pk, prop)) orelse return error.NotFound;
     const old_root = try Column.get(txn, r.prop_col, r.row);
     if ((try bindex.get(txn, old_root, member)) != null) return cat; // already a member, no version bump
     const new_root = try bindex.insert(txn, old_root, member, 1);
@@ -158,7 +158,7 @@ pub fn setAddBlob(txn: *WriteTxn, cat: Ref, pk: u64, prop: usize, member: []cons
 }
 
 pub fn setRemoveBlob(txn: *WriteTxn, cat: Ref, pk: u64, prop: usize, member: []const u8) !Ref {
-    const r = (try catalog.resolveProp(txn, cat, pk, prop)).?;
+    const r = (try catalog.resolveProp(txn, cat, pk, prop)) orelse return error.NotFound;
     const old_root = try Column.get(txn, r.prop_col, r.row);
     if ((try bindex.get(txn, old_root, member)) == null) return cat; // not a member, no version bump
     const new_root = try bindex.remove(txn, old_root, member);
@@ -177,7 +177,7 @@ pub fn setCollectBlob(
     out: *std.ArrayList([]const u8),
     allocator: std.mem.Allocator,
 ) !void {
-    const r = (try catalog.resolveProp(txn, cat, pk, prop)).?;
+    const r = (try catalog.resolveProp(txn, cat, pk, prop)) orelse return error.NotFound;
     const set_root = try Column.get(txn, r.prop_col, r.row);
     const Sink = struct {
         list: *std.ArrayList([]const u8),
@@ -202,7 +202,7 @@ pub fn buildDict(txn: *WriteTxn, entries: []const catalog.DictEntry) !Ref {
 }
 
 pub fn dictGet(txn: anytype, cat: Ref, pk: u64, prop: usize, key: []const u8) !?u64 {
-    const r = (try catalog.resolveProp(txn, cat, pk, prop)).?;
+    const r = (try catalog.resolveProp(txn, cat, pk, prop)) orelse return error.NotFound;
     const dict_root = try Column.get(txn, r.prop_col, r.row);
     return try bindex.get(txn, dict_root, key);
 }
@@ -214,14 +214,14 @@ pub fn dictCount(txn: anytype, cat: Ref, pk: u64, prop: usize) !?u64 {
 }
 
 pub fn dictPut(txn: *WriteTxn, cat: Ref, pk: u64, prop: usize, key: []const u8, val: u64) !Ref {
-    const r = (try catalog.resolveProp(txn, cat, pk, prop)).?;
+    const r = (try catalog.resolveProp(txn, cat, pk, prop)) orelse return error.NotFound;
     const old_root = try Column.get(txn, r.prop_col, r.row);
     const new_root = try bindex.insert(txn, old_root, key, val); // overwrites existing key
     return catalog.replaceCollRoot(txn, cat, r.row, prop, new_root);
 }
 
 pub fn dictRemove(txn: *WriteTxn, cat: Ref, pk: u64, prop: usize, key: []const u8) !Ref {
-    const r = (try catalog.resolveProp(txn, cat, pk, prop)).?;
+    const r = (try catalog.resolveProp(txn, cat, pk, prop)) orelse return error.NotFound;
     const old_root = try Column.get(txn, r.prop_col, r.row);
     if ((try bindex.get(txn, old_root, key)) == null) return cat; // absent, no version bump
     const new_root = try bindex.remove(txn, old_root, key);
@@ -240,7 +240,7 @@ pub fn dictCollect(
     out: *std.ArrayList(catalog.DictEntry),
     allocator: std.mem.Allocator,
 ) !void {
-    const r = (try catalog.resolveProp(txn, cat, pk, prop)).?;
+    const r = (try catalog.resolveProp(txn, cat, pk, prop)) orelse return error.NotFound;
     const dict_root = try Column.get(txn, r.prop_col, r.row);
     const Sink = struct {
         list: *std.ArrayList(catalog.DictEntry),
@@ -265,6 +265,45 @@ fn objTmpPath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const 
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const dlen = try tmp.dir.realPath(testing.io, &path_buf);
     return std.fs.path.join(allocator, &.{ path_buf[0..dlen], name });
+}
+
+test "collection accessors return error.NotFound for an absent pk" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "coll_notfound.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    defer w.deinit();
+    var cat = try catalog.createDefs(&w, &.{
+        .{ .kind = .int },
+        .{ .kind = .list, .elem = .int },
+        .{ .kind = .set, .elem = .int },
+        .{ .kind = .dict },
+        .{ .kind = .set, .elem = .blob },
+    });
+    cat = (try insertTyped(&w, cat, &.{
+        .{ .int = 1 },
+        .{ .list_int = &.{1} },
+        .{ .set_int = &.{1} },
+        .{ .dict_int = &.{} },
+        .{ .set_blob = &.{} },
+    })).cat;
+
+    const missing: u64 = 999;
+    try testing.expectError(error.NotFound, listGetInt(&w, cat, missing, 1, 0));
+    try testing.expectError(error.NotFound, listAppendInt(&w, cat, missing, 1, 7));
+    try testing.expectError(error.NotFound, listSetInt(&w, cat, missing, 1, 0, 7));
+    try testing.expectError(error.NotFound, setContainsInt(&w, cat, missing, 2, 1));
+    try testing.expectError(error.NotFound, setAddInt(&w, cat, missing, 2, 5));
+    try testing.expectError(error.NotFound, setRemoveInt(&w, cat, missing, 2, 1));
+    try testing.expectError(error.NotFound, dictGet(&w, cat, missing, 3, "k"));
+    try testing.expectError(error.NotFound, dictPut(&w, cat, missing, 3, "k", 1));
+    try testing.expectError(error.NotFound, dictRemove(&w, cat, missing, 3, "k"));
+    try testing.expectError(error.NotFound, setContainsBlob(&w, cat, missing, 4, "m"));
+    try testing.expectError(error.NotFound, setAddBlob(&w, cat, missing, 4, "m"));
+    try testing.expectError(error.NotFound, setRemoveBlob(&w, cat, missing, 4, "m"));
 }
 
 test "list of int: insert seeds members and reads back" {

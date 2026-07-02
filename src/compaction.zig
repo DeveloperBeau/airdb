@@ -168,7 +168,9 @@ pub const CompactCursor = struct {
 // relocateRow, so this holds even after earlier relocations in the same run.
 fn rowToOkey(txn: anytype, v: catalog.CatalogView, row: u64) !u64 {
     const pk = try Column.get(txn, v.propColRef(0), row);
-    return (try Index.get(txn, v.pk_index_ref, pk)).?;
+    // A live row whose pk does not resolve means the pk index diverged from the
+    // columns: surface corruption instead of crashing mid-compaction.
+    return (try Index.get(txn, v.pk_index_ref, pk)) orelse error.Corrupt;
 }
 
 // Incrementally pack a type toward dense storage, doing at most `budget`

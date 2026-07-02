@@ -115,7 +115,7 @@ pub fn linkSetCount(txn: anytype, cat: Ref, pk: u64, prop: usize) !?u64 {
 }
 
 pub fn linkSetContains(txn: anytype, cat: Ref, pk: u64, prop: usize, target: u64) !bool {
-    const r = (try catalog.resolveProp(txn, cat, pk, prop)).?;
+    const r = (try catalog.resolveProp(txn, cat, pk, prop)) orelse return error.NotFound;
     const set_root = try Column.get(txn, r.prop_col, r.row);
     return (try Index.get(txn, set_root, target)) != null;
 }
@@ -128,7 +128,7 @@ pub fn linkSetCollect(
     out: *std.ArrayList(u64),
     allocator: std.mem.Allocator,
 ) !void {
-    const r = (try catalog.resolveProp(txn, cat, pk, prop)).?;
+    const r = (try catalog.resolveProp(txn, cat, pk, prop)) orelse return error.NotFound;
     const set_root = try Column.get(txn, r.prop_col, r.row);
     const Sink = struct {
         list: *std.ArrayList(u64),
@@ -143,7 +143,7 @@ pub fn linkSetCollect(
 // Add `target` to the to-many link set of object `pk`; records the backlink.
 // No-op if already a member.
 pub fn linkSetAdd(txn: *WriteTxn, cat: Ref, pk: u64, prop: usize, target: u64) !Ref {
-    const r = (try catalog.resolveProp(txn, cat, pk, prop)).?;
+    const r = (try catalog.resolveProp(txn, cat, pk, prop)) orelse return error.NotFound;
     const row = r.row;
     const old_root = try Column.get(txn, r.prop_col, row);
     if ((try Index.get(txn, old_root, target)) != null) return cat; // already a member
@@ -156,7 +156,7 @@ pub fn linkSetAdd(txn: *WriteTxn, cat: Ref, pk: u64, prop: usize, target: u64) !
 // Remove `target` from the to-many link set of object `pk`; drops the backlink.
 // No-op if not a member.
 pub fn linkSetRemove(txn: *WriteTxn, cat: Ref, pk: u64, prop: usize, target: u64) !Ref {
-    const r = (try catalog.resolveProp(txn, cat, pk, prop)).?;
+    const r = (try catalog.resolveProp(txn, cat, pk, prop)) orelse return error.NotFound;
     const row = r.row;
     const old_root = try Column.get(txn, r.prop_col, row);
     if ((try Index.get(txn, old_root, target)) == null) return cat; // not a member
@@ -196,8 +196,11 @@ pub fn nullifyInboundInCatalog(txn: *WriteTxn, cat: Ref, okey: u64, target_type:
         for (sources.items) |src| {
             const vv = try catalog.loadCatalog(txn, cur);
             const col = vv.propColRef(p);
-            // src is a source object key; resolve to its physical row for column access.
-            const src_row = (try catalog.okeyToRow(txn, cur, src)).?;
+            // src is a source object key; resolve to its physical row for column
+            // access. A backlink entry whose source no longer resolves is stale
+            // (corrupt or already deleted); skip it -- the whole set for okey is
+            // dropped below regardless.
+            const src_row = (try catalog.okeyToRow(txn, cur, src)) orelse continue;
             const new_col = if (kind == .link)
                 try Column.set(txn, col, src_row, 0)
             else blk: {
@@ -235,7 +238,8 @@ pub fn cleanOutboundInCatalog(txn: *WriteTxn, cat: Ref, okey: u64) !Ref {
 
         // Outbound: remove okey's own entries from its targets' backlink sets.
         // okey is an object key; resolve to the physical row to read its columns.
-        const row = (try catalog.okeyToRow(txn, cur, okey)).?;
+        // An unresolvable okey has no readable outbound links to clean.
+        const row = (try catalog.okeyToRow(txn, cur, okey)) orelse return cur;
         if (kind == .link) {
             const vv2 = try catalog.loadCatalog(txn, cur);
             const out_raw = try Column.get(txn, vv2.propColRef(p), row);
@@ -284,6 +288,27 @@ fn objTmpPath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const 
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const dlen = try tmp.dir.realPath(testing.io, &path_buf);
     return std.fs.path.join(allocator, &.{ path_buf[0..dlen], name });
+}
+
+test "link-set accessors return error.NotFound for an absent pk" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "link_notfound.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    defer w.deinit();
+    var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link_set } });
+    cat = (try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .link_set = &.{} } })).cat;
+
+    const missing: u64 = 999;
+    try testing.expectError(error.NotFound, linkSetContains(&w, cat, missing, 1, 0));
+    try testing.expectError(error.NotFound, linkSetAdd(&w, cat, missing, 1, 0));
+    try testing.expectError(error.NotFound, linkSetRemove(&w, cat, missing, 1, 0));
+    var out = std.ArrayList(u64).empty;
+    defer out.deinit(testing.allocator);
+    try testing.expectError(error.NotFound, linkSetCollect(&w, cat, missing, 1, &out, testing.allocator));
 }
 
 test "insert stores a link and records the backlink" {

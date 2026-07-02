@@ -292,7 +292,7 @@ pub fn deleteNullifyX(txn: *WriteTxn, dir: Ref, type_id: u16, pk: u64, expected_
     var buf: [256]u64 = undefined;
     const ver = (try Objects.getByPk(txn, cat0, pk, buf[0..pc])) orelse return .not_found;
     if (ver != expected_version) return .{ .conflict = .{ .current_version = ver } };
-    const okey = (try catalog.pkToOkey(txn, cat0, pk)).?;
+    const okey = (try catalog.pkToOkey(txn, cat0, pk)) orelse return .not_found;
 
     // BLOCK check (top-level only): refuse if any block-rule link points at it.
     const tc = try typeCount(txn, dir);

@@ -327,7 +327,9 @@ pub fn sortByPropAsc(
     const pairs = try allocator.alloc(SortPair, okeys.len);
     defer allocator.free(pairs);
     for (okeys, 0..) |k, i| {
-        const row = (try catalog.okeyToRow(txn, cat, k)).?;
+        // A caller-supplied okey that no longer resolves (stale or deleted) is
+        // an input error, not a crash.
+        const row = (try catalog.okeyToRow(txn, cat, k)) orelse return error.NotFound;
         pairs[i] = .{ .val = try Column.get(txn, col, row), .key = k };
     }
     std.mem.sort(SortPair, pairs, {}, struct {
