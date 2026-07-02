@@ -82,6 +82,19 @@ pub fn compactType(txn: *WriteTxn, cat: Ref) !Ref {
         new_row += 1;
     }
 
+    // Free the replaced structures: the old property/version/live columns and
+    // the old key->row index are fully copied out above and unreferenced by the
+    // new catalog. Without this a full compact of a large type left its entire
+    // old column set as permanently unreclaimable garbage. (The pk index,
+    // backlinks, and value indexes are carried over, not rebuilt.)
+    {
+        var j: usize = 0;
+        while (j < pc) : (j += 1) try Column.freeTree(txn, old_prop[j]);
+    }
+    try Column.freeTree(txn, old_ver);
+    try Column.freeTree(txn, old_live);
+    try Index.freeTree(txn, old_keyrow);
+
     s.next_row = new_row;
     return s.write(txn);
 }
@@ -724,6 +737,38 @@ test "compactType packs live rows and drops dead ones" {
             try testing.expectEqual(pk * 10, out[1]);
         }
     }
+}
+
+test "compactType frees the replaced column set" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try cmpTmpPath(testing.allocator, &tmp, "packfree.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+
+    // Commit a type with rows and holes so compaction has real work.
+    {
+        var w = try db.beginWrite();
+        var cat = try catalog.create(&w, 2);
+        var pk: u64 = 0;
+        while (pk < 100) : (pk += 1) cat = (try objects.insert(&w, cat, &.{ pk, pk * 10 })).cat;
+        pk = 0;
+        while (pk < 100) : (pk += 5) {
+            var out: [2]u64 = undefined;
+            const ver = (try objects.getByPk(&w, cat, pk, &out)).?;
+            cat = (try objects.delete(&w, cat, pk, ver)).ok;
+        }
+        w.setRoot(cat);
+        _ = try w.commit();
+    }
+
+    // A full compact must record the old committed columns and key->row index
+    // as in-flight frees rather than leaving them as unreclaimable garbage.
+    var w = try db.beginWrite();
+    defer w.deinit();
+    _ = try compactType(&w, w.new_root);
+    try testing.expect(w.in_flight_frees.items.len > 0);
 }
 
 test "object keys and links survive compaction" {

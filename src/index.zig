@@ -387,6 +387,27 @@ pub fn remove(txn: *WriteTxn, root: Ref, key: u64) !Ref {
     return (try removeInto(txn, root, key, 0)).ref;
 }
 
+/// Recursively free every node of the tree rooted at node_ref so the space
+/// becomes reclaimable. Only the NODES are freed; for trees whose leaf values
+/// are refs to other structures (e.g. value-index inner sets) the caller owns
+/// those separately.
+pub fn freeTree(txn: *WriteTxn, node_ref: Ref) !void {
+    return freeTreeAt(txn, node_ref, 0);
+}
+
+fn freeTreeAt(txn: *WriteTxn, node_ref: Ref, depth: usize) !void {
+    if (depth >= max_depth) return error.Corrupt;
+    const bytes = try derefNode(txn, node_ref);
+    if (bytes[0] == kind_leaf) {
+        try txn.free(node_ref, leaf_node_size);
+        return;
+    }
+    const v = try parseInner(bytes);
+    var i: usize = 0;
+    while (i < v.child_count) : (i += 1) try freeTreeAt(txn, v.childRef(i), depth + 1);
+    try txn.free(node_ref, inner_node_size);
+}
+
 /// Return the number of keys in the tree rooted at root. A single-node read:
 /// leaves know their own count and inner nodes store per-child subtree counts.
 pub fn count(txn: anytype, root: Ref) !u64 {

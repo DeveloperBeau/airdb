@@ -211,7 +211,7 @@ pub fn set(txn: *WriteTxn, root: Ref, index: u64, value: u64) !Ref {
 
 /// Recursively free every node in the subtree rooted at node_ref. Leaves and inner
 /// nodes are freed at their respective on-disk sizes so the space becomes reclaimable.
-fn freeTree(txn: *WriteTxn, node_ref: Ref) !void {
+pub fn freeTree(txn: *WriteTxn, node_ref: Ref) !void {
     return freeTreeAt(txn, node_ref, 0);
 }
 

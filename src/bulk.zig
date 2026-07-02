@@ -314,6 +314,14 @@ pub fn indexAppendRun(txn: *WriteTxn, root: Ref, keys: []const u64, vals: []cons
 
     const result = level.items[0].ref;
     level.deinit(al);
+
+    // 5. Free the replaced right-edge nodes: the old rightmost leaf and every
+    //    inner node on the old rightmost path were rebuilt above and are no
+    //    longer referenced by the new tree. Committed nodes route to deferred
+    //    (MVCC-safe) reclaim; txn-private ones become immediately reusable.
+    try txn.free(leaf_ref, inode.leaf_node_size);
+    for (path_refs.items) |old_ref| try txn.free(old_ref, inode.inner_node_size);
+
     return result;
 }
 
@@ -407,6 +415,12 @@ pub fn columnAppendRun(txn: *WriteTxn, root: Ref, values: []const u64) !Ref {
 
     const result = level.items[0].ref;
     level.deinit(al);
+
+    // 5. Free the replaced right-edge nodes (old rightmost leaf + old spine),
+    //    exactly as indexAppendRun does: they are unreferenced by the new tree.
+    try txn.free(leaf_ref, cnode.leaf_node_size);
+    for (path_refs.items) |old_ref| try txn.free(old_ref, cnode.inner_node_size);
+
     return result;
 }
 
@@ -511,6 +525,21 @@ pub fn bulkImport(
     }
 
     // --- All validation passed; build the tree roots bottom-up. ---
+
+    // The type is empty, but its creation pre-allocated empty columns and
+    // indexes that the bulk-built roots replace; free them so the import
+    // leaves no orphan nodes behind.
+    {
+        var p: usize = 0;
+        while (p < prop_count) : (p += 1) {
+            try Column.freeTree(txn, s.props[p].col);
+            if (s.props[p].indexed) try Index.freeTree(txn, s.props[p].value_index);
+        }
+    }
+    try Column.freeTree(txn, s.version_col_ref);
+    try Column.freeTree(txn, s.live_col_ref);
+    try Index.freeTree(txn, s.pk_index_ref);
+    try Index.freeTree(txn, s.keyrow_index_ref);
 
     // Property columns: gather each property's values in sorted-row order.
     {
@@ -751,6 +780,33 @@ fn bulkTmpPath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const dlen = try tmp.dir.realPath(testing.io, &path_buf);
     return std.fs.path.join(allocator, &.{ path_buf[0..dlen], name });
+}
+
+test "bulk append frees the replaced right-edge nodes" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try bulkTmpPath(testing.allocator, &tmp, "bulkappend_free.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+
+    // Commit a populated type so the old right edge is committed nodes.
+    {
+        var w = try db.beginWrite();
+        var cat = try catalog.create(&w, 2);
+        var pk: u64 = 0;
+        while (pk < 200) : (pk += 1) cat = (try objects.insert(&w, cat, &.{ pk, pk })).cat;
+        w.setRoot(cat);
+        _ = try w.commit();
+    }
+
+    // A qualifying append must record the replaced committed spine as
+    // in-flight frees (deferred, MVCC-safe reclaim) instead of leaking it.
+    var w = try db.beginWrite();
+    defer w.deinit();
+    const rows = [_][]const u64{ &.{ 1000, 1 }, &.{ 1001, 2 } };
+    _ = try bulkAppend(&w, w.new_root, &rows);
+    try testing.expect(w.in_flight_frees.items.len > 0);
 }
 
 fn checkColumnSize(w: *WriteTxn, n: usize) !void {
