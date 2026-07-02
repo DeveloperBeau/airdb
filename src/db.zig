@@ -85,6 +85,11 @@ pub const Db = struct {
     /// `compactStep` calls; null between runs (and reset on any churn that moves
     /// the type's live_count/next_row). See `compaction.compactStep`.
     compact_cursor: ?compaction.CompactCursor = null,
+    /// Set when recovery could not use the primary commit slot (its checksum or
+    /// the header's was bad) and fell back to the other slot -- i.e. the database
+    /// silently resumed from the previous version. Surfaced via metrics() so
+    /// callers can log/alert on it; never set on a clean open.
+    recovered_fallback: bool = false,
 
     /// Measurement-only counters accumulated since open. Updated by commit; never
     /// affect behavior. fl_encode_ns is the total nanoseconds spent encoding the
@@ -240,25 +245,33 @@ pub const Db = struct {
 
             // Try the primary slot first (normal path and correct crash-recovery path).
             // Fall back to the other slot only if the primary checksum is bad, which
-            // indicates a crash mid-slot-write into the primary region itself.
-            return Slot.decode(self.store.map[primary_off..][0..Slot.size]) catch
-                Slot.decode(self.store.map[other_off..][0..Slot.size]) catch
-                return error.Corrupt;
+            // indicates a crash mid-slot-write into the primary region itself. The
+            // fallback silently resumes from the previous version, so it is recorded
+            // on the Db and surfaced via metrics().
+            return Slot.decode(self.store.map[primary_off..][0..Slot.size]) catch {
+                const s = Slot.decode(self.store.map[other_off..][0..Slot.size]) catch return error.Corrupt;
+                self.recovered_fallback = true;
+                return s;
+            };
         } else {
             // Header checksum failed: the authoritative active_slot pointer is unreadable,
             // so fall back to the highest valid-version slot. This last-resort heuristic is
-            // used ONLY when the header itself is corrupt.
+            // used ONLY when the header itself is corrupt, and is likewise surfaced.
             const maybe_a: ?Slot = Slot.decode(self.store.map[slot_a_off..][0..Slot.size]) catch null;
             const maybe_b: ?Slot = Slot.decode(self.store.map[slot_b_off..][0..Slot.size]) catch null;
-            if (maybe_a != null and maybe_b != null) {
-                return if (maybe_a.?.version >= maybe_b.?.version) maybe_a.? else maybe_b.?;
-            } else if (maybe_a != null) {
-                return maybe_a.?;
-            } else if (maybe_b != null) {
-                return maybe_b.?;
-            } else {
-                return error.Corrupt;
-            }
+            const chosen: Slot = blk: {
+                if (maybe_a != null and maybe_b != null) {
+                    break :blk if (maybe_a.?.version >= maybe_b.?.version) maybe_a.? else maybe_b.?;
+                } else if (maybe_a != null) {
+                    break :blk maybe_a.?;
+                } else if (maybe_b != null) {
+                    break :blk maybe_b.?;
+                } else {
+                    return error.Corrupt;
+                }
+            };
+            self.recovered_fallback = true;
+            return chosen;
         }
     }
 
@@ -595,6 +608,9 @@ pub const Db = struct {
         fl_clone_ns: u64,
         setlength_ns: u64,
         setlength_calls: u64,
+        /// True when open had to fall back past a corrupt primary slot or header
+        /// and resumed from the previous version. Worth logging/alerting on.
+        recovered_fallback: bool,
     };
 
     pub fn metrics(self: *Db) Metrics {
@@ -613,6 +629,7 @@ pub const Db = struct {
             .fl_clone_ns = self.fl_clone_ns,
             .setlength_ns = self.store.setlength_ns,
             .setlength_calls = self.store.setlength_calls,
+            .recovered_fallback = self.recovered_fallback,
         };
     }
 
@@ -782,6 +799,34 @@ test "recovery follows header active_slot pointer, not max version" {
     {
         var db = try Db.open(testing.allocator, path);
         defer db.deinit();
+        try testing.expectEqual(@as(u64, 1), db.active_version);
+    }
+}
+
+test "falling back past a corrupt primary slot is surfaced in metrics" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "fallback.airdb");
+    defer testing.allocator.free(path);
+    {
+        var db = try Db.create(testing.allocator, path);
+        defer db.deinit();
+        var w = try db.beginWrite();
+        const a = try w.alloc(8);
+        @memcpy(a.bytes, "VERSION2");
+        w.setRoot(a.ref);
+        _ = try w.commit();
+        try testing.expect(!db.metrics().recovered_fallback); // clean session
+        // Corrupt the PRIMARY (active) slot's checksum region on disk.
+        const primary_off: usize = if (db.store.header.active_slot == 0) slot_a_off else slot_b_off;
+        db.store.map[primary_off + 4] ^= 0xFF;
+        try db.store.syncer.flush(db.store.file);
+    }
+    {
+        var db = try Db.open(testing.allocator, path);
+        defer db.deinit();
+        // Recovery used the other slot (the previous version) and says so.
+        try testing.expect(db.metrics().recovered_fallback);
         try testing.expectEqual(@as(u64, 1), db.active_version);
     }
 }
