@@ -258,11 +258,28 @@ pub const CatalogView = struct {
 // Deref the catalog at cat, read prop_count, then deref the full node and parse
 // all fixed fields. Returns a CatalogView whose bytes slice is valid for the
 // lifetime of the transaction.
+//
+// All per-property enum bytes (kind, elem kind, deletion rule) are validated
+// here, ONCE, so the CatalogView accessors can stay infallible. These bytes
+// come straight from the mapped file: a corrupted value must surface as
+// error.Corrupt, never as a panic (ReleaseSafe) or undefined behavior
+// (ReleaseFast) from an unchecked @enumFromInt.
 pub fn loadCatalog(txn: anytype, cat: Ref) !CatalogView {
     const pc_bytes = try txn.deref(cat, 2);
     const prop_count = std.mem.readInt(u16, pc_bytes[0..2], .little);
-    std.debug.assert(prop_count <= max_prop_count);
+    if (prop_count > max_prop_count) return error.Corrupt;
     const bytes = try txn.deref(cat, catalogSize(prop_count));
+    {
+        const ko = kindsOffset(prop_count);
+        const eo = elemsOffset(prop_count);
+        const ro = rulesOffset(prop_count);
+        var p: usize = 0;
+        while (p < prop_count) : (p += 1) {
+            if (std.enums.fromInt(PropKind, bytes[ko + p]) == null) return error.Corrupt;
+            if (std.enums.fromInt(ElemKind, bytes[eo + p]) == null) return error.Corrupt;
+            if (std.enums.fromInt(DeletionRule, bytes[ro + p]) == null) return error.Corrupt;
+        }
+    }
     return CatalogView{
         .prop_count = prop_count,
         .next_row = std.mem.readInt(u64, bytes[off_next_row..][0..8], .little),
@@ -470,6 +487,32 @@ test "create allocates an empty type and load reads it back" {
     try testing.expectEqual(@as(PropCount, 3), try propCount(&w, cat));
     try testing.expectEqual(@as(u64, 0), try liveCount(&w, cat));
     w.deinit();
+}
+
+test "loadCatalog rejects corrupt disk values instead of panicking" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "corruptcat.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    defer w.deinit();
+    const cat = try create(&w, 2);
+    _ = try loadCatalog(&w, cat); // clean before corruption
+
+    // Corrupt a kind byte (out-of-range enum value) directly in the mapping.
+    const cat_off: usize = @intCast(cat);
+    const kind_byte_off = cat_off + off_prop_cols + 2 * 8; // kindsOffset(2), prop 0
+    const saved_kind = db.store.map[kind_byte_off];
+    db.store.map[kind_byte_off] = 200;
+    try testing.expectError(error.Corrupt, loadCatalog(&w, cat));
+    db.store.map[kind_byte_off] = saved_kind;
+    _ = try loadCatalog(&w, cat); // restored
+
+    // Corrupt the prop count to an implausible value.
+    std.mem.writeInt(u16, db.store.map[cat_off..][0..2], 6000, .little);
+    try testing.expectError(error.Corrupt, loadCatalog(&w, cat));
 }
 
 test "createTyped records property kinds; create defaults to all int" {
