@@ -812,6 +812,31 @@ test "commit then reopen sees the committed root" {
     }
 }
 
+test "ending a read transaction twice does not release another reader's pin" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "doubleend.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    {
+        var w = try db.beginWrite();
+        const a = try w.alloc(8);
+        @memcpy(a.bytes, "PINDATA_");
+        w.setRoot(a.ref);
+        _ = try w.commit();
+    }
+    var r1 = try db.beginRead();
+    var r2 = try db.beginRead(); // same version, pin count 2
+    const v = r1.version;
+    r1.end();
+    r1.end(); // must be a no-op, not a second decrement
+    try testing.expectEqual(@as(u32, 1), db.pins.get(v).?); // r2 still pinned
+    try testing.expectEqual(v, db.horizon());
+    r2.end();
+    try testing.expectEqual(db.active_version, db.horizon());
+}
+
 test "version horizon tracks the oldest live reader" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
