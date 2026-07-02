@@ -64,83 +64,38 @@ fn removeValueIndex(txn: *WriteTxn, cat: Ref, p: usize, value: u64, okey: u64) !
 // values.len must equal the prop_count stored in the catalog.
 // Returns error.DuplicateKey if values[0] (the primary key) already exists.
 pub fn insert(txn: *WriteTxn, cat: Ref, values: []const u64) !struct { cat: Ref, row: u64 } {
-    const v = try loadCatalog(txn, cat);
-    std.debug.assert(values.len == v.prop_count);
-
-    // Capture all refs from the view into locals before any mutation so the
-    // bytes slice backing CatalogView cannot be invalidated by file growth.
-    const old_keyrow = v.keyrow_index_ref;
-    const old_next_key = v.next_key;
-    const old_pk_index_ref = v.pk_index_ref;
-    const old_version_col_ref = v.version_col_ref;
-    const old_live_col_ref = v.live_col_ref;
-    var old_prop_refs: [max_prop_count]Ref = undefined;
-    var old_kinds: [max_prop_count]PropKind = undefined;
-    var old_elems: [max_prop_count]ElemKind = undefined;
-    var old_backlinks: [max_prop_count]Ref = undefined;
-    var old_targets: [max_prop_count]u16 = undefined;
-    var old_rules: [max_prop_count]catalog.DeletionRule = undefined;
-    var old_vidx: [max_prop_count]Ref = undefined;
-    var old_idxf: [max_prop_count]bool = undefined;
-    {
-        var j: usize = 0;
-        while (j < v.prop_count) : (j += 1) {
-            old_prop_refs[j] = v.propColRef(j);
-            old_kinds[j] = v.kind(j);
-            old_elems[j] = v.elemKind(j);
-            old_backlinks[j] = v.backlinkRef(j);
-            old_targets[j] = v.linkTarget(j);
-            old_rules[j] = v.delRule(j);
-            old_vidx[j] = v.valueIndexRef(j);
-            old_idxf[j] = v.indexed(j);
-        }
-    }
-    const prop_count = v.prop_count;
-    const row = v.next_row;
-    const okey = old_next_key;
+    var s = try catalog.CatalogSnapshot.load(txn, cat);
+    std.debug.assert(values.len == s.prop_count);
+    const prop_count = s.prop_count;
+    const row = s.next_row;
+    const okey = s.next_key;
 
     const pk = values[0];
-    if ((try Index.get(txn, old_pk_index_ref, pk)) != null) return error.DuplicateKey;
+    if ((try Index.get(txn, s.pk_index_ref, pk)) != null) return error.DuplicateKey;
 
     // COW-append to each property column.
-    var new_prop_refs: [max_prop_count]Ref = undefined;
     {
         var i: usize = 0;
         while (i < prop_count) : (i += 1) {
-            new_prop_refs[i] = try Column.append(txn, old_prop_refs[i], values[i]);
+            s.props[i].col = try Column.append(txn, s.props[i].col, values[i]);
         }
     }
-    const new_version_col = try Column.append(txn, old_version_col_ref, txn.new_version);
-    const new_live_col = try Column.append(txn, old_live_col_ref, 1);
+    s.version_col_ref = try Column.append(txn, s.version_col_ref, txn.new_version);
+    s.live_col_ref = try Column.append(txn, s.live_col_ref, 1);
     // pk index maps pk -> okey; keyrow index maps okey -> physical row.
-    const new_index = try Index.insert(txn, old_pk_index_ref, pk, okey);
-    const new_keyrow = try Index.insert(txn, old_keyrow, okey, row);
+    s.pk_index_ref = try Index.insert(txn, s.pk_index_ref, pk, okey);
+    s.keyrow_index_ref = try Index.insert(txn, s.keyrow_index_ref, okey, row);
+    s.next_row = row + 1;
+    s.next_key = okey + 1;
 
-    const new_cat = try writeCatalog(
-        txn,
-        prop_count,
-        row + 1,
-        new_keyrow,
-        old_next_key + 1,
-        new_index,
-        new_version_col,
-        new_live_col,
-        new_prop_refs[0..prop_count],
-        old_kinds[0..prop_count],
-        old_elems[0..prop_count],
-        old_backlinks[0..prop_count],
-        old_targets[0..prop_count],
-        old_rules[0..prop_count],
-        old_vidx[0..prop_count],
-        old_idxf[0..prop_count],
-    );
+    const new_cat = try s.write(txn);
     // Maintain the value index for each indexed property: add this row's okey to
     // the inner set at its stored value, in the same transaction as the row.
     var cat_out = new_cat;
     {
         var p: usize = 0;
         while (p < prop_count) : (p += 1) {
-            if (old_idxf[p]) cat_out = try addValueIndex(txn, cat_out, p, values[p], okey);
+            if (s.props[p].indexed) cat_out = try addValueIndex(txn, cat_out, p, values[p], okey);
         }
     }
     return .{ .cat = cat_out, .row = okey };
@@ -160,43 +115,16 @@ pub const DeleteResult = union(enum) {
 };
 
 pub fn update(txn: *WriteTxn, cat: Ref, pk: u64, values: []const u64, expected_version: u64) !UpdateResult {
-    const v = try loadCatalog(txn, cat);
-    std.debug.assert(values.len == v.prop_count);
+    var s = try catalog.CatalogSnapshot.load(txn, cat);
+    std.debug.assert(values.len == s.prop_count);
     std.debug.assert(values[0] == pk); // pk is identity, must not change
-    const okey = (try Index.get(txn, v.pk_index_ref, pk)) orelse return .not_found;
+    const okey = (try Index.get(txn, s.pk_index_ref, pk)) orelse return .not_found;
     // The pk index resolved but the key->row index did not: treat the divergence
     // as absent rather than crashing on corrupt data.
-    const row = (try catalog.okeyToRow(txn, cat, okey)) orelse return .not_found;
-    const cur = try Column.get(txn, v.version_col_ref, row);
+    const row = (try Index.get(txn, s.keyrow_index_ref, okey)) orelse return .not_found;
+    const cur = try Column.get(txn, s.version_col_ref, row);
     if (cur != expected_version) return .{ .conflict = .{ .current_version = cur } };
-
-    // Capture refs into locals before mutating (avoid relying on the catalog deref slice).
-    const pc = v.prop_count;
-    const idx_ref = v.pk_index_ref;
-    const live_ref = v.live_col_ref;
-    const next_row = v.next_row;
-    var prop_refs: [256]Ref = undefined;
-    var kinds: [256]PropKind = undefined;
-    var elems_buf: [max_prop_count]ElemKind = undefined;
-    var bl_buf: [max_prop_count]Ref = undefined;
-    var targets_buf: [max_prop_count]u16 = undefined;
-    var rules_buf: [max_prop_count]catalog.DeletionRule = undefined;
-    var vidx_buf: [max_prop_count]Ref = undefined;
-    var idxf_buf: [max_prop_count]bool = undefined;
-    {
-        var j: usize = 0;
-        while (j < pc) : (j += 1) {
-            prop_refs[j] = v.propColRef(j);
-            kinds[j] = v.kind(j);
-            elems_buf[j] = v.elemKind(j);
-            bl_buf[j] = v.backlinkRef(j);
-            targets_buf[j] = v.linkTarget(j);
-            rules_buf[j] = v.delRule(j);
-            vidx_buf[j] = v.valueIndexRef(j);
-            idxf_buf[j] = v.indexed(j);
-        }
-    }
-    var ver_ref = v.version_col_ref;
+    const pc = s.prop_count;
 
     // Snapshot the current value of each indexed property before overwriting the
     // column, so the value index can move the okey from its old to its new value.
@@ -204,7 +132,7 @@ pub fn update(txn: *WriteTxn, cat: Ref, pk: u64, values: []const u64, expected_v
     {
         var j: usize = 0;
         while (j < pc) : (j += 1) {
-            if (idxf_buf[j]) old_vals[j] = try Column.get(txn, prop_refs[j], row);
+            if (s.props[j].indexed) old_vals[j] = try Column.get(txn, s.props[j].col, row);
         }
     }
 
@@ -213,18 +141,18 @@ pub fn update(txn: *WriteTxn, cat: Ref, pk: u64, values: []const u64, expected_v
     // update on a wide type no longer rewrites every property column.
     var i: usize = 0;
     while (i < pc) : (i += 1) {
-        const cur_val = try Column.get(txn, prop_refs[i], row);
-        if (cur_val != values[i]) prop_refs[i] = try Column.set(txn, prop_refs[i], row, values[i]);
+        const cur_val = try Column.get(txn, s.props[i].col, row);
+        if (cur_val != values[i]) s.props[i].col = try Column.set(txn, s.props[i].col, row, values[i]);
     }
-    ver_ref = try Column.set(txn, ver_ref, row, txn.new_version);
+    s.version_col_ref = try Column.set(txn, s.version_col_ref, row, txn.new_version);
 
-    const new_cat = try writeCatalog(txn, pc, next_row, v.keyrow_index_ref, v.next_key, idx_ref, ver_ref, live_ref, prop_refs[0..pc], kinds[0..pc], elems_buf[0..pc], bl_buf[0..pc], targets_buf[0..pc], rules_buf[0..pc], vidx_buf[0..pc], idxf_buf[0..pc]);
+    const new_cat = try s.write(txn);
     // Re-point the value index for any indexed property whose value changed.
     var cat_out = new_cat;
     {
         var p: usize = 0;
         while (p < pc) : (p += 1) {
-            if (idxf_buf[p] and old_vals[p] != values[p]) {
+            if (s.props[p].indexed and old_vals[p] != values[p]) {
                 cat_out = try removeValueIndex(txn, cat_out, p, old_vals[p], okey);
                 cat_out = try addValueIndex(txn, cat_out, p, values[p], okey);
             }
@@ -234,68 +162,40 @@ pub fn update(txn: *WriteTxn, cat: Ref, pk: u64, values: []const u64, expected_v
 }
 
 pub fn delete(txn: *WriteTxn, cat: Ref, pk: u64, expected_version: u64) !DeleteResult {
-    const v = try loadCatalog(txn, cat);
-    const okey = (try Index.get(txn, v.pk_index_ref, pk)) orelse return .not_found;
-    const row = (try catalog.okeyToRow(txn, cat, okey)) orelse return .not_found;
-    const cur = try Column.get(txn, v.version_col_ref, row);
+    var s = try catalog.CatalogSnapshot.load(txn, cat);
+    const okey = (try Index.get(txn, s.pk_index_ref, pk)) orelse return .not_found;
+    const row = (try Index.get(txn, s.keyrow_index_ref, okey)) orelse return .not_found;
+    const cur = try Column.get(txn, s.version_col_ref, row);
     if (cur != expected_version) return .{ .conflict = .{ .current_version = cur } };
-
-    // Capture refs into locals before mutating.
-    const pc = v.prop_count;
-    const next_row = v.next_row;
-    var prop_refs: [256]Ref = undefined;
-    var kinds: [256]PropKind = undefined;
-    var elems_buf: [max_prop_count]ElemKind = undefined;
-    var bl_buf: [max_prop_count]Ref = undefined;
-    var targets_buf: [max_prop_count]u16 = undefined;
-    var rules_buf: [max_prop_count]catalog.DeletionRule = undefined;
-    var vidx_buf: [max_prop_count]Ref = undefined;
-    var idxf_buf: [max_prop_count]bool = undefined;
-    {
-        var j: usize = 0;
-        while (j < pc) : (j += 1) {
-            prop_refs[j] = v.propColRef(j);
-            kinds[j] = v.kind(j);
-            elems_buf[j] = v.elemKind(j);
-            bl_buf[j] = v.backlinkRef(j);
-            targets_buf[j] = v.linkTarget(j);
-            rules_buf[j] = v.delRule(j);
-            vidx_buf[j] = v.valueIndexRef(j);
-            idxf_buf[j] = v.indexed(j);
-        }
-    }
-    var live_ref = v.live_col_ref;
-    var ver_ref = v.version_col_ref;
-    var idx_ref = v.pk_index_ref;
-    var keyrow_ref = v.keyrow_index_ref;
+    const pc = s.prop_count;
 
     // Read the value of each indexed property while the row is still readable,
     // so its okey can be dropped from the value index. Property columns are not
-    // mutated by delete, so prop_refs still address the row's current values.
+    // mutated by delete, so the snapshot's cols still address the current values.
     var old_vals: [max_prop_count]u64 = undefined;
     {
         var j: usize = 0;
         while (j < pc) : (j += 1) {
-            if (idxf_buf[j]) old_vals[j] = try Column.get(txn, prop_refs[j], row);
+            if (s.props[j].indexed) old_vals[j] = try Column.get(txn, s.props[j].col, row);
         }
     }
 
-    live_ref = try Column.set(txn, live_ref, row, 0); // tombstone
-    ver_ref = try Column.set(txn, ver_ref, row, txn.new_version); // bump version stamp
-    idx_ref = try Index.remove(txn, idx_ref, pk); // remove pk from the index
+    s.live_col_ref = try Column.set(txn, s.live_col_ref, row, 0); // tombstone
+    s.version_col_ref = try Column.set(txn, s.version_col_ref, row, txn.new_version); // bump version stamp
+    s.pk_index_ref = try Index.remove(txn, s.pk_index_ref, pk); // remove pk from the index
     // Drop the object key from the key->row index. Copy-on-write keeps the old
     // index version intact for any reader pinned to the prior snapshot, so this
     // is MVCC-safe; it prevents a stale key from aliasing a row a later
     // relocation reuses.
-    keyrow_ref = try Index.remove(txn, keyrow_ref, okey);
+    s.keyrow_index_ref = try Index.remove(txn, s.keyrow_index_ref, okey);
 
-    const new_cat = try writeCatalog(txn, pc, next_row, keyrow_ref, v.next_key, idx_ref, ver_ref, live_ref, prop_refs[0..pc], kinds[0..pc], elems_buf[0..pc], bl_buf[0..pc], targets_buf[0..pc], rules_buf[0..pc], vidx_buf[0..pc], idxf_buf[0..pc]);
+    const new_cat = try s.write(txn);
     // Drop this row's okey from the value index for every indexed property.
     var cat_out = new_cat;
     {
         var p: usize = 0;
         while (p < pc) : (p += 1) {
-            if (idxf_buf[p]) cat_out = try removeValueIndex(txn, cat_out, p, old_vals[p], okey);
+            if (s.props[p].indexed) cat_out = try removeValueIndex(txn, cat_out, p, old_vals[p], okey);
         }
     }
     return .{ .ok = cat_out };

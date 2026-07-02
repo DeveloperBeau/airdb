@@ -11,73 +11,26 @@ const max_prop_count: usize = 256;
 // slot), updating the key->row index so the key and all links stay valid. Does
 // not shrink columns. Returns the new catalog ref.
 pub fn relocateRow(txn: *WriteTxn, cat: Ref, okey: u64, new_row: u64) !Ref {
-    const v = try catalog.loadCatalog(txn, cat);
-    const old_row = (try Index.get(txn, v.keyrow_index_ref, okey)) orelse return cat;
+    var s = try catalog.CatalogSnapshot.load(txn, cat);
+    const old_row = (try Index.get(txn, s.keyrow_index_ref, okey)) orelse return cat;
     if (old_row == new_row) return cat;
     // Bijection / safety guards.
-    std.debug.assert((try Column.get(txn, v.live_col_ref, old_row)) == 1);
-    std.debug.assert((try Column.get(txn, v.live_col_ref, new_row)) == 0);
+    std.debug.assert((try Column.get(txn, s.live_col_ref, old_row)) == 1);
+    std.debug.assert((try Column.get(txn, s.live_col_ref, new_row)) == 0);
 
-    // Capture all view-backed values into locals before the first Column.set,
-    // since growing the file can invalidate the bytes backing CatalogView.
-    const pc = v.prop_count;
-    const next_row = v.next_row;
-    const next_key = v.next_key;
-    const idx_ref = v.pk_index_ref;
-    var keyrow = v.keyrow_index_ref;
-    var ver_ref = v.version_col_ref;
-    var live_ref = v.live_col_ref;
-    var prop_refs: [max_prop_count]Ref = undefined;
-    var kinds: [max_prop_count]catalog.PropKind = undefined;
-    var elems: [max_prop_count]catalog.ElemKind = undefined;
-    var bl: [max_prop_count]Ref = undefined;
-    var targets: [max_prop_count]u16 = undefined;
-    var rules: [max_prop_count]catalog.DeletionRule = undefined;
-    var vidx: [max_prop_count]Ref = undefined;
-    var idxf: [max_prop_count]bool = undefined;
-    {
-        var j: usize = 0;
-        while (j < pc) : (j += 1) {
-            prop_refs[j] = v.propColRef(j);
-            kinds[j] = v.kind(j);
-            elems[j] = v.elemKind(j);
-            bl[j] = v.backlinkRef(j);
-            targets[j] = v.linkTarget(j);
-            rules[j] = v.delRule(j);
-            vidx[j] = v.valueIndexRef(j);
-            idxf[j] = v.indexed(j);
-        }
-    }
     // Copy each property cell + the version cell from old_row to new_row.
     var i: usize = 0;
-    while (i < pc) : (i += 1) {
-        const cell = try Column.get(txn, prop_refs[i], old_row);
-        prop_refs[i] = try Column.set(txn, prop_refs[i], new_row, cell);
+    while (i < s.prop_count) : (i += 1) {
+        const cell = try Column.get(txn, s.props[i].col, old_row);
+        s.props[i].col = try Column.set(txn, s.props[i].col, new_row, cell);
     }
-    const oldver = try Column.get(txn, ver_ref, old_row);
-    ver_ref = try Column.set(txn, ver_ref, new_row, oldver);
-    live_ref = try Column.set(txn, live_ref, new_row, 1);
-    live_ref = try Column.set(txn, live_ref, old_row, 0);
-    keyrow = try Index.insert(txn, keyrow, okey, new_row);
+    const oldver = try Column.get(txn, s.version_col_ref, old_row);
+    s.version_col_ref = try Column.set(txn, s.version_col_ref, new_row, oldver);
+    s.live_col_ref = try Column.set(txn, s.live_col_ref, new_row, 1);
+    s.live_col_ref = try Column.set(txn, s.live_col_ref, old_row, 0);
+    s.keyrow_index_ref = try Index.insert(txn, s.keyrow_index_ref, okey, new_row);
 
-    return catalog.writeCatalog(
-        txn,
-        pc,
-        next_row,
-        keyrow,
-        next_key,
-        idx_ref,
-        ver_ref,
-        live_ref,
-        prop_refs[0..pc],
-        kinds[0..pc],
-        elems[0..pc],
-        bl[0..pc],
-        targets[0..pc],
-        rules[0..pc],
-        vidx[0..pc],
-        idxf[0..pc],
-    );
+    return s.write(txn);
 }
 
 // ---------------------------------------------------------------------------

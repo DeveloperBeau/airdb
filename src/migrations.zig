@@ -25,83 +25,37 @@ const max_prop_count = catalog.max_prop_count;
 // `default_value` for every existing row (live or tombstoned). For a link or
 // link_set property a fresh backlink index is created. Returns the new catalog.
 pub fn addProperty(txn: *WriteTxn, cat: Ref, def: PropDef, default_value: u64) !Ref {
-    const v = try catalog.loadCatalog(txn, cat);
-    const pc = v.prop_count;
+    var s = try catalog.CatalogSnapshot.load(txn, cat);
+    const pc = s.prop_count;
     std.debug.assert(pc + 1 <= max_prop_count);
-    const next_row = v.next_row;
-    const idx_ref = v.pk_index_ref;
-    const ver_ref = v.version_col_ref;
-    const live_ref = v.live_col_ref;
-    var prop_refs: [max_prop_count]Ref = undefined;
-    var kinds: [max_prop_count]PropKind = undefined;
-    var elems: [max_prop_count]ElemKind = undefined;
-    var bl: [max_prop_count]Ref = undefined;
-    var targets: [max_prop_count]u16 = undefined;
-    var rules: [max_prop_count]catalog.DeletionRule = undefined;
-    var vidx: [max_prop_count]Ref = undefined;
-    var idxf: [max_prop_count]bool = undefined;
-    {
-        var j: usize = 0;
-        while (j < pc) : (j += 1) {
-            prop_refs[j] = v.propColRef(j);
-            kinds[j] = v.kind(j);
-            elems[j] = v.elemKind(j);
-            bl[j] = v.backlinkRef(j);
-            targets[j] = v.linkTarget(j);
-            rules[j] = v.delRule(j);
-            vidx[j] = v.valueIndexRef(j);
-            idxf[j] = v.indexed(j);
-        }
-    }
     // Build the new column, backfilled with the default for every existing row.
     var new_col = try Column.create(txn);
     var i: u64 = 0;
-    while (i < next_row) : (i += 1) new_col = try Column.append(txn, new_col, default_value);
-    prop_refs[pc] = new_col;
-    kinds[pc] = def.kind;
-    elems[pc] = def.elem;
-    bl[pc] = if (def.kind == .link or def.kind == .link_set) try Index.create(txn) else 0;
-    targets[pc] = def.link_target;
-    rules[pc] = def.del_rule;
-    idxf[pc] = def.indexed;
-    vidx[pc] = if (def.indexed) try Index.create(txn) else 0;
-    return catalog.writeCatalog(txn, pc + 1, next_row, v.keyrow_index_ref, v.next_key, idx_ref, ver_ref, live_ref, prop_refs[0 .. pc + 1], kinds[0 .. pc + 1], elems[0 .. pc + 1], bl[0 .. pc + 1], targets[0 .. pc + 1], rules[0 .. pc + 1], vidx[0 .. pc + 1], idxf[0 .. pc + 1]);
+    while (i < s.next_row) : (i += 1) new_col = try Column.append(txn, new_col, default_value);
+    s.props[pc] = .{
+        .col = new_col,
+        .kind = def.kind,
+        .elem = def.elem,
+        .backlink = if (def.kind == .link or def.kind == .link_set) try Index.create(txn) else 0,
+        .target = def.link_target,
+        .rule = def.del_rule,
+        .value_index = if (def.indexed) try Index.create(txn) else 0,
+        .indexed = def.indexed,
+    };
+    s.prop_count = pc + 1;
+    return s.write(txn);
 }
 
 // Remove property `prop` (must be >= 1; the primary key at 0 cannot be removed).
 // The dropped column is left for compaction to reclaim. Returns the new catalog.
 pub fn removeProperty(txn: *WriteTxn, cat: Ref, prop: usize) !Ref {
     std.debug.assert(prop >= 1);
-    const v = try catalog.loadCatalog(txn, cat);
-    const pc = v.prop_count;
-    std.debug.assert(prop < pc);
-    const next_row = v.next_row;
-    const idx_ref = v.pk_index_ref;
-    const ver_ref = v.version_col_ref;
-    const live_ref = v.live_col_ref;
-    var prop_refs: [max_prop_count]Ref = undefined;
-    var kinds: [max_prop_count]PropKind = undefined;
-    var elems: [max_prop_count]ElemKind = undefined;
-    var bl: [max_prop_count]Ref = undefined;
-    var targets: [max_prop_count]u16 = undefined;
-    var rules: [max_prop_count]catalog.DeletionRule = undefined;
-    var vidx: [max_prop_count]Ref = undefined;
-    var idxf: [max_prop_count]bool = undefined;
-    var out: usize = 0;
-    var j: usize = 0;
-    while (j < pc) : (j += 1) {
-        if (j == prop) continue;
-        prop_refs[out] = v.propColRef(j);
-        kinds[out] = v.kind(j);
-        elems[out] = v.elemKind(j);
-        bl[out] = v.backlinkRef(j);
-        targets[out] = v.linkTarget(j);
-        rules[out] = v.delRule(j);
-        vidx[out] = v.valueIndexRef(j);
-        idxf[out] = v.indexed(j);
-        out += 1;
-    }
-    return catalog.writeCatalog(txn, pc - 1, next_row, v.keyrow_index_ref, v.next_key, idx_ref, ver_ref, live_ref, prop_refs[0..out], kinds[0..out], elems[0..out], bl[0..out], targets[0..out], rules[0..out], vidx[0..out], idxf[0..out]);
+    var s = try catalog.CatalogSnapshot.load(txn, cat);
+    std.debug.assert(prop < s.prop_count);
+    var j: usize = prop;
+    while (j + 1 < s.prop_count) : (j += 1) s.props[j] = s.props[j + 1];
+    s.prop_count -= 1;
+    return s.write(txn);
 }
 
 // ---------------------------------------------------------------------------

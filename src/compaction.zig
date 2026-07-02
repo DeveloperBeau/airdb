@@ -32,34 +32,19 @@ pub fn shouldCompact(txn: anytype, cat: Ref) !bool {
 // remap the key->row index. Object keys, pk index, and backlink indexes are
 // preserved (keyed by object key). Returns the new catalog ref.
 pub fn compactType(txn: *WriteTxn, cat: Ref) !Ref {
-    const v = try catalog.loadCatalog(txn, cat);
-    const pc = v.prop_count;
-    const next_key = v.next_key;
-    const pk_index_ref = v.pk_index_ref;
-    const old_ver = v.version_col_ref;
-    const old_live = v.live_col_ref;
-    const old_keyrow = v.keyrow_index_ref;
+    var s = try catalog.CatalogSnapshot.load(txn, cat);
+    const pc = s.prop_count;
+    // Keep the old column/index roots to read from while the snapshot's fields
+    // are re-pointed at the fresh dense structures.
     var old_prop: [max_prop_count]Ref = undefined;
-    var kinds: [max_prop_count]catalog.PropKind = undefined;
-    var elems: [max_prop_count]catalog.ElemKind = undefined;
-    var bl: [max_prop_count]Ref = undefined;
-    var targets: [max_prop_count]u16 = undefined;
-    var rules: [max_prop_count]catalog.DeletionRule = undefined;
-    var vidx: [max_prop_count]Ref = undefined;
-    var idxf: [max_prop_count]bool = undefined;
     {
         var j: usize = 0;
-        while (j < pc) : (j += 1) {
-            old_prop[j] = v.propColRef(j);
-            kinds[j] = v.kind(j);
-            elems[j] = v.elemKind(j);
-            bl[j] = v.backlinkRef(j);
-            targets[j] = v.linkTarget(j);
-            rules[j] = v.delRule(j);
-            vidx[j] = v.valueIndexRef(j);
-            idxf[j] = v.indexed(j);
-        }
+        while (j < pc) : (j += 1) old_prop[j] = s.props[j].col;
     }
+    const old_ver = s.version_col_ref;
+    const old_live = s.live_col_ref;
+    const old_keyrow = s.keyrow_index_ref;
+
     const alloc = txn.db.store.allocator;
     var pairs = std.ArrayList(Pair).empty;
     defer pairs.deinit(alloc);
@@ -73,14 +58,13 @@ pub fn compactType(txn: *WriteTxn, cat: Ref) !Ref {
     try Index.forEachEntry(txn, old_keyrow, Collector{ .list = &pairs, .alloc = alloc }, Collector.onEntry);
 
     // Build fresh dense columns.
-    var new_prop: [max_prop_count]Ref = undefined;
     {
         var j: usize = 0;
-        while (j < pc) : (j += 1) new_prop[j] = try Column.create(txn);
+        while (j < pc) : (j += 1) s.props[j].col = try Column.create(txn);
     }
-    var new_ver = try Column.create(txn);
-    var new_live = try Column.create(txn);
-    var new_keyrow = try Index.create(txn);
+    s.version_col_ref = try Column.create(txn);
+    s.live_col_ref = try Column.create(txn);
+    s.keyrow_index_ref = try Index.create(txn);
 
     var new_row: u64 = 0;
     for (pairs.items) |pr| {
@@ -89,16 +73,17 @@ pub fn compactType(txn: *WriteTxn, cat: Ref) !Ref {
         var j: usize = 0;
         while (j < pc) : (j += 1) {
             const cell = try Column.get(txn, old_prop[j], pr.row);
-            new_prop[j] = try Column.append(txn, new_prop[j], cell);
+            s.props[j].col = try Column.append(txn, s.props[j].col, cell);
         }
         const ver = try Column.get(txn, old_ver, pr.row);
-        new_ver = try Column.append(txn, new_ver, ver);
-        new_live = try Column.append(txn, new_live, 1);
-        new_keyrow = try Index.insert(txn, new_keyrow, pr.okey, new_row);
+        s.version_col_ref = try Column.append(txn, s.version_col_ref, ver);
+        s.live_col_ref = try Column.append(txn, s.live_col_ref, 1);
+        s.keyrow_index_ref = try Index.insert(txn, s.keyrow_index_ref, pr.okey, new_row);
         new_row += 1;
     }
 
-    return catalog.writeCatalog(txn, pc, new_row, new_keyrow, next_key, pk_index_ref, new_ver, new_live, new_prop[0..pc], kinds[0..pc], elems[0..pc], bl[0..pc], targets[0..pc], rules[0..pc], vidx[0..pc], idxf[0..pc]);
+    s.next_row = new_row;
+    return s.write(txn);
 }
 
 // Truncate a fully-packed type's columns down to `new_len` rows and publish a
@@ -106,45 +91,15 @@ pub fn compactType(txn: *WriteTxn, cat: Ref) !Ref {
 // [0, new_len); the dead tail is dropped. Object key/pk/backlink indexes are
 // preserved unchanged. Returns the new catalog ref.
 fn truncatePacked(txn: *WriteTxn, cat: Ref, new_len: u64) !Ref {
-    const v = try catalog.loadCatalog(txn, cat);
-    const pc = v.prop_count;
-    const next_key = v.next_key;
-    const keyrow = v.keyrow_index_ref;
-    const pk_index_ref = v.pk_index_ref;
-    // Snapshot all view-backed values before truncating: Column.truncate can grow
-    // the file and invalidate the bytes backing the CatalogView.
-    var prop: [max_prop_count]Ref = undefined;
-    var kinds: [max_prop_count]catalog.PropKind = undefined;
-    var elems: [max_prop_count]catalog.ElemKind = undefined;
-    var bl: [max_prop_count]Ref = undefined;
-    var targets: [max_prop_count]u16 = undefined;
-    var rules: [max_prop_count]catalog.DeletionRule = undefined;
-    var vidx: [max_prop_count]Ref = undefined;
-    var idxf: [max_prop_count]bool = undefined;
+    var s = try catalog.CatalogSnapshot.load(txn, cat);
     {
         var j: usize = 0;
-        while (j < pc) : (j += 1) {
-            prop[j] = v.propColRef(j);
-            kinds[j] = v.kind(j);
-            elems[j] = v.elemKind(j);
-            bl[j] = v.backlinkRef(j);
-            targets[j] = v.linkTarget(j);
-            rules[j] = v.delRule(j);
-            vidx[j] = v.valueIndexRef(j);
-            idxf[j] = v.indexed(j);
-        }
+        while (j < s.prop_count) : (j += 1) s.props[j].col = try Column.truncate(txn, s.props[j].col, new_len);
     }
-    var ver = v.version_col_ref;
-    var live = v.live_col_ref;
-
-    {
-        var j: usize = 0;
-        while (j < pc) : (j += 1) prop[j] = try Column.truncate(txn, prop[j], new_len);
-    }
-    ver = try Column.truncate(txn, ver, new_len);
-    live = try Column.truncate(txn, live, new_len);
-
-    return catalog.writeCatalog(txn, pc, new_len, keyrow, next_key, pk_index_ref, ver, live, prop[0..pc], kinds[0..pc], elems[0..pc], bl[0..pc], targets[0..pc], rules[0..pc], vidx[0..pc], idxf[0..pc]);
+    s.version_col_ref = try Column.truncate(txn, s.version_col_ref, new_len);
+    s.live_col_ref = try Column.truncate(txn, s.live_col_ref, new_len);
+    s.next_row = new_len;
+    return s.write(txn);
 }
 
 // Two-pointer packing cursor for one in-flight compaction run. live_count and
@@ -342,29 +297,20 @@ fn copyBindex(src: anytype, dst: *WriteTxn, src_root: u64) !u64 {
 // indexes are created empty (rebuild with rebuildBacklinks afterward). Returns
 // the new destination catalog ref.
 pub fn copyTypeRows(src: anytype, src_cat: Ref, dst: *WriteTxn) !Ref {
-    const sv = try catalog.loadCatalog(src, src_cat);
-    const pc = sv.prop_count;
-    const next_key = sv.next_key;
+    // Load the source snapshot, then re-point every ref field at structures
+    // created in the DESTINATION db before writing. Kinds, elem kinds, targets,
+    // rules, and indexed flags carry over as plain values.
+    var s = try catalog.CatalogSnapshot.load(src, src_cat);
+    const pc = s.prop_count;
+    // Keep the source refs to read from.
     var s_prop: [catalog.max_prop_count]Ref = undefined;
-    var kinds: [catalog.max_prop_count]catalog.PropKind = undefined;
-    var elems: [catalog.max_prop_count]catalog.ElemKind = undefined;
-    var targets: [catalog.max_prop_count]u16 = undefined;
-    var rules: [catalog.max_prop_count]catalog.DeletionRule = undefined;
-    var idxf: [catalog.max_prop_count]bool = undefined;
     {
         var j: usize = 0;
-        while (j < pc) : (j += 1) {
-            s_prop[j] = sv.propColRef(j);
-            kinds[j] = sv.kind(j);
-            elems[j] = sv.elemKind(j);
-            targets[j] = sv.linkTarget(j);
-            rules[j] = sv.delRule(j);
-            idxf[j] = sv.indexed(j);
-        }
+        while (j < pc) : (j += 1) s_prop[j] = s.props[j].col;
     }
-    const s_ver = sv.version_col_ref;
-    const s_live = sv.live_col_ref;
-    const s_keyrow = sv.keyrow_index_ref;
+    const s_ver = s.version_col_ref;
+    const s_live = s.live_col_ref;
+    const s_keyrow = s.keyrow_index_ref;
 
     // Collect live (okey, src_row) pairs.
     const alloc = dst.db.store.allocator;
@@ -379,25 +325,21 @@ pub fn copyTypeRows(src: anytype, src_cat: Ref, dst: *WriteTxn) !Ref {
     };
     try Index.forEachEntry(src, s_keyrow, Collector{ .list = &pairs, .a = alloc }, Collector.onEntry);
 
-    // Fresh destination structures.
-    var d_prop: [catalog.max_prop_count]Ref = undefined;
-    var d_bl: [catalog.max_prop_count]Ref = undefined;
-    // Value indexes, like backlink indexes, are created empty in the destination
-    // db (the source ref lives in the source db's address space) and repopulated
-    // separately; the indexed flag itself is carried through.
-    var d_vidx: [catalog.max_prop_count]Ref = undefined;
+    // Fresh destination structures. Backlink and value indexes are created empty
+    // in the destination db (the source refs live in the source db's address
+    // space) and repopulated separately; the indexed flag carries through.
     {
         var j: usize = 0;
         while (j < pc) : (j += 1) {
-            d_prop[j] = try Column.create(dst);
-            d_bl[j] = if (kinds[j] == .link or kinds[j] == .link_set) try Index.create(dst) else 0;
-            d_vidx[j] = if (idxf[j]) try Index.create(dst) else 0;
+            s.props[j].col = try Column.create(dst);
+            s.props[j].backlink = if (s.props[j].kind == .link or s.props[j].kind == .link_set) try Index.create(dst) else 0;
+            s.props[j].value_index = if (s.props[j].indexed) try Index.create(dst) else 0;
         }
     }
-    var d_ver = try Column.create(dst);
-    var d_live = try Column.create(dst);
-    var d_keyrow = try Index.create(dst);
-    var d_pk = try Index.create(dst);
+    s.version_col_ref = try Column.create(dst);
+    s.live_col_ref = try Column.create(dst);
+    s.keyrow_index_ref = try Index.create(dst);
+    s.pk_index_ref = try Index.create(dst);
 
     var d_row: u64 = 0;
     for (pairs.items) |pr| {
@@ -405,19 +347,20 @@ pub fn copyTypeRows(src: anytype, src_cat: Ref, dst: *WriteTxn) !Ref {
         var j: usize = 0;
         while (j < pc) : (j += 1) {
             const sraw = try Column.get(src, s_prop[j], pr.row);
-            const draw = try copyValue(src, dst, kinds[j], elems[j], sraw);
-            d_prop[j] = try Column.append(dst, d_prop[j], draw);
+            const draw = try copyValue(src, dst, s.props[j].kind, s.props[j].elem, sraw);
+            s.props[j].col = try Column.append(dst, s.props[j].col, draw);
         }
         const ver = try Column.get(src, s_ver, pr.row);
-        d_ver = try Column.append(dst, d_ver, ver);
-        d_live = try Column.append(dst, d_live, 1);
-        d_keyrow = try Index.insert(dst, d_keyrow, pr.okey, d_row);
+        s.version_col_ref = try Column.append(dst, s.version_col_ref, ver);
+        s.live_col_ref = try Column.append(dst, s.live_col_ref, 1);
+        s.keyrow_index_ref = try Index.insert(dst, s.keyrow_index_ref, pr.okey, d_row);
         const pk = try Column.get(src, s_prop[0], pr.row);
-        d_pk = try Index.insert(dst, d_pk, pk, pr.okey);
+        s.pk_index_ref = try Index.insert(dst, s.pk_index_ref, pk, pr.okey);
         d_row += 1;
     }
 
-    return catalog.writeCatalog(dst, pc, d_row, d_keyrow, next_key, d_pk, d_ver, d_live, d_prop[0..pc], kinds[0..pc], elems[0..pc], d_bl[0..pc], targets[0..pc], rules[0..pc], d_vidx[0..pc], idxf[0..pc]);
+    s.next_row = d_row;
+    return s.write(dst);
 }
 
 // Rebuild backlink indexes for `cat` (in dst) from its copied forward links.

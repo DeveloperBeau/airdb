@@ -459,31 +459,17 @@ pub fn bulkImport(
     rows: []const []const u64,
     opts: struct { presorted: bool = false },
 ) !Ref {
-    const v = try catalog.loadCatalog(txn, cat);
-    if (v.next_row != 0) return error.TypeNotEmpty;
-    const prop_count = v.prop_count;
-    const old_next_key = v.next_key;
+    var s = try catalog.CatalogSnapshot.load(txn, cat);
+    if (s.next_row != 0) return error.TypeNotEmpty;
+    const prop_count = s.prop_count;
+    const old_next_key = s.next_key;
 
-    // Capture every per-property field into locals before any allocation can
-    // grow/remap the file and invalidate the CatalogView bytes slice. Reject a
-    // link-bearing type here, before a single node is written.
-    var kinds: [max_prop_count]PropKind = undefined;
-    var elems: [max_prop_count]ElemKind = undefined;
-    var backlinks: [max_prop_count]Ref = undefined;
-    var targets: [max_prop_count]u16 = undefined;
-    var rules: [max_prop_count]DeletionRule = undefined;
-    var idxf: [max_prop_count]bool = undefined;
+    // Reject a link-bearing type here, before a single node is written.
     {
         var j: usize = 0;
         while (j < prop_count) : (j += 1) {
-            const k = v.kind(j);
+            const k = s.props[j].kind;
             if (k == .link or k == .link_set) return error.UnsupportedForBulk;
-            kinds[j] = k;
-            elems[j] = v.elemKind(j);
-            backlinks[j] = v.backlinkRef(j);
-            targets[j] = v.linkTarget(j);
-            rules[j] = v.delRule(j);
-            idxf[j] = v.indexed(j);
         }
     }
 
@@ -523,14 +509,13 @@ pub fn bulkImport(
     // --- All validation passed; build the tree roots bottom-up. ---
 
     // Property columns: gather each property's values in sorted-row order.
-    var prop_col_refs: [max_prop_count]Ref = undefined;
     {
         const col_vals = try al.alloc(u64, n);
         defer al.free(col_vals);
         var p: usize = 0;
         while (p < prop_count) : (p += 1) {
             for (perm, 0..) |src, r| col_vals[r] = rows[src][p];
-            prop_col_refs[p] = try bulkColumn(txn, col_vals[0..n]);
+            s.props[p].col = try bulkColumn(txn, col_vals[0..n]);
         }
     }
 
@@ -540,9 +525,9 @@ pub fn bulkImport(
     const stamps = try al.alloc(u64, n);
     defer al.free(stamps);
     @memset(stamps, txn.new_version);
-    const version_col_ref = try bulkColumn(txn, stamps[0..n]);
+    s.version_col_ref = try bulkColumn(txn, stamps[0..n]);
     @memset(stamps, 1);
-    const live_col_ref = try bulkColumn(txn, stamps[0..n]);
+    s.live_col_ref = try bulkColumn(txn, stamps[0..n]);
 
     // pk index (pk -> okey) and key->row index (okey -> physical row). okeys are
     // assigned in sorted-pk order from the type's current next_key, so
@@ -558,39 +543,22 @@ pub fn bulkImport(
         okeys[r] = old_next_key + @as(u64, @intCast(r));
         phys_rows[r] = @intCast(r);
     }
-    const pk_index_ref = try bulkIndex(txn, pks[0..n], okeys[0..n]);
-    const keyrow_index_ref = try bulkIndex(txn, okeys[0..n], phys_rows[0..n]);
+    s.pk_index_ref = try bulkIndex(txn, pks[0..n], okeys[0..n]);
+    s.keyrow_index_ref = try bulkIndex(txn, okeys[0..n], phys_rows[0..n]);
 
     // Value indexes: for each indexed property, group its okeys by value.
-    var value_index_refs: [max_prop_count]Ref = undefined;
     {
         var p: usize = 0;
         while (p < prop_count) : (p += 1) {
-            value_index_refs[p] = if (idxf[p])
-                try buildPropValueIndex(txn, rows, perm, p, old_next_key, al)
-            else
-                0;
+            if (s.props[p].indexed) {
+                s.props[p].value_index = try buildPropValueIndex(txn, rows, perm, p, old_next_key, al);
+            }
         }
     }
 
-    return catalog.writeCatalog(
-        txn,
-        prop_count,
-        @intCast(n), // next_row
-        keyrow_index_ref,
-        old_next_key + @as(u64, @intCast(n)), // next_key
-        pk_index_ref,
-        version_col_ref,
-        live_col_ref,
-        prop_col_refs[0..prop_count],
-        kinds[0..prop_count],
-        elems[0..prop_count],
-        backlinks[0..prop_count],
-        targets[0..prop_count],
-        rules[0..prop_count],
-        value_index_refs[0..prop_count],
-        idxf[0..prop_count],
-    );
+    s.next_row = @intCast(n);
+    s.next_key = old_next_key + @as(u64, @intCast(n));
+    return s.write(txn);
 }
 
 // Build the value index for indexed property `p`: emit (value -> {okey -> 1})
@@ -658,8 +626,8 @@ fn buildPropValueIndex(
 // node is allocated, so a NotAppendable return leaves the catalog and all trees
 // untouched. The CALLER commits.
 pub fn bulkAppend(txn: *WriteTxn, cat: Ref, rows: []const []const u64) !Ref {
-    const v = try catalog.loadCatalog(txn, cat);
-    const prop_count = v.prop_count;
+    var s = try catalog.CatalogSnapshot.load(txn, cat);
+    const prop_count = s.prop_count;
 
     // Validate row widths first: a single malformed row aborts before any work.
     for (rows) |row| {
@@ -667,38 +635,16 @@ pub fn bulkAppend(txn: *WriteTxn, cat: Ref, rows: []const []const u64) !Ref {
     }
     if (rows.len == 0) return cat;
 
-    // Capture every catalog field into locals before any allocation can grow the
-    // file and invalidate the CatalogView bytes slice. While here, qualify the
-    // schema: reject an indexed or link-bearing property -- both keep secondary
-    // structures that a pure right-edge append cannot maintain.
-    const old_next_row = v.next_row;
-    const old_next_key = v.next_key;
-    const old_keyrow = v.keyrow_index_ref;
-    const old_pk_index = v.pk_index_ref;
-    const old_version_col = v.version_col_ref;
-    const old_live_col = v.live_col_ref;
-    var prop_refs: [max_prop_count]Ref = undefined;
-    var kinds: [max_prop_count]PropKind = undefined;
-    var elems: [max_prop_count]ElemKind = undefined;
-    var backlinks: [max_prop_count]Ref = undefined;
-    var targets: [max_prop_count]u16 = undefined;
-    var rules: [max_prop_count]DeletionRule = undefined;
-    var vidx: [max_prop_count]Ref = undefined;
-    var idxf: [max_prop_count]bool = undefined;
+    // Qualify the schema: reject an indexed or link-bearing property -- both
+    // keep secondary structures that a pure right-edge append cannot maintain.
+    const old_next_row = s.next_row;
+    const old_next_key = s.next_key;
     {
         var j: usize = 0;
         while (j < prop_count) : (j += 1) {
-            const k = v.kind(j);
+            const k = s.props[j].kind;
             if (k == .link or k == .link_set) return error.NotAppendable;
-            if (v.indexed(j)) return error.NotAppendable;
-            prop_refs[j] = v.propColRef(j);
-            kinds[j] = k;
-            elems[j] = v.elemKind(j);
-            backlinks[j] = v.backlinkRef(j);
-            targets[j] = v.linkTarget(j);
-            rules[j] = v.delRule(j);
-            vidx[j] = v.valueIndexRef(j);
-            idxf[j] = v.indexed(j);
+            if (s.props[j].indexed) return error.NotAppendable;
         }
     }
 
@@ -716,7 +662,7 @@ pub fn bulkAppend(txn: *WriteTxn, cat: Ref, rows: []const []const u64) !Ref {
 
     // The smallest batch pk (rows[0][0], since ascending) must clear the current
     // max pk in the type. An empty type (no max) admits any ascending batch.
-    if (try Index.maxKey(txn, old_pk_index)) |max_pk| {
+    if (try Index.maxKey(txn, s.pk_index_ref)) |max_pk| {
         if (rows[0][0] <= max_pk) return error.NotAppendable;
     }
 
@@ -739,14 +685,13 @@ pub fn bulkAppend(txn: *WriteTxn, cat: Ref, rows: []const []const u64) !Ref {
     }
 
     // Property columns: append each property's values in batch order.
-    var new_prop_refs: [max_prop_count]Ref = undefined;
     {
         const col_vals = try al.alloc(u64, n);
         defer al.free(col_vals);
         var p: usize = 0;
         while (p < prop_count) : (p += 1) {
             for (rows, 0..) |row, j| col_vals[j] = row[p];
-            new_prop_refs[p] = try columnAppendRun(txn, prop_refs[p], col_vals[0..n]);
+            s.props[p].col = try columnAppendRun(txn, s.props[p].col, col_vals[0..n]);
         }
     }
 
@@ -754,34 +699,19 @@ pub fn bulkAppend(txn: *WriteTxn, cat: Ref, rows: []const []const u64) !Ref {
     const stamps = try al.alloc(u64, n);
     defer al.free(stamps);
     @memset(stamps, txn.new_version);
-    const new_version_col = try columnAppendRun(txn, old_version_col, stamps[0..n]);
+    s.version_col_ref = try columnAppendRun(txn, s.version_col_ref, stamps[0..n]);
     @memset(stamps, 1);
-    const new_live_col = try columnAppendRun(txn, old_live_col, stamps[0..n]);
+    s.live_col_ref = try columnAppendRun(txn, s.live_col_ref, stamps[0..n]);
 
     // pk index (pk -> okey) and key->row index (okey -> physical row). Both runs
     // land on the right edge: batch pks are ascending and above the current max,
     // and okeys are consecutive from next_key (thus above every existing okey).
-    const new_pk_index = try indexAppendRun(txn, old_pk_index, pks[0..n], okeys[0..n]);
-    const new_keyrow = try indexAppendRun(txn, old_keyrow, okeys[0..n], phys_rows[0..n]);
+    s.pk_index_ref = try indexAppendRun(txn, s.pk_index_ref, pks[0..n], okeys[0..n]);
+    s.keyrow_index_ref = try indexAppendRun(txn, s.keyrow_index_ref, okeys[0..n], phys_rows[0..n]);
 
-    return catalog.writeCatalog(
-        txn,
-        prop_count,
-        old_next_row + @as(u64, @intCast(n)), // next_row
-        new_keyrow,
-        old_next_key + @as(u64, @intCast(n)), // next_key
-        new_pk_index,
-        new_version_col,
-        new_live_col,
-        new_prop_refs[0..prop_count],
-        kinds[0..prop_count],
-        elems[0..prop_count],
-        backlinks[0..prop_count],
-        targets[0..prop_count],
-        rules[0..prop_count],
-        vidx[0..prop_count],
-        idxf[0..prop_count],
-    );
+    s.next_row = old_next_row + @as(u64, @intCast(n));
+    s.next_key = old_next_key + @as(u64, @intCast(n));
+    return s.write(txn);
 }
 
 // Try the right-edge fast path; on NotAppendable, fall back to row-by-row
