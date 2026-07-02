@@ -22,6 +22,7 @@ const kind_inner = node.kind_inner;
 const hdr = node.hdr;
 const leaf_node_size = node.leaf_node_size;
 const inner_node_size = node.inner_node_size;
+const inner_stride = node.inner_stride;
 const encodeLeaf = node.encodeLeaf;
 const parseLeaf = node.parseLeaf;
 const LeafView = node.LeafView;
@@ -111,8 +112,10 @@ fn getAt(txn: anytype, root: Ref, key: []const u8, depth: usize) !?u64 {
     return getAt(txn, child_ref, key, depth + 1);
 }
 
-const Split = struct { ref: Ref, low: u64 };
-const InsertResult = struct { ref: Ref, split: ?Split };
+// Same count-carrying result shapes as index.zig: parents maintain per-child
+// subtree counts so bindex.count is a single-node read.
+const Split = struct { ref: Ref, low: u64, count: u64 };
+const InsertResult = struct { ref: Ref, count: u64, split: ?Split };
 
 /// Descend the leftmost spine to the leftmost leaf and return the blob ref of
 /// its first (smallest) key.
@@ -151,7 +154,7 @@ fn insertInto(txn: *WriteTxn, node_ref: Ref, key_ref: u64, key: []const u8, val:
             std.mem.writeInt(u64, a.bytes[hdr + i * 16 + 8 ..][0..8], val, .little);
             // The just-put key blob is redundant: the existing slot keeps its key.
             try blob.free(txn, key_ref);
-            return InsertResult{ .ref = a.ref, .split = null };
+            return InsertResult{ .ref = a.ref, .count = v.count, .split = null };
         }
 
         // Not full: shift and insert (key_ref, val) at slot i.
@@ -166,7 +169,7 @@ fn insertInto(txn: *WriteTxn, node_ref: Ref, key_ref: u64, key: []const u8, val:
             std.mem.writeInt(u64, a.bytes[hdr + i * 16 ..][0..8], key_ref, .little);
             std.mem.writeInt(u64, a.bytes[hdr + i * 16 + 8 ..][0..8], val, .little);
             std.mem.writeInt(u16, a.bytes[1..3], v.count + 1, .little);
-            return InsertResult{ .ref = a.ref, .split = null };
+            return InsertResult{ .ref = a.ref, .count = @as(u64, v.count) + 1, .split = null };
         }
 
         // Full: build LEAF_CAP+1 sorted pairs (key refs + values), split at midpoint.
@@ -195,69 +198,94 @@ fn insertInto(txn: *WriteTxn, node_ref: Ref, key_ref: u64, key: []const u8, val:
         }
         const right_a = try txn.alloc(leaf_node_size);
         _ = encodeLeaf(right_a.bytes, keys_buf[m_leaf..total_leaf], vals_buf[m_leaf..total_leaf]);
-        return InsertResult{ .ref = left_a.ref, .split = Split{ .ref = right_a.ref, .low = keys_buf[m_leaf] } };
+        return InsertResult{
+            .ref = left_a.ref,
+            .count = m_leaf,
+            .split = Split{ .ref = right_a.ref, .low = keys_buf[m_leaf], .count = total_leaf - m_leaf },
+        };
     }
 
     // ---- INNER --------------------------------------------------------------
     const inner_bytes = try txn.deref(node_ref, inner_node_size);
     const v = try parseInner(inner_bytes);
     const ci = try childIndexForKey(txn, v, key);
+    const old_total = v.totalCount();
+    const old_child_count = v.subtreeCount(ci);
     const r = try insertInto(txn, v.childRef(ci), key_ref, key, val, depth + 1);
 
-    // No split in child: just update the child ref.
+    // No split in child: update the child's ref and subtree count.
     if (r.split == null) {
         const new_inner = try txn.writableCopy(node_ref, inner_node_size);
-        std.mem.writeInt(u64, new_inner.bytes[hdr + ci * 16 ..][0..8], r.ref, .little);
-        return InsertResult{ .ref = new_inner.ref, .split = null };
+        std.mem.writeInt(u64, new_inner.bytes[hdr + ci * inner_stride ..][0..8], r.ref, .little);
+        std.mem.writeInt(u64, new_inner.bytes[hdr + ci * inner_stride + 16 ..][0..8], r.count, .little);
+        return InsertResult{ .ref = new_inner.ref, .count = old_total - old_child_count + r.count, .split = null };
     }
 
     const split = r.split.?;
+    const new_total = old_total - old_child_count + r.count + split.count;
 
     // Child split but this inner node is not full: shift and insert at ci+1.
     if (v.child_count < FANOUT) {
         const new_inner = try txn.writableCopy(node_ref, inner_node_size);
-        std.mem.writeInt(u64, new_inner.bytes[hdr + ci * 16 ..][0..8], r.ref, .little);
+        std.mem.writeInt(u64, new_inner.bytes[hdr + ci * inner_stride ..][0..8], r.ref, .little);
+        std.mem.writeInt(u64, new_inner.bytes[hdr + ci * inner_stride + 16 ..][0..8], r.count, .little);
         var j: usize = v.child_count;
         while (j > ci + 1) : (j -= 1) {
-            const src = hdr + (j - 1) * 16;
-            const dst = hdr + j * 16;
-            @memcpy(new_inner.bytes[dst..][0..16], new_inner.bytes[src..][0..16]);
+            const src = hdr + (j - 1) * inner_stride;
+            const dst = hdr + j * inner_stride;
+            @memcpy(new_inner.bytes[dst..][0..inner_stride], new_inner.bytes[src..][0..inner_stride]);
         }
-        std.mem.writeInt(u64, new_inner.bytes[hdr + (ci + 1) * 16 ..][0..8], split.ref, .little);
-        std.mem.writeInt(u64, new_inner.bytes[hdr + (ci + 1) * 16 + 8 ..][0..8], split.low, .little);
+        std.mem.writeInt(u64, new_inner.bytes[hdr + (ci + 1) * inner_stride ..][0..8], split.ref, .little);
+        std.mem.writeInt(u64, new_inner.bytes[hdr + (ci + 1) * inner_stride + 8 ..][0..8], split.low, .little);
+        std.mem.writeInt(u64, new_inner.bytes[hdr + (ci + 1) * inner_stride + 16 ..][0..8], split.count, .little);
         std.mem.writeInt(u16, new_inner.bytes[1..3], v.child_count + 1, .little);
-        return InsertResult{ .ref = new_inner.ref, .split = null };
+        return InsertResult{ .ref = new_inner.ref, .count = new_total, .split = null };
     }
 
     // Child split AND this inner node is full: build FANOUT+1 entries, split at midpoint.
     const total_inner: usize = @as(usize, FANOUT) + 1;
     var refs_buf: [FANOUT + 1]u64 = undefined;
     var lows_buf: [FANOUT + 1]u64 = undefined;
+    var counts_buf: [FANOUT + 1]u64 = undefined;
     var j: usize = 0;
     while (j < v.child_count) : (j += 1) {
         refs_buf[j] = v.childRef(j);
         lows_buf[j] = v.lowKey(j);
+        counts_buf[j] = v.subtreeCount(j);
     }
     refs_buf[ci] = r.ref;
+    counts_buf[ci] = r.count;
     j = v.child_count; // = FANOUT
     while (j > ci + 1) : (j -= 1) {
         refs_buf[j] = refs_buf[j - 1];
         lows_buf[j] = lows_buf[j - 1];
+        counts_buf[j] = counts_buf[j - 1];
     }
     refs_buf[ci + 1] = split.ref;
     lows_buf[ci + 1] = split.low;
+    counts_buf[ci + 1] = split.count;
 
     const m_inner: usize = total_inner / 2;
     const left_a = try txn.writableCopy(node_ref, inner_node_size);
     std.mem.writeInt(u16, left_a.bytes[1..3], @intCast(m_inner), .little);
+    var left_count: u64 = 0;
     j = 0;
     while (j < m_inner) : (j += 1) {
-        std.mem.writeInt(u64, left_a.bytes[hdr + j * 16 ..][0..8], refs_buf[j], .little);
-        std.mem.writeInt(u64, left_a.bytes[hdr + j * 16 + 8 ..][0..8], lows_buf[j], .little);
+        std.mem.writeInt(u64, left_a.bytes[hdr + j * inner_stride ..][0..8], refs_buf[j], .little);
+        std.mem.writeInt(u64, left_a.bytes[hdr + j * inner_stride + 8 ..][0..8], lows_buf[j], .little);
+        std.mem.writeInt(u64, left_a.bytes[hdr + j * inner_stride + 16 ..][0..8], counts_buf[j], .little);
+        left_count += counts_buf[j];
     }
+    var right_count: u64 = 0;
+    j = m_inner;
+    while (j < total_inner) : (j += 1) right_count += counts_buf[j];
     const right_a = try txn.alloc(inner_node_size);
-    _ = encodeInner(right_a.bytes, refs_buf[m_inner..total_inner], lows_buf[m_inner..total_inner]);
-    return InsertResult{ .ref = left_a.ref, .split = Split{ .ref = right_a.ref, .low = lows_buf[m_inner] } };
+    _ = encodeInner(right_a.bytes, refs_buf[m_inner..total_inner], lows_buf[m_inner..total_inner], counts_buf[m_inner..total_inner]);
+    return InsertResult{
+        .ref = left_a.ref,
+        .count = left_count,
+        .split = Split{ .ref = right_a.ref, .low = lows_buf[m_inner], .count = right_count },
+    };
 }
 
 /// Insert or update key->val in the tree rooted at `root`. If `key` already
@@ -273,12 +301,15 @@ pub fn insert(txn: *WriteTxn, root: Ref, key: []const u8, val: u64) !Ref {
     const new_root = try txn.alloc(inner_node_size);
     const root_refs = [_]u64{ r.ref, r.split.?.ref };
     const root_lows = [_]u64{ left_min, r.split.?.low };
-    _ = encodeInner(new_root.bytes, &root_refs, &root_lows);
+    const root_counts = [_]u64{ r.count, r.split.?.count };
+    _ = encodeInner(new_root.bytes, &root_refs, &root_lows, &root_counts);
     return new_root.ref;
 }
 
+const RemoveResult = struct { ref: Ref, count: u64 };
+
 /// Recursive remove. Returns node_ref unchanged when the key is absent.
-fn removeInto(txn: *WriteTxn, node_ref: Ref, key: []const u8, depth: usize) !Ref {
+fn removeInto(txn: *WriteTxn, node_ref: Ref, key: []const u8, depth: usize) !RemoveResult {
     if (depth >= max_depth) return error.Corrupt;
     const kind = (try txn.deref(node_ref, 1))[0];
 
@@ -287,7 +318,9 @@ fn removeInto(txn: *WriteTxn, node_ref: Ref, key: []const u8, depth: usize) !Ref
         const leaf_bytes = try txn.deref(node_ref, leaf_node_size);
         const v = try parseLeaf(leaf_bytes);
         const i = try leafLowerBound(txn, v, key);
-        if (i >= v.count or (try keyOrder(txn, v.key(i), key)) != .eq) return node_ref; // no-op
+        if (i >= v.count or (try keyOrder(txn, v.key(i), key)) != .eq) {
+            return .{ .ref = node_ref, .count = v.count }; // no-op
+        }
         // Capture the key blob ref before COW so we can free it afterward.
         const removed_key_ref = v.key(i);
         const a = try txn.writableCopy(node_ref, leaf_node_size);
@@ -299,7 +332,7 @@ fn removeInto(txn: *WriteTxn, node_ref: Ref, key: []const u8, depth: usize) !Ref
         }
         std.mem.writeInt(u16, a.bytes[1..3], v.count - 1, .little);
         try blob.free(txn, removed_key_ref);
-        return a.ref;
+        return .{ .ref = a.ref, .count = @as(u64, v.count) - 1 };
     }
 
     // ---- INNER --------------------------------------------------------------
@@ -307,39 +340,31 @@ fn removeInto(txn: *WriteTxn, node_ref: Ref, key: []const u8, depth: usize) !Ref
     const v = try parseInner(inner_bytes);
     const ci = try childIndexForKey(txn, v, key);
     const old_child_ref: Ref = v.childRef(ci);
-    const new_child = try removeInto(txn, old_child_ref, key, depth + 1);
-    if (new_child == old_child_ref) return node_ref;
+    const old_total = v.totalCount();
+    const r = try removeInto(txn, old_child_ref, key, depth + 1);
+    if (r.ref == old_child_ref) return .{ .ref = node_ref, .count = old_total };
     const new_inner = try txn.writableCopy(node_ref, inner_node_size);
-    std.mem.writeInt(u64, new_inner.bytes[hdr + ci * 16 ..][0..8], new_child, .little);
-    return new_inner.ref;
+    std.mem.writeInt(u64, new_inner.bytes[hdr + ci * inner_stride ..][0..8], r.ref, .little);
+    std.mem.writeInt(u64, new_inner.bytes[hdr + ci * inner_stride + 16 ..][0..8], r.count, .little);
+    return .{ .ref = new_inner.ref, .count = old_total - v.subtreeCount(ci) + r.count };
 }
 
 /// Remove `key` from the tree rooted at `root`. Frees the key's blob node when
 /// present. Returns the (possibly new) root; unchanged if the key is absent.
 pub fn remove(txn: *WriteTxn, root: Ref, key: []const u8) !Ref {
-    return removeInto(txn, root, key, 0);
+    return (try removeInto(txn, root, key, 0)).ref;
 }
 
-/// Return the number of entries in the tree rooted at `root`.
+/// Return the number of entries in the tree rooted at `root`. A single-node
+/// read: inner nodes store per-child subtree counts.
 pub fn count(txn: anytype, root: Ref) !u64 {
-    return countAt(txn, root, 0);
-}
-
-fn countAt(txn: anytype, root: Ref, depth: usize) !u64 {
-    if (depth >= max_depth) return error.Corrupt;
     const bytes = try derefNode(txn, root);
     if (bytes[0] == kind_leaf) {
         const v = try parseLeaf(bytes);
         return v.count;
     }
     const v = try parseInner(bytes);
-    var total: u64 = 0;
-    var i: usize = 0;
-    while (i < v.child_count) : (i += 1) {
-        const child_ref: Ref = v.childRef(i);
-        total += try countAt(txn, child_ref, depth + 1);
-    }
-    return total;
+    return v.totalCount();
 }
 
 /// Visit every (key, value) entry in ascending byte-key order, dereferencing
@@ -407,11 +432,14 @@ test "a bindex ref cycle fails with error.Corrupt" {
     // ordering compare succeeds and the walk descends into the cycle.
     const key_ref = try blob.put(&w, "k");
     const a = try w.alloc(inner_node_size);
-    _ = encodeInner(a.bytes, &.{a.ref}, &.{key_ref});
+    _ = encodeInner(a.bytes, &.{a.ref}, &.{key_ref}, &.{1});
     try testing.expectError(error.Corrupt, get(&w, a.ref, "k"));
-    try testing.expectError(error.Corrupt, count(&w, a.ref));
     try testing.expectError(error.Corrupt, insert(&w, a.ref, "x", 1));
     try testing.expectError(error.Corrupt, remove(&w, a.ref, "k"));
+    const NopSink = struct {
+        fn onEntry(_: @This(), _: []const u8, _: u64) !void {}
+    };
+    try testing.expectError(error.Corrupt, forEachEntry(&w, a.ref, NopSink{}, NopSink.onEntry));
 }
 
 test "insert and get round-trip byte keys" {

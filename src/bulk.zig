@@ -114,9 +114,9 @@ pub fn bulkColumn(txn: *WriteTxn, values: []const u64) !Ref {
 }
 
 // An index B+tree node together with the low key (smallest key in its subtree)
-// its parent records for it. Used as the per-level work item by the bottom-up
-// index builders below.
-const SpineChild = struct { ref: u64, low: u64 };
+// and its subtree entry count, both of which its parent records for it. Used as
+// the per-level work item by the bottom-up index builders below.
+const SpineChild = struct { ref: u64, low: u64, count: u64 };
 
 // Deref an index node, sizing the read by its kind byte (leaf vs inner).
 fn derefIdxNode(txn: *WriteTxn, ref: Ref) ![]const u8 {
@@ -145,15 +145,15 @@ fn packIndexLeaves(
         const end = @min(i + cap, keys.len);
         const a = try txn.alloc(inode.leaf_node_size);
         _ = inode.encodeLeaf(a.bytes, keys[i..end], vals[i..end]);
-        try out.append(al, .{ .ref = a.ref, .low = keys[i] });
+        try out.append(al, .{ .ref = a.ref, .low = keys[i], .count = @intCast(end - i) });
         i = end;
     }
     return out;
 }
 
 // Build one inner level over `children`, packed in runs of FANOUT. An index
-// inner node stores (child_ref, low_key); a parent's low key is the low key of
-// its first child, so each emitted node's low == children[run_start].low.
+// inner node stores (child_ref, low_key, subtree_count); a parent's low key is
+// the low key of its first child and its count is the sum of its run.
 fn stackIndexInner(
     txn: *WriteTxn,
     children: []const SpineChild,
@@ -164,18 +164,22 @@ fn stackIndexInner(
     const fan: usize = inode.FANOUT;
     var refs: [inode.FANOUT]u64 = undefined;
     var lows: [inode.FANOUT]u64 = undefined;
+    var counts: [inode.FANOUT]u64 = undefined;
     var j: usize = 0;
     while (j < children.len) {
         const end = @min(j + fan, children.len);
+        var total: u64 = 0;
         var k: usize = j;
         while (k < end) : (k += 1) {
             refs[k - j] = children[k].ref;
             lows[k - j] = children[k].low;
+            counts[k - j] = children[k].count;
+            total += children[k].count;
         }
         const cnt = end - j;
         const a = try txn.alloc(inode.inner_node_size);
-        _ = inode.encodeInner(a.bytes, refs[0..cnt], lows[0..cnt]);
-        try out.append(al, .{ .ref = a.ref, .low = children[j].low });
+        _ = inode.encodeInner(a.bytes, refs[0..cnt], lows[0..cnt], counts[0..cnt]);
+        try out.append(al, .{ .ref = a.ref, .low = children[j].low, .count = total });
         j = end;
     }
     return out;
@@ -291,7 +295,7 @@ pub fn indexAppendRun(txn: *WriteTxn, root: Ref, keys: []const u64, vals: []cons
         defer full.deinit(al);
         var j: usize = 0;
         while (j < ri) : (j += 1) {
-            try full.append(al, .{ .ref = iv.childRef(j), .low = iv.lowKey(j) });
+            try full.append(al, .{ .ref = iv.childRef(j), .low = iv.lowKey(j), .count = iv.subtreeCount(j) });
         }
         for (level.items) |c| try full.append(al, c);
         const next = try stackIndexInner(txn, full.items, al);
