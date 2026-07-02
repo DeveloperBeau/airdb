@@ -43,7 +43,7 @@ pub fn addProperty(txn: *WriteTxn, cat: Ref, def: PropDef, default_value: u64) !
         .indexed = def.indexed,
     };
     s.prop_count = pc + 1;
-    return s.write(txn);
+    return s.replace(txn);
 }
 
 // Remove property `prop` (must be >= 1; the primary key at 0 cannot be removed).
@@ -55,7 +55,7 @@ pub fn removeProperty(txn: *WriteTxn, cat: Ref, prop: usize) !Ref {
     var j: usize = prop;
     while (j + 1 < s.prop_count) : (j += 1) s.props[j] = s.props[j + 1];
     s.prop_count -= 1;
-    return s.write(txn);
+    return s.replace(txn);
 }
 
 // ---------------------------------------------------------------------------

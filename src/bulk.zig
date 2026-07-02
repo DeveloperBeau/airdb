@@ -591,7 +591,7 @@ pub fn bulkImport(
 
     s.next_row = @intCast(n);
     s.next_key = old_next_key + @as(u64, @intCast(n));
-    return s.write(txn);
+    return s.replace(txn);
 }
 
 // Build the value index for indexed property `p`: emit (value -> {okey -> 1})
@@ -744,7 +744,7 @@ pub fn bulkAppend(txn: *WriteTxn, cat: Ref, rows: []const []const u64) !Ref {
 
     s.next_row = old_next_row + @as(u64, @intCast(n));
     s.next_key = old_next_key + @as(u64, @intCast(n));
-    return s.write(txn);
+    return s.replace(txn);
 }
 
 // Try the right-edge fast path; on NotAppendable, fall back to row-by-row

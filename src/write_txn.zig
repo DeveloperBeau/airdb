@@ -32,9 +32,36 @@ pub const WriteTxn = struct {
     /// arena.top at transaction start. A freed ref >= this was bump-allocated during this
     /// transaction and is txn-private; a ref below it belongs to a committed version.
     txn_start_top: u64,
+    /// Reclaim horizon for this transaction, computed lazily on the first
+    /// pool allocation and reused for the rest of the transaction. Computing
+    /// it per allocation costs syscalls (pid liveness + incarnation checks per
+    /// participant slot) on the hottest path in the engine. Caching is safe:
+    /// every reusable extent has freed_version <= active_version; a reader that
+    /// pins DURING this transaction either pins >= active_version (latest
+    /// reads, above every reusable extent) or, for point-in-time reads, pins
+    /// inside the shared retention window -- and `eff` is already clamped to
+    /// active_version - retain, so no extent a mid-transaction PITR pin could
+    /// reference is ever admitted regardless of when the horizon was sampled.
+    cached_eff: ?u64 = null,
 
     pub fn deref(self: *WriteTxn, ref: Ref, len: usize) ![]const u8 {
         return self.db.arena.deref(ref, len);
+    }
+
+    fn reclaimHorizon(self: *WriteTxn) u64 {
+        if (self.cached_eff) |e| return e;
+        // Horizon-gated reuse is only safe when no reader in ANY live process
+        // pins a version below the extent's freeing version. globalHorizon =
+        // min of live processes' min-pinned versions, clamped to this writer's
+        // active_version. Without a participant slot this process cannot
+        // advertise its readers, so it stays bump-only.
+        const h: u64 = if (self.db.participant_slot == null) 0 else self.db.coord.globalHorizon(self.db.active_version);
+        // Clamp by the retention window: withhold space freed within the most
+        // recent retainVersions() versions. The window is read from the shared
+        // header page, so a floor raised by any process gates THIS writer too.
+        const eff = @min(h, self.db.active_version -| self.db.retainVersions());
+        self.cached_eff = eff;
+        return eff;
     }
 
     pub fn alloc(self: *WriteTxn, size: usize) !Allocation {
@@ -43,18 +70,8 @@ pub const WriteTxn = struct {
         //    reusing it is always safe and keeps single-transaction bulk writes space-bounded).
         //    Exact-size match: no carving, so fixed-size node churn never fragments the pool.
         if (self.db.arena.allocFromPool(&self.txn_reuse, size, std.math.maxInt(u64))) |a| return a;
-        // 2. Reuse a committed-free node, horizon-gated: only safe when no reader in ANY live
-        //    process pins a version below its freeing-version. globalHorizon = min of live
-        //    processes' min-pinned versions, clamped to this writer's active_version. Without a
-        //    participant slot this process cannot advertise its readers, so it stays bump-only.
-        const h: u64 = if (self.db.participant_slot == null) 0 else self.db.coord.globalHorizon(self.db.active_version);
-        // Clamp by the retention window: withhold space freed within the most
-        // recent retainVersions() versions. The window is read from the shared
-        // header page, so a floor raised by any process gates THIS writer's
-        // reuse too. With a window of 0, eff == h (h is already
-        // <= active_version), so behavior is unchanged.
-        const eff = @min(h, self.db.active_version -| self.db.retainVersions());
-        if (self.db.arena.allocFromPool(&self.work_freelist, size, eff)) |a| return a;
+        // 2. Reuse a committed-free node, gated by the per-transaction reclaim horizon.
+        if (self.db.arena.allocFromPool(&self.work_freelist, size, self.reclaimHorizon())) |a| return a;
         // 3. Bump-allocate, growing the file if the arena is full.
         return self.db.bumpGrowing(size);
     }
@@ -169,12 +186,6 @@ pub const WriteTxn = struct {
         for (self.txn_reuse.extents.items) |e| {
             try new_fl.add(.{ .offset = e.offset, .len = e.len, .freed_version = self.new_version });
         }
-        // 3c. Merge adjacent extents. Bounds extent-count growth under churn,
-        //     which in turn bounds the O(extent count) clone/rebuild/encode
-        //     every transaction pays. Merged blocks keep the newest
-        //     freed_version of their parts and stay reusable for smaller
-        //     requests through the carve fallback.
-        try new_fl.coalesce();
         db.fl_rebuild_ns += @intCast(Io.Clock.now(.awake, rebuild_io).nanoseconds - rebuild_start);
 
         // 4. Encode the new free list onto the arena via a BUMP allocation (never
@@ -315,6 +326,46 @@ fn churnLogicalSize(path: []const u8, retain: u64, n: u64) !u64 {
         }
     }
     return db.logicalSize();
+}
+
+test "steady-state batched inserts keep the free list bounded" {
+    // Regression for the free-pool death spiral: every insert rewrites the
+    // catalog node, and if those nodes are not freed (or if carving/coalescing
+    // shreds the node-size classes), the committed free list grows by hundreds
+    // of unusable extents per batch and commit cost explodes at scale. With
+    // catalog recycling and exact-class reuse the list must stay tiny.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "steadystate.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    {
+        var w = try db.beginWrite();
+        const cat = try catalog.create(&w, 2);
+        w.setRoot(cat);
+        _ = try w.commit();
+    }
+    var pk: u64 = 0;
+    var batch: usize = 0;
+    while (batch < 10) : (batch += 1) {
+        var w = try db.beginWrite();
+        var cat = w.new_root;
+        var i: usize = 0;
+        while (i < 500) : (i += 1) {
+            cat = (try objects.insert(&w, cat, &.{ pk, pk })).cat;
+            pk += 1;
+        }
+        w.setRoot(cat);
+        _ = try w.commit();
+    }
+    // The committed list legitimately tracks the copy-on-write working set (the
+    // committed nodes the last batch touched), which grows with tree depth and
+    // plateaus. The failure mode this guards against is unusable extents
+    // accumulating at roughly one per insert PER BATCH (the fragmentation
+    // death spiral): after 10 batches that lands near inserts-per-batch x 10,
+    // while the healthy working set stays well under one batch's width.
+    try testing.expect(db.freeListLenForTest() < 500);
 }
 
 test "an abandoned transaction's bump allocations are rolled back" {

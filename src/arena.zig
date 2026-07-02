@@ -45,15 +45,6 @@ pub const Arena = struct {
         return .{ .ref = ref, .bytes = self.translate(aligned, size) };
     }
 
-    pub fn allocReusing(self: *Arena, size: usize, fl: *FreeList, horizon: u64) error{ OutOfSpace, AllocTooLarge }!Allocation {
-        const aligned_size = std.mem.alignForward(usize, size, 8);
-        if (fl.reuse(aligned_size, horizon)) |off| {
-            const offu: usize = @intCast(off);
-            return .{ .ref = off, .bytes = self.translate(offu, size) };
-        }
-        return self.alloc(size);
-    }
-
     // Reuse an EXACT-size node extent from a pool whose freed_version <= horizon, else null
     // (no bump fallback, no carving). Exact-size matching keeps fixed-size node allocation
     // fragment-free and the pool scan short. For a transaction-private pool (always safe to
@@ -114,24 +105,6 @@ test "deref rejects an out-of-range or misaligned or null ref" {
     try testing.expectError(error.BadRef, arena.deref(section_size, 8));
     try testing.expectError(error.BadRef, arena.deref(7, 8)); // misaligned
     try testing.expectError(error.BadRef, arena.deref(0, 8)); // null ref
-}
-
-test "allocReusing reuses a freed extent below the horizon, else bumps" {
-    const backing = try testing.allocator.alignedAlloc(u8, page_align, 4096 * 4);
-    defer testing.allocator.free(backing);
-    var secs = [_]platform.Section{testSection(backing)};
-    var arena = Arena.init(&secs, 4096);
-
-    var fl = @import("freelist.zig").FreeList.init(testing.allocator);
-    defer fl.deinit();
-    try fl.add(.{ .offset = 4096, .len = 64, .freed_version = 2 });
-
-    const bumped = try arena.allocReusing(16, &fl, 1); // horizon 1 < freed 2: bump
-    try testing.expect(bumped.ref >= 4096);
-    try testing.expectEqual(@as(usize, 1), fl.extents.items.len);
-
-    const reused = try arena.allocReusing(16, &fl, 2); // horizon 2 >= freed 2: reuse
-    try testing.expectEqual(@as(u64, 4096), reused.ref);
 }
 
 test "alloc fails cleanly when the arena is full" {

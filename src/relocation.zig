@@ -30,7 +30,7 @@ pub fn relocateRow(txn: *WriteTxn, cat: Ref, okey: u64, new_row: u64) !Ref {
     s.live_col_ref = try Column.set(txn, s.live_col_ref, old_row, 0);
     s.keyrow_index_ref = try Index.insert(txn, s.keyrow_index_ref, okey, new_row);
 
-    return s.write(txn);
+    return s.replace(txn);
 }
 
 // ---------------------------------------------------------------------------

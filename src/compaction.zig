@@ -96,7 +96,7 @@ pub fn compactType(txn: *WriteTxn, cat: Ref) !Ref {
     try Index.freeTree(txn, old_keyrow);
 
     s.next_row = new_row;
-    return s.write(txn);
+    return s.replace(txn);
 }
 
 // Truncate a fully-packed type's columns down to `new_len` rows and publish a
@@ -112,7 +112,7 @@ fn truncatePacked(txn: *WriteTxn, cat: Ref, new_len: u64) !Ref {
     s.version_col_ref = try Column.truncate(txn, s.version_col_ref, new_len);
     s.live_col_ref = try Column.truncate(txn, s.live_col_ref, new_len);
     s.next_row = new_len;
-    return s.write(txn);
+    return s.replace(txn);
 }
 
 // Two-pointer packing cursor for one in-flight compaction run. live_count and

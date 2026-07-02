@@ -96,7 +96,7 @@ pub fn insert(txn: *WriteTxn, cat: Ref, values: []const u64) !struct { cat: Ref,
     s.next_row = row + 1;
     s.next_key = okey + 1;
 
-    const new_cat = try s.write(txn);
+    const new_cat = try s.replace(txn);
     // Maintain the value index for each indexed property: add this row's okey to
     // the inner set at its stored value, in the same transaction as the row.
     var cat_out = new_cat;
@@ -154,7 +154,7 @@ pub fn update(txn: *WriteTxn, cat: Ref, pk: u64, values: []const u64, expected_v
     }
     s.version_col_ref = try Column.set(txn, s.version_col_ref, row, txn.new_version);
 
-    const new_cat = try s.write(txn);
+    const new_cat = try s.replace(txn);
     // Re-point the value index for any indexed property whose value changed.
     var cat_out = new_cat;
     {
@@ -197,7 +197,7 @@ pub fn delete(txn: *WriteTxn, cat: Ref, pk: u64, expected_version: u64) !DeleteR
     // relocation reuses.
     s.keyrow_index_ref = try Index.remove(txn, s.keyrow_index_ref, okey);
 
-    const new_cat = try s.write(txn);
+    const new_cat = try s.replace(txn);
     // Drop this row's okey from the value index for every indexed property.
     var cat_out = new_cat;
     {

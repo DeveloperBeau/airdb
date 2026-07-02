@@ -331,14 +331,30 @@ fn deleteWorker(txn: *WriteTxn, dir: Ref, type_id: u16, okey: u64, visited: *std
     if ((try Objects.getByObjectKey(txn, cat_t0, okey, rbuf[0..pc])) == null) return cur; // already gone
     const pk = rbuf[0];
 
-    // 1) Cascade: delete children reached by this object's cascade-rule props.
+    // Snapshot the cascade-relevant schema BEFORE any mutation. Catalog nodes
+    // are freed the moment they are rewritten, so a CatalogView into cat_t0
+    // must not be read after a recursive delete has rewritten this type's
+    // catalog -- the node's bytes may already belong to a new allocation.
+    var kinds: [256]catalog.PropKind = undefined;
+    var rules: [256]catalog.DeletionRule = undefined;
+    var targets: [256]u16 = undefined;
     {
         const sv = try catalog.loadCatalog(txn, cat_t0);
         var p: usize = 0;
-        while (p < sv.prop_count) : (p += 1) {
-            const k = sv.kind(p);
-            if ((k != .link and k != .link_set) or sv.delRule(p) != .cascade) continue;
-            const child_type = sv.linkTarget(p);
+        while (p < pc) : (p += 1) {
+            kinds[p] = sv.kind(p);
+            rules[p] = sv.delRule(p);
+            targets[p] = sv.linkTarget(p);
+        }
+    }
+
+    // 1) Cascade: delete children reached by this object's cascade-rule props.
+    {
+        var p: usize = 0;
+        while (p < pc) : (p += 1) {
+            const k = kinds[p];
+            if ((k != .link and k != .link_set) or rules[p] != .cascade) continue;
+            const child_type = targets[p];
             if (k == .link) {
                 if (try links.getLink(txn, try catalogRef(txn, cur, type_id), pk, p)) |child| {
                     cur = try deleteWorker(txn, cur, child_type, child, visited);

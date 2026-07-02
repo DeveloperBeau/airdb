@@ -320,10 +320,17 @@ pub const CatalogSnapshot = struct {
     version_col_ref: Ref,
     live_col_ref: Ref,
     props: [max_prop_count]PropSnap,
+    /// The node this snapshot was loaded from and its on-disk size, so
+    /// replace() can free it. prop_count may change after load (migrations),
+    /// so the size is captured here, not recomputed.
+    source: Ref,
+    source_len: usize,
 
     pub fn load(txn: anytype, cat: Ref) !CatalogSnapshot {
         const v = try loadCatalog(txn, cat);
         var s: CatalogSnapshot = undefined;
+        s.source = cat;
+        s.source_len = catalogSize(v.prop_count);
         s.prop_count = v.prop_count;
         s.next_row = v.next_row;
         s.keyrow_index_ref = v.keyrow_index_ref;
@@ -389,6 +396,18 @@ pub const CatalogSnapshot = struct {
             idxf[0..pc],
         );
     }
+
+    /// Write the snapshot as a fresh node and free the node it was loaded
+    /// from. This is the normal way to rewrite a catalog within one database:
+    /// the old node is garbage the moment the caller adopts the new ref, and a
+    /// txn-private old node is reused by the very next same-size catalog write,
+    /// so catalog churn stops growing the file. Do NOT use when the source
+    /// lives in a different database (copyTypeRows) or must stay readable.
+    pub fn replace(self: *const CatalogSnapshot, txn: *WriteTxn) !Ref {
+        const new_ref = try self.write(txn);
+        try txn.free(self.source, self.source_len);
+        return new_ref;
+    }
 };
 
 pub fn propCount(txn: anytype, cat: Ref) !PropCount {
@@ -433,28 +452,28 @@ pub fn replaceCollRoot(txn: *WriteTxn, cat: Ref, row: u64, prop: usize, new_root
     var s = try CatalogSnapshot.load(txn, cat);
     s.props[prop].col = try Column.set(txn, s.props[prop].col, row, new_root);
     s.version_col_ref = try Column.set(txn, s.version_col_ref, row, txn.new_version);
-    return s.write(txn);
+    return s.replace(txn);
 }
 
 // Write a new backlink ref into property `p`, preserving everything else.
 pub fn setBacklinkRef(txn: *WriteTxn, cat: Ref, p: usize, new_bl: Ref) !Ref {
     var s = try CatalogSnapshot.load(txn, cat);
     s.props[p].backlink = new_bl;
-    return s.write(txn);
+    return s.replace(txn);
 }
 
 // Write a new value-index ref into property `p`, preserving everything else.
 pub fn setValueIndexRef(txn: *WriteTxn, cat: Ref, p: usize, new_vi: Ref) !Ref {
     var s = try CatalogSnapshot.load(txn, cat);
     s.props[p].value_index = new_vi;
-    return s.write(txn);
+    return s.replace(txn);
 }
 
 // Write a new column ref into property `p`, preserving everything else.
 pub fn setPropColRef(txn: *WriteTxn, cat: Ref, p: usize, new_col: Ref) !Ref {
     var s = try CatalogSnapshot.load(txn, cat);
     s.props[p].col = new_col;
-    return s.write(txn);
+    return s.replace(txn);
 }
 
 // ---------------------------------------------------------------------------
