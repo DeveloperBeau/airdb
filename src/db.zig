@@ -40,6 +40,16 @@ pub const ring_head_off: usize = 1016;
 pub const ring_off: usize = 1024;
 pub const ring_capacity: u32 = 128;
 
+// Retention window, persisted in the header page so EVERY process honors the
+// same reclaim floor: committed-free space is withheld from reuse until it is
+// older than `active_version - retain`. A per-instance in-memory setting would
+// let a default-configured writer in another process reuse space under a
+// point-in-time reader that relies on the window. u64 LE at [192, 200);
+// 8-aligned, clear of slot B ([128, 164)) and the ring head (1016). Zero on a
+// fresh (zero-filled) file, matching the old default. maxInt means "retain
+// everything". Read/written atomically through the shared mapping.
+pub const retain_off: usize = 192;
+
 // ---------------------------------------------------------------------------
 // Db
 // ---------------------------------------------------------------------------
@@ -75,9 +85,9 @@ pub const Db = struct {
     /// Index into the coord participant slot array claimed by this Db instance, or null
     /// if all 64 slots were occupied at open/create time.
     participant_slot: ?usize,
-    /// Retention window: committed-free space is withheld from reuse until it is
-    /// older than `active_version - retain_versions`. 0 disables the window.
-    retain_versions: u64 = 0,
+    // NOTE: the retention window is NOT an in-memory field. It lives in the
+    // header page (see retain_off) so all attached processes share one floor;
+    // read it with retainVersions() and set it with setRetainVersions().
     /// Opt-in: when set, the caller drives `maybeCompactStep` to amortize compaction.
     auto_compact: bool = false,
     /// In-flight cursor for budget-proportional packing. Holds the two-pointer
@@ -156,7 +166,6 @@ pub const Db = struct {
             .free_list_node_len = 0,
             .coord = coord,
             .participant_slot = slot,
-            .retain_versions = 0,
             .auto_compact = false,
         };
     }
@@ -191,7 +200,6 @@ pub const Db = struct {
             .free_list_node_len = 0,
             .coord = undefined,
             .participant_slot = null,
-            .retain_versions = 0,
             .auto_compact = false,
         };
         errdefer db.free_list.deinit();
@@ -395,9 +403,10 @@ pub const Db = struct {
         try self.refreshToLatest();
         if (version > self.active_version) return error.VersionUnavailable;
         // Must be inside the retention window: older versions' nodes may already
-        // be reclaimed. maxInt retain_versions means "retain everything".
-        if (self.retain_versions != std.math.maxInt(u64)) {
-            if (version < self.active_version -| self.retain_versions) return error.VersionUnavailable;
+        // be reclaimed. maxInt means "retain everything".
+        const retain = self.retainVersions();
+        if (retain != coord_mod.sentinel_max) {
+            if (version < self.active_version -| retain) return error.VersionUnavailable;
         }
         const root = if (version == self.active_version)
             self.active_root
@@ -409,6 +418,22 @@ pub const Db = struct {
             try self.pins.put(version, 1);
         }
         self.publishPins();
+        // Pin-then-validate. A writer in another process whose reclaim-horizon
+        // load happened BEFORE our pin became visible may reuse extents freed
+        // above `version` -- but only extents with freed_version <= its
+        // active_version - retain. So once the pin is published, re-read the
+        // published latest version: if `version` still clears the shared
+        // retention floor of the newest possible in-flight writer, no such
+        // writer can have reused a node this snapshot references. Otherwise
+        // unpin and refuse the read rather than risk a corrupt snapshot.
+        if (retain != coord_mod.sentinel_max) {
+            const lv = self.coord.latestVersion();
+            if (version < lv -| retain) {
+                var txn = ReadTxn{ .db = self, .root_ref = root, .version = version };
+                txn.end(); // unpin
+                return error.VersionUnavailable;
+            }
+        }
         return ReadTxn{ .db = self, .root_ref = root, .version = version };
     }
 
@@ -443,9 +468,23 @@ pub const Db = struct {
         return self.store.fileLen();
     }
 
+    fn retainPtr(self: *Db) *u64 {
+        return @ptrCast(@alignCast(&self.store.map[retain_off]));
+    }
+
+    /// The shared retention window: recently-freed space is withheld from reuse
+    /// for the most recent `retainVersions()` versions, across ALL processes.
+    pub fn retainVersions(self: *Db) u64 {
+        return @atomicLoad(u64, self.retainPtr(), .acquire);
+    }
+
     /// Withhold recently-freed space from reuse for the most recent `n` versions.
+    /// Shared and durable: the value lives in the header page, so every attached
+    /// process honors it immediately, and it is carried to disk by the next
+    /// commit's flush. Lowering the window while point-in-time readers are
+    /// active in other processes is unsafe; raise-only while readers may exist.
     pub fn setRetainVersions(self: *Db, n: u64) void {
-        self.retain_versions = n;
+        @atomicStore(u64, self.retainPtr(), n, .release);
     }
 
     /// Perform at most one budgeted incremental-compaction step on `type_id`,
@@ -519,8 +558,9 @@ pub const Db = struct {
     /// and the retention-window floor. Versions in [this, active_version] open.
     pub fn oldestReadableVersion(self: *Db) u64 {
         const ring_floor = self.oldestRetainedVersion();
-        if (self.retain_versions == std.math.maxInt(u64)) return ring_floor;
-        return @max(ring_floor, self.active_version -| self.retain_versions);
+        const retain = self.retainVersions();
+        if (retain == coord_mod.sentinel_max) return ring_floor;
+        return @max(ring_floor, self.active_version -| retain);
     }
 
     /// Shared body for beginWrite and beginWriteTry. Caller must hold the coord
@@ -1591,6 +1631,73 @@ test "beginReadAt opens a past version within the retention window" {
     }
     // A future version is unavailable.
     try testing.expectError(error.VersionUnavailable, db.beginReadAt(vc + 5));
+}
+
+test "the retention window is shared across instances and survives reopen" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "retain_shared.airdb");
+    defer testing.allocator.free(path);
+    {
+        var a = try Db.create(testing.allocator, path);
+        defer a.deinit();
+        var b = try Db.open(testing.allocator, path);
+        defer b.deinit();
+        // A raises the floor; B sees it immediately through the shared mapping.
+        a.setRetainVersions(100);
+        try testing.expectEqual(@as(u64, 100), b.retainVersions());
+        // Make the header page durable via a commit.
+        var w = try a.beginWrite();
+        const x = try w.alloc(8);
+        @memcpy(x.bytes, "RETAINED");
+        w.setRoot(x.ref);
+        _ = try w.commit();
+    }
+    {
+        var db = try Db.open(testing.allocator, path);
+        defer db.deinit();
+        try testing.expectEqual(@as(u64, 100), db.retainVersions());
+    }
+}
+
+test "a writer honors a retention floor raised by another instance" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "retain_writer.airdb");
+    defer testing.allocator.free(path);
+    var a = try Db.create(testing.allocator, path);
+    defer a.deinit();
+    var b = try Db.open(testing.allocator, path);
+    defer b.deinit();
+    // Instance a (the "reader" side) demands full retention; b never called
+    // setRetainVersions and would previously reuse freed space immediately.
+    a.setRetainVersions(std.math.maxInt(u64));
+
+    // b commits a node, then frees it and commits again: with the shared floor
+    // the freed extent must NOT be reused by b's next allocation.
+    {
+        var w = try b.beginWrite();
+        const x = try w.alloc(8);
+        @memcpy(x.bytes, "AAAAAAAA");
+        w.setRoot(x.ref);
+        _ = try w.commit();
+    }
+    const old_root = b.active_root;
+    {
+        var w = try b.beginWrite();
+        const y = try w.alloc(8);
+        @memcpy(y.bytes, "BBBBBBBB");
+        try w.free(old_root, 8);
+        w.setRoot(y.ref);
+        _ = try w.commit();
+    }
+    {
+        var w = try b.beginWrite();
+        const z = try w.alloc(8);
+        // Without the shared window this allocation reused old_root.
+        try testing.expect(z.ref != old_root);
+        w.deinit();
+    }
 }
 
 test "beginReadAt rejects a version aged out of the retention window" {

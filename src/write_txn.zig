@@ -48,10 +48,12 @@ pub const WriteTxn = struct {
         //    processes' min-pinned versions, clamped to this writer's active_version. Without a
         //    participant slot this process cannot advertise its readers, so it stays bump-only.
         const h: u64 = if (self.db.participant_slot == null) 0 else self.db.coord.globalHorizon(self.db.active_version);
-        // Clamp by the retention window: withhold space freed within the most recent
-        // `retain_versions` versions. With retain_versions == 0, eff == h (h is already
+        // Clamp by the retention window: withhold space freed within the most
+        // recent retainVersions() versions. The window is read from the shared
+        // header page, so a floor raised by any process gates THIS writer's
+        // reuse too. With a window of 0, eff == h (h is already
         // <= active_version), so behavior is unchanged.
-        const eff = @min(h, self.db.active_version -| self.db.retain_versions);
+        const eff = @min(h, self.db.active_version -| self.db.retainVersions());
         if (self.db.arena.allocFromPool(&self.work_freelist, size, eff)) |a| return a;
         // 3. Bump-allocate, growing the file if the arena is full.
         return self.db.bumpGrowing(size);
