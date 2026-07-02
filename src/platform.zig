@@ -60,6 +60,12 @@ const win = if (is_windows) struct {
     const LOCKFILE_FAIL_IMMEDIATELY: DWORD = 0x00000001;
     const LOCKFILE_EXCLUSIVE_LOCK: DWORD = 0x00000002;
     const SYNCHRONIZE: DWORD = 0x00100000;
+    const PROCESS_QUERY_LIMITED_INFORMATION: DWORD = 0x00001000;
+
+    const FILETIME = extern struct {
+        dwLowDateTime: DWORD,
+        dwHighDateTime: DWORD,
+    };
     const WAIT_OBJECT_0: DWORD = 0x00000000;
     const WAIT_TIMEOUT: DWORD = 0x00000102;
     const lock_all_low: DWORD = 0xFFFFFFFF;
@@ -75,6 +81,7 @@ const win = if (is_windows) struct {
     extern "kernel32" fn OpenProcess(access: DWORD, inherit: BOOL, pid: DWORD) callconv(.winapi) ?HANDLE;
     extern "kernel32" fn WaitForSingleObject(h: HANDLE, ms: DWORD) callconv(.winapi) DWORD;
     extern "kernel32" fn GetCurrentProcess() callconv(.winapi) HANDLE;
+    extern "kernel32" fn GetProcessTimes(h: HANDLE, creation: *FILETIME, exit: *FILETIME, kernel: *FILETIME, user: *FILETIME) callconv(.winapi) BOOL;
 
     // PROCESS_MEMORY_COUNTERS: SIZE_T fields are usize; cb/PageFaultCount are DWORD.
     const PROCESS_MEMORY_COUNTERS = extern struct {
@@ -204,6 +211,57 @@ pub fn currentPid() u32 {
     }
 }
 
+/// A token identifying a specific INCARNATION of a process: its start time.
+/// PIDs are recycled by every OS, so "pid is alive" cannot distinguish a
+/// crashed reader from an unrelated new process that inherited its pid; the
+/// start time can. Returns null when the query fails (callers treat that
+/// conservatively). Truncated to u32 by the coord layer -- a false match needs
+/// a recycled pid AND a start-time collision in the same microsecond class.
+pub fn processStartToken(pid: u32) ?u64 {
+    if (pid == 0) return null;
+    if (is_windows) {
+        const h = win.OpenProcess(win.PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) orelse return null;
+        defer _ = win.CloseHandle(h);
+        var creation: win.FILETIME = undefined;
+        var exit: win.FILETIME = undefined;
+        var kernel: win.FILETIME = undefined;
+        var user: win.FILETIME = undefined;
+        if (win.GetProcessTimes(h, &creation, &exit, &kernel, &user) == 0) return null;
+        return (@as(u64, creation.dwHighDateTime) << 32) | creation.dwLowDateTime;
+    } else if (comptime builtin.target.os.tag.isDarwin()) {
+        // kinfo_proc's first field is the extern_proc union whose overlay is
+        // p_starttime (a timeval), so the start time sits at offset 0 of the
+        // sysctl result.
+        var buf: [1024]u8 align(8) = undefined;
+        var len: usize = buf.len;
+        var mib = [4]c_int{ 1, 14, 1, @intCast(pid) }; // CTL_KERN, KERN_PROC, KERN_PROC_PID, pid
+        const rc = std.c.sysctl(&mib, 4, &buf, &len, null, 0);
+        if (std.c.errno(rc) != .SUCCESS or len < 16) return null;
+        const sec = std.mem.readInt(i64, buf[0..8], .little);
+        const usec = std.mem.readInt(i32, buf[8..12], .little);
+        return @as(u64, @bitCast(sec)) *% 1_000_000 +% @as(u32, @bitCast(usec));
+    } else {
+        // Linux: field 22 of /proc/<pid>/stat is starttime in clock ticks.
+        var path_buf: [64]u8 = undefined;
+        const path = std.fmt.bufPrint(&path_buf, "/proc/{d}/stat", .{pid}) catch return null;
+        const io = std.Io.Threaded.global_single_threaded.io();
+        var f = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return null;
+        defer f.close(io);
+        var stat_buf: [512]u8 = undefined;
+        const n = f.readPositionalAll(io, &stat_buf, 0) catch return null;
+        const content = stat_buf[0..n];
+        // comm can contain spaces/parens: skip past the LAST ')'.
+        const close = std.mem.lastIndexOfScalar(u8, content, ')') orelse return null;
+        var it = std.mem.tokenizeScalar(u8, content[close + 1 ..], ' ');
+        // The token after ')' is field 3 (state); starttime is field 22.
+        var field: usize = 3;
+        while (it.next()) |tok| : (field += 1) {
+            if (field == 22) return std.fmt.parseInt(u64, tok, 10) catch null;
+        }
+        return null;
+    }
+}
+
 /// Returns true if the process with the given pid is alive.
 /// pid==0 is always considered dead (free slot sentinel).
 pub fn processAlive(pid: u32) bool {
@@ -239,6 +297,13 @@ pub fn peakResidentBytes() usize {
     const usage = std.posix.getrusage(std.posix.rusage.SELF);
     const maxrss: usize = @intCast(usage.maxrss);
     return if (builtin.os.tag == .macos) maxrss else maxrss * 1024;
+}
+
+test "processStartToken identifies the current process incarnation" {
+    const tok = processStartToken(currentPid());
+    try std.testing.expect(tok != null);
+    // Stable across repeated queries of the same incarnation.
+    try std.testing.expectEqual(tok, processStartToken(currentPid()));
 }
 
 test "peakResidentBytes returns a plausible nonzero value" {

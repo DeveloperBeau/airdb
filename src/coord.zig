@@ -7,8 +7,11 @@
 //   [16..24] latest_ver   u64     (atomic, 8-aligned)
 //   [24..64] reserved     (zero)
 //   [64..1088] participant slots  64 x 16 bytes each
-//              slot layout: [pid u32 @+0][reserved u32 @+4][min_pinned u64 @+8]
-//              pid==0 means slot is free; min_pinned==sentinel_max means "pins nothing"
+//              slot layout: [pid u32 @+0][start_token u32 @+4][min_pinned u64 @+8]
+//              pid==0 means slot is free; min_pinned==sentinel_max means "pins
+//              nothing". start_token is the (truncated) process start time of
+//              the claimer: a recycled pid alone cannot keep a dead reader's
+//              slot alive, the incarnation must match too.
 //
 // Zig 0.16 notes (same adaptations as file_store.zig):
 //   - File I/O via std.Io.File and std.Io.Dir.*Absolute(io, path, .{})
@@ -156,6 +159,10 @@ pub const Coord = struct {
         return @ptrCast(@alignCast(&self.map[participants_off + idx * slot_stride]));
     }
 
+    fn slotTokenPtr(self: *Coord, idx: usize) *u32 {
+        return @ptrCast(@alignCast(&self.map[participants_off + idx * slot_stride + 4]));
+    }
+
     fn slotMinPtr(self: *Coord, idx: usize) *u64 {
         return @ptrCast(@alignCast(&self.map[participants_off + idx * slot_stride + 8]));
     }
@@ -164,11 +171,13 @@ pub const Coord = struct {
     /// or null if all 64 slots are occupied. Uses CAS to avoid races.
     pub fn claimSlot(self: *Coord) !?usize {
         const my_pid: u32 = @intCast(currentPid());
+        const my_token: u32 = @truncate(platform.processStartToken(my_pid) orelse 0);
         var i: usize = 0;
         while (i < participant_slots) : (i += 1) {
             const p = self.slotPidPtr(i);
             if (@cmpxchgStrong(u32, p, 0, my_pid, .seq_cst, .seq_cst) == null) {
                 @atomicStore(u64, self.slotMinPtr(i), sentinel_max, .seq_cst);
+                @atomicStore(u32, self.slotTokenPtr(i), my_token, .seq_cst);
                 return i;
             }
         }
@@ -179,6 +188,7 @@ pub const Coord = struct {
     /// observes a stale min_pinned after the slot appears free.
     pub fn releaseSlot(self: *Coord, idx: usize) void {
         @atomicStore(u64, self.slotMinPtr(idx), sentinel_max, .seq_cst);
+        @atomicStore(u32, self.slotTokenPtr(idx), 0, .seq_cst);
         @atomicStore(u32, self.slotPidPtr(idx), 0, .seq_cst);
     }
 
@@ -209,6 +219,17 @@ pub const Coord = struct {
                 @atomicStore(u32, self.slotPidPtr(i), 0, .seq_cst); // reclaim dead slot
                 continue;
             }
+            // The pid is alive, but pids are recycled: verify the incarnation.
+            // A live unrelated process that inherited a dead reader's pid would
+            // otherwise pin the horizon forever. An unavailable token (query
+            // failed) is treated as a match -- conservative, never unsafe.
+            const stored_token = @atomicLoad(u32, self.slotTokenPtr(i), .seq_cst);
+            if (platform.processStartToken(pid)) |tok| {
+                if (@as(u32, @truncate(tok)) != stored_token) {
+                    @atomicStore(u32, self.slotPidPtr(i), 0, .seq_cst); // recycled pid: reclaim
+                    continue;
+                }
+            }
             const mp = @atomicLoad(u64, self.slotMinPtr(i), .acquire);
             if (mp < min_v) min_v = mp;
         }
@@ -216,9 +237,11 @@ pub const Coord = struct {
     }
 
     /// Test helper: write a slot directly without going through claimSlot.
-    /// Allows tests to simulate a slot owned by an arbitrary (possibly dead) pid.
-    pub fn forgeSlotForTest(self: *Coord, idx: usize, pid: u32, min_pinned: u64) void {
+    /// Allows tests to simulate a slot owned by an arbitrary (possibly dead or
+    /// recycled) pid with an arbitrary incarnation token.
+    pub fn forgeSlotForTest(self: *Coord, idx: usize, pid: u32, token: u32, min_pinned: u64) void {
         @atomicStore(u64, self.slotMinPtr(idx), min_pinned, .seq_cst);
+        @atomicStore(u32, self.slotTokenPtr(idx), token, .seq_cst);
         @atomicStore(u32, self.slotPidPtr(idx), pid, .seq_cst);
     }
 };
@@ -386,8 +409,34 @@ test "globalHorizon ignores and reclaims a dead-pid slot" {
     defer c.deinit();
     const live = (try c.claimSlot()).?;
     c.publishMinPinned(live, sentinel_max);
-    c.forgeSlotForTest(1, 0x7fffffff, 3); // an almost-certainly-dead pid with a low min_pinned
+    c.forgeSlotForTest(1, 0x7fffffff, 0, 3); // an almost-certainly-dead pid with a low min_pinned
     try testing.expectEqual(@as(u64, 50), c.globalHorizon(50));
     try testing.expectEqual(@as(u32, 0), c.slotPidForTest(1)); // reclaimed
     c.releaseSlot(live);
+}
+
+test "globalHorizon reclaims a slot whose live pid has the wrong incarnation token" {
+    // A recycled pid must not keep a dead reader's pin alive: the slot names a
+    // LIVE pid (our own) but a token from a different process incarnation, so
+    // the horizon must ignore and reclaim it.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dlen = try tmp.dir.realPath(coordIo(), &path_buf);
+    const cpath = try std.fs.path.join(testing.allocator, &.{ path_buf[0..dlen], "recycled.coord" });
+    defer testing.allocator.free(cpath);
+    var c = try Coord.openOrCreate(cpath);
+    defer c.deinit();
+
+    const my_pid: u32 = @intCast(platform.currentPid());
+    const my_token: u32 = @truncate(platform.processStartToken(my_pid) orelse return error.SkipZigTest);
+    c.forgeSlotForTest(2, my_pid, my_token +% 1, 3); // alive pid, wrong incarnation
+    try testing.expectEqual(@as(u64, 50), c.globalHorizon(50));
+    try testing.expectEqual(@as(u32, 0), c.slotPidForTest(2)); // reclaimed
+
+    // A correctly claimed slot (matching token) still pins the horizon.
+    const idx = (try c.claimSlot()).?;
+    c.publishMinPinned(idx, 7);
+    try testing.expectEqual(@as(u64, 7), c.globalHorizon(50));
+    c.releaseSlot(idx);
 }
