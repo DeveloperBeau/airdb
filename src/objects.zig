@@ -206,8 +206,14 @@ pub fn update(txn: *WriteTxn, cat: Ref, pk: u64, values: []const u64, expected_v
         }
     }
 
+    // Copy-on-write only the columns whose value actually changed: an O(height)
+    // read is strictly cheaper than an O(height) path copy, so a one-field
+    // update on a wide type no longer rewrites every property column.
     var i: usize = 0;
-    while (i < pc) : (i += 1) prop_refs[i] = try Column.set(txn, prop_refs[i], row, values[i]);
+    while (i < pc) : (i += 1) {
+        const cur_val = try Column.get(txn, prop_refs[i], row);
+        if (cur_val != values[i]) prop_refs[i] = try Column.set(txn, prop_refs[i], row, values[i]);
+    }
     ver_ref = try Column.set(txn, ver_ref, row, txn.new_version);
 
     const new_cat = try writeCatalog(txn, pc, next_row, v.keyrow_index_ref, v.next_key, idx_ref, ver_ref, live_ref, prop_refs[0..pc], kinds[0..pc], elems_buf[0..pc], bl_buf[0..pc], targets_buf[0..pc], rules_buf[0..pc], vidx_buf[0..pc], idxf_buf[0..pc]);
@@ -637,6 +643,40 @@ test "update applies on a matching version" {
         try testing.expectEqual(@as(u64, 77), out[1]);
         r.end();
     }
+}
+
+test "update copies only the columns whose value changed" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "obj4_diff.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var cat = try create(&w, 3);
+    cat = (try insert(&w, cat, &.{ 1, 10, 20 })).cat;
+
+    const before = try loadCatalog(&w, cat);
+    const col0 = before.propColRef(0);
+    const col1 = before.propColRef(1);
+    const col2 = before.propColRef(2);
+
+    var out: [3]u64 = undefined;
+    const ver = (try getByPk(&w, cat, 1, &out)).?;
+    const res = try update(&w, cat, 1, &.{ 1, 99, 20 }, ver);
+    try testing.expect(res == .ok);
+    cat = res.ok.cat;
+
+    const after = try loadCatalog(&w, cat);
+    // Unchanged columns keep their exact roots (no copy-on-write happened).
+    try testing.expectEqual(col0, after.propColRef(0));
+    try testing.expectEqual(col2, after.propColRef(2));
+    // The changed column was rewritten.
+    try testing.expect(after.propColRef(1) != col1);
+    _ = (try getByPk(&w, cat, 1, &out)).?;
+    try testing.expectEqual(@as(u64, 99), out[1]);
+    try testing.expectEqual(@as(u64, 20), out[2]);
+    w.deinit();
 }
 
 test "update conflicts on a stale version" {
