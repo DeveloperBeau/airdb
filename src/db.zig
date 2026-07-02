@@ -66,6 +66,12 @@ pub const VerifyError = error{
     // A value-index entry points at a dead/absent row, or at a live row whose
     // property value differs from the indexed value (backward direction).
     ValueIndexStaleEntry,
+    // A live row's outbound link/link_set target is missing from the target's
+    // backlink set (forward direction of the backlink invariant).
+    BacklinkMissingEntry,
+    // A backlink entry names a source that is dead/absent or whose link column
+    // does not actually point at the target (backward direction).
+    BacklinkStaleEntry,
 };
 
 pub const Db = struct {
@@ -726,6 +732,11 @@ pub const Db = struct {
             const cv = catalog.loadCatalog(&r, cat) catch return;
             var p: usize = 0;
             while (p < cv.prop_count) : (p += 1) {
+                const kind = cv.kind(p);
+                if (kind == .link or kind == .link_set) {
+                    try auditBacklinksForward(&r, cv, p, kind);
+                    try auditBacklinksBackward(&r, cv, p, kind);
+                }
                 if (!cv.indexed(p)) continue;
                 const vi_ref = cv.valueIndexRef(p);
                 const prop_col = cv.propColRef(p);
@@ -797,6 +808,99 @@ fn auditValueIndexBackward(r: *ReadTxn, vi_ref: Ref, keyrow_ref: Ref, prop_col: 
         }
     };
     Index.forEachEntry(r, vi_ref, Ctx{ .r = r, .keyrow_ref = keyrow_ref, .prop_col = prop_col, .live_col = live_col }, Ctx.onEntry) catch return error.ValueIndexStaleEntry;
+}
+
+// Forward direction of the backlink invariant: every live row's outbound
+// link/link_set target must carry that row's okey in the target's backlink set.
+// Any structural failure while walking is itself a divergence.
+fn auditBacklinksForward(r: *ReadTxn, cv: catalog.CatalogView, p: usize, kind: catalog.PropKind) VerifyError!void {
+    const Ctx = struct {
+        r: *ReadTxn,
+        bl: Ref,
+        prop_col: Ref,
+        live_col: Ref,
+        kind: catalog.PropKind,
+        fn checkOne(self: @This(), target: u64, source_okey: u64) anyerror!void {
+            const inner = (try Index.get(self.r, self.bl, target)) orelse return error.BacklinkMissingEntry;
+            if ((try Index.get(self.r, inner, source_okey)) == null) return error.BacklinkMissingEntry;
+        }
+        fn onEntry(self: @This(), okey: u64, row: u64) anyerror!void {
+            if ((try Column.get(self.r, self.live_col, row)) == 0) return; // defensive: skip dead
+            const raw = try Column.get(self.r, self.prop_col, row);
+            if (self.kind == .link) {
+                if (raw == 0) return; // null link
+                try self.checkOne(raw - 1, okey);
+                return;
+            }
+            // link_set: every member of the row's set must backlink to this row.
+            const Walk = struct {
+                r: *ReadTxn,
+                bl: Ref,
+                okey: u64,
+                fn onKey(m: @This(), target: u64) anyerror!void {
+                    const inner = (try Index.get(m.r, m.bl, target)) orelse return error.BacklinkMissingEntry;
+                    if ((try Index.get(m.r, inner, m.okey)) == null) return error.BacklinkMissingEntry;
+                }
+            };
+            try Index.forEachKey(self.r, raw, Walk{ .r = self.r, .bl = self.bl, .okey = okey }, Walk.onKey);
+        }
+    };
+    Index.forEachEntry(r, cv.keyrow_index_ref, Ctx{
+        .r = r,
+        .bl = cv.backlinkRef(p),
+        .prop_col = cv.propColRef(p),
+        .live_col = cv.live_col_ref,
+        .kind = kind,
+    }, Ctx.onEntry) catch return error.BacklinkMissingEntry;
+}
+
+// Backward direction of the backlink invariant: every backlink entry's source
+// must be a live row whose link column actually points at the entry's target.
+// Empty inner sets are tolerated defensively (maintenance prunes them now).
+fn auditBacklinksBackward(r: *ReadTxn, cv: catalog.CatalogView, p: usize, kind: catalog.PropKind) VerifyError!void {
+    const Ctx = struct {
+        r: *ReadTxn,
+        keyrow: Ref,
+        prop_col: Ref,
+        live_col: Ref,
+        kind: catalog.PropKind,
+        fn onEntry(self: @This(), target: u64, inner_root: u64) anyerror!void {
+            if ((try Index.count(self.r, inner_root)) == 0) return;
+            const Inner = struct {
+                r: *ReadTxn,
+                keyrow: Ref,
+                prop_col: Ref,
+                live_col: Ref,
+                kind: catalog.PropKind,
+                target: u64,
+                fn onKey(inner: @This(), src_okey: u64) anyerror!void {
+                    const row = (try Index.get(inner.r, inner.keyrow, src_okey)) orelse return error.BacklinkStaleEntry;
+                    if ((try Column.get(inner.r, inner.live_col, row)) == 0) return error.BacklinkStaleEntry;
+                    const raw = try Column.get(inner.r, inner.prop_col, row);
+                    if (inner.kind == .link) {
+                        if (raw == 0 or raw - 1 != inner.target) return error.BacklinkStaleEntry;
+                    } else {
+                        if ((try Index.get(inner.r, raw, inner.target)) == null) return error.BacklinkStaleEntry;
+                    }
+                }
+            };
+            try Index.forEachKey(self.r, inner_root, Inner{
+                .r = self.r,
+                .keyrow = self.keyrow,
+                .prop_col = self.prop_col,
+                .live_col = self.live_col,
+                .kind = self.kind,
+                .target = target,
+            }, Inner.onKey);
+        }
+    };
+    Index.forEachEntry(r, cv.backlinkRef(p), Ctx{
+        .r = r,
+        .keyrow = cv.keyrow_index_ref,
+        .prop_col = cv.propColRef(p),
+        .live_col = cv.live_col_ref,
+        .kind = kind,
+    }, Ctx.onEntry) catch return error.BacklinkStaleEntry;
 }
 
 // ---------------------------------------------------------------------------
@@ -1169,6 +1273,77 @@ test "verifyIntegrity detects a corrupted value index" {
     }
 
     try testing.expectError(error.ValueIndexStaleEntry, db.verifyIntegrity());
+}
+
+test "verifyIntegrity passes on a clean link graph after churn" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "vi_bl_clean.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    const links = @import("links.zig");
+
+    {
+        var w = try db.beginWrite();
+        var dir = try typedir.createTypes(&w, &.{
+            &.{ .{ .kind = .int }, .{ .kind = .blob } }, // 0: target type
+            &.{ .{ .kind = .int }, .{ .kind = .link, .link_target = 0 }, .{ .kind = .link_set, .link_target = 0 } }, // 1: source
+        }, &.{ false, false });
+        const a = try typedir.insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .bytes = "A" } });
+        dir = a.dir;
+        const b = try typedir.insert(&w, dir, 0, &.{ .{ .int = 2 }, .{ .bytes = "B" } });
+        dir = b.dir;
+        dir = (try typedir.insert(&w, dir, 1, &.{ .{ .int = 1 }, .{ .link = a.row }, .{ .link_set = &.{ a.row, b.row } } })).dir;
+        dir = (try typedir.insert(&w, dir, 1, &.{ .{ .int = 2 }, .{ .link = b.row }, .{ .link_set = &.{} } })).dir;
+        // Churn: move source 1's to-one link, drop one set member.
+        dir = try typedir.setLink(&w, dir, 1, 1, 1, b.row);
+        const src_cat = try typedir.catalogRef(&w, dir, 1);
+        const new_cat = try links.linkSetRemove(&w, src_cat, 1, 2, a.row);
+        dir = try typedir.setCatalogRef(&w, dir, 1, new_cat);
+        w.setRoot(dir);
+        _ = try w.commit();
+    }
+    try db.verifyIntegrity(); // forward + backward backlink audit finds no divergence
+}
+
+test "verifyIntegrity detects a corrupted backlink index" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "vi_bl_corrupt.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var target_okey: u64 = undefined;
+
+    {
+        var w = try db.beginWrite();
+        var dir = try typedir.createTypes(&w, &.{
+            &.{ .{ .kind = .int }, .{ .kind = .link, .link_target = 0 } },
+        }, &.{false});
+        const a = try typedir.insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .link = null } });
+        dir = a.dir;
+        target_okey = a.row;
+        dir = (try typedir.insert(&w, dir, 0, &.{ .{ .int = 2 }, .{ .link = target_okey } })).dir;
+        w.setRoot(dir);
+        _ = try w.commit();
+    }
+    try db.verifyIntegrity(); // clean before corruption
+
+    // White-box corruption: drop the target's backlink entry while the source's
+    // link column still points at it. Forward audit must flag the divergence.
+    {
+        var w = try db.beginWrite();
+        const dir = db.active_root;
+        const cat = try typedir.catalogRef(&w, dir, 0);
+        const cv = try catalog.loadCatalog(&w, cat);
+        const new_bl = try Index.remove(&w, cv.backlinkRef(1), target_okey);
+        const new_cat = try catalog.setBacklinkRef(&w, cat, 1, new_bl);
+        const new_dir = try typedir.setCatalogRef(&w, dir, 0, new_cat);
+        w.setRoot(new_dir);
+        _ = try w.commit();
+    }
+    try testing.expectError(error.BacklinkMissingEntry, db.verifyIntegrity());
 }
 
 test "verifyIntegrity passes on a non-indexed type" {
