@@ -73,11 +73,25 @@ pub const Coord = struct {
         errdefer section.unmap();
         const map = section.map;
 
-        const magic = std.mem.readInt(u64, map[off_magic..][0..8], .little);
-        if (magic != coord_magic) {
-            // New file: zero the entire page and stamp the magic.
-            @memset(map[0..coord_size], 0);
-            std.mem.writeInt(u64, map[off_magic..][0..8], coord_magic, .little);
+        // Initialize with double-checked locking. Two processes racing on a
+        // brand-new coord file must not both see "magic absent" and zero the
+        // page: the loser would wipe the winner's attach count, participant
+        // slot, and published pins, letting a writer compute a reclaim horizon
+        // that ignores live readers. The exclusive flock serializes the
+        // check-then-init window; the magic is release-stored AFTER the zeroing
+        // so any process that acquire-loads it is guaranteed to see a fully
+        // initialized page without taking the lock. The lock is only touched on
+        // the magic-absent path, so opening an existing database never blocks
+        // behind a writer holding the same flock for a transaction.
+        const magic_ptr: *u64 = @ptrCast(@alignCast(&map[off_magic]));
+        if (@atomicLoad(u64, magic_ptr, .acquire) != coord_magic) {
+            _ = try platform.lockFileExclusive(file, true);
+            defer platform.unlockFile(file);
+            if (@atomicLoad(u64, magic_ptr, .acquire) != coord_magic) {
+                // New file: zero the entire page, then stamp the magic last.
+                @memset(map[0..coord_size], 0);
+                @atomicStore(u64, magic_ptr, coord_magic, .release);
+            }
         }
         // Existing file with correct magic: leave all fields as-is.
 
@@ -231,6 +245,52 @@ test "coord create initializes magic and zero attach count, reopen reads them" {
     c2.deinit();
     _ = c1.detach();
     c1.deinit();
+}
+
+test "a second openOrCreate preserves live coordination state" {
+    // Regression: the init path must never re-zero an already-stamped page.
+    // Attach count, claimed slot, published pin, and latest version written by
+    // the first opener must all survive a second open of the same file.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dlen = try tmp.dir.realPath(coordIo(), &path_buf);
+    const cpath = try std.fs.path.join(testing.allocator, &.{ path_buf[0..dlen], "keep.coord" });
+    defer testing.allocator.free(cpath);
+
+    var c1 = try Coord.openOrCreate(cpath);
+    defer c1.deinit();
+    _ = c1.attach();
+    const slot = (try c1.claimSlot()).?;
+    c1.publishMinPinned(slot, 7);
+    c1.setLatestVersion(42);
+
+    var c2 = try Coord.openOrCreate(cpath);
+    defer c2.deinit();
+    try testing.expectEqual(@as(u32, 1), c2.attachCount());
+    try testing.expectEqual(@as(u64, 7), c2.slotMinPinnedForTest(slot));
+    try testing.expectEqual(@as(u64, 42), c2.latestVersion());
+    c1.releaseSlot(slot);
+    _ = c1.detach();
+}
+
+test "openOrCreate succeeds while another holder owns the coord flock" {
+    // The init fast path must not block behind the write lock: an existing
+    // (stamped) coord file opens without touching the flock.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dlen = try tmp.dir.realPath(coordIo(), &path_buf);
+    const cpath = try std.fs.path.join(testing.allocator, &.{ path_buf[0..dlen], "locked.coord" });
+    defer testing.allocator.free(cpath);
+
+    var a = try Coord.openOrCreate(cpath);
+    defer a.deinit();
+    try a.lockExclusive(); // simulate a writer mid-transaction
+
+    var b = try Coord.openOrCreate(cpath); // must not deadlock
+    b.deinit();
+    a.unlock();
 }
 
 test "latest_version round-trips through the mapping" {
