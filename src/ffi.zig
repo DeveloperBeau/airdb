@@ -64,7 +64,15 @@ export fn airdb_open(path_ptr: [*:0]const u8, prop_count: u16) ?*Database {
         r.end();
         self.prop_count = pc;
         return self;
-    } else |_| {
+    } else |open_err| {
+        // Create only when the file genuinely does not exist. Any other open
+        // failure (corruption, resources, permissions) must NOT fall through to
+        // create: FileStore.create truncates, which would destroy a database
+        // that may still be recoverable.
+        if (open_err != error.FileNotFound) {
+            alloc.destroy(self);
+            return null;
+        }
         self.db = Db.create(alloc, path) catch {
             alloc.destroy(self);
             return null;
@@ -480,6 +488,42 @@ test "ffi: null handle is safe" {
 
 test "ffi: relative path is rejected without aborting" {
     try testing.expect(airdb_open("relative/path.airdb", 2) == null);
+}
+
+test "ffi: open of a corrupt database returns null and never truncates the file" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try ffiTmpPathZ(testing.allocator, &tmp, "corrupt_open.airdb");
+    defer testing.allocator.free(path);
+
+    // Create a real database with one row, then close it.
+    {
+        const h = airdb_open(path.ptr, 2) orelse return error.OpenFailed;
+        try testing.expect(airdb_insert(h, &[_]u64{ 1, 42 }, 2) >= 0);
+        airdb_close(h);
+    }
+
+    // Corrupt the magic so Db.open fails with something other than FileNotFound.
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var len_before: u64 = 0;
+    {
+        var f = try std.Io.Dir.openFileAbsolute(io, path, .{ .mode = .read_write });
+        defer f.close(io);
+        len_before = try f.length(io);
+        try f.writePositionalAll(io, &[_]u8{ 0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF }, 0);
+        try f.sync(io);
+    }
+
+    // Open must fail cleanly -- and must NOT truncate/recreate the file.
+    try testing.expect(airdb_open(path.ptr, 2) == null);
+
+    var f = try std.Io.Dir.openFileAbsolute(io, path, .{ .mode = .read_only });
+    defer f.close(io);
+    try testing.expectEqual(len_before, try f.length(io));
+    var magic: [8]u8 = undefined;
+    _ = try f.readPositionalAll(io, &magic, 0);
+    // The corrupted magic is still there: nothing rewrote the header.
+    try testing.expectEqualSlices(u8, &[_]u8{ 0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF }, &magic);
 }
 
 test "ffi txn: begin then abort releases the write lock" {
