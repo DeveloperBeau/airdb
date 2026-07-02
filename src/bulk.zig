@@ -36,8 +36,11 @@ const ColChild = struct { ref: u64, count: u64 };
 // Deref a column node, sizing the read by its kind byte (leaf vs inner).
 fn derefColNode(txn: *WriteTxn, ref: Ref) ![]const u8 {
     const kb = try txn.deref(ref, 1);
-    if (kb[0] == cnode.kind_leaf) return txn.deref(ref, cnode.leaf_node_size);
-    return txn.deref(ref, cnode.inner_node_size);
+    return switch (kb[0]) {
+        cnode.kind_leaf => txn.deref(ref, cnode.leaf_node_size),
+        cnode.kind_inner => txn.deref(ref, cnode.inner_node_size),
+        else => error.Corrupt,
+    };
 }
 
 // Pack `values` into leaves filled to LEAF_CAP in row order. Returns the leaf
@@ -118,8 +121,11 @@ const SpineChild = struct { ref: u64, low: u64 };
 // Deref an index node, sizing the read by its kind byte (leaf vs inner).
 fn derefIdxNode(txn: *WriteTxn, ref: Ref) ![]const u8 {
     const kb = try txn.deref(ref, 1);
-    if (kb[0] == inode.kind_leaf) return txn.deref(ref, inode.leaf_node_size);
-    return txn.deref(ref, inode.inner_node_size);
+    return switch (kb[0]) {
+        inode.kind_leaf => txn.deref(ref, inode.leaf_node_size),
+        inode.kind_inner => txn.deref(ref, inode.inner_node_size),
+        else => error.Corrupt,
+    };
 }
 
 // Pack strictly-ascending (keys, vals) into leaves filled to LEAF_CAP in key
@@ -224,7 +230,9 @@ pub fn indexAppendRun(txn: *WriteTxn, root: Ref, keys: []const u64, vals: []cons
     defer path_ridx.deinit(al);
     var cur: Ref = root;
     var leaf_ref: Ref = root;
-    while (true) {
+    var hops: usize = 0;
+    while (true) : (hops += 1) {
+        if (hops >= Index.max_depth) return error.Corrupt; // ref cycle guard
         const nb = try derefIdxNode(txn, cur);
         if (nb[0] == inode.kind_leaf) {
             leaf_ref = cur;
@@ -324,7 +332,9 @@ pub fn columnAppendRun(txn: *WriteTxn, root: Ref, values: []const u64) !Ref {
     defer path_ridx.deinit(al);
     var cur: Ref = root;
     var leaf_ref: Ref = root;
-    while (true) {
+    var hops: usize = 0;
+    while (true) : (hops += 1) {
+        if (hops >= Column.max_depth) return error.Corrupt; // ref cycle guard
         const nb = try derefColNode(txn, cur);
         if (nb[0] == cnode.kind_leaf) {
             leaf_ref = cur;

@@ -66,14 +66,17 @@ fn leafLowerBound(txn: anytype, v: LeafView, target: []const u8) !usize {
     return lo;
 }
 
+// Same cycle guard as index.zig: any walk deeper than a legal tree's maximum
+// height is following a corrupt ref cycle and fails instead of overflowing.
+const max_depth = @import("index.zig").max_depth;
+
 fn derefNode(txn: anytype, ref: Ref) ![]const u8 {
     const kind_bytes = try txn.deref(ref, 1);
-    const kind = kind_bytes[0];
-    if (kind == kind_leaf) {
-        return txn.deref(ref, leaf_node_size);
-    } else {
-        return txn.deref(ref, inner_node_size);
-    }
+    return switch (kind_bytes[0]) {
+        kind_leaf => txn.deref(ref, leaf_node_size),
+        kind_inner => txn.deref(ref, inner_node_size),
+        else => error.Corrupt,
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -90,6 +93,11 @@ pub fn create(txn: *WriteTxn) !Ref {
 /// Look up `key` in the tree rooted at `root`. Returns the value on exact
 /// byte-equality, else null.
 pub fn get(txn: anytype, root: Ref, key: []const u8) !?u64 {
+    return getAt(txn, root, key, 0);
+}
+
+fn getAt(txn: anytype, root: Ref, key: []const u8, depth: usize) !?u64 {
+    if (depth >= max_depth) return error.Corrupt;
     const bytes = try derefNode(txn, root);
     if (bytes[0] == kind_leaf) {
         const v = try parseLeaf(bytes);
@@ -100,7 +108,7 @@ pub fn get(txn: anytype, root: Ref, key: []const u8) !?u64 {
     const v = try parseInner(bytes);
     const ci = try childIndexForKey(txn, v, key);
     const child_ref: Ref = v.childRef(ci);
-    return get(txn, child_ref, key);
+    return getAt(txn, child_ref, key, depth + 1);
 }
 
 const Split = struct { ref: Ref, low: u64 };
@@ -109,19 +117,25 @@ const InsertResult = struct { ref: Ref, split: ?Split };
 /// Descend the leftmost spine to the leftmost leaf and return the blob ref of
 /// its first (smallest) key.
 fn minKey(txn: anytype, ref: Ref) !u64 {
-    const bytes = try derefNode(txn, ref);
-    if (bytes[0] == kind_leaf) {
-        const v = try parseLeaf(bytes);
-        return v.key(0);
+    var cur: Ref = ref;
+    var depth: usize = 0;
+    while (depth < max_depth) : (depth += 1) {
+        const bytes = try derefNode(txn, cur);
+        if (bytes[0] == kind_leaf) {
+            const v = try parseLeaf(bytes);
+            return v.key(0);
+        }
+        const v = try parseInner(bytes);
+        cur = v.childRef(0);
     }
-    const v = try parseInner(bytes);
-    return minKey(txn, v.childRef(0));
+    return error.Corrupt;
 }
 
 /// Recursive insert. `key_ref` is the blob ref for `key` (pre-allocated by the
 /// public insert). On an in-place overwrite the redundant `key_ref` blob is
 /// freed here, since the existing entry already references the key bytes.
-fn insertInto(txn: *WriteTxn, node_ref: Ref, key_ref: u64, key: []const u8, val: u64) !InsertResult {
+fn insertInto(txn: *WriteTxn, node_ref: Ref, key_ref: u64, key: []const u8, val: u64, depth: usize) !InsertResult {
+    if (depth >= max_depth) return error.Corrupt;
     const node_bytes = try txn.deref(node_ref, 1);
     const kind = node_bytes[0];
 
@@ -188,7 +202,7 @@ fn insertInto(txn: *WriteTxn, node_ref: Ref, key_ref: u64, key: []const u8, val:
     const inner_bytes = try txn.deref(node_ref, inner_node_size);
     const v = try parseInner(inner_bytes);
     const ci = try childIndexForKey(txn, v, key);
-    const r = try insertInto(txn, v.childRef(ci), key_ref, key, val);
+    const r = try insertInto(txn, v.childRef(ci), key_ref, key, val, depth + 1);
 
     // No split in child: just update the child ref.
     if (r.split == null) {
@@ -252,7 +266,7 @@ fn insertInto(txn: *WriteTxn, node_ref: Ref, key_ref: u64, key: []const u8, val:
 /// is inserted in byte-sorted order. Returns the (possibly new) root.
 pub fn insert(txn: *WriteTxn, root: Ref, key: []const u8, val: u64) !Ref {
     const key_ref = try blob.put(txn, key);
-    const r = try insertInto(txn, root, key_ref, key, val);
+    const r = try insertInto(txn, root, key_ref, key, val, 0);
     if (r.split == null) return r.ref;
     // Root was split: build a new two-child inner root.
     const left_min = try minKey(txn, r.ref);
@@ -264,7 +278,8 @@ pub fn insert(txn: *WriteTxn, root: Ref, key: []const u8, val: u64) !Ref {
 }
 
 /// Recursive remove. Returns node_ref unchanged when the key is absent.
-fn removeInto(txn: *WriteTxn, node_ref: Ref, key: []const u8) !Ref {
+fn removeInto(txn: *WriteTxn, node_ref: Ref, key: []const u8, depth: usize) !Ref {
+    if (depth >= max_depth) return error.Corrupt;
     const kind = (try txn.deref(node_ref, 1))[0];
 
     // ---- LEAF ---------------------------------------------------------------
@@ -292,7 +307,7 @@ fn removeInto(txn: *WriteTxn, node_ref: Ref, key: []const u8) !Ref {
     const v = try parseInner(inner_bytes);
     const ci = try childIndexForKey(txn, v, key);
     const old_child_ref: Ref = v.childRef(ci);
-    const new_child = try removeInto(txn, old_child_ref, key);
+    const new_child = try removeInto(txn, old_child_ref, key, depth + 1);
     if (new_child == old_child_ref) return node_ref;
     const new_inner = try txn.writableCopy(node_ref, inner_node_size);
     std.mem.writeInt(u64, new_inner.bytes[hdr + ci * 16 ..][0..8], new_child, .little);
@@ -302,11 +317,16 @@ fn removeInto(txn: *WriteTxn, node_ref: Ref, key: []const u8) !Ref {
 /// Remove `key` from the tree rooted at `root`. Frees the key's blob node when
 /// present. Returns the (possibly new) root; unchanged if the key is absent.
 pub fn remove(txn: *WriteTxn, root: Ref, key: []const u8) !Ref {
-    return removeInto(txn, root, key);
+    return removeInto(txn, root, key, 0);
 }
 
 /// Return the number of entries in the tree rooted at `root`.
 pub fn count(txn: anytype, root: Ref) !u64 {
+    return countAt(txn, root, 0);
+}
+
+fn countAt(txn: anytype, root: Ref, depth: usize) !u64 {
+    if (depth >= max_depth) return error.Corrupt;
     const bytes = try derefNode(txn, root);
     if (bytes[0] == kind_leaf) {
         const v = try parseLeaf(bytes);
@@ -317,7 +337,7 @@ pub fn count(txn: anytype, root: Ref) !u64 {
     var i: usize = 0;
     while (i < v.child_count) : (i += 1) {
         const child_ref: Ref = v.childRef(i);
-        total += try count(txn, child_ref);
+        total += try countAt(txn, child_ref, depth + 1);
     }
     return total;
 }
@@ -332,6 +352,17 @@ pub fn forEachEntry(
     ctx: anytype,
     comptime onEntry: fn (@TypeOf(ctx), key: []const u8, val: u64) anyerror!void,
 ) !void {
+    return forEachEntryAt(txn, root, ctx, onEntry, 0);
+}
+
+fn forEachEntryAt(
+    txn: anytype,
+    root: Ref,
+    ctx: anytype,
+    comptime onEntry: fn (@TypeOf(ctx), key: []const u8, val: u64) anyerror!void,
+    depth: usize,
+) !void {
+    if (depth >= max_depth) return error.Corrupt;
     const bytes = try derefNode(txn, root);
     if (bytes[0] == kind_leaf) {
         const leaf = try parseLeaf(bytes);
@@ -346,7 +377,7 @@ pub fn forEachEntry(
     var i: usize = 0;
     while (i < inner.child_count) : (i += 1) {
         const child_ref: Ref = inner.childRef(i);
-        try forEachEntry(txn, child_ref, ctx, onEntry);
+        try forEachEntryAt(txn, child_ref, ctx, onEntry, depth + 1);
     }
 }
 
@@ -360,6 +391,27 @@ fn bidxTmpPath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const dlen = try tmp.dir.realPath(testing.io, &path_buf);
     return std.fs.path.join(allocator, &.{ path_buf[0..dlen], name });
+}
+
+test "a bindex ref cycle fails with error.Corrupt" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try bidxTmpPath(testing.allocator, &tmp, "bidx_cycle.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    defer w.deinit();
+
+    // Inner node whose only child is itself; its low key is a real blob so the
+    // ordering compare succeeds and the walk descends into the cycle.
+    const key_ref = try blob.put(&w, "k");
+    const a = try w.alloc(inner_node_size);
+    _ = encodeInner(a.bytes, &.{a.ref}, &.{key_ref});
+    try testing.expectError(error.Corrupt, get(&w, a.ref, "k"));
+    try testing.expectError(error.Corrupt, count(&w, a.ref));
+    try testing.expectError(error.Corrupt, insert(&w, a.ref, "x", 1));
+    try testing.expectError(error.Corrupt, remove(&w, a.ref, "k"));
 }
 
 test "insert and get round-trip byte keys" {
