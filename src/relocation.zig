@@ -94,6 +94,60 @@ test "relocateRow moves a row and keeps key, pk, and value" {
     w.deinit();
 }
 
+test "setLink after relocating the SOURCE keeps the backlink graph exact" {
+    // Regression: setLink/linkSetAdd/linkSetRemove recorded the source's
+    // PHYSICAL ROW as the backlink source, while every consumer treats sources
+    // as stable okeys. Once a source row was relocated the two diverged:
+    // removals missed, stale entries inflated counts, and nullify could clear
+    // an unrelated object's link. Backlink sources must be okeys.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "reloc3.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    defer w.deinit();
+
+    var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
+
+    // Throwaway opens a dead slot; then two targets and the source.
+    const dead = try objects.insert(&w, cat, &.{ 99, 0 });
+    cat = dead.cat;
+    const t1 = try objects.insert(&w, cat, &.{ 1, 0 });
+    cat = t1.cat;
+    const t2 = try objects.insert(&w, cat, &.{ 2, 0 });
+    cat = t2.cat;
+    const src = try objects.insert(&w, cat, &.{ 3, 0 });
+    cat = src.cat;
+
+    // Free the throwaway's physical slot and relocate the SOURCE into it, so
+    // the source's row and okey diverge.
+    const dead_row = (try catalog.okeyToRow(&w, cat, dead.row)).?;
+    var out: [2]u64 = undefined;
+    const dv = (try objects.getByPk(&w, cat, 99, &out)).?;
+    cat = (try objects.delete(&w, cat, 99, dv)).ok;
+    cat = try relocateRow(&w, cat, src.row, dead_row);
+    try testing.expect((try catalog.okeyToRow(&w, cat, src.row)).? != src.row);
+
+    // Link src -> t1, then move it to t2: counts must track exactly.
+    cat = try links.setLink(&w, cat, 3, 1, t1.row);
+    try testing.expectEqual(@as(u64, 1), try links.backlinkCount(&w, cat, 1, t1.row));
+    cat = try links.setLink(&w, cat, 3, 1, t2.row);
+    try testing.expectEqual(@as(u64, 0), try links.backlinkCount(&w, cat, 1, t1.row));
+    try testing.expectEqual(@as(u64, 1), try links.backlinkCount(&w, cat, 1, t2.row));
+
+    // Deleting t2 must nullify the relocated source's link (backlink resolves
+    // through the okey), leaving t1 and the source's other data untouched.
+    const t2v = (try objects.getByPk(&w, cat, 2, &out)).?;
+    cat = switch (try objects.deleteAndNullify(&w, cat, 2, t2v)) {
+        .ok => |c| c,
+        else => unreachable,
+    };
+    try testing.expectEqual(@as(?u64, null), try links.getLink(&w, cat, 3, 1));
+    try testing.expect((try objects.getByPk(&w, cat, 1, &out)) != null);
+}
+
 test "a same-type link to a relocated object still resolves" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();

@@ -68,12 +68,16 @@ Freed space is reclaimed through a horizon:
 - The retention window (`setRetainVersions`) is stored in the header page and
   shared by all processes: space freed within the most recent N versions is
   withheld, which is what makes point-in-time reads (`beginReadAt`) safe under
-  concurrent writers. `beginReadAt` pins first and re-validates the floor
-  after the pin is visible.
+  concurrent writers. Both `beginRead` and `beginReadAt` pin first and
+  re-validate against the published latest version after the pin is visible,
+  retrying (latest reads) or refusing (point-in-time reads) when the world
+  moved past the pin while it was in flight.
 
-The free list itself is bucketed by 8-byte size class for O(1) exact reuse,
-carves larger blocks when no exact class matches, and coalesces adjacent
-extents at each commit so extent count stays bounded under churn.
+The free list itself is bucketed by 8-byte size class with back-pointer
+repair, making exact-class reuse O(1). It deliberately does not carve or
+coalesce: the copy-on-write cycle frees and reallocates a small fixed set of
+node sizes, and exact matching keeps that pool fragment-free (both carving and
+merging were tried and shredded it).
 
 ## Point-in-time reads
 

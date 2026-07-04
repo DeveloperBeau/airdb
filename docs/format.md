@@ -18,7 +18,7 @@ mapped individually and never moved. A `Ref` is an absolute byte offset,
 | `[64, 100)` | commit slot A |
 | `[128, 164)` | commit slot B |
 | `[192, 200)` | retention window u64 (shared reclaim floor; 0 = none, maxInt = retain everything) |
-| `[1016, 1020)` | version-ring head counter u32 (monotonic; live index = head % 128) |
+| `[1016, 1024)` | version-ring head counter u64 (monotonic; live index = head % 128) |
 | `[1024, 3072)` | version ring: 128 × (version u64, root_ref u64) |
 
 A commit slot is `version u64, root_ref u64, free_list_ref u64,

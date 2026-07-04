@@ -45,6 +45,10 @@ export fn airdb_open(path_ptr: [*:0]const u8, prop_count: u16) ?*Database {
     // The storage layer requires an absolute path. Reject anything else here so
     // a relative path returns a clean error instead of aborting the host.
     if (!std.fs.path.isAbsolute(path)) return null;
+    // A C ABI must not trust its arguments: prop_count 0 trips an internal
+    // assert (abort in safe builds), and > 256 would overflow fixed-size
+    // per-property buffers in release builds. Reject both cleanly.
+    if (prop_count == 0 or prop_count > MAX_PROPS) return null;
     const self = alloc.create(Database) catch return null;
 
     if (Db.open(alloc, path)) |opened| {
@@ -231,6 +235,7 @@ export fn airdb_delete(handle: ?*Database, pk: u64) i64 {
 export fn airdb_bulk_insert(handle: ?*Database, rows_flat: [*]const u64, row_count: usize, prop_count: usize) i64 {
     const self = handle orelse return AIRDB_E_GENERIC;
     if (prop_count != self.prop_count) return AIRDB_E_BAD_ARGS;
+    if (row_count > std.math.maxInt(i64)) return AIRDB_E_BAD_ARGS; // return value is i64
 
     // Build a []const []const u64 view over the flat buffer: each row slice
     // points at its prop_count-wide window. Freed regardless of outcome.
@@ -272,6 +277,7 @@ export fn airdb_bulk_insert(handle: ?*Database, rows_flat: [*]const u64, row_cou
 export fn airdb_bulk_append(handle: ?*Database, rows_flat: [*]const u64, row_count: usize, prop_count: usize) i64 {
     const self = handle orelse return AIRDB_E_GENERIC;
     if (prop_count != self.prop_count) return AIRDB_E_BAD_ARGS;
+    if (row_count > std.math.maxInt(i64)) return AIRDB_E_BAD_ARGS; // return value is i64
 
     // Build a []const []const u64 view over the flat buffer: each row slice
     // points at its prop_count-wide window. Freed regardless of outcome.
@@ -488,6 +494,17 @@ test "ffi: null handle is safe" {
 
 test "ffi: relative path is rejected without aborting" {
     try testing.expect(airdb_open("relative/path.airdb", 2) == null);
+}
+
+test "ffi: hostile prop_count is rejected without aborting" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try ffiTmpPathZ(testing.allocator, &tmp, "badpc.airdb");
+    defer testing.allocator.free(path);
+    // 0 used to trip an internal assert (host abort); >256 overflowed
+    // fixed-size per-property buffers in release builds.
+    try testing.expect(airdb_open(path.ptr, 0) == null);
+    try testing.expect(airdb_open(path.ptr, 300) == null);
 }
 
 test "ffi: open of a corrupt database returns null and never truncates the file" {

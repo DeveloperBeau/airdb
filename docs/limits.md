@@ -41,8 +41,9 @@ newer one. Ship a matched engine with your app.
 
 - Bounded by the 128-entry version ring and the retention window. With
   `retain_versions = 0` (the default) only the latest version is readable.
-- The retention window is shared and persisted. Raising it is always safe;
-  lowering it while another process may hold point-in-time readers is not —
+- The retention window is shared and persisted. Raising it protects versions
+  committed AFTER the raise (space already reused cannot be un-reused);
+  lowering it while another process may hold point-in-time readers is unsafe —
   raise-only while readers can exist.
 - Retention withholds freed space from reuse, so a wide window trades file
   growth for history.
@@ -61,6 +62,9 @@ newer one. Ship a matched engine with your app.
   query fails (exotic sandboxing), a recycled pid degrades to pid-only
   liveness: safe, but a dead reader's pin may persist until the slot is
   reused.
+- At most 64 simultaneously attached Db instances per database; the 65th
+  open fails with TooManyAttachments rather than degrade to reads whose pins
+  no writer can see.
 - The coord file must live next to the data file on the same filesystem.
 - Advisory locks: a process that bypasses airdb and writes the file directly
   defeats every guarantee.
