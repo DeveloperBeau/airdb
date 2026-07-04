@@ -36,21 +36,23 @@ exact committed figures live in `bench/baseline-1m.json`.
 
 | Scenario | Ops | Throughput | p50 | p99 | File |
 |---|---|---|---|---|---|
-| insert_recovery | 1,000,000 | 327k ops/s | — | — | 112 MiB |
-| lookup_query | 100,000 | 1.03M ops/s | 0.9 µs | 3.6 µs | 208 MiB |
-| churn_compaction | 40,000 | 7.1k ops/s | 58 ms/iter | 121 ms | 80 MiB |
-| blobs_pitr | 8 × 24 MiB | put 1182 MiB/s, get 14.5 GiB/s | — | — | 272 MiB |
-| types_crud | 350,000 | 13.8k ops/s | 3.6 µs | 507 µs | 992 MiB |
-| embedded_crud | 350,000 | 25.6k ops/s | 4.3 µs | 300 µs | 352 MiB |
-| nested_embedded | 150,000 | 72.7k ops/s | 2.8 µs | 18.7 µs | 352 MiB |
-| bulk_import | 1,000,000 | 16.4M rows/s (49× row-wise) | — | — | 64 MiB |
-| bulk_append | 500,000 | 18.5M rows/s (49× row-wise) | — | — | 64 MiB |
+| insert_recovery | 1,000,000 | 358k ops/s | — | — | 112 MiB |
+| lookup_query | 100,000 | 1.24M ops/s | 0.8 µs | 2.8 µs | 208 MiB |
+| churn_compaction | 40,000 | 21.6k ops/s | 15.4 ms/iter | 16.7 ms | 80 MiB |
+| blobs_pitr | 8 × 24 MiB | put 1180 MiB/s, get 13.1 GiB/s | — | — | 272 MiB |
+| types_crud | 350,000 | 54.0k ops/s | 3.5 µs | 37 µs | 1056 MiB |
+| embedded_crud | 350,000 | 88.9k ops/s | 4.2 µs | 27 µs | 352 MiB |
+| nested_embedded | 150,000 | 73.2k ops/s | 2.8 µs | 16 µs | 352 MiB |
+| bulk_import | 1,000,000 | 16.8M rows/s (47× row-wise) | — | — | 64 MiB |
+| bulk_append | 500,000 | 20.0M rows/s (51× row-wise) | — | — | 64 MiB |
 
 Highlights from the notes lines:
 
-- indexed equality query over 1M rows: 1.7 ms for 10k hits vs 49 ms full scan
-- cold reopen of a 1M-row database: 51 ms; first read after reopen: 35 µs
-- free-list cost per commit: ~30 µs encode across 101 batched commits
+- indexed equality query over 1M rows: 1.3 ms for 10k hits vs 43 ms full scan
+- cold reopen of a 1M-row database: 51 ms; first read after reopen: 46 µs
+- free-list cost per commit: ~20 µs encode across 101 batched commits
+- typed CRUD per-phase p50: create 3.4 µs, read 1.8 µs, update 9.0 µs,
+  delete 12.0 µs — deletes now reclaim every collection tree and blob
 - the churn scenario's `bound=held` asserts incremental compaction kept dead
   rows under its bound for the whole run
 
