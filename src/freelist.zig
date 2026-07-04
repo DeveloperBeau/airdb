@@ -16,6 +16,12 @@ fn round8(n: u64) u64 {
 pub const FreeList = struct {
     allocator: std.mem.Allocator,
     extents: std.ArrayList(FreeExtent),
+    /// bucket_pos[i] is extent i's position inside its size-class bucket.
+    /// The back-pointer makes every bucket repair O(1): without it, removing
+    /// an extent means linearly searching the moved element's bucket, which is
+    /// O(bucket length) per removal and turned delete-heavy transactions
+    /// quadratic once buckets reached tens of thousands of entries.
+    bucket_pos: std.ArrayList(usize),
     /// size class -> indices into `extents` with that exact (rounded) len.
     /// Makes reuseExact a bucket probe instead of a linear scan over every
     /// extent -- the free-pool lookup sits on the hot allocation path of every
@@ -26,6 +32,7 @@ pub const FreeList = struct {
         return .{
             .allocator = allocator,
             .extents = .empty,
+            .bucket_pos = .empty,
             .by_size = std.AutoHashMap(u64, std.ArrayList(usize)).init(allocator),
         };
     }
@@ -34,6 +41,7 @@ pub const FreeList = struct {
         var it = self.by_size.valueIterator();
         while (it.next()) |list| list.deinit(self.allocator);
         self.by_size.deinit();
+        self.bucket_pos.deinit(self.allocator);
         self.extents.deinit(self.allocator);
     }
 
@@ -41,33 +49,29 @@ pub const FreeList = struct {
         const gop = try self.by_size.getOrPut(size);
         if (!gop.found_existing) gop.value_ptr.* = .empty;
         try gop.value_ptr.append(self.allocator, idx);
+        self.bucket_pos.items[idx] = gop.value_ptr.items.len - 1;
     }
 
-    // Remove extent index `idx` from its size bucket (it must be present).
-    fn bucketRemove(self: *FreeList, size: u64, idx: usize) void {
-        const list = self.by_size.getPtr(size).?;
-        for (list.items, 0..) |v, i| {
-            if (v == idx) {
-                _ = list.swapRemove(i);
-                return;
-            }
+    // Remove the bucket entry at `pos` inside the `class` bucket, repairing the
+    // moved (former last) entry's back-pointer. O(1).
+    fn bucketRemoveAt(self: *FreeList, class: u64, pos: usize) void {
+        const list = self.by_size.getPtr(class).?;
+        _ = list.swapRemove(pos);
+        if (pos < list.items.len) {
+            const moved_extent = list.items[pos];
+            self.bucket_pos.items[moved_extent] = pos;
         }
-        unreachable; // bucket bookkeeping out of sync
     }
 
-    // Swap-remove extent `idx` and repair the moved element's bucket entry.
+    // Swap-remove extent `idx` (whose bucket entry is already gone), repairing
+    // the moved (former last) extent's bucket entry via its back-pointer. O(1).
     fn removeExtentAt(self: *FreeList, idx: usize) FreeExtent {
         const removed = self.extents.swapRemove(idx);
+        _ = self.bucket_pos.swapRemove(idx);
         if (idx < self.extents.items.len) {
-            // The former last element now lives at idx; re-point its bucket entry.
             const moved = self.extents.items[idx];
-            const list = self.by_size.getPtr(moved.len).?;
-            for (list.items, 0..) |v, i| {
-                if (v == self.extents.items.len) {
-                    list.items[i] = idx;
-                    break;
-                }
-            }
+            const pos = self.bucket_pos.items[idx];
+            self.by_size.getPtr(moved.len).?.items[pos] = idx;
         }
         return removed;
     }
@@ -81,6 +85,9 @@ pub const FreeList = struct {
         if (e.len == 0) return;
         const rounded = FreeExtent{ .offset = e.offset, .len = round8(e.len), .freed_version = e.freed_version };
         try self.extents.append(self.allocator, rounded);
+        errdefer _ = self.extents.pop();
+        try self.bucket_pos.append(self.allocator, 0); // set by bucketAdd
+        errdefer _ = self.bucket_pos.pop();
         try self.bucketAdd(rounded.len, self.extents.items.len - 1);
     }
 
@@ -108,6 +115,7 @@ pub const FreeList = struct {
         const count = std.mem.readInt(u32, buf[0..4], .little);
         if (buf.len < 4 + @as(usize, count) * extent_bytes) return error.Corrupt;
         self.extents.clearRetainingCapacity();
+        self.bucket_pos.clearRetainingCapacity();
         self.clearBuckets();
         var off: usize = 4;
         var i: u32 = 0;
@@ -135,7 +143,7 @@ pub const FreeList = struct {
         for (list.items, 0..) |idx, i| {
             if (self.extents.items[idx].freed_version <= horizon) {
                 const off = self.extents.items[idx].offset;
-                _ = list.swapRemove(i);
+                self.bucketRemoveAt(want, i);
                 _ = self.removeExtentAt(idx);
                 return off;
             }
