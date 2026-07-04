@@ -228,25 +228,35 @@ pub const Coord = struct {
     /// live participant slots. Slots whose process no longer exists are
     /// reclaimed (pid zeroed) in the same pass. Returns `fallback` if no
     /// live slot publishes a pinned version below it.
-    // Free a dead or recycled slot. The whole claim word must clear, not just
-    // the pid half: a leftover token kept the u64 nonzero, so the packed claim
-    // CAS could never take the slot again and 64 dead readers exhausted the
-    // table forever. Sentinel the min FIRST -- clearing the word first lets a
-    // concurrent claimant win the CAS and publish a real pin that a late
-    // sentinel store would wipe out, hiding a live reader from the horizon.
-    fn reclaimSlot(self: *Coord, idx: usize) void {
-        @atomicStore(u64, self.slotMinPtr(idx), sentinel_max, .seq_cst);
-        @atomicStore(u64, self.slotClaimPtr(idx), 0, .seq_cst);
+    // Free a dead or recycled slot, but ONLY if it still holds the exact
+    // (pid, token) word the caller sampled. The liveness verdict spans
+    // syscalls, and in that window the dead owner's slot can be released and
+    // re-claimed by a live process; an unconditional clear wiped the new
+    // owner's published pin and freed its slot for a second claimant -- two
+    // processes then shared one slot and overwrote each other's pins, hiding
+    // a live reader from the reclaim horizon. The CAS makes a re-claimed slot
+    // fail the exchange and survive untouched. (The whole word must clear,
+    // not just the pid half: a leftover token kept the u64 nonzero and the
+    // packed claim CAS could never take the slot again.) min_pinned is left
+    // alone: a free slot's min is never read (word == 0 is skipped), and the
+    // next claimant sentinels it itself. Residual ABA -- the same pid AND the
+    // same 32-bit start token re-claimed within the window -- is accepted.
+    fn reclaimSlot(self: *Coord, idx: usize, sampled_word: u64) void {
+        _ = @cmpxchgStrong(u64, self.slotClaimPtr(idx), sampled_word, 0, .seq_cst, .seq_cst);
     }
 
     pub fn globalHorizon(self: *Coord, fallback: u64) u64 {
         var min_v: u64 = fallback;
         var i: usize = 0;
         while (i < participant_slots) : (i += 1) {
-            const pid = @atomicLoad(u32, self.slotPidPtr(i), .seq_cst);
-            if (pid == 0) continue;
+            // Sample pid and token as ONE word so the liveness verdict and the
+            // guarded reclaim below all refer to the same claim -- separate
+            // loads could pair one owner's pid with its successor's token.
+            const word = @atomicLoad(u64, self.slotClaimPtr(i), .seq_cst);
+            if (word == 0) continue;
+            const pid: u32 = @truncate(word);
             if (!pidAlive(pid)) {
-                self.reclaimSlot(i);
+                self.reclaimSlot(i, word);
                 continue;
             }
             // The pid is alive, but pids are recycled: verify the incarnation.
@@ -254,11 +264,11 @@ pub const Coord = struct {
             // otherwise pin the horizon forever. Unavailable tokens on EITHER
             // side (query failed here, or the claimer could not obtain one and
             // stored 0) are treated as a match -- conservative, never unsafe.
-            const stored_token = @atomicLoad(u32, self.slotTokenPtr(i), .seq_cst);
+            const stored_token: u32 = @truncate(word >> 32);
             if (stored_token != 0) {
                 if (platform.processStartToken(pid)) |tok| {
                     if (@as(u32, @truncate(tok)) != stored_token) {
-                        self.reclaimSlot(i); // recycled pid
+                        self.reclaimSlot(i, word); // recycled pid
                         continue;
                     }
                 }
@@ -540,4 +550,32 @@ test "a reclaimed slot becomes claimable again" {
     for (&claimed) |*slot| slot.* = (try c.claimSlot()) orelse return error.SlotLeaked;
     try testing.expectEqual(@as(?usize, null), try c.claimSlot());
     for (claimed) |idx| c.releaseSlot(idx);
+}
+
+test "reclaim leaves a slot alone when its claim word changed since the sample" {
+    // Regression: the liveness verdict spans syscalls; a slot released and
+    // re-claimed inside that window was wiped unconditionally -- the new
+    // owner's pin vanished and a second claimant took the same slot. Reclaim
+    // now exchanges against the sampled word and must fail on a mismatch.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dlen = try tmp.dir.realPath(coordIo(), &path_buf);
+    const cpath = try std.fs.path.join(testing.allocator, &.{ path_buf[0..dlen], "guardedreclaim.coord" });
+    defer testing.allocator.free(cpath);
+    var c = try Coord.openOrCreate(cpath);
+    defer c.deinit();
+
+    c.forgeSlotForTest(2, 0x7fffffff, 0xbeef, 9); // the dead owner we sampled
+    const sampled = @atomicLoad(u64, c.slotClaimPtr(2), .seq_cst);
+    // The slot changes hands before the reclaim lands.
+    const my_pid: u32 = @intCast(platform.currentPid());
+    c.forgeSlotForTest(2, my_pid, 0xf00d, 5);
+    c.reclaimSlot(2, sampled);
+    try testing.expectEqual(my_pid, c.slotPidForTest(2)); // new owner intact
+    try testing.expectEqual(@as(u64, 5), @atomicLoad(u64, c.slotMinPtr(2), .seq_cst));
+    // With the matching word, the reclaim goes through.
+    const word2 = @atomicLoad(u64, c.slotClaimPtr(2), .seq_cst);
+    c.reclaimSlot(2, word2);
+    try testing.expectEqual(@as(u64, 0), @atomicLoad(u64, c.slotClaimPtr(2), .seq_cst));
 }

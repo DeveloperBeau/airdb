@@ -200,6 +200,9 @@ pub const WriteTxn = struct {
                 const hdr = try self.deref(cref, FreeList.chunk_header_bytes);
                 const cnt = std.mem.readInt(u32, hdr[0..4], .little);
                 const next = std.mem.readInt(u64, hdr[4..12], .little);
+                // Legitimate chains strictly decrease (written back-to-front);
+                // anything else is corruption and must not feed the free list.
+                if (next != 0 and next >= cref) return error.Corrupt;
                 try new_fl.add(.{
                     .offset = cref,
                     .len = @intCast(FreeList.chunkByteLen(cnt)),

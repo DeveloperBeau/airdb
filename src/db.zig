@@ -322,7 +322,12 @@ pub const Db = struct {
             const node_len = FreeList.chunkByteLen(count);
             const node_bytes = try self.arena.deref(cref, node_len);
             const next = try out.decodeChunkAppend(node_bytes);
-            if (next != 0 and (next % 8 != 0 or next >= limit)) return error.Corrupt;
+            // Chunks are written back-to-front, so a legitimate chain's refs
+            // strictly DECREASE along the walk. Enforcing that kills forged or
+            // bit-rotted cycles outright: a next_ref pointing at itself or any
+            // up-chain chunk re-decoded its extents every hop, demanding
+            // terabytes of heap before the hop guard could ever fire.
+            if (next != 0 and (next % 8 != 0 or next >= cref)) return error.Corrupt;
             if (hops == 0) head_len = node_len;
             cref = next;
         }
@@ -2360,4 +2365,44 @@ test "a free list spanning multiple chunks survives commit and reopen" {
     defer db2.deinit();
     try testing.expect(db2.freeListLenForTest() >= n_extents);
     try db2.verifyIntegrity();
+}
+
+test "a free-list chain whose next ref points up-chain is rejected as corrupt" {
+    // Regression: a forged or bit-rotted next_ref forming a cycle re-decoded
+    // the same chunk's extents on every hop -- an out-of-memory death, not an
+    // error, long before the hop guard tripped. Legitimate chains have
+    // strictly decreasing refs (chunks are written back-to-front), so a
+    // self-referencing head must fail the open cheaply with error.Corrupt.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "flcycle.airdb");
+    defer testing.allocator.free(path);
+    var node_ref: u64 = 0;
+    {
+        var db = try Db.create(testing.allocator, path);
+        defer db.deinit();
+        {
+            var w = try db.beginWrite();
+            const a = try w.alloc(8);
+            @memcpy(a.bytes, "CYCLBASE");
+            w.setRoot(a.ref);
+            _ = try w.commit();
+        }
+        const old_root = db.active_root;
+        {
+            var w = try db.beginWrite();
+            const b = try w.alloc(8);
+            @memcpy(b.bytes, "CYCLNEXT");
+            try w.free(old_root, 8);
+            w.setRoot(b.ref);
+            _ = try w.commit();
+        }
+        node_ref = db.free_list_node_ref;
+        try testing.expect(node_ref != 0);
+        // Point the head chunk's next_ref at itself.
+        const off: usize = @intCast(node_ref);
+        std.mem.writeInt(u64, db.store.map[off + 4 ..][0..8], node_ref, .little);
+        try db.store.syncer.flush(db.store.file);
+    }
+    try testing.expectError(error.Corrupt, Db.open(testing.allocator, path));
 }
