@@ -305,26 +305,36 @@ pub const Db = struct {
         }
     }
 
-    /// Decode the persisted free-list node at free_list_ref into `out`,
-    /// returning the node's byte length. `out` must already be initialized.
+    /// Decode the persisted free-list chain headed at free_list_ref into
+    /// `out`, returning the HEAD chunk's byte length. `out` must already be
+    /// initialized; its previous contents are discarded.
     fn decodeFreeListNode(self: *Db, free_list_ref: Ref, out: *FreeList) !usize {
-        // First read the 4-byte count prefix to know the full node size.
-        const count_bytes = try self.arena.deref(free_list_ref, 4);
-        const count = std.mem.readInt(u32, count_bytes[0..4], .little);
-        const node_len = 4 + @as(usize, count) * 24;
-        // Now read the full node and decode it.
-        const node_bytes = try self.arena.deref(free_list_ref, node_len);
-        try out.decode(node_bytes);
+        out.reset();
+        const limit: u64 = @intCast(self.store.sectionsView().len * platform.section_size);
+        var head_len: usize = 0;
+        var cref = free_list_ref;
+        var hops: usize = 0;
+        while (cref != 0) : (hops += 1) {
+            if (hops >= FreeList.max_chunks) return error.Corrupt; // ref cycle
+            // Read the chunk header to learn the chunk size and successor.
+            const hdr = try self.arena.deref(cref, FreeList.chunk_header_bytes);
+            const count = std.mem.readInt(u32, hdr[0..4], .little);
+            const node_len = FreeList.chunkByteLen(count);
+            const node_bytes = try self.arena.deref(cref, node_len);
+            const next = try out.decodeChunkAppend(node_bytes);
+            if (next != 0 and (next % 8 != 0 or next >= limit)) return error.Corrupt;
+            if (hops == 0) head_len = node_len;
+            cref = next;
+        }
         // Validate every decoded extent before trusting it for reuse: the
-        // free-list node carries no checksum of its own, and the reuse path
+        // free-list chunks carry no checksum of their own, and the reuse path
         // translates offsets without bounds checks -- a bit-rotted extent
         // would silently hand out live or out-of-bounds bytes as free space.
-        const limit: u64 = @intCast(self.store.sectionsView().len * platform.section_size);
         for (out.extents.items) |ex| {
             if (ex.len == 0 or ex.offset % 8 != 0) return error.Corrupt;
             if (ex.offset > limit or ex.len > limit - ex.offset) return error.Corrupt;
         }
-        return node_len;
+        return head_len;
     }
 
     /// Decode the persisted free-list node at free_list_ref into self.free_list.
@@ -2252,7 +2262,7 @@ test "a corrupt persisted free-list extent fails open instead of poisoning reuse
         try testing.expect(node_ref != 0);
         // Corrupt the first extent's offset into something misaligned.
         const off: usize = @intCast(node_ref);
-        std.mem.writeInt(u64, db.store.map[off + 4 ..][0..8], 12345, .little); // % 8 != 0
+        std.mem.writeInt(u64, db.store.map[off + 12 ..][0..8], 12345, .little); // % 8 != 0
         try db.store.syncer.flush(db.store.file);
     }
     try testing.expectError(error.Corrupt, Db.open(testing.allocator, path));
@@ -2308,4 +2318,46 @@ test "maybeCompactStep is a no-op when nothing to compact" {
     const cat = try typedir.catalogRef(&r, r.root(), tid);
     try testing.expectEqual(@as(u64, 3), try compaction.liveCount(&r, cat));
     try testing.expectEqual(@as(u64, 3), (try catalog.loadCatalog(&r, cat)).next_row);
+}
+
+test "a free list spanning multiple chunks survives commit and reopen" {
+    // Regression: the free list was persisted as ONE node whose size grew
+    // with the extent count; once heavy churn pushed it past the 16 MiB
+    // section cap, the commit-path allocation failed with error.AllocTooLarge
+    // and the database could no longer commit at all. The list is now a chain
+    // of bounded chunks; a list overflowing one chunk must persist, reload,
+    // and verify.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "flchain.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    errdefer db.deinit();
+
+    const n_extents = FreeList.chunk_extent_cap + 500;
+    const refs = try testing.allocator.alloc(u64, n_extents);
+    defer testing.allocator.free(refs);
+    {
+        var w = try db.beginWrite();
+        for (refs) |*r| r.* = (try w.alloc(8)).ref;
+        const root = try w.alloc(8);
+        @memcpy(root.bytes, "CHUNKED!");
+        w.setRoot(root.ref);
+        _ = try w.commit();
+    }
+    {
+        var w = try db.beginWrite();
+        for (refs) |r| try w.free(r, 8);
+        const root = try w.alloc(8);
+        @memcpy(root.bytes, "CHUNKED2");
+        w.setRoot(root.ref);
+        _ = try w.commit();
+    }
+    try testing.expect(db.freeListLenForTest() >= n_extents);
+    db.deinit();
+
+    var db2 = try Db.open(testing.allocator, path);
+    defer db2.deinit();
+    try testing.expect(db2.freeListLenForTest() >= n_extents);
+    try db2.verifyIntegrity();
 }

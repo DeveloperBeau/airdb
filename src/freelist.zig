@@ -91,13 +91,30 @@ pub const FreeList = struct {
         try self.bucketAdd(rounded.len, self.extents.items.len - 1);
     }
 
-    // [count:u32 LE] then count * ([offset u64][len u64][freed_version u64]) LE.
-    pub fn encode(self: *FreeList, buf: []u8) usize {
-        const count: u32 = @intCast(self.extents.items.len);
-        std.debug.assert(buf.len >= self.byteLen());
-        std.mem.writeInt(u32, buf[0..4], count, .little);
-        var off: usize = 4;
-        for (self.extents.items) |e| {
+    // The persisted free list is a CHAIN of bounded chunks, not one node: a
+    // single node's size grows with the extent count, and once heavy churn
+    // pushed the list past the 16 MiB section cap the commit-path allocation
+    // died with error.AllocTooLarge -- an unrecoverable commit failure.
+    //
+    // Chunk layout: [count u32 LE][next_ref u64 LE] then
+    // count * ([offset u64][len u64][freed_version u64]) LE.
+    pub const chunk_header_bytes: usize = 12;
+    /// Extents per chunk: 12 + 65_536 * 24 bytes keeps every chunk allocation
+    /// near 1.5 MiB, far below the section size.
+    pub const chunk_extent_cap: usize = 65_536;
+    /// Chain-walk bound (cycle guard); supports ~68 billion extents.
+    pub const max_chunks: usize = 1 << 20;
+
+    pub fn chunkByteLen(count: usize) usize {
+        return chunk_header_bytes + count * extent_bytes;
+    }
+
+    pub fn encodeChunk(extents: []const FreeExtent, next_ref: u64, buf: []u8) usize {
+        std.debug.assert(buf.len >= chunkByteLen(extents.len));
+        std.mem.writeInt(u32, buf[0..4], @intCast(extents.len), .little);
+        std.mem.writeInt(u64, buf[4..12], next_ref, .little);
+        var off: usize = chunk_header_bytes;
+        for (extents) |e| {
             std.mem.writeInt(u64, buf[off..][0..8], e.offset, .little);
             std.mem.writeInt(u64, buf[off + 8 ..][0..8], e.len, .little);
             std.mem.writeInt(u64, buf[off + 16 ..][0..8], e.freed_version, .little);
@@ -106,18 +123,21 @@ pub const FreeList = struct {
         return off;
     }
 
-    pub fn byteLen(self: *FreeList) usize {
-        return 4 + self.extents.items.len * extent_bytes;
-    }
-
-    pub fn decode(self: *FreeList, buf: []const u8) !void {
-        if (buf.len < 4) return error.Corrupt;
-        const count = std.mem.readInt(u32, buf[0..4], .little);
-        if (buf.len < 4 + @as(usize, count) * extent_bytes) return error.Corrupt;
+    /// Clear this list in preparation for decoding a chain of chunks.
+    pub fn reset(self: *FreeList) void {
         self.extents.clearRetainingCapacity();
         self.bucket_pos.clearRetainingCapacity();
         self.clearBuckets();
-        var off: usize = 4;
+    }
+
+    /// Append one decoded chunk's extents to this list; returns the chunk's
+    /// next_ref (0 for the last chunk in the chain).
+    pub fn decodeChunkAppend(self: *FreeList, buf: []const u8) !u64 {
+        if (buf.len < chunk_header_bytes) return error.Corrupt;
+        const count = std.mem.readInt(u32, buf[0..4], .little);
+        const next = std.mem.readInt(u64, buf[4..12], .little);
+        if (buf.len < chunkByteLen(count)) return error.Corrupt;
+        var off: usize = chunk_header_bytes;
         var i: u32 = 0;
         while (i < count) : (i += 1) {
             try self.add(.{
@@ -127,6 +147,7 @@ pub const FreeList = struct {
             });
             off += extent_bytes;
         }
+        return next;
     }
 
     /// Reuse space of exactly `size` (rounded to its 8-byte class) whose
@@ -154,19 +175,25 @@ pub const FreeList = struct {
 
 const testing = std.testing;
 
-test "extent array encodes and decodes round-trip" {
+test "extent chunks encode and decode round-trip, preserving the chain link" {
     const allocator = testing.allocator;
     var list = FreeList.init(allocator);
     defer list.deinit();
     try list.add(.{ .offset = 4096, .len = 64, .freed_version = 2 });
     try list.add(.{ .offset = 8192, .len = 128, .freed_version = 3 });
+    try list.add(.{ .offset = 16384, .len = 8, .freed_version = 4 });
     var buf: [4096]u8 = undefined;
-    const n = list.encode(&buf);
+    // Split across two chunks; the first names the second's ref.
+    const n1 = FreeList.encodeChunk(list.extents.items[0..2], 0xDEAD_BEE8, buf[0..]);
+    const n2 = FreeList.encodeChunk(list.extents.items[2..], 0, buf[n1..]);
     var list2 = FreeList.init(allocator);
     defer list2.deinit();
-    try list2.decode(buf[0..n]);
-    try testing.expectEqual(@as(usize, 2), list2.extents.items.len);
+    list2.reset();
+    try testing.expectEqual(@as(u64, 0xDEAD_BEE8), try list2.decodeChunkAppend(buf[0..n1]));
+    try testing.expectEqual(@as(u64, 0), try list2.decodeChunkAppend(buf[n1 .. n1 + n2]));
+    try testing.expectEqual(@as(usize, 3), list2.extents.items.len);
     try testing.expectEqual(@as(u64, 4096), list2.extents.items[0].offset);
+    try testing.expectEqual(@as(u64, 16384), list2.extents.items[2].offset);
 }
 
 test "reuseExact returns an extent only when freed_version <= horizon" {

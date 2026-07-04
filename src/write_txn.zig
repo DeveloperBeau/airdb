@@ -189,13 +189,24 @@ pub const WriteTxn = struct {
         for (self.in_flight_frees.items) |e| {
             try new_fl.add(e);
         }
-        // 3. Reclaim the OLD free-list node so its space re-enters the free pool.
-        if (db.free_list_node_ref != 0) {
-            try new_fl.add(.{
-                .offset = db.free_list_node_ref,
-                .len = @intCast(db.free_list_node_len),
-                .freed_version = self.new_version,
-            });
+        // 3. Reclaim the OLD free-list chain so its space re-enters the free
+        //    pool. Every chunk is walked: reclaiming only the head would leak
+        //    the tail chunks on each commit.
+        {
+            var cref = db.free_list_node_ref;
+            var hops: usize = 0;
+            while (cref != 0) : (hops += 1) {
+                if (hops >= FreeList.max_chunks) return error.Corrupt;
+                const hdr = try self.deref(cref, FreeList.chunk_header_bytes);
+                const cnt = std.mem.readInt(u32, hdr[0..4], .little);
+                const next = std.mem.readInt(u64, hdr[4..12], .little);
+                try new_fl.add(.{
+                    .offset = cref,
+                    .len = @intCast(FreeList.chunkByteLen(cnt)),
+                    .freed_version = self.new_version,
+                });
+                cref = next;
+            }
         }
         // 3b. Reclaim any leftover transaction-private nodes that were freed but not reused
         //     within this transaction. They are committed-but-unreferenced space; tag them
@@ -205,20 +216,36 @@ pub const WriteTxn = struct {
         }
         db.fl_rebuild_ns += @intCast(Io.Clock.now(.awake, rebuild_io).nanoseconds - rebuild_start);
 
-        // 4. Encode the new free list onto the arena via a BUMP allocation (never
-        //    reuse, to avoid recursion: the free-list node must not reference itself).
-        //    Use bumpGrowing so the file is extended if the arena is full.
-        // Measurement only: time the free-list byteLen + bump alloc + encode that
-        // every commit pays. No behavior change; counters live on the Db.
+        // 4. Encode the new free list onto the arena via BUMP allocations
+        //    (never reuse, to avoid recursion: the chunks must not reference
+        //    themselves), growing the file if the arena is full. The list is
+        //    persisted as a chain of bounded chunks -- a single node's size
+        //    grows with the extent count, and past the section cap its
+        //    allocation failed the commit outright with error.AllocTooLarge.
+        //    Chunks are written back-to-front so each knows its successor.
         const enc_io = std.Io.Threaded.global_single_threaded.io();
         const enc_start = Io.Clock.now(.awake, enc_io).nanoseconds;
-        const node_len = new_fl.byteLen();
-        const node = try db.bumpGrowing(node_len);
-        const written = new_fl.encode(node.bytes);
+        const items = new_fl.extents.items;
+        const nchunks = @max(1, (items.len + FreeList.chunk_extent_cap - 1) / FreeList.chunk_extent_cap);
+        var head_ref: u64 = 0;
+        var head_len: usize = 0;
+        {
+            var ci = nchunks;
+            while (ci > 0) {
+                ci -= 1;
+                const lo = ci * FreeList.chunk_extent_cap;
+                const hi = @min(lo + FreeList.chunk_extent_cap, items.len);
+                const chunk_len = FreeList.chunkByteLen(hi - lo);
+                const node = try db.bumpGrowing(chunk_len);
+                const written = FreeList.encodeChunk(items[lo..hi], head_ref, node.bytes);
+                std.debug.assert(written == chunk_len);
+                head_ref = node.ref;
+                head_len = chunk_len;
+            }
+        }
         db.fl_encode_ns += @intCast(Io.Clock.now(.awake, enc_io).nanoseconds - enc_start);
-        db.fl_extents_encoded += new_fl.extents.items.len;
+        db.fl_extents_encoded += items.len;
         db.commit_count += 1;
-        std.debug.assert(written == node_len);
 
         // --- Two-slot atomic durable commit ---
 
@@ -231,7 +258,7 @@ pub const WriteTxn = struct {
         const new_slot = Slot{
             .version = self.new_version,
             .root_ref = self.new_root,
-            .free_list_ref = node.ref,
+            .free_list_ref = head_ref,
             .logical_size = @intCast(db.arena.top),
         };
         new_slot.encode(db.store.map[inactive_off..][0..Slot.size]);
@@ -282,8 +309,8 @@ pub const WriteTxn = struct {
         // because we are on the success return path (return self.new_version below).
         db.free_list.deinit();
         db.free_list = new_fl; // ownership transferred; do not call new_fl.deinit()
-        db.free_list_node_ref = node.ref;
-        db.free_list_node_len = node_len;
+        db.free_list_node_ref = head_ref;
+        db.free_list_node_len = head_len;
         self.done = true; // a later deinit must not roll back the committed state
         self.in_flight_frees.deinit(self.db.store.allocator);
         self.work_freelist.deinit();
