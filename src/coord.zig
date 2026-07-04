@@ -228,6 +228,17 @@ pub const Coord = struct {
     /// live participant slots. Slots whose process no longer exists are
     /// reclaimed (pid zeroed) in the same pass. Returns `fallback` if no
     /// live slot publishes a pinned version below it.
+    // Free a dead or recycled slot. The whole claim word must clear, not just
+    // the pid half: a leftover token kept the u64 nonzero, so the packed claim
+    // CAS could never take the slot again and 64 dead readers exhausted the
+    // table forever. Sentinel the min FIRST -- clearing the word first lets a
+    // concurrent claimant win the CAS and publish a real pin that a late
+    // sentinel store would wipe out, hiding a live reader from the horizon.
+    fn reclaimSlot(self: *Coord, idx: usize) void {
+        @atomicStore(u64, self.slotMinPtr(idx), sentinel_max, .seq_cst);
+        @atomicStore(u64, self.slotClaimPtr(idx), 0, .seq_cst);
+    }
+
     pub fn globalHorizon(self: *Coord, fallback: u64) u64 {
         var min_v: u64 = fallback;
         var i: usize = 0;
@@ -235,7 +246,7 @@ pub const Coord = struct {
             const pid = @atomicLoad(u32, self.slotPidPtr(i), .seq_cst);
             if (pid == 0) continue;
             if (!pidAlive(pid)) {
-                @atomicStore(u32, self.slotPidPtr(i), 0, .seq_cst); // reclaim dead slot
+                self.reclaimSlot(i);
                 continue;
             }
             // The pid is alive, but pids are recycled: verify the incarnation.
@@ -247,7 +258,7 @@ pub const Coord = struct {
             if (stored_token != 0) {
                 if (platform.processStartToken(pid)) |tok| {
                     if (@as(u32, @truncate(tok)) != stored_token) {
-                        @atomicStore(u32, self.slotPidPtr(i), 0, .seq_cst); // recycled pid: reclaim
+                        self.reclaimSlot(i); // recycled pid
                         continue;
                     }
                 }
@@ -505,4 +516,28 @@ test "globalHorizon keeps a live-pid slot whose stored token is zero" {
     try testing.expectEqual(@as(u64, 5), c.globalHorizon(50));
     try testing.expectEqual(my_pid, c.slotPidForTest(1)); // not reclaimed
     c.releaseSlot(1);
+}
+
+test "a reclaimed slot becomes claimable again" {
+    // Regression: reclaim cleared only the pid half of the claim word; the
+    // stale incarnation token kept the slot's u64 nonzero, so the packed
+    // claim CAS never matched it again -- every dead reader permanently
+    // burned a slot until the table was exhausted.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dlen = try tmp.dir.realPath(coordIo(), &path_buf);
+    const cpath = try std.fs.path.join(testing.allocator, &.{ path_buf[0..dlen], "reclaimable.coord" });
+    defer testing.allocator.free(cpath);
+    var c = try Coord.openOrCreate(cpath);
+    defer c.deinit();
+
+    c.forgeSlotForTest(0, 0x7fffffff, 0xdead, 3); // dead pid, nonzero token
+    try testing.expectEqual(@as(u64, 50), c.globalHorizon(50));
+    try testing.expectEqual(@as(u64, 0), @atomicLoad(u64, c.slotClaimPtr(0), .seq_cst));
+    // Fill the whole table: every slot, including the reclaimed one, must land.
+    var claimed: [participant_slots]usize = undefined;
+    for (&claimed) |*slot| slot.* = (try c.claimSlot()) orelse return error.SlotLeaked;
+    try testing.expectEqual(@as(?usize, null), try c.claimSlot());
+    for (claimed) |idx| c.releaseSlot(idx);
 }
