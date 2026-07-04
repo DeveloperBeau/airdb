@@ -128,6 +128,28 @@ fn derefIdxNode(txn: *WriteTxn, ref: Ref) ![]const u8 {
     };
 }
 
+// When the BLIND rightmost leaf of the index is empty (removals emptied it),
+// return its parent-recorded low key; null otherwise (non-empty leaf, or an
+// empty ROOT leaf, which has no recorded low). The recorded low propagates
+// identically up every level of the rightmost path, so it is the single value
+// an appended run's first key must clear (see the qualification in bulkAppend).
+fn emptyRightmostLow(txn: *WriteTxn, root: Ref) !?u64 {
+    var cur: Ref = root;
+    var recorded_low: ?u64 = null;
+    var hops: usize = 0;
+    while (true) : (hops += 1) {
+        if (hops >= Index.max_depth) return error.Corrupt;
+        const nb = try derefIdxNode(txn, cur);
+        if (nb[0] == inode.kind_leaf) {
+            if ((try inode.parseLeaf(nb)).count != 0) return null;
+            return recorded_low; // null when the empty leaf IS the root
+        }
+        const iv = try inode.parseInner(nb);
+        recorded_low = iv.lowKey(iv.child_count - 1);
+        cur = iv.childRef(iv.child_count - 1);
+    }
+}
+
 // Pack strictly-ascending (keys, vals) into leaves filled to LEAF_CAP in key
 // order. Returns the leaf level: one SpineChild per leaf, low == its first key.
 fn packIndexLeaves(
@@ -702,6 +724,18 @@ pub fn bulkAppend(txn: *WriteTxn, cat: Ref, rows: []const []const u64) !Ref {
         if (rows[0][0] <= max_pk) return error.NotAppendable;
     }
 
+    // If the BLIND rightmost pk-index leaf is empty (removals never merge
+    // leaves), its RECORDED LOW may exceed every surviving key -- a pk-history
+    // gap. indexAppendRun rebuilds exactly that leaf and derives the new
+    // parent low from the batch's first key; a batch below the recorded low
+    // would break the ascending-lows invariant and make the appended rows
+    // unreachable. Such a batch must take the row-by-row fallback. (The
+    // keyrow index is immune: new okeys are allocated above every okey -- and
+    // therefore every stale low -- the tree has ever held.)
+    if (try emptyRightmostLow(txn, s.pk_index_ref)) |stale_low| {
+        if (rows[0][0] < stale_low) return error.NotAppendable;
+    }
+
     // --- Qualified. Nothing has been written yet; build the right-edge runs. ---
     const al = txn.db.store.allocator;
 
@@ -832,6 +866,47 @@ test "bulk append is refused when the batch does not clear the true max pk" {
     cat = try bulkAppend(&w, cat, &ok_rows);
     try testing.expect((try objects.getByPk(&w, cat, 100, &out)) != null);
     try testing.expect((try objects.getByPk(&w, cat, 31, &out)) != null);
+}
+
+test "bulk append into a pk-history gap takes the fallback" {
+    // Regression: with pks 0..31 and 40..104 inserted then 40..104 deleted,
+    // the rightmost pk-index leaves are EMPTY but keep recorded lows (40, 72).
+    // A batch of {33, 34} clears the surviving max (31) but sits BELOW the
+    // stale low; the old fast path rebuilt the low-72 leaf with low 33 and the
+    // appended rows became unreachable. Such a batch must fall back; a batch
+    // clearing the stale low may still take the fast path.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try bulkTmpPath(testing.allocator, &tmp, "bulkappend_gap.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    defer w.deinit();
+
+    var cat = try catalog.create(&w, 2);
+    var pk: u64 = 0;
+    while (pk <= 31) : (pk += 1) cat = (try objects.insert(&w, cat, &.{ pk, pk })).cat;
+    pk = 40;
+    while (pk <= 104) : (pk += 1) cat = (try objects.insert(&w, cat, &.{ pk, pk })).cat;
+    var out: [2]u64 = undefined;
+    pk = 40;
+    while (pk <= 104) : (pk += 1) {
+        const ver = (try objects.getByPk(&w, cat, pk, &out)).?;
+        cat = (try objects.delete(&w, cat, pk, ver)).ok;
+    }
+
+    // Below the stale low: NotAppendable; the orchestrator's fallback must
+    // leave every row reachable.
+    const gap_rows = [_][]const u64{ &.{ 33, 1 }, &.{ 34, 2 } };
+    try testing.expectError(error.NotAppendable, bulkAppend(&w, cat, &gap_rows));
+    cat = try bulkAppendOrInsert(&w, cat, &gap_rows);
+    try testing.expect((try objects.getByPk(&w, cat, 33, &out)) != null);
+    try testing.expect((try objects.getByPk(&w, cat, 34, &out)) != null);
+
+    // Every surviving pk still resolves (routing lows intact).
+    pk = 0;
+    while (pk <= 31) : (pk += 1) try testing.expect((try objects.getByPk(&w, cat, pk, &out)) != null);
 }
 
 test "bulk append fallback refuses link-bearing schemas" {

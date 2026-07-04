@@ -123,10 +123,14 @@ fn truncatePacked(txn: *WriteTxn, cat: Ref, new_len: u64) !Ref {
 // seeking live rows that must move down. Both advance monotonically across
 // steps so no slot is ever revisited (relocateRow is not idempotent).
 pub const CompactCursor = struct {
-    /// The catalog ref this cursor was persisted against. Resuming is gated on
-    /// an exact match: live_count/next_row alone are a heuristic two DIFFERENT
-    /// types can momentarily share, and resuming another type's high_hi would
-    /// leave rows unexamined and let the final truncate drop live data.
+    /// The TYPE this cursor belongs to plus the catalog ref it was persisted
+    /// against. Both are required for a resume: live_count/next_row are a
+    /// heuristic two different types can momentarily share, and the catalog
+    /// ref ALONE is recyclable (freed catalog nodes are exact-size-class
+    /// reused, so another type's catalog can land on the same ref). Resuming
+    /// a foreign cursor would leave rows unexamined ahead of the tail
+    /// truncate -- silent live-row loss in release builds.
+    type_id: u16,
     cat: Ref,
     live_count: u64,
     next_row: u64,
@@ -171,7 +175,7 @@ fn rowToOkey(txn: anytype, v: catalog.CatalogView, row: u64) !u64 {
 // in [live_count, next_row) before the truncate. A debug-only bounded scan
 // asserts exactly that immediately before truncating. Returns the updated
 // catalog ref, the rows moved this call, and whether packing finished.
-pub fn compactStep(txn: *WriteTxn, cat: Ref, budget: usize) !struct { cat: Ref, moved: usize, done: bool } {
+pub fn compactStep(txn: *WriteTxn, cat: Ref, type_id: u16, budget: usize) !struct { cat: Ref, moved: usize, done: bool } {
     var cur = cat;
     const lc = try liveCount(txn, cur);
     const next_row = (try catalog.loadCatalog(txn, cur)).next_row;
@@ -188,9 +192,9 @@ pub fn compactStep(txn: *WriteTxn, cat: Ref, budget: usize) !struct { cat: Ref, 
     // shape; otherwise (another type, churn, or a fresh run) restart the scan.
     var cursor: CompactCursor = blk: {
         if (txn.db.compact_cursor) |c| {
-            if (c.cat == cat and c.live_count == lc and c.next_row == next_row) break :blk c;
+            if (c.type_id == type_id and c.cat == cat and c.live_count == lc and c.next_row == next_row) break :blk c;
         }
-        break :blk .{ .cat = cat, .live_count = lc, .next_row = next_row, .hole_lo = 0, .high_hi = next_row };
+        break :blk .{ .type_id = type_id, .cat = cat, .live_count = lc, .next_row = next_row, .hole_lo = 0, .high_hi = next_row };
     };
 
     var moved: usize = 0;
@@ -314,10 +318,20 @@ fn copyBindex(src: anytype, dst: *WriteTxn, src_root: u64) !u64 {
     return newr;
 }
 
+// Add okey under `value` in a value index (value -> {okey -> 1}), mirroring the
+// shape the object layer's maintenance keeps. Local to the copy path, which
+// must rebuild value indexes in the destination database.
+fn viAddInto(dst: *WriteTxn, vi_ref: Ref, value: u64, okey: u64) !Ref {
+    const existing = try Index.get(dst, vi_ref, value);
+    var set_root = existing orelse try Index.create(dst);
+    set_root = try Index.insert(dst, set_root, okey, 1);
+    return try Index.insert(dst, vi_ref, value, set_root);
+}
+
 // Copy all live rows of `src_cat` (in the source db) into a fresh catalog in the
 // destination db, preserving object keys, primary keys, and next_key. Backlink
-// indexes are created empty (rebuild with rebuildBacklinks afterward). Returns
-// the new destination catalog ref.
+// indexes are created empty (rebuild with rebuildBacklinks afterward); value
+// indexes are repopulated inline. Returns the new destination catalog ref.
 pub fn copyTypeRows(src: anytype, src_cat: Ref, dst: *WriteTxn) !Ref {
     // Load the source snapshot, then re-point every ref field at structures
     // created in the DESTINATION db before writing. Kinds, elem kinds, targets,
@@ -371,6 +385,13 @@ pub fn copyTypeRows(src: anytype, src_cat: Ref, dst: *WriteTxn) !Ref {
             const sraw = try Column.get(src, s_prop[j], pr.row);
             const draw = try copyValue(src, dst, s.props[j].kind, s.props[j].elem, sraw);
             s.props[j].col = try Column.append(dst, s.props[j].col, draw);
+            // Repopulate the destination value index in the same pass. Leaving
+            // it empty while the catalog still says indexed=true silently
+            // empties every indexed query after a full-file compaction (the
+            // planner trusts the flag) and fails the value-index audit.
+            if (s.props[j].indexed) {
+                s.props[j].value_index = try viAddInto(dst, s.props[j].value_index, draw, pr.okey);
+            }
         }
         const ver = try Column.get(src, s_ver, pr.row);
         s.version_col_ref = try Column.append(dst, s.version_col_ref, ver);
@@ -517,14 +538,23 @@ fn foldPksAndCheck(allocator: std.mem.Allocator, src: anytype, sc: Ref, dst: any
         // (a) readability: the same object key must decode in dst.
         if ((try objects.getTypedByOkey(dst, dc, pr.okey, out[0..pc])) == null) return error.CompactionMismatch;
 
-        // (b) to-one forward links must carry the identical raw target in dst.
+        // (b) to-one forward links must carry the identical raw target in dst,
+        //     and (c) every indexed property value must be covered by the
+        //     destination's value index -- an empty or stale index passes the
+        //     row-readability checks but silently empties queries.
         const drow = (try catalog.okeyToRow(dst, dc, pr.okey)) orelse return error.CompactionMismatch;
         var p: usize = 0;
         while (p < pc) : (p += 1) {
-            if (kinds[p] != .link) continue;
-            const s_raw = try Column.get(src, s_prop[p], pr.row);
-            const d_raw = try Column.get(dst, d_prop[p], drow);
-            if (s_raw != d_raw) return error.CompactionMismatch;
+            if (kinds[p] == .link) {
+                const s_raw = try Column.get(src, s_prop[p], pr.row);
+                const d_raw = try Column.get(dst, d_prop[p], drow);
+                if (s_raw != d_raw) return error.CompactionMismatch;
+            }
+            if (dv.indexed(p)) {
+                const d_raw = try Column.get(dst, d_prop[p], drow);
+                const inner = (try Index.get(dst, dv.valueIndexRef(p), d_raw)) orelse return error.CompactionMismatch;
+                if ((try Index.get(dst, inner, pr.okey)) == null) return error.CompactionMismatch;
+            }
         }
     }
 }
@@ -590,7 +620,7 @@ pub fn compactToNewFile(allocator: std.mem.Allocator, src_path: []const u8, dst_
             const defs = try allocator.alloc(catalog.PropDef, v.prop_count);
             var j: usize = 0;
             while (j < v.prop_count) : (j += 1) {
-                defs[j] = .{ .kind = v.kind(j), .elem = v.elemKind(j), .link_target = v.linkTarget(j), .del_rule = v.delRule(j) };
+                defs[j] = .{ .kind = v.kind(j), .elem = v.elemKind(j), .link_target = v.linkTarget(j), .del_rule = v.delRule(j), .indexed = v.indexed(j) };
             }
             try schema.append(allocator, defs);
             try embedded.append(allocator, try typedir.isEmbedded(&src_r, src_dir, t));
@@ -1263,7 +1293,7 @@ test "compactStep packs a delete-heavy type across several small steps" {
     // Pack in small budgeted steps until done.
     var guard: usize = 0;
     while (true) {
-        const res = try compactStep(&w, cat, 2);
+        const res = try compactStep(&w, cat, 0, 2);
         cat = res.cat;
         try testing.expect(res.moved <= 2);
         if (res.done) break;
@@ -1321,7 +1351,7 @@ test "compactStep on an all-dead type truncates to zero" {
 
     var guard: usize = 0;
     while (true) {
-        const res = try compactStep(&w, cat, 2);
+        const res = try compactStep(&w, cat, 0, 2);
         cat = res.cat;
         if (res.done) break;
         guard += 1;
@@ -1351,7 +1381,7 @@ test "compactStep is a no-op on an already-packed type" {
         okeys[@intCast(pk)] = r.row;
     }
 
-    const res = try compactStep(&w, cat, 4);
+    const res = try compactStep(&w, cat, 0, 4);
     cat = res.cat;
     try testing.expect(res.done);
     try testing.expectEqual(@as(usize, 0), res.moved);
@@ -1420,7 +1450,7 @@ test "compactStep cursor path packs identically to the scan path" {
     // Step path: budgeted cursor steps until done.
     var guard: usize = 0;
     while (true) {
-        const res = try compactStep(&step_w, step_cat, 3);
+        const res = try compactStep(&step_w, step_cat, 0, 3);
         step_cat = res.cat;
         try testing.expect(res.moved <= 3);
         if (res.done) break;
@@ -1490,7 +1520,7 @@ test "compactStep truncation never drops a live row at the top" {
     // Pack in tiny steps; the downward cursor must examine the entire top range.
     var guard: usize = 0;
     while (true) {
-        const res = try compactStep(&w, cat, 2);
+        const res = try compactStep(&w, cat, 0, 2);
         cat = res.cat;
         try testing.expect(res.moved <= 2);
         if (res.done) break;
@@ -1541,7 +1571,7 @@ test "compactStep moves at most budget rows per call" {
     var guard: usize = 0;
     var saw_full_budget = false;
     while (true) {
-        const res = try compactStep(&w, cat, budget);
+        const res = try compactStep(&w, cat, 0, budget);
         cat = res.cat;
         try testing.expect(res.moved <= budget);
         if (res.moved == budget) saw_full_budget = true;
@@ -1558,6 +1588,45 @@ test "compactStep moves at most budget rows per call" {
 // relocation.zig's tests ("a same-type link to a relocated object still
 // resolves"); compactStep only sequences relocateRow calls, so wiring links
 // into these tests would duplicate that coverage without exercising new paths.
+
+test "compactInPlace preserves value indexes and passes verifyIntegrity" {
+    // Regression: the full-file copy created value indexes empty and nothing
+    // repopulated them, so routine maintenance silently emptied every indexed
+    // query and produced a file the integrity checker itself called corrupt.
+    const query = @import("query.zig");
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try cmpTmpPath(testing.allocator, &tmp, "inplace_vidx.airdb");
+    defer testing.allocator.free(path);
+
+    {
+        var db = try Db.create(testing.allocator, path);
+        var w = try db.beginWrite();
+        var dir = try typedir.createTypes(&w, &.{
+            &.{ .{ .kind = .int }, .{ .kind = .int, .indexed = true } },
+        }, &.{false});
+        var pk: u64 = 0;
+        while (pk < 50) : (pk += 1) {
+            dir = (try typedir.insert(&w, dir, 0, &.{ .{ .int = pk }, .{ .int = pk % 5 } })).dir;
+        }
+        w.setRoot(dir);
+        _ = try w.commit();
+        db.deinit();
+    }
+
+    try compactInPlace(testing.allocator, path);
+
+    var db = try Db.open(testing.allocator, path);
+    defer db.deinit();
+    try db.verifyIntegrity(); // the audit must agree the indexes are intact
+    var r = try db.beginRead();
+    defer r.end();
+    const cat = try typedir.catalogRef(&r, r.root(), 0);
+    var hits = std.ArrayList(u64).empty;
+    defer hits.deinit(testing.allocator);
+    try query.where(&r, cat, &.{.{ .prop = 1, .op = .eq, .value = 3 }}, &hits, testing.allocator);
+    try testing.expectEqual(@as(usize, 10), hits.items.len);
+}
 
 test "compactInPlace shrinks and preserves data" {
     var tmp = testing.tmpDir(.{});

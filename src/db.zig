@@ -108,6 +108,14 @@ pub const Db = struct {
     /// silently resumed from the previous version. Surfaced via metrics() so
     /// callers can log/alert on it; never set on a clean open.
     recovered_fallback: bool = false,
+    /// Set when a commit's HEADER flush (the commit point) failed. The flipped
+    /// commit pointer was already in the mapped header page before the failed
+    /// barrier, so async writeback may persist it regardless -- the commit's
+    /// on-disk fate is indeterminate. Further writes from this instance could
+    /// scribble the maybe-published version's nodes, so beginWrite refuses
+    /// until the database is reopened (open re-reads the header and resolves
+    /// which side won).
+    poisoned: bool = false,
 
     /// Measurement-only counters accumulated since open. Updated by commit; never
     /// affect behavior. fl_encode_ns is the total nanoseconds spent encoding the
@@ -415,10 +423,16 @@ pub const Db = struct {
         // window: if the world moved past the pinned version while it was in
         // flight, unpin and chase the new version. The loop terminates because
         // versions only move forward and each retry pins the newest one seen.
+        var prev_v: ?u64 = null;
         while (true) {
             try self.refreshToLatest();
             const v = self.active_version;
             const root = self.active_root;
+            // A retry that made no progress means the published version keeps
+            // running ahead of anything this instance can adopt (e.g. newer
+            // slots do not decode). Fail rather than spin forever.
+            if (prev_v != null and prev_v.? == v) return error.Corrupt;
+            prev_v = v;
             if (self.pins.getPtr(v)) |ptr| {
                 ptr.* += 1;
             } else {
@@ -546,7 +560,7 @@ pub const Db = struct {
             w.deinit();
             return .{ .ran = false, .moved = 0, .done = false };
         }
-        const step = try compaction.compactStep(&w, cat, budget);
+        const step = try compaction.compactStep(&w, cat, type_id, budget);
         const new_dir = try typedir.setCatalogRef(&w, dir, type_id, step.cat);
         w.setRoot(new_dir);
         _ = try w.commit();
@@ -609,6 +623,10 @@ pub const Db = struct {
     /// lock before calling; an errdefer in the caller releases the lock if this
     /// function returns an error.
     fn beginWriteLocked(self: *Db) !WriteTxn {
+        // A failed commit-point flush left the on-disk header indeterminate;
+        // writing further could corrupt the version that may in fact have been
+        // published. Reopen to resolve.
+        if (self.poisoned) return error.CommitIndeterminate;
         // Refresh under the lock so the writer sees the truly-latest committed version.
         try self.refreshToLatest();
         // Clone the committed free list into work_freelist so the transaction
@@ -2037,6 +2055,42 @@ fn churnNetZero(path: []const u8, live: u64, iters: u64, auto: bool) !struct { n
         .next_row = (try catalog.loadCatalog(&r, cat)).next_row,
         .live = try compaction.liveCount(&r, cat),
     };
+}
+
+test "a failed commit-point flush poisons the instance until reopen" {
+    // The flipped header pointer sits in the mapped page before the failed
+    // barrier, so its on-disk fate is indeterminate; further writes from this
+    // instance could scribble the maybe-published version. Reopen resolves.
+    const FailingSyncer = @import("syncer.zig").FailingSyncer;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "poison.airdb");
+    defer testing.allocator.free(path);
+
+    // create = 2 flushes; the first commit's data barrier is #3 and its
+    // HEADER flush (the commit point) is #4.
+    var fsync = FailingSyncer{ .fail_on = 4 };
+    {
+        var db = try Db.createWith(testing.allocator, path, fsync.any());
+        defer db.deinit();
+        {
+            var w = try db.beginWrite();
+            errdefer w.deinit();
+            const a = try w.alloc(8);
+            @memcpy(a.bytes, "POISON!!");
+            w.setRoot(a.ref);
+            try testing.expectError(error.Durability, w.commit());
+        }
+        try testing.expectError(error.CommitIndeterminate, db.beginWrite());
+    }
+    // Reopen resolves the header and writes flow again.
+    var db = try Db.open(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    const a = try w.alloc(8);
+    @memcpy(a.bytes, "RESOLVED");
+    w.setRoot(a.ref);
+    _ = try w.commit();
 }
 
 test "a failed commit inside maybeCompactStep neither crashes nor wedges the write lock" {

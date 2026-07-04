@@ -27,7 +27,7 @@ pub const AIRDB_E_DUPLICATE: i64 = -5;
 pub const AIRDB_E_NOT_EMPTY: i64 = -6;
 pub const AIRDB_E_UNSUPPORTED: i64 = -7;
 
-const MAX_PROPS: usize = 256;
+const MAX_PROPS: usize = catalog.max_prop_count;
 
 const Database = struct {
     db: Db,

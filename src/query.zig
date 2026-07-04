@@ -87,6 +87,16 @@ fn evalRow(txn: anytype, s: *const Scan, row: u64, preds: []const Predicate) !bo
     return rowMatches(txn, s, row, preds);
 }
 
+// Reject out-of-range property indices up front: the evaluators index
+// fixed-size ref arrays, so an unchecked prop is an undefined ref below 256
+// and an out-of-bounds read past it. Query inputs will eventually cross the
+// C ABI, which must not trust its arguments.
+fn validateProps(s: *const Scan, preds: []const Predicate) !void {
+    for (preds) |p| {
+        if (p.prop >= s.prop_count) return error.BadProp;
+    }
+}
+
 // (okey, physical row) pair, as surfaced by the key->row index.
 const Pair = struct { okey: u64, row: u64 };
 
@@ -255,6 +265,7 @@ pub fn where(
     allocator: std.mem.Allocator,
 ) !void {
     const s = try openScan(txn, cat);
+    try validateProps(&s, preds);
     const Sink = struct {
         out: *std.ArrayList(u64),
         allocator: std.mem.Allocator,
@@ -269,6 +280,7 @@ pub fn where(
 // so this allocates nothing proportional to the table.
 pub fn countWhere(txn: anytype, cat: Ref, preds: []const Predicate, allocator: std.mem.Allocator) !u64 {
     const s = try openScan(txn, cat);
+    try validateProps(&s, preds);
     var n: u64 = 0;
     const Sink = struct {
         n: *u64,
@@ -286,6 +298,8 @@ pub const Aggregate = struct { count: u64, sum: u64, min: ?u64, max: ?u64 };
 // `sum` wraps on overflow (wrapping add); min/max are null when no row matches.
 pub fn aggregateInt(txn: anytype, cat: Ref, prop: usize, preds: []const Predicate, allocator: std.mem.Allocator) !Aggregate {
     const s = try openScan(txn, cat);
+    try validateProps(&s, preds);
+    if (prop >= s.prop_count) return error.BadProp;
     var agg = Aggregate{ .count = 0, .sum = 0, .min = null, .max = null };
     const Sink = struct {
         txn: @TypeOf(txn),
@@ -333,6 +347,7 @@ pub fn sortByPropAsc(
     allocator: std.mem.Allocator,
 ) !void {
     const v = try catalog.loadCatalog(txn, cat);
+    if (prop >= v.prop_count) return error.BadProp;
     const col = v.propColRef(prop);
     const SortPair = struct { val: u64, key: u64 };
     const pairs = try allocator.alloc(SortPair, okeys.len);
@@ -402,6 +417,26 @@ test "where filters live rows by ANDed predicates" {
     try where(&w, cat, &.{.{ .prop = 1, .op = .eq, .value = 30 }}, &r3, testing.allocator);
     try testing.expectEqual(@as(usize, 1), r3.items.len);
     w.deinit();
+}
+
+test "out-of-range property indices are rejected up front" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try qTmpPath(testing.allocator, &tmp, "qbadprop.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    defer w.deinit();
+    const cat = try seed(&w, &.{.{ 1, 20 }});
+    var hits = std.ArrayList(u64).empty;
+    defer hits.deinit(testing.allocator);
+    const bad = [_]Predicate{.{ .prop = 2, .op = .eq, .value = 1 }};
+    try testing.expectError(error.BadProp, where(&w, cat, &bad, &hits, testing.allocator));
+    try testing.expectError(error.BadProp, countWhere(&w, cat, &bad, testing.allocator));
+    try testing.expectError(error.BadProp, aggregateInt(&w, cat, 9, &.{}, testing.allocator));
+    var okeys = [_]u64{};
+    try testing.expectError(error.BadProp, sortByPropAsc(&w, cat, &okeys, 5, testing.allocator));
 }
 
 test "streamed full scan agrees with where on count and aggregate" {

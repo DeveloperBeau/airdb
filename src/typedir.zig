@@ -295,6 +295,8 @@ pub fn deleteNullifyX(txn: *WriteTxn, dir: Ref, type_id: u16, pk: u64, expected_
     const okey = (try catalog.pkToOkey(txn, cat0, pk)) orelse return .not_found;
 
     // BLOCK check (top-level only): refuse if any block-rule link points at it.
+    // The object's own self-link does not block: this delete clears that link
+    // anyway, and counting it made self-linked rows permanently undeletable.
     const tc = try typeCount(txn, dir);
     var s: u16 = 0;
     while (s < tc) : (s += 1) {
@@ -304,7 +306,12 @@ pub fn deleteNullifyX(txn: *WriteTxn, dir: Ref, type_id: u16, pk: u64, expected_
         while (p < sv.prop_count) : (p += 1) {
             const k = sv.kind(p);
             if ((k == .link or k == .link_set) and sv.linkTarget(p) == type_id and sv.delRule(p) == .block) {
-                if ((try links.backlinkCount(txn, s_cat, p, okey)) > 0) return .blocked;
+                const cnt = try links.backlinkCount(txn, s_cat, p, okey);
+                if (cnt > 1) return .blocked;
+                if (cnt == 1) {
+                    const self_only = s == type_id and (try links.backlinkContains(txn, s_cat, p, okey, okey));
+                    if (!self_only) return .blocked;
+                }
             }
         }
     }
@@ -999,6 +1006,48 @@ test "directory delete works after relocating the target" {
 }
 
 const relocation = @import("relocation.zig");
+
+test "a self-linked object is deletable across transactions" {
+    // Two regressions in one shape: (a) a block-rule self-link counted itself
+    // and refused the delete forever; (b) the nullify version bump stamped the
+    // row being deleted, so the follow-up tombstone's version check failed
+    // forever. Both must not block a self-linked delete.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tdTmpPath(testing.allocator, &tmp, "selflink.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+
+    // Commit a row that links to ITSELF via a block-rule property.
+    {
+        var w = try db.beginWrite();
+        var dir = try createWithDefs(&w, &.{
+            &.{ .{ .kind = .int }, .{ .kind = .link, .link_target = 0, .del_rule = .block } },
+        });
+        const a = try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .link = null } });
+        dir = a.dir;
+        dir = try setLink(&w, dir, 0, 1, 1, a.row);
+        w.setRoot(dir);
+        _ = try w.commit();
+    }
+    // Deleting it in a LATER transaction must succeed: the self-link neither
+    // blocks nor invalidates the version the caller read.
+    {
+        var w = try db.beginWrite();
+        var out: [2]Value = undefined;
+        const ver = (try get(&w, w.new_root, 0, 1, &out)).?;
+        const res = try deleteNullifyX(&w, w.new_root, 0, 1, ver);
+        try testing.expect(res == .ok);
+        w.setRoot(res.ok);
+        _ = try w.commit();
+    }
+    var r = try db.beginRead();
+    defer r.end();
+    try testing.expectEqual(@as(u64, 0), try liveCount(&r, r.root(), 0));
+    // A FOREIGN block-rule source must still block, self-exemption or not.
+    // (covered by the existing "block prevents deleting a referenced object")
+}
 
 test "cascade is cycle-safe" {
     var tmp = testing.tmpDir(.{});

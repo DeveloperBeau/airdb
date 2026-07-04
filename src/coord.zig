@@ -192,9 +192,16 @@ pub const Coord = struct {
         @atomicStore(u32, self.slotPidPtr(idx), 0, .seq_cst);
     }
 
-    /// Publish the minimum pinned version for this slot (release ordering).
+    /// Publish the minimum pinned version for this slot. seq_cst, not release:
+    /// readers publish a pin and then VALIDATE by loading latest_version with
+    /// no intervening syscall. That store->load sequence is the classic
+    /// store-buffering pattern -- with a plain release store, x86 may order the
+    /// validating load before the pin store drains, letting a concurrent
+    /// writer's horizon miss the pin while the reader's validation misses the
+    /// new version. The seq_cst store compiles to a fenced exchange on x86 and
+    /// closes it. (The writer side is fenced by the lock/unlock syscalls.)
     pub fn publishMinPinned(self: *Coord, idx: usize, v: u64) void {
-        @atomicStore(u64, self.slotMinPtr(idx), v, .release);
+        @atomicStore(u64, self.slotMinPtr(idx), v, .seq_cst);
     }
 
     pub fn slotMinPinnedForTest(self: *Coord, idx: usize) u64 {

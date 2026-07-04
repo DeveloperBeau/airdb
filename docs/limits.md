@@ -34,8 +34,8 @@ newer one. Ship a matched engine with your app.
   `bindex`).
 - Up to 256 types, 256 properties per type. Properties are positional; names
   live in whatever binding layer sits on top.
-- `updateTyped` does not yet rewrite collection properties (lists/sets/dicts
-  are mutated through their own APIs instead).
+- `updateTyped` carries collection properties through unchanged; lists, sets,
+  and dicts are mutated through their own APIs.
 
 ## Point-in-time reads
 
@@ -75,6 +75,16 @@ newer one. Ship a matched engine with your app.
   transparently, but list/set/dict *elements* are u64s (blob elements are refs
   and follow blob rules).
 - `Db.create`/`open` require absolute paths.
+
+## Failed commits
+
+- A data-barrier flush failure leaves the previous version fully live; the
+  transaction is concluded and the commit can simply be retried.
+- A commit-point (header) flush failure is different: the flipped commit
+  pointer was already in the mapped page, so its on-disk fate is
+  indeterminate. The instance refuses further writes (CommitIndeterminate)
+  until the database is reopened; reopen re-reads the header and resolves
+  which version won. Reads remain available throughout.
 
 ## Durability environment
 

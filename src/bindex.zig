@@ -368,6 +368,33 @@ pub fn remove(txn: *WriteTxn, root: Ref, key: []const u8) !Ref {
     return (try removeInto(txn, root, key, 0)).ref;
 }
 
+/// Recursively free every node of the tree rooted at `root`, INCLUDING the
+/// blobs the tree owns: leaf key blobs and inner low-key blobs (routing
+/// separators are duplicated at split time, so the tree is their sole owner).
+/// Values are NOT freed -- they are plain u64s at this layer.
+pub fn freeTree(txn: *WriteTxn, root: Ref) !void {
+    return freeTreeAt(txn, root, 0);
+}
+
+fn freeTreeAt(txn: *WriteTxn, node_ref: Ref, depth: usize) !void {
+    if (depth >= max_depth) return error.Corrupt;
+    const bytes = try derefNode(txn, node_ref);
+    if (bytes[0] == kind_leaf) {
+        const v = try parseLeaf(bytes);
+        var i: usize = 0;
+        while (i < v.count) : (i += 1) try blob.free(txn, v.key(i));
+        try txn.free(node_ref, leaf_node_size);
+        return;
+    }
+    const v = try parseInner(bytes);
+    var i: usize = 0;
+    while (i < v.child_count) : (i += 1) {
+        try freeTreeAt(txn, v.childRef(i), depth + 1);
+        try blob.free(txn, v.lowKey(i));
+    }
+    try txn.free(node_ref, inner_node_size);
+}
+
 /// Return the number of entries in the tree rooted at `root`. A single-node
 /// read: inner nodes store per-child subtree counts.
 pub fn count(txn: anytype, root: Ref) !u64 {

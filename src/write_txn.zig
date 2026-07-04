@@ -262,10 +262,15 @@ pub const WriteTxn = struct {
             // Revert every in-memory header change so the old version stays live.
             db.store.header.active_slot = prev_active_slot;
             db.store.header.logical_size = prev_logical_size;
-            // Restore the mmap bytes to match the reverted header so subsequent
-            // persistHeader calls (from the next commit attempt) write the right
-            // value. Cleanup (including the unlock) is the errdefer's job.
+            // Restore the mmap bytes to match the reverted header so a future
+            // open reads the right value. Cleanup (unlock etc.) is the
+            // errdefer's job. The flipped pointer was in the mapped page before
+            // the failed barrier, so async writeback may have persisted it
+            // anyway: this commit's on-disk fate is INDETERMINATE. Poison the
+            // instance -- further writes could scribble the maybe-published
+            // version's nodes; a reopen resolves which side won.
             db.store.persistHeader();
+            db.poisoned = true;
             return error.Durability;
         };
 

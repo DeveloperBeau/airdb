@@ -4,6 +4,7 @@ const Db = @import("db.zig").Db;
 const Ref = @import("ref.zig").Ref;
 const Column = @import("column.zig");
 const Index = @import("index.zig");
+const bindex = @import("bindex.zig");
 const blob = @import("blob.zig");
 const catalog = @import("catalog.zig");
 const collections = @import("collections.zig");
@@ -397,7 +398,10 @@ pub fn updateTyped(
     // Step 2: version check BEFORE freeing or allocating any blob.
     if (current_version != expected_version)
         return .{ .conflict = .{ .current_version = current_version } };
-    // Step 3: apply path -- free old blobs and allocate new ones.
+    // Step 3: apply path -- free old blobs and allocate new ones. Collection
+    // properties are CARRIED THROUGH unchanged (mutate them via their own
+    // APIs): updating any row of a collection-bearing type must not require
+    // the caller to re-supply roots, and must never crash.
     var new_raw: [max_prop_count]u64 = undefined;
     var i: usize = 0;
     while (i < pc) : (i += 1) {
@@ -407,7 +411,7 @@ pub fn updateTyped(
                 try blob.free(txn, cur_raw[i]);
                 break :blk try blob.put(txn, values[i].bytes);
             },
-            .list, .set, .dict, .link_set => unreachable, // collection update not yet implemented
+            .list, .set, .dict, .link_set => cur_raw[i],
             .link => if (values[i].link) |k| k + 1 else 0,
         };
     }
@@ -424,7 +428,10 @@ pub fn updateTyped(
             var p: usize = 0;
             while (p < pc) : (p += 1) {
                 if (kinds[p] != .link or cur_raw[p] == new_raw[p]) continue;
-                const okey = (try catalog.pkToOkey(txn, cat_out, pk)) orelse break;
+                // The row was just updated successfully, so its pk must
+                // resolve; anything else is index divergence, and bailing
+                // mid-loop would leave the backlinks half-moved.
+                const okey = (try catalog.pkToOkey(txn, cat_out, pk)) orelse return error.Corrupt;
                 if (cur_raw[p] != 0) cat_out = try links.removeBacklink(txn, cat_out, p, cur_raw[p] - 1, okey);
                 if (new_raw[p] != 0) cat_out = try links.addBacklink(txn, cat_out, p, new_raw[p] - 1, okey);
                 changed = true;
@@ -447,11 +454,15 @@ pub fn deleteTyped(
     const v = try loadCatalog(txn, cat);
     const pc = v.prop_count;
     std.debug.assert(pc <= max_prop_count);
-    // Capture kinds before any mutation.
+    // Capture kinds/elems before any mutation.
     var kinds: [max_prop_count]PropKind = undefined;
+    var elems: [max_prop_count]ElemKind = undefined;
     {
         var j: usize = 0;
-        while (j < pc) : (j += 1) kinds[j] = v.kind(j);
+        while (j < pc) : (j += 1) {
+            kinds[j] = v.kind(j);
+            elems[j] = v.elemKind(j);
+        }
     }
     // Step 1: read the current row.
     var cur_raw: [max_prop_count]u64 = undefined;
@@ -465,7 +476,39 @@ pub fn deleteTyped(
         if (kinds[i] == .blob) try blob.free(txn, cur_raw[i]);
     }
     // Step 4: delegate to the graph-safe delete (nullifies inbound links).
-    return try deleteAndNullify(txn, cat, pk, expected_version);
+    const result = try deleteAndNullify(txn, cat, pk, expected_version);
+    // Step 5: on the apply path, free the row's collection storage. This runs
+    // AFTER deleteAndNullify because the outbound backlink cleanup reads the
+    // link_set roots; the tombstoned row's columns still hold the roots, so
+    // cur_raw stays accurate. Without this every deleted row leaked its
+    // list/set/dict trees (and their element/key blobs) permanently.
+    switch (result) {
+        .ok => {
+            i = 0;
+            while (i < pc) : (i += 1) {
+                switch (kinds[i]) {
+                    .list => {
+                        if (elems[i] == .blob) {
+                            // Elements are blob refs: free each before the tree.
+                            const n = try Column.len(txn, cur_raw[i]);
+                            var e: u64 = 0;
+                            while (e < n) : (e += 1) try blob.free(txn, try Column.get(txn, cur_raw[i], e));
+                        }
+                        try Column.freeTree(txn, cur_raw[i]);
+                    },
+                    .set => switch (elems[i]) {
+                        .int => try Index.freeTree(txn, cur_raw[i]),
+                        .blob => try bindex.freeTree(txn, cur_raw[i]),
+                    },
+                    .dict => try bindex.freeTree(txn, cur_raw[i]),
+                    .link_set => try Index.freeTree(txn, cur_raw[i]),
+                    .int, .blob, .link => {},
+                }
+            }
+        },
+        else => {},
+    }
+    return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -1095,6 +1138,74 @@ test "value index tracks deletes" {
     try expectIndexOkeys(&w, cat, 1, 10, &.{o2.row});
     try expectIndexOkeys(&w, cat, 1, 20, &.{o1.row});
     w.deinit();
+}
+
+test "updateTyped carries collection properties through unchanged" {
+    // Regression: updating any row of a collection-bearing type hit
+    // `unreachable` (panic in Debug, UB in release). Collections are now
+    // carried through; mutate them via their own APIs.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "utyped_coll.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    defer w.deinit();
+    var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .int }, .{ .kind = .list, .elem = .int } });
+    cat = (try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .int = 10 }, .{ .list_int = &.{ 7, 8, 9 } } })).cat;
+
+    var out: [3]Value = undefined;
+    const ver = (try getTyped(&w, cat, 1, &out)).?;
+    const res = try updateTyped(&w, cat, 1, &.{ .{ .int = 1 }, .{ .int = 20 }, out[2] }, ver);
+    try testing.expect(res == .ok);
+    cat = res.ok.cat;
+
+    _ = (try getTyped(&w, cat, 1, &out)).?;
+    try testing.expectEqual(@as(u64, 20), out[1].int);
+    try testing.expectEqual(@as(?u64, 3), try collections.listLen(&w, cat, 1, 2));
+    try testing.expectEqual(@as(u64, 8), try collections.listGetInt(&w, cat, 1, 2, 1));
+}
+
+test "deleteTyped frees the row's collection storage" {
+    // Regression: deleted rows leaked their list/set/dict trees (and element
+    // and key blobs) permanently -- unreclaimable except by a full file copy.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "del_coll_free.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+
+    // Commit a row carrying every collection kind so its trees are committed.
+    {
+        var w = try db.beginWrite();
+        var cat = try catalog.createDefs(&w, &.{
+            .{ .kind = .int },
+            .{ .kind = .list, .elem = .blob },
+            .{ .kind = .set, .elem = .int },
+            .{ .kind = .dict },
+        });
+        cat = (try insertTyped(&w, cat, &.{
+            .{ .int = 1 },
+            .{ .list_blob = &.{ "alpha", "beta" } },
+            .{ .set_int = &.{ 1, 2, 3 } },
+            .{ .dict_int = &.{ .{ .key = "k1", .val = 10 }, .{ .key = "k2", .val = 20 } } },
+        })).cat;
+        w.setRoot(cat);
+        _ = try w.commit();
+    }
+    // Deleting the row must record the collection trees as in-flight frees.
+    var w = try db.beginWrite();
+    defer w.deinit();
+    var out: [4]Value = undefined;
+    const ver = (try getTyped(&w, w.new_root, 1, &out)).?;
+    const before = w.in_flight_frees.items.len;
+    const res = try deleteTyped(&w, w.new_root, 1, ver);
+    try testing.expect(res == .ok);
+    // list tree + 2 element blobs + set tree + dict tree + 2 key blobs, plus
+    // the COW frees of the delete itself: well above the tombstone-only count.
+    try testing.expect(w.in_flight_frees.items.len >= before + 7);
 }
 
 test "updateTyped moves backlinks when a link value changes" {

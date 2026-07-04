@@ -74,6 +74,14 @@ pub fn backlinkCount(txn: anytype, cat: Ref, prop: usize, target: u64) !u64 {
     return try Index.count(txn, set_root);
 }
 
+// True when `source` is recorded in link property `prop`'s backlink set for
+// `target`.
+pub fn backlinkContains(txn: anytype, cat: Ref, prop: usize, target: u64, source: u64) !bool {
+    const v = try catalog.loadCatalog(txn, cat);
+    const set_root = (try Index.get(txn, v.backlinkRef(prop), target)) orelse return false;
+    return (try Index.get(txn, set_root, source)) != null;
+}
+
 // Collect the source okeys whose link property `prop` points at `target`.
 pub fn backlinkCollect(
     txn: anytype,
@@ -225,8 +233,14 @@ pub fn nullifyInboundInCatalog(txn: *WriteTxn, cat: Ref, okey: u64, target_type:
             }
             // Bump the source row's version: its link column changed, and a
             // client holding the pre-nullify version must get a conflict on
-            // update rather than silently resurrecting a dangling link.
-            s.version_col_ref = try Column.set(txn, s.version_col_ref, src_row, txn.new_version);
+            // update rather than silently resurrecting a dangling link. The
+            // SELF-link case is exempt (match_all means this catalog is the
+            // target's own type, so src == okey is the row being deleted):
+            // bumping it would make the follow-up tombstone's version check
+            // fail forever, leaving self-linked objects undeletable.
+            if (!(match_all and src == okey)) {
+                s.version_col_ref = try Column.set(txn, s.version_col_ref, src_row, txn.new_version);
+            }
             cur = try s.replace(txn);
         }
         // Drop the whole backlink set for okey (its inbound links are now
