@@ -16,7 +16,11 @@ pub const Value = union(enum) {
     int: u64,
     // A blob property decodes to one of two read-side shapes:
     //   .bytes    -- a small blob (<= inline cap): a zero-copy slice into the
-    //                mapped storage, valid for the lifetime of the transaction.
+    //                mapped storage. Valid until the next MUTATING call on the
+    //                same transaction: an update/delete that frees the blob
+    //                routes a txn-private node to the immediate-reuse pool, so
+    //                the next allocation may scribble it. Copy the bytes out
+    //                before mutating if they must survive.
     //   .blob_ref -- a blob larger than the inline cap, stored chunked and thus
     //                without a single contiguous slice. The caller materializes
     //                it with `blob.getAlloc(txn, ref, allocator)` and frees the

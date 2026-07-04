@@ -53,7 +53,7 @@ pub fn addBacklink(txn: *WriteTxn, cat: Ref, p: usize, target: u64, source: u64)
 }
 
 // Remove source from link property p's backlink set for target.
-fn removeBacklink(txn: *WriteTxn, cat: Ref, p: usize, target: u64, source: u64) !Ref {
+pub fn removeBacklink(txn: *WriteTxn, cat: Ref, p: usize, target: u64, source: u64) !Ref {
     const v = try catalog.loadCatalog(txn, cat);
     const new_bl = try blRemove(txn, v.backlinkRef(p), target, source);
     return try catalog.setBacklinkRef(txn, cat, p, new_bl);
@@ -97,8 +97,15 @@ pub fn backlinkCollect(
 
 // Set or clear link property `prop` of the object with primary key `pk`.
 // Maintains the backlink index and bumps the row version. No-op if unchanged.
+//
+// Backlink SOURCES are object keys, never physical rows: rows move under
+// relocation/compaction while okeys are stable, and every backlink consumer
+// (nullifyInboundInCatalog, cleanOutboundInCatalog, rebuildBacklinks) resolves
+// sources through the key->row index. Recording the row here would corrupt the
+// graph the moment a source row is relocated.
 pub fn setLink(txn: *WriteTxn, cat: Ref, pk: u64, prop: usize, target: ?u64) !Ref {
     const r0 = (try catalog.resolveProp(txn, cat, pk, prop)) orelse return cat;
+    const okey = (try catalog.pkToOkey(txn, cat, pk)) orelse return cat;
     const row = r0.row;
     const old_raw = try Column.get(txn, r0.prop_col, row);
     const old_target: ?u64 = if (old_raw == 0) null else old_raw - 1;
@@ -106,8 +113,8 @@ pub fn setLink(txn: *WriteTxn, cat: Ref, pk: u64, prop: usize, target: ?u64) !Re
 
     const new_raw: u64 = if (target) |t| t + 1 else 0;
     var new_cat = try catalog.replaceCollRoot(txn, cat, row, prop, new_raw);
-    if (old_target) |ot| new_cat = try removeBacklink(txn, new_cat, prop, ot, row);
-    if (target) |nt| new_cat = try addBacklink(txn, new_cat, prop, nt, row);
+    if (old_target) |ot| new_cat = try removeBacklink(txn, new_cat, prop, ot, okey);
+    if (target) |nt| new_cat = try addBacklink(txn, new_cat, prop, nt, okey);
     return new_cat;
 }
 
@@ -148,28 +155,30 @@ pub fn linkSetCollect(
 }
 
 // Add `target` to the to-many link set of object `pk`; records the backlink.
-// No-op if already a member.
+// No-op if already a member. The backlink source is the okey (see setLink).
 pub fn linkSetAdd(txn: *WriteTxn, cat: Ref, pk: u64, prop: usize, target: u64) !Ref {
     const r = (try catalog.resolveProp(txn, cat, pk, prop)) orelse return error.NotFound;
+    const okey = (try catalog.pkToOkey(txn, cat, pk)) orelse return error.NotFound;
     const row = r.row;
     const old_root = try Column.get(txn, r.prop_col, row);
     if ((try Index.get(txn, old_root, target)) != null) return cat; // already a member
     const new_root = try Index.insert(txn, old_root, target, 1);
     var new_cat = try catalog.replaceCollRoot(txn, cat, row, prop, new_root);
-    new_cat = try addBacklink(txn, new_cat, prop, target, row);
+    new_cat = try addBacklink(txn, new_cat, prop, target, okey);
     return new_cat;
 }
 
 // Remove `target` from the to-many link set of object `pk`; drops the backlink.
-// No-op if not a member.
+// No-op if not a member. The backlink source is the okey (see setLink).
 pub fn linkSetRemove(txn: *WriteTxn, cat: Ref, pk: u64, prop: usize, target: u64) !Ref {
     const r = (try catalog.resolveProp(txn, cat, pk, prop)) orelse return error.NotFound;
+    const okey = (try catalog.pkToOkey(txn, cat, pk)) orelse return error.NotFound;
     const row = r.row;
     const old_root = try Column.get(txn, r.prop_col, row);
     if ((try Index.get(txn, old_root, target)) == null) return cat; // not a member
     const new_root = try Index.remove(txn, old_root, target);
     var new_cat = try catalog.replaceCollRoot(txn, cat, row, prop, new_root);
-    new_cat = try removeBacklink(txn, new_cat, prop, target, row);
+    new_cat = try removeBacklink(txn, new_cat, prop, target, okey);
     return new_cat;
 }
 
@@ -201,21 +210,24 @@ pub fn nullifyInboundInCatalog(txn: *WriteTxn, cat: Ref, okey: u64, target_type:
         defer sources.deinit(alloc);
         try backlinkCollect(txn, cur, p, okey, &sources, alloc);
         for (sources.items) |src| {
-            const vv = try catalog.loadCatalog(txn, cur);
-            const col = vv.propColRef(p);
             // src is a source object key; resolve to its physical row for column
             // access. A backlink entry whose source no longer resolves is stale
             // (corrupt or already deleted); skip it -- the whole set for okey is
             // dropped below regardless.
             const src_row = (try catalog.okeyToRow(txn, cur, src)) orelse continue;
-            const new_col = if (kind == .link)
-                try Column.set(txn, col, src_row, 0)
-            else blk: {
-                const src_set = try Column.get(txn, col, src_row);
+            var s = try catalog.CatalogSnapshot.load(txn, cur);
+            if (kind == .link) {
+                s.props[p].col = try Column.set(txn, s.props[p].col, src_row, 0);
+            } else {
+                const src_set = try Column.get(txn, s.props[p].col, src_row);
                 const new_set = try Index.remove(txn, src_set, okey);
-                break :blk try Column.set(txn, col, src_row, new_set);
-            };
-            cur = try catalog.setPropColRef(txn, cur, p, new_col);
+                s.props[p].col = try Column.set(txn, s.props[p].col, src_row, new_set);
+            }
+            // Bump the source row's version: its link column changed, and a
+            // client holding the pre-nullify version must get a conflict on
+            // update rather than silently resurrecting a dangling link.
+            s.version_col_ref = try Column.set(txn, s.version_col_ref, src_row, txn.new_version);
+            cur = try s.replace(txn);
         }
         // Drop the whole backlink set for okey (its inbound links are now
         // clear): remove the outer entry and free the set's nodes, rather than
@@ -366,6 +378,87 @@ test "setLink moves a link and updates both backlink sets" {
     try testing.expectEqual(@as(u64, 0), try backlinkCount(&w, cat, 1, a.row));
     try testing.expectEqual(@as(u64, 1), try backlinkCount(&w, cat, 1, b.row));
     w.deinit();
+}
+
+test "nullifying a source's link bumps its version" {
+    // Regression: nullify cleared the source's link column without bumping its
+    // version, so a client holding the pre-nullify version could update the
+    // source with no conflict and silently resurrect the dangling link.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "nullify_version.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var a_okey: u64 = undefined;
+
+    // Commit 1: target + linked source.
+    {
+        var w = try db.beginWrite();
+        var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
+        const a = try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .link = null } });
+        cat = a.cat;
+        a_okey = a.row;
+        const s = try insertTyped(&w, cat, &.{ .{ .int = 2 }, .{ .link = a.row } });
+        w.setRoot(s.cat);
+        _ = try w.commit();
+    }
+    // Snapshot the source's version, then nullify it via the target's delete
+    // in a LATER commit (a distinct transaction version).
+    var out: [2]catalog.Value = undefined;
+    var stale: u64 = undefined;
+    {
+        var r = try db.beginRead();
+        defer r.end();
+        stale = (try getTyped(&r, r.root(), 2, &out)).?;
+    }
+    {
+        var w = try db.beginWrite();
+        var raw: [2]u64 = undefined;
+        const av = (try @import("objects.zig").getByPk(&w, w.new_root, 1, &raw)).?;
+        const cat = switch (try @import("objects.zig").deleteAndNullify(&w, w.new_root, 1, av)) {
+            .ok => |x| x,
+            else => unreachable,
+        };
+        try testing.expectEqual(@as(?u64, null), try getLink(&w, cat, 2, 1));
+        w.setRoot(cat);
+        _ = try w.commit();
+    }
+    // The pre-nullify version must now conflict instead of resurrecting the
+    // dangling link.
+    {
+        var w = try db.beginWrite();
+        defer w.deinit();
+        const res = try @import("objects.zig").updateTyped(&w, w.new_root, 2, &.{ .{ .int = 2 }, .{ .link = a_okey } }, stale);
+        try testing.expect(res == .conflict);
+    }
+}
+
+test "a multi-leaf backlink set is pruned and freed when emptied" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "bl_prune_big.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    defer w.deinit();
+    var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
+    const target = try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .link = null } });
+    cat = target.cat;
+    // >64 sources so the backlink inner set splits past one leaf.
+    var pk: u64 = 2;
+    while (pk <= 82) : (pk += 1) {
+        const src = try insertTyped(&w, cat, &.{ .{ .int = pk }, .{ .link = target.row } });
+        cat = src.cat;
+    }
+    try testing.expectEqual(@as(u64, 81), try backlinkCount(&w, cat, 1, target.row));
+    // Clear every inbound link; the set (and its inner nodes) must be pruned.
+    pk = 2;
+    while (pk <= 82) : (pk += 1) cat = try setLink(&w, cat, pk, 1, null);
+    const v = try catalog.loadCatalog(&w, cat);
+    try testing.expectEqual(@as(?u64, null), try Index.get(&w, v.backlinkRef(1), target.row));
+    try testing.expectEqual(@as(u64, 0), try backlinkCount(&w, cat, 1, target.row));
 }
 
 test "an emptied backlink set is pruned from the backlink index" {

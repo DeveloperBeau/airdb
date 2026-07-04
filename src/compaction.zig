@@ -123,6 +123,11 @@ fn truncatePacked(txn: *WriteTxn, cat: Ref, new_len: u64) !Ref {
 // seeking live rows that must move down. Both advance monotonically across
 // steps so no slot is ever revisited (relocateRow is not idempotent).
 pub const CompactCursor = struct {
+    /// The catalog ref this cursor was persisted against. Resuming is gated on
+    /// an exact match: live_count/next_row alone are a heuristic two DIFFERENT
+    /// types can momentarily share, and resuming another type's high_hi would
+    /// leave rows unexamined and let the final truncate drop live data.
+    cat: Ref,
     live_count: u64,
     next_row: u64,
     hole_lo: u64,
@@ -178,13 +183,14 @@ pub fn compactStep(txn: *WriteTxn, cat: Ref, budget: usize) !struct { cat: Ref, 
         return .{ .cat = cur, .moved = 0, .done = true };
     }
 
-    // Resume the stored cursor only if it pins this exact catalog shape;
-    // otherwise (churn, or first step of a run) restart the scan.
+    // Resume the stored cursor only if it pins this exact CATALOG (the ref
+    // uniquely identifies the type and its committed state) with this exact
+    // shape; otherwise (another type, churn, or a fresh run) restart the scan.
     var cursor: CompactCursor = blk: {
         if (txn.db.compact_cursor) |c| {
-            if (c.live_count == lc and c.next_row == next_row) break :blk c;
+            if (c.cat == cat and c.live_count == lc and c.next_row == next_row) break :blk c;
         }
-        break :blk .{ .live_count = lc, .next_row = next_row, .hole_lo = 0, .high_hi = next_row };
+        break :blk .{ .cat = cat, .live_count = lc, .next_row = next_row, .hole_lo = 0, .high_hi = next_row };
     };
 
     var moved: usize = 0;
@@ -233,6 +239,9 @@ pub fn compactStep(txn: *WriteTxn, cat: Ref, budget: usize) !struct { cat: Ref, 
         return .{ .cat = cur, .moved = moved, .done = true };
     }
 
+    // Persist against the catalog ref the NEXT call will see: relocations COW
+    // the catalog, so `cur` is what the caller publishes and later re-derives.
+    cursor.cat = cur;
     txn.db.compact_cursor = cursor;
     return .{ .cat = cur, .moved = moved, .done = false };
 }

@@ -412,7 +412,28 @@ pub fn updateTyped(
         };
     }
     // Step 4: delegate to the core update; it will re-check the version (match).
-    return try update(txn, cat, pk, new_raw[0..pc], expected_version);
+    const result = try update(txn, cat, pk, new_raw[0..pc], expected_version);
+    // Step 5: maintain backlinks for any changed to-one link, mirroring
+    // setLink. Skipping this left the old target's backlink set naming this
+    // source forever and the new target's set missing it -- corrupting
+    // nullify/cascade/block enforcement. The backlink source is the okey.
+    switch (result) {
+        .ok => |ok| {
+            var cat_out = ok.cat;
+            var changed = false;
+            var p: usize = 0;
+            while (p < pc) : (p += 1) {
+                if (kinds[p] != .link or cur_raw[p] == new_raw[p]) continue;
+                const okey = (try catalog.pkToOkey(txn, cat_out, pk)) orelse break;
+                if (cur_raw[p] != 0) cat_out = try links.removeBacklink(txn, cat_out, p, cur_raw[p] - 1, okey);
+                if (new_raw[p] != 0) cat_out = try links.addBacklink(txn, cat_out, p, new_raw[p] - 1, okey);
+                changed = true;
+            }
+            if (changed) return .{ .ok = .{ .cat = cat_out, .version = ok.version } };
+            return result;
+        },
+        else => return result,
+    }
 }
 
 // deleteTyped is MVCC-safe: blobs are freed only on the apply path, never on
@@ -1074,6 +1095,71 @@ test "value index tracks deletes" {
     try expectIndexOkeys(&w, cat, 1, 10, &.{o2.row});
     try expectIndexOkeys(&w, cat, 1, 20, &.{o1.row});
     w.deinit();
+}
+
+test "updateTyped moves backlinks when a link value changes" {
+    // Regression: updateTyped encoded the new link into the column but never
+    // touched the backlink index, leaving the old target's set naming this
+    // source forever and the new target's set missing it.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "utyped_link.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    defer w.deinit();
+    var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
+    const a = try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .link = null } });
+    cat = a.cat;
+    const b = try insertTyped(&w, cat, &.{ .{ .int = 2 }, .{ .link = null } });
+    cat = b.cat;
+    const c = try insertTyped(&w, cat, &.{ .{ .int = 3 }, .{ .link = a.row } });
+    cat = c.cat;
+
+    var out: [2]Value = undefined;
+    const ver = (try getTyped(&w, cat, 3, &out)).?;
+    const res = try updateTyped(&w, cat, 3, &.{ .{ .int = 3 }, .{ .link = b.row } }, ver);
+    try testing.expect(res == .ok);
+    cat = res.ok.cat;
+
+    const links_mod = @import("links.zig");
+    try testing.expectEqual(@as(u64, 0), try links_mod.backlinkCount(&w, cat, 1, a.row));
+    try testing.expectEqual(@as(u64, 1), try links_mod.backlinkCount(&w, cat, 1, b.row));
+    // Deleting the NEW target nullifies the source's link.
+    var raw: [2]u64 = undefined;
+    const bv = (try getByPk(&w, cat, 2, &raw)).?;
+    cat = switch (try deleteAndNullify(&w, cat, 2, bv)) {
+        .ok => |x| x,
+        else => unreachable,
+    };
+    try testing.expectEqual(@as(?u64, null), try links_mod.getLink(&w, cat, 3, 1));
+}
+
+test "a multi-leaf value-index set is pruned and freed when emptied" {
+    // The single-leaf prune case is covered elsewhere; this drives the inner
+    // set past one leaf (>64 members) so freeTree's inner-node recursion runs.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "vidx_prune_big.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    defer w.deinit();
+    var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .int, .indexed = true } });
+    const n: u64 = 80;
+    var pk: u64 = 1;
+    while (pk <= n) : (pk += 1) cat = (try insert(&w, cat, &.{ pk, 7 })).cat;
+    var out: [2]u64 = undefined;
+    pk = 1;
+    while (pk <= n) : (pk += 1) {
+        const ver = (try getByPk(&w, cat, pk, &out)).?;
+        cat = (try delete(&w, cat, pk, ver)).ok;
+    }
+    const v = try loadCatalog(&w, cat);
+    try testing.expectEqual(@as(?u64, null), try Index.get(&w, v.valueIndexRef(1), 7));
+    try testing.expectEqual(@as(u64, 0), try Index.count(&w, v.valueIndexRef(1)));
 }
 
 test "an emptied value-index set is pruned from the outer index" {
