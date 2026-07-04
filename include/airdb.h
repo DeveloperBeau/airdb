@@ -31,6 +31,9 @@ typedef struct AirdbTxn AirdbTxn;
 #define AIRDB_E_DUPLICATE    (-5)
 #define AIRDB_E_NOT_EMPTY    (-6)
 #define AIRDB_E_UNSUPPORTED  (-7)
+/* A commit-point flush failed: the commit's on-disk fate is indeterminate and
+ * this handle refuses further writes. Close and reopen to resolve. */
+#define AIRDB_E_INDETERMINATE (-8)
 
 /* Open (creating if absent with `prop_count` int properties, property 0 is the
  * primary key). `path` must be absolute. Returns NULL on failure (including a

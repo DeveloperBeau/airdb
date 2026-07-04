@@ -711,6 +711,9 @@ pub const Db = struct {
         /// True when open had to fall back past a corrupt primary slot or header
         /// and resumed from the previous version. Worth logging/alerting on.
         recovered_fallback: bool,
+        /// True when a commit-point flush failed and the instance refuses
+        /// writes until reopen. Strictly more alarming than recovered_fallback.
+        poisoned: bool,
     };
 
     pub fn metrics(self: *Db) Metrics {
@@ -730,6 +733,7 @@ pub const Db = struct {
             .setlength_ns = self.store.setlength_ns,
             .setlength_calls = self.store.setlength_calls,
             .recovered_fallback = self.recovered_fallback,
+            .poisoned = self.poisoned,
         };
     }
 
@@ -1647,6 +1651,7 @@ test "metrics report mapped length, versions, and reclaimable bytes" {
     try testing.expect(m.free_extent_count >= 1);
     try testing.expect(m.reclaimable_bytes >= 8);
     try testing.expectEqual(db.active_version, m.oldest_pinned_version); // no readers
+    try testing.expect(!m.poisoned);
 }
 
 test "version->root ring records committed versions" {
@@ -2082,6 +2087,7 @@ test "a failed commit-point flush poisons the instance until reopen" {
             try testing.expectError(error.Durability, w.commit());
         }
         try testing.expectError(error.CommitIndeterminate, db.beginWrite());
+        try testing.expect(db.metrics().poisoned);
     }
     // Reopen resolves the header and writes flow again.
     var db = try Db.open(testing.allocator, path);

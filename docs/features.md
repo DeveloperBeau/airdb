@@ -85,7 +85,7 @@ Code pointers use `module.function` names under `src/`.
 
 ## Multi-process
 
-- Any number of attached processes; one writer at a time via the coord lock.
+- Up to 64 simultaneously attached instances; one writer at a time via the coord lock.
 - Reader pins published per process; the space-reclaim horizon respects every
   live reader, with pid+incarnation liveness so recycled pids can't pin the
   horizon.

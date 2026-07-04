@@ -167,29 +167,41 @@ pub const Coord = struct {
         return @ptrCast(@alignCast(&self.map[participants_off + idx * slot_stride + 8]));
     }
 
+    // The (pid, token) pair viewed as one aligned u64 (LE: low 32 bits pid,
+    // high 32 bits token). Claiming publishes both fields in a SINGLE CAS: a
+    // pid-first claim left a (live pid, token 0) window that a concurrent
+    // globalHorizon read as a recycled pid and reclaimed -- after which a
+    // third process could re-claim the slot and the two owners overwrote each
+    // other's pins, hiding a live reader from the reclaim horizon.
+    fn slotClaimPtr(self: *Coord, idx: usize) *u64 {
+        return @ptrCast(@alignCast(&self.map[participants_off + idx * slot_stride]));
+    }
+
     /// Claim a free participant slot. Returns the slot index on success,
     /// or null if all 64 slots are occupied. Uses CAS to avoid races.
     pub fn claimSlot(self: *Coord) !?usize {
         const my_pid: u32 = @intCast(currentPid());
         const my_token: u32 = @truncate(platform.processStartToken(my_pid) orelse 0);
+        const claim: u64 = (@as(u64, my_token) << 32) | my_pid;
         var i: usize = 0;
         while (i < participant_slots) : (i += 1) {
-            const p = self.slotPidPtr(i);
-            if (@cmpxchgStrong(u32, p, 0, my_pid, .seq_cst, .seq_cst) == null) {
+            // A free slot's min_pinned is already sentinel (releaseSlot orders
+            // it before the pid/token clear), so the claim itself is the only
+            // publication step and it is atomic.
+            if (@cmpxchgStrong(u64, self.slotClaimPtr(i), 0, claim, .seq_cst, .seq_cst) == null) {
                 @atomicStore(u64, self.slotMinPtr(i), sentinel_max, .seq_cst);
-                @atomicStore(u32, self.slotTokenPtr(i), my_token, .seq_cst);
                 return i;
             }
         }
         return null;
     }
 
-    /// Release a previously claimed slot. Zeros the pid last so no reader
-    /// observes a stale min_pinned after the slot appears free.
+    /// Release a previously claimed slot. Resets min_pinned first, then clears
+    /// pid+token in one store, so no reader observes a stale min_pinned after
+    /// the slot appears free.
     pub fn releaseSlot(self: *Coord, idx: usize) void {
         @atomicStore(u64, self.slotMinPtr(idx), sentinel_max, .seq_cst);
-        @atomicStore(u32, self.slotTokenPtr(idx), 0, .seq_cst);
-        @atomicStore(u32, self.slotPidPtr(idx), 0, .seq_cst);
+        @atomicStore(u64, self.slotClaimPtr(idx), 0, .seq_cst);
     }
 
     /// Publish the minimum pinned version for this slot. seq_cst, not release:
@@ -228,13 +240,16 @@ pub const Coord = struct {
             }
             // The pid is alive, but pids are recycled: verify the incarnation.
             // A live unrelated process that inherited a dead reader's pid would
-            // otherwise pin the horizon forever. An unavailable token (query
-            // failed) is treated as a match -- conservative, never unsafe.
+            // otherwise pin the horizon forever. Unavailable tokens on EITHER
+            // side (query failed here, or the claimer could not obtain one and
+            // stored 0) are treated as a match -- conservative, never unsafe.
             const stored_token = @atomicLoad(u32, self.slotTokenPtr(i), .seq_cst);
-            if (platform.processStartToken(pid)) |tok| {
-                if (@as(u32, @truncate(tok)) != stored_token) {
-                    @atomicStore(u32, self.slotPidPtr(i), 0, .seq_cst); // recycled pid: reclaim
-                    continue;
+            if (stored_token != 0) {
+                if (platform.processStartToken(pid)) |tok| {
+                    if (@as(u32, @truncate(tok)) != stored_token) {
+                        @atomicStore(u32, self.slotPidPtr(i), 0, .seq_cst); // recycled pid: reclaim
+                        continue;
+                    }
                 }
             }
             const mp = @atomicLoad(u64, self.slotMinPtr(i), .acquire);
@@ -446,4 +461,48 @@ test "globalHorizon reclaims a slot whose live pid has the wrong incarnation tok
     c.publishMinPinned(idx, 7);
     try testing.expectEqual(@as(u64, 7), c.globalHorizon(50));
     c.releaseSlot(idx);
+}
+
+test "claimSlot publishes pid and incarnation token in one atomic word" {
+    // Regression: the pid was CAS'd first and the token stored after, leaving
+    // a (live pid, token 0) window a concurrent globalHorizon could misread as
+    // a recycled pid and reclaim -- a third process then re-claimed the slot
+    // and the two owners overwrote each other's pins. The claim is now a
+    // single u64 CAS of (token << 32) | pid; both fields must land together.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dlen = try tmp.dir.realPath(coordIo(), &path_buf);
+    const cpath = try std.fs.path.join(testing.allocator, &.{ path_buf[0..dlen], "packedclaim.coord" });
+    defer testing.allocator.free(cpath);
+    var c = try Coord.openOrCreate(cpath);
+    defer c.deinit();
+
+    const idx = (try c.claimSlot()).?;
+    defer c.releaseSlot(idx);
+    const my_pid: u32 = @intCast(platform.currentPid());
+    const my_token: u32 = @truncate(platform.processStartToken(my_pid) orelse 0);
+    const word = @atomicLoad(u64, c.slotClaimPtr(idx), .seq_cst);
+    try testing.expectEqual((@as(u64, my_token) << 32) | my_pid, word);
+    try testing.expectEqual(sentinel_max, @atomicLoad(u64, c.slotMinPtr(idx), .seq_cst));
+}
+
+test "globalHorizon keeps a live-pid slot whose stored token is zero" {
+    // A claimer that could not obtain its own start token stores 0. Treating
+    // that as a token mismatch would reclaim a LIVE reader's slot and drop its
+    // pin; the horizon must honor the pin (pid-only liveness) instead.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dlen = try tmp.dir.realPath(coordIo(), &path_buf);
+    const cpath = try std.fs.path.join(testing.allocator, &.{ path_buf[0..dlen], "zerotoken.coord" });
+    defer testing.allocator.free(cpath);
+    var c = try Coord.openOrCreate(cpath);
+    defer c.deinit();
+
+    const my_pid: u32 = @intCast(platform.currentPid());
+    c.forgeSlotForTest(1, my_pid, 0, 5); // alive pid, unknown incarnation
+    try testing.expectEqual(@as(u64, 5), c.globalHorizon(50));
+    try testing.expectEqual(my_pid, c.slotPidForTest(1)); // not reclaimed
+    c.releaseSlot(1);
 }

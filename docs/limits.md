@@ -58,10 +58,11 @@ newer one. Ship a matched engine with your app.
 
 ## Multi-process caveats
 
-- Liveness of reader pins is pid + process-start-time. If the start-time
-  query fails (exotic sandboxing), a recycled pid degrades to pid-only
-  liveness: safe, but a dead reader's pin may persist until the slot is
-  reused.
+- Liveness of reader pins is pid + process-start-time (truncated to 32 bits;
+  a false match needs a recycled pid AND a start-time collision). If the
+  start-time query fails (exotic sandboxing), a recycled pid degrades to
+  pid-only liveness: safe, but a dead reader's pin then persists until the
+  squatting pid itself exits.
 - At most 64 simultaneously attached Db instances per database; the 65th
   open fails with TooManyAttachments rather than degrade to reads whose pins
   no writer can see.
