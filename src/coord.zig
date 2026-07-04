@@ -185,9 +185,13 @@ pub const Coord = struct {
         const claim: u64 = (@as(u64, my_token) << 32) | my_pid;
         var i: usize = 0;
         while (i < participant_slots) : (i += 1) {
-            // A free slot's min_pinned is already sentinel (releaseSlot orders
-            // it before the pid/token clear), so the claim itself is the only
-            // publication step and it is atomic.
+            // The sentinel store below is LOAD-BEARING: a release-freed slot's
+            // min is already sentinel, but a RECLAIM-freed slot keeps its dead
+            // owner's min (reclaim touches only the claim word). Without the
+            // store, inheriting such a slot would depress every process's
+            // reclaim horizon with a stale low pin for as long as this claim
+            // lives. Between the CAS and the store a horizon scan can read the
+            // stale min -- a too-low horizon, which is merely conservative.
             if (@cmpxchgStrong(u64, self.slotClaimPtr(i), 0, claim, .seq_cst, .seq_cst) == null) {
                 @atomicStore(u64, self.slotMinPtr(i), sentinel_max, .seq_cst);
                 return i;
