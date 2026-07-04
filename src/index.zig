@@ -125,7 +125,12 @@ fn getAt(txn: anytype, root: Ref, key: u64, depth: usize) !?u64 {
 }
 
 /// Return the largest key in the tree rooted at root, or null if the tree is
-/// empty. Descends the rightmost root-to-leaf path; read-only, O(height).
+/// empty. Read-only, O(height). Descends the LAST NON-EMPTY child at each
+/// level: removals never merge or drop leaves, so the rightmost leaf can be
+/// empty while the tree still holds keys -- blindly following the rightmost
+/// path would report a non-empty tree as empty, and bulkAppend would then
+/// admit a batch whose keys do not clear the true maximum, corrupting the pk
+/// index with duplicates and broken ordering.
 pub fn maxKey(txn: anytype, root: Ref) !?u64 {
     var cur: Ref = root;
     var depth: usize = 0;
@@ -133,11 +138,18 @@ pub fn maxKey(txn: anytype, root: Ref) !?u64 {
         const bytes = try derefNode(txn, cur);
         if (bytes[0] == kind_leaf) {
             const v = try parseLeaf(bytes);
-            if (v.count == 0) return null;
+            if (v.count == 0) return null; // only the empty root reaches here
             return v.key(v.count - 1);
         }
         const v = try parseInner(bytes);
-        cur = v.childRef(v.child_count - 1);
+        var i: usize = v.child_count;
+        cur = blk: {
+            while (i > 0) {
+                i -= 1;
+                if (v.subtreeCount(i) > 0) break :blk v.childRef(i);
+            }
+            return null; // every subtree is empty
+        };
     }
     return error.Corrupt;
 }
@@ -371,14 +383,17 @@ fn removeInto(txn: *WriteTxn, node_ref: Ref, key: u64, depth: usize) !RemoveResu
     const v = try parseInner(inner_bytes);
     const ci = childIndexForKey(v, key);
     const old_child_ref: Ref = v.childRef(ci);
+    // Capture BEFORE writableCopy: it frees node_ref into the reuse pool, so
+    // v's bytes must not be read after it (the node can be reallocated).
     const old_total = v.totalCount();
+    const old_child_count = v.subtreeCount(ci);
     const r = try removeInto(txn, old_child_ref, key, depth + 1);
     // No change in the subtree: skip COW on this inner node too.
     if (r.ref == old_child_ref) return .{ .ref = node_ref, .count = old_total };
     const new_inner = try txn.writableCopy(node_ref, inner_node_size);
     std.mem.writeInt(u64, new_inner.bytes[hdr + ci * inner_stride ..][0..8], r.ref, .little);
     std.mem.writeInt(u64, new_inner.bytes[hdr + ci * inner_stride + 16 ..][0..8], r.count, .little);
-    return .{ .ref = new_inner.ref, .count = old_total - v.subtreeCount(ci) + r.count };
+    return .{ .ref = new_inner.ref, .count = old_total - old_child_count + r.count };
 }
 
 /// Remove key from the tree rooted at root.
@@ -703,6 +718,35 @@ test "a committed index version stays intact for a pinned reader while a later c
     try testing.expect((try get(&r2, r2.root(), 500)) == null);
     try testing.expectEqual(@as(?u64, 1235 * 10), try get(&r2, r2.root(), 1235)); // untouched key
     r2.end();
+}
+
+test "maxKey survives an emptied rightmost leaf" {
+    // Removals never merge or drop leaves, so deleting the upper key range
+    // leaves an EMPTY rightmost leaf. maxKey must keep descending into the
+    // last non-empty subtree instead of reporting the tree empty -- bulkAppend
+    // uses maxKey to qualify batches, and a false "empty" admits keys below
+    // the true maximum.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try idxTmpPath(testing.allocator, &tmp, "idx_maxkey.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    defer w.deinit();
+
+    var root = try create(&w);
+    var k: u64 = 0;
+    while (k <= 64) : (k += 1) root = try insert(&w, root, k, k); // forces a leaf split
+    try testing.expectEqual(@as(?u64, 64), try maxKey(&w, root));
+    // Empty the rightmost leaf by removing the upper half.
+    k = 32;
+    while (k <= 64) : (k += 1) root = try remove(&w, root, k);
+    try testing.expectEqual(@as(?u64, 31), try maxKey(&w, root));
+    // Fully emptied tree reports null.
+    k = 0;
+    while (k < 32) : (k += 1) root = try remove(&w, root, k);
+    try testing.expectEqual(@as(?u64, null), try maxKey(&w, root));
 }
 
 test "stored subtree counts match a full iteration under churn" {

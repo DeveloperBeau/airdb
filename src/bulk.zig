@@ -313,15 +313,17 @@ pub fn indexAppendRun(txn: *WriteTxn, root: Ref, keys: []const u64, vals: []cons
     }
 
     const result = level.items[0].ref;
-    level.deinit(al);
 
     // 5. Free the replaced right-edge nodes: the old rightmost leaf and every
     //    inner node on the old rightmost path were rebuilt above and are no
     //    longer referenced by the new tree. Committed nodes route to deferred
     //    (MVCC-safe) reclaim; txn-private ones become immediately reusable.
+    //    These frees are fallible, so they run BEFORE the manual level.deinit:
+    //    the errdefer must never fire on an already-deinitialized list.
     try txn.free(leaf_ref, inode.leaf_node_size);
     for (path_refs.items) |old_ref| try txn.free(old_ref, inode.inner_node_size);
 
+    level.deinit(al);
     return result;
 }
 
@@ -414,13 +416,14 @@ pub fn columnAppendRun(txn: *WriteTxn, root: Ref, values: []const u64) !Ref {
     }
 
     const result = level.items[0].ref;
-    level.deinit(al);
 
     // 5. Free the replaced right-edge nodes (old rightmost leaf + old spine),
     //    exactly as indexAppendRun does: they are unreferenced by the new tree.
+    //    Frees run before the manual deinit so the errdefer never double-frees.
     try txn.free(leaf_ref, cnode.leaf_node_size);
     for (path_refs.items) |old_ref| try txn.free(old_ref, cnode.inner_node_size);
 
+    level.deinit(al);
     return result;
 }
 
@@ -758,8 +761,21 @@ pub fn bulkAppendOrInsert(txn: *WriteTxn, cat: Ref, rows: []const []const u64) !
 
 // Insert every row one at a time, threading the catalog ref. A DuplicateKey from
 // objects.insert propagates to the caller. Empty rows return cat unchanged.
+//
+// Link-bearing schemas are rejected outright: objects.insert writes raw column
+// values without backlink maintenance (that is insertTyped's job), so silently
+// accepting them here would corrupt the link graph -- the same reason
+// bulkImport refuses them.
 fn fallbackInsert(txn: *WriteTxn, cat: Ref, rows: []const []const u64) !Ref {
     if (rows.len == 0) return cat;
+    {
+        const v = try catalog.loadCatalog(txn, cat);
+        var j: usize = 0;
+        while (j < v.prop_count) : (j += 1) {
+            const k = v.kind(j);
+            if (k == .link or k == .link_set) return error.UnsupportedForBulk;
+        }
+    }
     var c = cat;
     for (rows) |row| {
         c = (try objects.insert(txn, c, row)).cat;
@@ -780,6 +796,59 @@ fn bulkTmpPath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const dlen = try tmp.dir.realPath(testing.io, &path_buf);
     return std.fs.path.join(allocator, &.{ path_buf[0..dlen], name });
+}
+
+test "bulk append is refused when the batch does not clear the true max pk" {
+    // Regression: deleting the upper pk range empties the pk index's rightmost
+    // leaf. A maxKey that followed only the rightmost path then reported the
+    // type EMPTY, so bulkAppend admitted a batch below the surviving keys --
+    // duplicate pks and broken leaf ordering. The batch must be NotAppendable
+    // (and the fallback must handle it correctly instead).
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try bulkTmpPath(testing.allocator, &tmp, "bulkappend_maxpk.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    defer w.deinit();
+
+    var cat = try catalog.create(&w, 2);
+    var pk: u64 = 0;
+    while (pk <= 64) : (pk += 1) cat = (try objects.insert(&w, cat, &.{ pk, pk })).cat; // pk index splits
+    var out: [2]u64 = undefined;
+    pk = 32;
+    while (pk <= 64) : (pk += 1) {
+        const ver = (try objects.getByPk(&w, cat, pk, &out)).?;
+        cat = (try objects.delete(&w, cat, pk, ver)).ok;
+    }
+    // pks 0..31 survive; a batch starting at 10 must NOT take the fast path.
+    const rows = [_][]const u64{ &.{ 10, 1 }, &.{ 11, 2 } };
+    try testing.expectError(error.NotAppendable, bulkAppend(&w, cat, &rows));
+    // The orchestrator falls back to row-by-row, which detects the duplicate.
+    try testing.expectError(error.DuplicateKey, bulkAppendOrInsert(&w, cat, &rows));
+    // A batch that truly clears the surviving max qualifies.
+    const ok_rows = [_][]const u64{ &.{ 100, 1 }, &.{ 101, 2 } };
+    cat = try bulkAppend(&w, cat, &ok_rows);
+    try testing.expect((try objects.getByPk(&w, cat, 100, &out)) != null);
+    try testing.expect((try objects.getByPk(&w, cat, 31, &out)) != null);
+}
+
+test "bulk append fallback refuses link-bearing schemas" {
+    // objects.insert writes raw columns without backlink maintenance, so the
+    // row-by-row fallback must reject link/link_set types like bulkImport does
+    // instead of silently corrupting the graph.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try bulkTmpPath(testing.allocator, &tmp, "bulkappend_links.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    defer w.deinit();
+    const cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
+    const rows = [_][]const u64{&.{ 1, 0 }};
+    try testing.expectError(error.UnsupportedForBulk, bulkAppendOrInsert(&w, cat, &rows));
 }
 
 test "bulk append frees the replaced right-edge nodes" {

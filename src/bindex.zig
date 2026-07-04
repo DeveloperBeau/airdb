@@ -198,10 +198,17 @@ fn insertInto(txn: *WriteTxn, node_ref: Ref, key_ref: u64, key: []const u8, val:
         }
         const right_a = try txn.alloc(leaf_node_size);
         _ = encodeLeaf(right_a.bytes, keys_buf[m_leaf..total_leaf], vals_buf[m_leaf..total_leaf]);
+        // The parent's low key must OWN its bytes: aliasing the right leaf's
+        // slot-0 key blob would leave every ancestor dereferencing freed bytes
+        // once that key is removed (removeInto frees leaf key blobs). Routing
+        // separators are duplicated at split time and, like classic B+tree
+        // separators, deliberately never freed -- one small blob per split.
+        const boundary_bytes = try blob.get(txn, keys_buf[m_leaf]);
+        const boundary_low = try blob.put(txn, boundary_bytes);
         return InsertResult{
             .ref = left_a.ref,
             .count = m_leaf,
-            .split = Split{ .ref = right_a.ref, .low = keys_buf[m_leaf], .count = total_leaf - m_leaf },
+            .split = Split{ .ref = right_a.ref, .low = boundary_low, .count = total_leaf - m_leaf },
         };
     }
 
@@ -296,11 +303,14 @@ pub fn insert(txn: *WriteTxn, root: Ref, key: []const u8, val: u64) !Ref {
     const key_ref = try blob.put(txn, key);
     const r = try insertInto(txn, root, key_ref, key, val, 0);
     if (r.split == null) return r.ref;
-    // Root was split: build a new two-child inner root.
-    const left_min = try minKey(txn, r.ref);
+    // Root was split: build a new two-child inner root. The left low is
+    // duplicated for the same ownership reason as split boundaries: minKey
+    // returns the leftmost LEAF's slot-0 key blob, which removeInto may free.
+    const left_min_bytes = try blob.get(txn, try minKey(txn, r.ref));
+    const left_low = try blob.put(txn, left_min_bytes);
     const new_root = try txn.alloc(inner_node_size);
     const root_refs = [_]u64{ r.ref, r.split.?.ref };
-    const root_lows = [_]u64{ left_min, r.split.?.low };
+    const root_lows = [_]u64{ left_low, r.split.?.low };
     const root_counts = [_]u64{ r.count, r.split.?.count };
     _ = encodeInner(new_root.bytes, &root_refs, &root_lows, &root_counts);
     return new_root.ref;
@@ -340,13 +350,16 @@ fn removeInto(txn: *WriteTxn, node_ref: Ref, key: []const u8, depth: usize) !Rem
     const v = try parseInner(inner_bytes);
     const ci = try childIndexForKey(txn, v, key);
     const old_child_ref: Ref = v.childRef(ci);
+    // Capture BEFORE writableCopy: it frees node_ref into the reuse pool, so
+    // v's bytes must not be read after it (the node can be reallocated).
     const old_total = v.totalCount();
+    const old_child_count = v.subtreeCount(ci);
     const r = try removeInto(txn, old_child_ref, key, depth + 1);
     if (r.ref == old_child_ref) return .{ .ref = node_ref, .count = old_total };
     const new_inner = try txn.writableCopy(node_ref, inner_node_size);
     std.mem.writeInt(u64, new_inner.bytes[hdr + ci * inner_stride ..][0..8], r.ref, .little);
     std.mem.writeInt(u64, new_inner.bytes[hdr + ci * inner_stride + 16 ..][0..8], r.count, .little);
-    return .{ .ref = new_inner.ref, .count = old_total - v.subtreeCount(ci) + r.count };
+    return .{ .ref = new_inner.ref, .count = old_total - old_child_count + r.count };
 }
 
 /// Remove `key` from the tree rooted at `root`. Frees the key's blob node when
@@ -440,6 +453,54 @@ test "a bindex ref cycle fails with error.Corrupt" {
         fn onEntry(_: @This(), _: []const u8, _: u64) !void {}
     };
     try testing.expectError(error.Corrupt, forEachEntry(&w, a.ref, NopSink{}, NopSink.onEntry));
+}
+
+test "removing split-boundary keys never dangles routing separators" {
+    // Regression: parent low keys used to alias the right leaf's slot-0 key
+    // blob; removing that key freed bytes every ancestor still dereferenced
+    // for ordering, and the immediately-reused blob misrouted later lookups.
+    // Churn removal+insert (same key sizes, so the freed blob is reused at
+    // once) across a split tree must keep every lookup exact.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try bidxTmpPath(testing.allocator, &tmp, "bidx_boundary.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    defer w.deinit();
+
+    var root = try create(&w);
+    var buf: [8]u8 = undefined;
+    var i: u64 = 0;
+    while (i < 200) : (i += 1) { // multiple leaf splits
+        const key = try std.fmt.bufPrint(&buf, "k{d:0>5}", .{i});
+        root = try insert(&w, root, key, i);
+    }
+    // Remove each key (any of them may be a split boundary) and immediately
+    // insert a same-length replacement so the freed key blob is reused.
+    i = 0;
+    while (i < 200) : (i += 1) {
+        const key = try std.fmt.bufPrint(&buf, "k{d:0>5}", .{i});
+        root = try remove(&w, root, key);
+        const repl = try std.fmt.bufPrint(&buf, "z{d:0>5}", .{i});
+        root = try insert(&w, root, repl, i);
+        // Every surviving original key must still resolve exactly.
+        var j: u64 = i + 1;
+        while (j < 200) : (j += 17) {
+            const probe = try std.fmt.bufPrint(&buf, "k{d:0>5}", .{j});
+            try testing.expectEqual(@as(?u64, j), try get(&w, root, probe));
+        }
+    }
+    // All replacements resolve; all originals are gone.
+    i = 0;
+    while (i < 200) : (i += 1) {
+        const repl = try std.fmt.bufPrint(&buf, "z{d:0>5}", .{i});
+        try testing.expectEqual(@as(?u64, i), try get(&w, root, repl));
+        const orig = try std.fmt.bufPrint(&buf, "k{d:0>5}", .{i});
+        try testing.expectEqual(@as(?u64, null), try get(&w, root, orig));
+    }
+    try testing.expectEqual(@as(u64, 200), try count(&w, root));
 }
 
 test "insert and get round-trip byte keys" {
