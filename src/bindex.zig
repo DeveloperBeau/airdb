@@ -288,10 +288,16 @@ fn insertInto(txn: *WriteTxn, node_ref: Ref, key_ref: u64, key: []const u8, val:
     while (j < total_inner) : (j += 1) right_count += counts_buf[j];
     const right_a = try txn.alloc(inner_node_size);
     _ = encodeInner(right_a.bytes, refs_buf[m_inner..total_inner], lows_buf[m_inner..total_inner], counts_buf[m_inner..total_inner]);
+    // Duplicate the promoted low for the parent: the right inner node keeps
+    // lows_buf[m_inner] as its own slot-0 low, and freeTree releases every
+    // node's low blobs exactly once -- aliasing the two would double-free the
+    // blob into the pool and corrupt whatever reuses it.
+    const promoted_bytes = try blob.get(txn, lows_buf[m_inner]);
+    const promoted_low = try blob.put(txn, promoted_bytes);
     return InsertResult{
         .ref = left_a.ref,
         .count = left_count,
-        .split = Split{ .ref = right_a.ref, .low = lows_buf[m_inner], .count = right_count },
+        .split = Split{ .ref = right_a.ref, .low = promoted_low, .count = right_count },
     };
 }
 
@@ -480,6 +486,45 @@ test "a bindex ref cycle fails with error.Corrupt" {
         fn onEntry(_: @This(), _: []const u8, _: u64) !void {}
     };
     try testing.expectError(error.Corrupt, forEachEntry(&w, a.ref, NopSink{}, NopSink.onEntry));
+}
+
+test "freeTree over a three-level tree frees every blob exactly once" {
+    // Regression: an inner split promoted its boundary low to the parent while
+    // the right inner node kept the SAME blob ref as its slot-0 low; freeTree
+    // then freed that blob twice, planting a duplicate extent in the pool
+    // (two later allocations handed the same bytes). The promoted low is now
+    // duplicated. Detector: after freeing the whole tree, no freed offset may
+    // appear twice.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try bidxTmpPath(testing.allocator, &tmp, "bidx_freedup.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    defer w.deinit();
+
+    var root = try create(&w);
+    var buf: [10]u8 = undefined;
+    var i: u64 = 0;
+    while (i < 4300) : (i += 1) { // > LEAF_CAP * FANOUT: forces inner splits
+        const key = try std.fmt.bufPrint(&buf, "k{d:0>7}", .{i});
+        root = try insert(&w, root, key, i);
+    }
+    try testing.expectEqual(@as(u64, 4300), try count(&w, root));
+
+    try freeTree(&w, root);
+
+    var seen = std.AutoHashMap(u64, void).init(testing.allocator);
+    defer seen.deinit();
+    for (w.txn_reuse.extents.items) |e| {
+        const gop = try seen.getOrPut(e.offset);
+        try testing.expect(!gop.found_existing); // duplicate free
+    }
+    for (w.in_flight_frees.items) |e| {
+        const gop = try seen.getOrPut(e.offset);
+        try testing.expect(!gop.found_existing);
+    }
 }
 
 test "removing split-boundary keys never dangles routing separators" {
