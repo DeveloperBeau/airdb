@@ -443,6 +443,41 @@ pub fn updateTyped(
     }
 }
 
+// Free the blob and collection storage held in a deleted row's columns.
+// `raw` holds the row's column values captured before the tombstone (the
+// tombstone leaves the physical columns intact, so a pre-delete read stays
+// accurate). Shared by deleteTyped and the directory-level delete
+// (typedir.deleteWorker); before that sharing, every row deleted through the
+// directory path -- including every cascade-deleted child -- leaked its blobs
+// and list/set/dict trees permanently. A raw of 0 (no storage, e.g. a row
+// written with caller-supplied raws or a dead-row migration backfill) frees
+// nothing rather than erroring mid-delete.
+pub fn freeRowStorage(txn: *WriteTxn, kinds: []const PropKind, elems: []const ElemKind, raw: []const u64) !void {
+    var i: usize = 0;
+    while (i < kinds.len) : (i += 1) {
+        if (raw[i] == 0) continue;
+        switch (kinds[i]) {
+            .blob => try blob.free(txn, raw[i]),
+            .list => {
+                if (elems[i] == .blob) {
+                    // Elements are blob refs: free each before the tree.
+                    const n = try Column.len(txn, raw[i]);
+                    var e: u64 = 0;
+                    while (e < n) : (e += 1) try blob.free(txn, try Column.get(txn, raw[i], e));
+                }
+                try Column.freeTree(txn, raw[i]);
+            },
+            .set => switch (elems[i]) {
+                .int => try Index.freeTree(txn, raw[i]),
+                .blob => try bindex.freeTree(txn, raw[i]),
+            },
+            .dict => try bindex.freeTree(txn, raw[i]),
+            .link_set => try Index.freeTree(txn, raw[i]),
+            .int, .link => {},
+        }
+    }
+}
+
 // deleteTyped is MVCC-safe: blobs are freed only on the apply path, never on
 // conflict or not_found.
 pub fn deleteTyped(
@@ -470,42 +505,16 @@ pub fn deleteTyped(
     // Step 2: version check BEFORE freeing any blob.
     if (current_version != expected_version)
         return .{ .conflict = .{ .current_version = current_version } };
-    // Step 3: apply path -- free all blob props.
-    var i: usize = 0;
-    while (i < pc) : (i += 1) {
-        if (kinds[i] == .blob) try blob.free(txn, cur_raw[i]);
-    }
-    // Step 4: delegate to the graph-safe delete (nullifies inbound links).
+    // Step 3: delegate to the graph-safe delete (nullifies inbound links).
     const result = try deleteAndNullify(txn, cat, pk, expected_version);
-    // Step 5: on the apply path, free the row's collection storage. This runs
-    // AFTER deleteAndNullify because the outbound backlink cleanup reads the
-    // link_set roots; the tombstoned row's columns still hold the roots, so
-    // cur_raw stays accurate. Without this every deleted row leaked its
-    // list/set/dict trees (and their element/key blobs) permanently.
+    // Step 4: on the apply path, free the row's blob and collection storage.
+    // This runs AFTER deleteAndNullify because the outbound backlink cleanup
+    // reads the link_set roots; the tombstoned row's columns still hold the
+    // roots, so cur_raw stays accurate. Without this every deleted row leaked
+    // its blobs and list/set/dict trees (and their element/key blobs)
+    // permanently. MVCC-safe: a conflict or not_found result frees nothing.
     switch (result) {
-        .ok => {
-            i = 0;
-            while (i < pc) : (i += 1) {
-                switch (kinds[i]) {
-                    .list => {
-                        if (elems[i] == .blob) {
-                            // Elements are blob refs: free each before the tree.
-                            const n = try Column.len(txn, cur_raw[i]);
-                            var e: u64 = 0;
-                            while (e < n) : (e += 1) try blob.free(txn, try Column.get(txn, cur_raw[i], e));
-                        }
-                        try Column.freeTree(txn, cur_raw[i]);
-                    },
-                    .set => switch (elems[i]) {
-                        .int => try Index.freeTree(txn, cur_raw[i]),
-                        .blob => try bindex.freeTree(txn, cur_raw[i]),
-                    },
-                    .dict => try bindex.freeTree(txn, cur_raw[i]),
-                    .link_set => try Index.freeTree(txn, cur_raw[i]),
-                    .int, .blob, .link => {},
-                }
-            }
-        },
+        .ok => try freeRowStorage(txn, kinds[0..pc], elems[0..pc], cur_raw[0..pc]),
         else => {},
     }
     return result;
@@ -1348,4 +1357,48 @@ test "reinserting a primary key after delete yields a new object key" {
     try testing.expect((try getByPk(&w, cat, 100, &out)) != null);
     try testing.expectEqual(@as(u64, 70), out[1]);
     w.deinit();
+}
+
+test "deleteTyped frees a self-referencing link_set root exactly once" {
+    // Regression: deleting a row whose link_set contained its own okey freed
+    // the set root twice. The inbound nullify removed okey from the row's own
+    // set -- a COW whose Index.remove freed the old root -- and the delete's
+    // storage reclamation then freed the same root again from the captured
+    // column raw, handing one extent to two future allocations. The nullify
+    // now leaves a self-sourced set untouched; no freed offset may repeat.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "selfset.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+
+    {
+        var w = try db.beginWrite();
+        var cat = try catalog.createDefs(&w, &.{
+            .{ .kind = .int },
+            .{ .kind = .link_set },
+        });
+        const ins = try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .link_set = &.{} } });
+        cat = ins.cat;
+        cat = try links.linkSetAdd(&w, cat, 1, 1, ins.row); // set contains own okey
+        w.setRoot(cat);
+        _ = try w.commit();
+    }
+    var w = try db.beginWrite();
+    defer w.deinit();
+    var out: [2]Value = undefined;
+    const ver = (try getTyped(&w, w.new_root, 1, &out)).?;
+    const res = try deleteTyped(&w, w.new_root, 1, ver);
+    try testing.expect(res == .ok);
+    var seen = std.AutoHashMap(u64, void).init(testing.allocator);
+    defer seen.deinit();
+    for (w.txn_reuse.extents.items) |e| {
+        const gop = try seen.getOrPut(e.offset);
+        try testing.expect(!gop.found_existing); // duplicate free
+    }
+    for (w.in_flight_frees.items) |e| {
+        const gop = try seen.getOrPut(e.offset);
+        try testing.expect(!gop.found_existing);
+    }
 }

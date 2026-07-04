@@ -343,6 +343,7 @@ fn deleteWorker(txn: *WriteTxn, dir: Ref, type_id: u16, okey: u64, visited: *std
     // must not be read after a recursive delete has rewritten this type's
     // catalog -- the node's bytes may already belong to a new allocation.
     var kinds: [256]catalog.PropKind = undefined;
+    var elems: [256]catalog.ElemKind = undefined;
     var rules: [256]catalog.DeletionRule = undefined;
     var targets: [256]u16 = undefined;
     {
@@ -350,6 +351,7 @@ fn deleteWorker(txn: *WriteTxn, dir: Ref, type_id: u16, okey: u64, visited: *std
         var p: usize = 0;
         while (p < pc) : (p += 1) {
             kinds[p] = sv.kind(p);
+            elems[p] = sv.elemKind(p);
             rules[p] = sv.delRule(p);
             targets[p] = sv.linkTarget(p);
         }
@@ -391,13 +393,21 @@ fn deleteWorker(txn: *WriteTxn, dir: Ref, type_id: u16, okey: u64, visited: *std
         const cleaned = try links.cleanOutboundInCatalog(txn, t_cat, okey);
         cur = try setCatalogRef(txn, cur, type_id, cleaned);
     }
-    // 4) Tombstone (re-read current version, which matches in this txn).
+    // 4) Tombstone (re-read current version, which matches in this txn), then
+    //    reclaim the row's blob/collection storage from the raws just re-read.
+    //    The re-read (not the step-0 rbuf) matters: step 2 may have nullified
+    //    this row's own to-one link columns. Reclaiming only on .ok mirrors
+    //    deleteTyped; without it every directory-path delete -- including
+    //    every cascade-deleted child -- leaked its blobs and collection trees.
     {
         const t_cat = try catalogRef(txn, cur, type_id);
         const cur_ver = (try Objects.getByObjectKey(txn, t_cat, okey, rbuf[0..pc])) orelse return cur;
         const dres = try Objects.delete(txn, t_cat, pk, cur_ver);
         switch (dres) {
-            .ok => |new_cat| cur = try setCatalogRef(txn, cur, type_id, new_cat),
+            .ok => |new_cat| {
+                cur = try setCatalogRef(txn, cur, type_id, new_cat);
+                try Objects.freeRowStorage(txn, kinds[0..pc], elems[0..pc], rbuf[0..pc]);
+            },
             else => {},
         }
     }
@@ -1076,3 +1086,127 @@ test "cascade is cycle-safe" {
     try testing.expectEqual(@as(u64, 0), try liveCount(&w, dir, 0)); // both gone
     w.deinit();
 }
+
+test "a directory delete of a self-referencing link_set row frees its set root exactly once" {
+    // Directory-path variant of the objects-layer regression: deleteWorker now
+    // reclaims the row's collection storage, so the inbound nullify must not
+    // COW (and thereby free) the dying row's own set root first.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tdTmpPath(testing.allocator, &tmp, "selfset_dir.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+
+    {
+        var w = try db.beginWrite();
+        var dir = try createWithDefs(&w, &.{
+            &.{ .{ .kind = .int }, .{ .kind = .link_set, .link_target = 0 } },
+        });
+        const ins = try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .link_set = &.{} } });
+        dir = ins.dir;
+        dir = try linkSetAdd(&w, dir, 0, 1, 1, ins.row); // set contains own okey
+        w.setRoot(dir);
+        _ = try w.commit();
+    }
+    var w = try db.beginWrite();
+    defer w.deinit();
+    var out: [2]Value = undefined;
+    const ver = (try get(&w, w.new_root, 0, 1, &out)).?;
+    const res = try deleteNullifyX(&w, w.new_root, 0, 1, ver);
+    try testing.expect(res == .ok);
+    var seen = std.AutoHashMap(u64, void).init(testing.allocator);
+    defer seen.deinit();
+    for (w.txn_reuse.extents.items) |e| {
+        const gop = try seen.getOrPut(e.offset);
+        try testing.expect(!gop.found_existing); // duplicate free
+    }
+    for (w.in_flight_frees.items) |e| {
+        const gop = try seen.getOrPut(e.offset);
+        try testing.expect(!gop.found_existing);
+    }
+}
+
+test "a directory delete frees the row's collection storage" {
+    // Regression: deleteWorker tombstoned via the raw delete and never freed
+    // the row's collection trees -- every directory-path delete leaked them
+    // permanently. The captured roots must show up among the freed extents.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tdTmpPath(testing.allocator, &tmp, "dircoll.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+
+    {
+        var w = try db.beginWrite();
+        var dir = try createWithDefs(&w, &.{
+            &.{ .{ .kind = .int }, .{ .kind = .set, .elem = .int }, .{ .kind = .list, .elem = .int } },
+        });
+        dir = (try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .set_int = &.{ 1, 2, 3 } }, .{ .list_int = &.{ 7, 8, 9 } } })).dir;
+        w.setRoot(dir);
+        _ = try w.commit();
+    }
+    var w = try db.beginWrite();
+    defer w.deinit();
+    var raw: [3]u64 = undefined;
+    _ = (try Objects.getByPk(&w, try catalogRef(&w, w.new_root, 0), 1, &raw)).?;
+    var out: [3]Value = undefined;
+    const ver = (try get(&w, w.new_root, 0, 1, &out)).?;
+    const res = try deleteNullifyX(&w, w.new_root, 0, 1, ver);
+    try testing.expect(res == .ok);
+    var freed_set = false;
+    var freed_list = false;
+    for (w.in_flight_frees.items) |e| {
+        if (e.offset == raw[1]) freed_set = true;
+        if (e.offset == raw[2]) freed_list = true;
+    }
+    for (w.txn_reuse.extents.items) |e| {
+        if (e.offset == raw[1]) freed_set = true;
+        if (e.offset == raw[2]) freed_list = true;
+    }
+    try testing.expect(freed_set);
+    try testing.expect(freed_list);
+}
+
+test "a cascade delete frees the child's collection storage" {
+    // Regression: cascade-deleted children go through deleteWorker, which
+    // leaked their collection trees; the child's set root must be freed.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tdTmpPath(testing.allocator, &tmp, "casccoll.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+
+    {
+        var w = try db.beginWrite();
+        var dir = try createWithDefs(&w, &.{
+            &.{ .{ .kind = .int }, .{ .kind = .link, .link_target = 1, .del_rule = .cascade } }, // 0: owner
+            &.{ .{ .kind = .int }, .{ .kind = .set, .elem = .int } }, // 1: child
+        });
+        const child = try insert(&w, dir, 1, &.{ .{ .int = 100 }, .{ .set_int = &.{ 1, 2, 3 } } });
+        dir = child.dir;
+        dir = (try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .link = child.row } })).dir;
+        w.setRoot(dir);
+        _ = try w.commit();
+    }
+    var w = try db.beginWrite();
+    defer w.deinit();
+    var raw: [2]u64 = undefined;
+    _ = (try Objects.getByPk(&w, try catalogRef(&w, w.new_root, 1), 100, &raw)).?;
+    var out: [2]Value = undefined;
+    const ver = (try get(&w, w.new_root, 0, 1, &out)).?;
+    const res = try deleteNullifyX(&w, w.new_root, 0, 1, ver);
+    try testing.expect(res == .ok);
+    try testing.expectEqual(@as(u64, 0), try liveCount(&w, res.ok, 1)); // child cascaded
+    var freed_child_set = false;
+    for (w.in_flight_frees.items) |e| {
+        if (e.offset == raw[1]) freed_child_set = true;
+    }
+    for (w.txn_reuse.extents.items) |e| {
+        if (e.offset == raw[1]) freed_child_set = true;
+    }
+    try testing.expect(freed_child_set);
+}
+

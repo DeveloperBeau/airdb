@@ -223,6 +223,15 @@ pub fn nullifyInboundInCatalog(txn: *WriteTxn, cat: Ref, okey: u64, target_type:
             // (corrupt or already deleted); skip it -- the whole set for okey is
             // dropped below regardless.
             const src_row = (try catalog.okeyToRow(txn, cur, src)) orelse continue;
+            // match_all means this catalog is the target's own type, so
+            // src == okey is the row being deleted referencing itself.
+            const self_source = match_all and src == okey;
+            // A self-sourced to-many entry is left untouched: the dying row's
+            // set tree is freed wholesale from its column raw by the delete's
+            // storage reclamation, and Index.remove COWs -- freeing the old
+            // root -- so mutating it here made that reclamation a double free.
+            // The backlink set for okey is dropped below regardless.
+            if (self_source and kind == .link_set) continue;
             var s = try catalog.CatalogSnapshot.load(txn, cur);
             if (kind == .link) {
                 s.props[p].col = try Column.set(txn, s.props[p].col, src_row, 0);
@@ -234,11 +243,10 @@ pub fn nullifyInboundInCatalog(txn: *WriteTxn, cat: Ref, okey: u64, target_type:
             // Bump the source row's version: its link column changed, and a
             // client holding the pre-nullify version must get a conflict on
             // update rather than silently resurrecting a dangling link. The
-            // SELF-link case is exempt (match_all means this catalog is the
-            // target's own type, so src == okey is the row being deleted):
-            // bumping it would make the follow-up tombstone's version check
-            // fail forever, leaving self-linked objects undeletable.
-            if (!(match_all and src == okey)) {
+            // SELF-link case is exempt: bumping the row being deleted would
+            // make the follow-up tombstone's version check fail forever,
+            // leaving self-linked objects undeletable.
+            if (!self_source) {
                 s.version_col_ref = try Column.set(txn, s.version_col_ref, src_row, txn.new_version);
             }
             cur = try s.replace(txn);
