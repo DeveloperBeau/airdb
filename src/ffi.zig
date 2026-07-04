@@ -130,7 +130,7 @@ export fn airdb_prop_count(handle: ?*Database) i64 {
 export fn airdb_insert(handle: ?*Database, vals: [*]const u64, len: usize) i64 {
     const self = handle orelse return AIRDB_E_GENERIC;
     if (len != self.prop_count) return AIRDB_E_BAD_ARGS;
-    var w = self.db.beginWrite() catch return AIRDB_E_GENERIC;
+    var w = self.db.beginWrite() catch return commitErrCode(self);
     const r = objects.insert(&w, w.new_root, vals[0..len]) catch |e| {
         w.deinit();
         return if (e == error.DuplicateKey) AIRDB_E_DUPLICATE else AIRDB_E_GENERIC;
@@ -167,7 +167,7 @@ export fn airdb_update(handle: ?*Database, vals: [*]const u64, len: usize) i64 {
     const self = handle orelse return AIRDB_E_GENERIC;
     if (len != self.prop_count) return AIRDB_E_BAD_ARGS;
     const pk = vals[0];
-    var w = self.db.beginWrite() catch return AIRDB_E_GENERIC;
+    var w = self.db.beginWrite() catch return commitErrCode(self);
     var cur: [MAX_PROPS]u64 = undefined;
     const ver = objects.getByPk(&w, w.new_root, pk, cur[0..len]) catch {
         w.deinit();
@@ -201,7 +201,7 @@ export fn airdb_update(handle: ?*Database, vals: [*]const u64, len: usize) i64 {
 // Delete the row with primary key `pk`. Returns AIRDB_OK or an error code.
 export fn airdb_delete(handle: ?*Database, pk: u64) i64 {
     const self = handle orelse return AIRDB_E_GENERIC;
-    var w = self.db.beginWrite() catch return AIRDB_E_GENERIC;
+    var w = self.db.beginWrite() catch return commitErrCode(self);
     var cur: [MAX_PROPS]u64 = undefined;
     const ver = objects.getByPk(&w, w.new_root, pk, cur[0..self.prop_count]) catch {
         w.deinit();
@@ -254,7 +254,7 @@ export fn airdb_bulk_insert(handle: ?*Database, rows_flat: [*]const u64, row_cou
         row.* = rows_flat[i * prop_count ..][0..prop_count];
     }
 
-    var w = self.db.beginWrite() catch return AIRDB_E_GENERIC;
+    var w = self.db.beginWrite() catch return commitErrCode(self);
     const newcat = bulk.bulkImport(&w, w.new_root, rows_slices, .{}) catch |e| {
         w.deinit(); // releases the write lock; nothing was made durable
         return switch (e) {
@@ -296,7 +296,7 @@ export fn airdb_bulk_append(handle: ?*Database, rows_flat: [*]const u64, row_cou
         row.* = rows_flat[i * prop_count ..][0..prop_count];
     }
 
-    var w = self.db.beginWrite() catch return AIRDB_E_GENERIC;
+    var w = self.db.beginWrite() catch return commitErrCode(self);
     const newcat = bulk.bulkAppendOrInsert(&w, w.new_root, rows_slices) catch |e| {
         w.deinit(); // releases the write lock; nothing was made durable
         return switch (e) {
@@ -311,8 +311,6 @@ export fn airdb_bulk_append(handle: ?*Database, rows_flat: [*]const u64, row_cou
     _ = w.commit() catch return commitErrCode(self);
     return @intCast(row_count);
 }
-
-// Append `row_count` rows
 
 // ---------------------------------------------------------------------------
 // Explicit multi-operation write transactions.
@@ -896,4 +894,21 @@ test "ffi txn: a poisoned txn refuses commit and releases the lock" {
     try testing.expectEqual(@as(i64, 0), airdb_count(h));
     const t2 = airdb_begin(h) orelse return error.BeginFailed;
     airdb_abort(t2);
+}
+
+test "ffi: a poisoned handle reports AIRDB_E_INDETERMINATE, not generic failure" {
+    // Regression: only the failing commit itself returned -8; every later
+    // write on the poisoned handle collapsed to AIRDB_E_GENERIC, so a caller
+    // who missed the one -8 could never learn the handle needs a reopen.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try ffiTmpPathZ(testing.allocator, &tmp, "poisonedh.airdb");
+    defer testing.allocator.free(path);
+    const h = airdb_open(path.ptr, 2) orelse return error.OpenFailed;
+    defer airdb_close(h);
+
+    h.db.poisoned = true; // simulate a failed commit-point flush
+    try testing.expectEqual(AIRDB_E_INDETERMINATE, airdb_insert(h, &[_]u64{ 1, 10 }, 2));
+    try testing.expectEqual(AIRDB_E_INDETERMINATE, airdb_update(h, &[_]u64{ 1, 11 }, 2));
+    try testing.expectEqual(AIRDB_E_INDETERMINATE, airdb_delete(h, 1));
 }

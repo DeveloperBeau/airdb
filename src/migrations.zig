@@ -5,6 +5,8 @@ const Column = @import("column.zig");
 const Index = @import("index.zig");
 const bindex = @import("bindex.zig");
 const catalog = @import("catalog.zig");
+const blob = @import("blob.zig");
+const objects = @import("objects.zig");
 
 const PropKind = catalog.PropKind;
 const ElemKind = catalog.ElemKind;
@@ -38,18 +40,26 @@ pub fn addProperty(txn: *WriteTxn, cat: Ref, def: PropDef, default_value: u64) !
     // meaningless as values and impossible to backfill coherently.
     if (def.indexed and is_collection) return error.Unsupported;
 
-    // Build the new column. Collection kinds are backfilled with a REAL empty
-    // root PER LIVE ROW: a raw zero root breaks every collection accessor and
-    // made pre-migration rows undeletable through the graph-safe delete (its
-    // outbound cleanup walks link_set roots), while a SHARED root would be
-    // freed by the first row's deleteTyped underneath every other row. Dead
-    // rows get 0 -- nothing ever dereferences a tombstoned row's collections.
+    // Build the new column. Storage-bearing kinds are backfilled PER LIVE
+    // ROW, never shared. Collections: a raw zero root breaks every collection
+    // accessor and made pre-migration rows undeletable through the graph-safe
+    // delete (its outbound cleanup walks link_set roots), while a SHARED root
+    // would be freed by the first row's delete underneath every other row.
+    // Blobs have the same aliasing hazard: writing the caller's single
+    // default ref into every row meant the first row's delete freed the node
+    // under all the others, planting a duplicate extent in the free list --
+    // so each live row gets its own copy of the default bytes (the caller
+    // keeps ownership of the passed-in ref). Dead rows get 0 for both;
+    // nothing ever dereferences a tombstoned row's columns.
     var new_col = try Column.create(txn);
     var i: u64 = 0;
     while (i < s.next_row) : (i += 1) {
-        const fill: u64 = if (!is_collection)
+        const live = (try Column.get(txn, s.live_col_ref, i)) != 0;
+        const fill: u64 = if (def.kind == .blob)
+            (if (live and default_value != 0) try blobDup(txn, default_value) else if (live) default_value else 0)
+        else if (!is_collection)
             default_value
-        else if ((try Column.get(txn, s.live_col_ref, i)) == 0)
+        else if (!live)
             0
         else switch (def.kind) {
             .list => try Column.create(txn),
@@ -67,23 +77,22 @@ pub fn addProperty(txn: *WriteTxn, cat: Ref, def: PropDef, default_value: u64) !
     // Backfill the value index for existing LIVE rows: the query planner
     // trusts the indexed flag, so an empty index would silently drop every
     // pre-migration row from indexed queries (and fail the integrity audit).
+    // Each row is indexed under its OWN raw column value (mirroring the
+    // insert path) -- blob backfills give every row a distinct ref, so a
+    // single shared key would diverge from what reads and audits expect.
     var vi: Ref = 0;
     if (def.indexed) {
-        var set_root = try Index.create(txn);
+        vi = try Index.create(txn);
         const Sink = struct {
             txn: *WriteTxn,
-            root: *Ref,
-            fn onEntry(self: @This(), okey: u64, _: u64) anyerror!void {
-                self.root.* = try Index.insert(self.txn, self.root.*, okey, 1);
+            vi: *Ref,
+            col: Ref,
+            fn onEntry(self: @This(), okey: u64, row: u64) anyerror!void {
+                const raw = try Column.get(self.txn, self.col, row);
+                self.vi.* = try objects.viAdd(self.txn, self.vi.*, raw, okey);
             }
         };
-        try Index.forEachEntry(txn, s.keyrow_index_ref, Sink{ .txn = txn, .root = &set_root }, Sink.onEntry);
-        vi = try Index.create(txn);
-        if ((try Index.count(txn, set_root)) > 0) {
-            vi = try Index.insert(txn, vi, default_value, set_root);
-        } else {
-            try Index.freeTree(txn, set_root); // no live rows: keep the index empty
-        }
+        try Index.forEachEntry(txn, s.keyrow_index_ref, Sink{ .txn = txn, .vi = &vi, .col = new_col }, Sink.onEntry);
     }
 
     s.props[pc] = .{
@@ -98,6 +107,22 @@ pub fn addProperty(txn: *WriteTxn, cat: Ref, def: PropDef, default_value: u64) !
     };
     s.prop_count = pc + 1;
     return s.replace(txn);
+}
+
+// Copy a blob's bytes into a fresh node, returning the new ref. Used by the
+// blob-default backfill so no two rows share one node.
+fn blobDup(txn: *WriteTxn, ref: u64) !u64 {
+    if (blob.get(txn, ref)) |bytes| {
+        return blob.put(txn, bytes);
+    } else |err| switch (err) {
+        error.BlobChunked => {
+            const alloc = txn.db.store.allocator;
+            const bytes = try blob.getAlloc(txn, ref, alloc);
+            defer alloc.free(bytes);
+            return blob.put(txn, bytes);
+        },
+        else => |e| return e,
+    }
 }
 
 // Remove property `prop` (must be >= 1; the primary key at 0 cannot be removed).
@@ -292,4 +317,58 @@ test "addProperty link type gets a backlink index" {
     // a row created before the migration reads as a null link
     try testing.expectEqual(@as(?u64, null), try getLink(&w, cat, 1, 1));
     w.deinit();
+}
+
+test "addProperty copies a blob default per row instead of sharing one node" {
+    // Regression: the backfill wrote the caller's single blob ref into every
+    // existing row. The first row's delete freed the node underneath all the
+    // others, and a second delete freed it again -- a duplicate extent in the
+    // free list, handing the same bytes to two future allocations.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "blobdefault.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+
+    {
+        var w = try db.beginWrite();
+        var cat = try catalog.createTyped(&w, &.{ .int, .int });
+        cat = (try insert(&w, cat, &.{ 1, 10 })).cat;
+        cat = (try insert(&w, cat, &.{ 2, 20 })).cat;
+        const dflt = try blob.put(&w, "default-bytes");
+        cat = try addProperty(&w, cat, .{ .kind = .blob }, dflt);
+        w.setRoot(cat);
+        _ = try w.commit();
+    }
+    var w = try db.beginWrite();
+    defer w.deinit();
+    // Every row reads the default bytes, but from its OWN node.
+    var raw1: [3]u64 = undefined;
+    var raw2: [3]u64 = undefined;
+    const v1 = (try getByPk(&w, w.new_root, 1, &raw1)).?;
+    const v2 = (try getByPk(&w, w.new_root, 2, &raw2)).?;
+    try testing.expectEqualStrings("default-bytes", try blob.get(&w, raw1[2]));
+    try testing.expectEqualStrings("default-bytes", try blob.get(&w, raw2[2]));
+    try testing.expect(raw1[2] != raw2[2]);
+    // Deleting both rows must not free any extent twice.
+    var cat = w.new_root;
+    switch (try objects.deleteTyped(&w, cat, 1, v1)) {
+        .ok => |c| cat = c,
+        else => return error.TestUnexpectedResult,
+    }
+    switch (try objects.deleteTyped(&w, cat, 2, v2)) {
+        .ok => |c| cat = c,
+        else => return error.TestUnexpectedResult,
+    }
+    var seen = std.AutoHashMap(u64, void).init(testing.allocator);
+    defer seen.deinit();
+    for (w.txn_reuse.extents.items) |e| {
+        const gop = try seen.getOrPut(e.offset);
+        try testing.expect(!gop.found_existing); // duplicate free
+    }
+    for (w.in_flight_frees.items) |e| {
+        const gop = try seen.getOrPut(e.offset);
+        try testing.expect(!gop.found_existing);
+    }
 }

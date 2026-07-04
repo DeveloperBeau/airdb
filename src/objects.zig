@@ -32,7 +32,8 @@ const writeCatalog = catalog.writeCatalog;
 // ---------------------------------------------------------------------------
 
 // Add `okey` to the value-index inner set for `value`, returning the new index ref.
-fn viAdd(txn: *WriteTxn, vi_ref: Ref, value: u64, okey: u64) !Ref {
+// Pub: the migration backfill reuses it to index pre-migration rows.
+pub fn viAdd(txn: *WriteTxn, vi_ref: Ref, value: u64, okey: u64) !Ref {
     const existing = try Index.get(txn, vi_ref, value);
     var set_root = existing orelse try Index.create(txn);
     set_root = try Index.insert(txn, set_root, okey, 1);

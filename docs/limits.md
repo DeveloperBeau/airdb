@@ -58,6 +58,10 @@ newer one. Ship a matched engine with your app.
 
 ## Multi-process caveats
 
+- Zero-copy `bytes` slices returned by reads point into the mapped file and
+  are invalidated by any later mutation in the same write transaction that
+  frees the underlying blob (e.g. replacing an embedded child, deleting or
+  updating the row). Copy the bytes out before mutating if they must survive.
 - Liveness of reader pins is pid + process-start-time (truncated to 32 bits;
   a false match needs a recycled pid AND a start-time collision). If the
   start-time query fails (exotic sandboxing), a recycled pid degrades to
