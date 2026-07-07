@@ -1,5 +1,6 @@
 pub const blob = @import("blob.zig");
 pub const typedir = @import("typedir.zig");
+pub const typeRouting = @import("typeRouting.zig");
 pub const objects = @import("objects.zig");
 pub const rows = @import("rows.zig");
 pub const catalog = @import("catalog.zig");
