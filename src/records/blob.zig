@@ -1,20 +1,20 @@
-// blob.zig -- blob heap with a tagged small/large representation.
-//
-// A single arena allocation must fit within one mmap section
-// (`platform.sectionSize` = 16 MiB); larger requests fail with
-// `error.AllocTooLarge`. Blobs are therefore stored in one of two shapes,
-// distinguished by a leading tag byte:
-//
-//   Inline (length <= inlineMax):
-//     [tag=0 u8][length u32 LE][bytes...]
-//   Chunked (length > inlineMax): an index node
-//     [tag=1 u8][totalLen u64 LE][chunkCount u32 LE][chunkRef u64 LE * count]
-//   plus `chunkCount` separate chunk nodes, each holding up to `chunkSize`
-//   RAW bytes (no per-chunk header). All but the last chunk are exactly
-//   `chunkSize` bytes; the last is `totalLen - (chunkCount-1)*chunkSize`.
-//
-// Empty blob (zero-length bytes) is represented as the null ref (0); no node
-// is allocated for it.
+//! Blob heap with a tagged small/large representation.
+//!
+//! A single arena allocation must fit within one mmap section
+//! (`platform.sectionSize` = 16 MiB); larger requests fail with
+//! `error.AllocTooLarge`. Blobs are therefore stored in one of two shapes,
+//! distinguished by a leading tag byte:
+//!
+//!   Inline (length <= inlineMax):
+//!     [tag=0 u8][length u32 LE][bytes...]
+//!   Chunked (length > inlineMax): an index node
+//!     [tag=1 u8][totalLen u64 LE][chunkCount u32 LE][chunkRef u64 LE * count]
+//!   plus `chunkCount` separate chunk nodes, each holding up to `chunkSize`
+//!   RAW bytes (no per-chunk header). All but the last chunk are exactly
+//!   `chunkSize` bytes; the last is `totalLen - (chunkCount-1)*chunkSize`.
+//!
+//! Empty blob (zero-length bytes) is represented as the null ref (0); no node
+//! is allocated for it.
 
 const std = @import("std");
 const Reference = @import("../storage/reference.zig").Reference;

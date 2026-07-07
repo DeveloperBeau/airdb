@@ -1,10 +1,10 @@
-// rows.zig -- raw row CRUD over the catalog's columns and indexes.
-//
-// This is the storage-level half of the object layer: insert/update/delete of
-// raw u64 rows, reads by primary key or stable object key, per-property value
-// index maintenance, and reclamation of a deleted row's blob/collection
-// storage. Typed encode/decode orchestration (Values, backlinks, cascades)
-// lives above this in objects.zig.
+//! Raw row CRUD over the catalog's columns and indexes.
+//!
+//! This is the storage-level half of the object layer: insert/update/delete of
+//! raw u64 rows, reads by primary key or stable object key, per-property value
+//! index maintenance, and reclamation of a deleted row's blob/collection
+//! storage. Typed encode/decode orchestration (Values, backlinks, cascades)
+//! lives above this in objects.zig.
 
 const std = @import("std");
 const WriteTransaction = @import("../transactions/writeTransaction.zig").WriteTransaction;
