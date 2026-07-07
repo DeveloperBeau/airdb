@@ -142,32 +142,51 @@ pub fn bulkImport(
 ) !Ref {
     var s = try catalog.CatalogSnapshot.load(txn, cat);
     if (s.next_row != 0) return error.TypeNotEmpty;
-    const prop_count = s.prop_count;
     const old_next_key = s.next_key;
+    try validateImportInput(&s, rows);
 
-    // Reject a link-bearing type here, before a single node is written.
-    {
-        var j: usize = 0;
-        while (j < prop_count) : (j += 1) {
-            const k = s.props[j].kind;
-            if (k == .link or k == .link_set) return error.UnsupportedForBulk;
-        }
-    }
-
-    // Validate row widths up front: a single malformed row aborts before any write.
-    for (rows) |row| {
-        if (row.len != prop_count) return error.BadRow;
-    }
-
-    const n = rows.len;
     const al = txn.db.store.allocator;
-
-    // Determine the primary-key sort order. perm[r] is the input index of the
-    // r-th row in ascending-pk order.
-    const perm = try al.alloc(usize, n);
+    const perm = try primaryKeySortOrder(rows, opts.presorted, al);
     defer al.free(perm);
+
+    // --- All validation passed; build the tree roots bottom-up. ---
+    try freePreallocatedTrees(txn, &s);
+    try buildImportTrees(txn, &s, rows, perm, old_next_key);
+    try buildValueIndexes(txn, &s, rows, perm, old_next_key);
+
+    s.next_row = @intCast(rows.len);
+    s.next_key = old_next_key + @as(u64, @intCast(rows.len));
+    return s.replace(txn);
+}
+
+// Reject a link-bearing type and any malformed row width here, before a single
+// node is written.
+fn validateImportInput(s: *const catalog.CatalogSnapshot, rows: []const []const u64) !void {
+    var j: usize = 0;
+    while (j < s.prop_count) : (j += 1) {
+        const k = s.props[j].kind;
+        if (k == .link or k == .link_set) return error.UnsupportedForBulk;
+    }
+    for (rows) |row| {
+        if (row.len != s.prop_count) return error.BadRow;
+    }
+}
+
+// The primary-key sort order of `rows`: perm[r] is the input index of the r-th
+// row in ascending-pk order. The caller owns the returned slice. A duplicate
+// primary key (adjacent equal after sort) is rejected before anything is
+// written. With `presorted`, the input order is trusted (asserted ascending
+// under runtime safety) and the sort is skipped.
+fn primaryKeySortOrder(
+    rows: []const []const u64,
+    presorted: bool,
+    al: std.mem.Allocator,
+) ![]usize {
+    const n = rows.len;
+    const perm = try al.alloc(usize, n);
+    errdefer al.free(perm);
     for (perm, 0..) |*x, i| x.* = i;
-    if (opts.presorted) {
+    if (presorted) {
         if (std.debug.runtime_safety) {
             var i: usize = 1;
             while (i < n) : (i += 1) std.debug.assert(rows[i][0] > rows[i - 1][0]);
@@ -179,37 +198,46 @@ pub fn bulkImport(
             }
         }.lt);
     }
-    // Reject a duplicate primary key (adjacent equal after sort) before writing.
-    {
-        var r: usize = 1;
-        while (r < n) : (r += 1) {
-            if (rows[perm[r]][0] == rows[perm[r - 1]][0]) return error.DuplicateKey;
-        }
+    var r: usize = 1;
+    while (r < n) : (r += 1) {
+        if (rows[perm[r]][0] == rows[perm[r - 1]][0]) return error.DuplicateKey;
     }
+    return perm;
+}
 
-    // --- All validation passed; build the tree roots bottom-up. ---
-
-    // The type is empty, but its creation pre-allocated empty columns and
-    // indexes that the bulk-built roots replace; free them so the import
-    // leaves no orphan nodes behind.
-    {
-        var p: usize = 0;
-        while (p < prop_count) : (p += 1) {
-            try Column.freeTree(txn, s.props[p].col);
-            if (s.props[p].indexed) try Index.freeTree(txn, s.props[p].value_index);
-        }
+// The type is empty, but its creation pre-allocated empty columns and indexes
+// that the bulk-built roots replace; free them so the import leaves no orphan
+// nodes behind.
+fn freePreallocatedTrees(txn: *WriteTxn, s: *const catalog.CatalogSnapshot) !void {
+    var p: usize = 0;
+    while (p < s.prop_count) : (p += 1) {
+        try Column.freeTree(txn, s.props[p].col);
+        if (s.props[p].indexed) try Index.freeTree(txn, s.props[p].value_index);
     }
     try Column.freeTree(txn, s.version_col_ref);
     try Column.freeTree(txn, s.live_col_ref);
     try Index.freeTree(txn, s.pk_index_ref);
     try Index.freeTree(txn, s.keyrow_index_ref);
+}
+
+// Build the property columns, version/live columns, and pk/key->row indexes
+// bottom-up from the sorted input, storing the new roots into the snapshot.
+fn buildImportTrees(
+    txn: *WriteTxn,
+    s: *catalog.CatalogSnapshot,
+    rows: []const []const u64,
+    perm: []const usize,
+    old_next_key: u64,
+) !void {
+    const n = rows.len;
+    const al = txn.db.store.allocator;
 
     // Property columns: gather each property's values in sorted-row order.
     {
         const col_vals = try al.alloc(u64, n);
         defer al.free(col_vals);
         var p: usize = 0;
-        while (p < prop_count) : (p += 1) {
+        while (p < s.prop_count) : (p += 1) {
             for (perm, 0..) |src, r| col_vals[r] = rows[src][p];
             s.props[p].col = try bulkColumn(txn, col_vals[0..n]);
         }
@@ -241,20 +269,24 @@ pub fn bulkImport(
     }
     s.pk_index_ref = try bulkIndex(txn, pks[0..n], okeys[0..n]);
     s.keyrow_index_ref = try bulkIndex(txn, okeys[0..n], phys_rows[0..n]);
+}
 
-    // Value indexes: for each indexed property, group its okeys by value.
-    {
-        var p: usize = 0;
-        while (p < prop_count) : (p += 1) {
-            if (s.props[p].indexed) {
-                s.props[p].value_index = try buildPropValueIndex(txn, rows, perm, p, old_next_key, al);
-            }
+// Value indexes: for each indexed property, group its okeys by value and store
+// the built index root into the snapshot.
+fn buildValueIndexes(
+    txn: *WriteTxn,
+    s: *catalog.CatalogSnapshot,
+    rows: []const []const u64,
+    perm: []const usize,
+    old_next_key: u64,
+) !void {
+    const al = txn.db.store.allocator;
+    var p: usize = 0;
+    while (p < s.prop_count) : (p += 1) {
+        if (s.props[p].indexed) {
+            s.props[p].value_index = try buildPropValueIndex(txn, rows, perm, p, old_next_key, al);
         }
     }
-
-    s.next_row = @intCast(n);
-    s.next_key = old_next_key + @as(u64, @intCast(n));
-    return s.replace(txn);
 }
 
 // Build the value index for indexed property `p`: emit (value -> {okey -> 1})
@@ -323,35 +355,107 @@ fn buildPropValueIndex(
 // untouched. The CALLER commits.
 pub fn bulkAppend(txn: *WriteTxn, cat: Ref, rows: []const []const u64) !Ref {
     var s = try catalog.CatalogSnapshot.load(txn, cat);
-    const prop_count = s.prop_count;
 
     // Validate row widths first: a single malformed row aborts before any work.
     for (rows) |row| {
-        if (row.len != prop_count) return error.BadRow;
+        if (row.len != s.prop_count) return error.BadRow;
     }
     if (rows.len == 0) return cat;
 
-    // Qualify the schema: reject an indexed or link-bearing property -- both
-    // keep secondary structures that a pure right-edge append cannot maintain.
+    try qualifyRightEdgeAppend(txn, &s, rows);
+
+    // --- Qualified. Nothing has been written yet; build the right-edge runs. ---
     const old_next_row = s.next_row;
     const old_next_key = s.next_key;
+    const n = rows.len;
+    const al = txn.db.store.allocator;
+
+    // Object keys and physical rows are assigned in batch order from the type's
+    // current counters, exactly as sequential ascending-pk inserts would: the
+    // j-th row gets okey = next_key + j and physical row = next_row + j.
+    const pks = try al.alloc(u64, n);
+    defer al.free(pks);
+    const okeys = try al.alloc(u64, n);
+    defer al.free(okeys);
+    const phys_rows = try al.alloc(u64, n);
+    defer al.free(phys_rows);
+    for (rows, 0..) |row, j| {
+        pks[j] = row[0];
+        okeys[j] = old_next_key + @as(u64, @intCast(j));
+        phys_rows[j] = old_next_row + @as(u64, @intCast(j));
+    }
+
+    try appendColumnRuns(txn, &s, rows);
+
+    // pk index (pk -> okey) and key->row index (okey -> physical row). Both runs
+    // land on the right edge: batch pks are ascending and above the current max,
+    // and okeys are consecutive from next_key (thus above every existing okey).
+    s.pk_index_ref = try Index.appendRun(txn, s.pk_index_ref, pks[0..n], okeys[0..n], al);
+    s.keyrow_index_ref = try Index.appendRun(txn, s.keyrow_index_ref, okeys[0..n], phys_rows[0..n], al);
+
+    s.next_row = old_next_row + @as(u64, @intCast(n));
+    s.next_key = old_next_key + @as(u64, @intCast(n));
+    return s.replace(txn);
+}
+
+// Append each property's values in batch order to the right edge of its
+// column, then one version stamp and one live stamp per row (the version
+// matches rows.insert, txn.new_version; live = 1), storing the new column
+// roots into the snapshot.
+fn appendColumnRuns(
+    txn: *WriteTxn,
+    s: *catalog.CatalogSnapshot,
+    rows: []const []const u64,
+) !void {
+    const n = rows.len;
+    const al = txn.db.store.allocator;
+
+    // Property columns: append each property's values in batch order.
+    {
+        const col_vals = try al.alloc(u64, n);
+        defer al.free(col_vals);
+        var p: usize = 0;
+        while (p < s.prop_count) : (p += 1) {
+            for (rows, 0..) |row, j| col_vals[j] = row[p];
+            s.props[p].col = try Column.appendRun(txn, s.props[p].col, col_vals[0..n], al);
+        }
+    }
+
+    // Version and live columns: one stamp per row, matching rows.insert.
+    const stamps = try al.alloc(u64, n);
+    defer al.free(stamps);
+    @memset(stamps, txn.new_version);
+    s.version_col_ref = try Column.appendRun(txn, s.version_col_ref, stamps[0..n], al);
+    @memset(stamps, 1);
+    s.live_col_ref = try Column.appendRun(txn, s.live_col_ref, stamps[0..n], al);
+}
+
+// Qualify a batch for the right-edge fast path, returning error.NotAppendable
+// for any shape it cannot handle. Every check is read-only and runs before the
+// first node is allocated, so a NotAppendable return leaves the catalog and
+// all trees untouched and the caller's fallback can replay row-by-row.
+fn qualifyRightEdgeAppend(
+    txn: *WriteTxn,
+    s: *const catalog.CatalogSnapshot,
+    rows: []const []const u64,
+) !void {
+    // Qualify the schema: reject an indexed or link-bearing property -- both
+    // keep secondary structures that a pure right-edge append cannot maintain.
     {
         var j: usize = 0;
-        while (j < prop_count) : (j += 1) {
+        while (j < s.prop_count) : (j += 1) {
             const k = s.props[j].kind;
             if (k == .link or k == .link_set) return error.NotAppendable;
             if (s.props[j].indexed) return error.NotAppendable;
         }
     }
 
-    const n = rows.len;
-
     // Batch pks must be strictly ascending and unique; any non-ascending or
     // duplicate-in-batch shape is NotAppendable so the fallback handles it
     // (including per-row duplicate detection against the existing rows).
     {
         var i: usize = 1;
-        while (i < n) : (i += 1) {
+        while (i < rows.len) : (i += 1) {
             if (rows[i][0] <= rows[i - 1][0]) return error.NotAppendable;
         }
     }
@@ -373,53 +477,6 @@ pub fn bulkAppend(txn: *WriteTxn, cat: Ref, rows: []const []const u64) !Ref {
     if (try emptyRightmostLow(txn, s.pk_index_ref)) |stale_low| {
         if (rows[0][0] < stale_low) return error.NotAppendable;
     }
-
-    // --- Qualified. Nothing has been written yet; build the right-edge runs. ---
-    const al = txn.db.store.allocator;
-
-    // Object keys and physical rows are assigned in batch order from the type's
-    // current counters, exactly as sequential ascending-pk inserts would: the
-    // j-th row gets okey = next_key + j and physical row = next_row + j.
-    const pks = try al.alloc(u64, n);
-    defer al.free(pks);
-    const okeys = try al.alloc(u64, n);
-    defer al.free(okeys);
-    const phys_rows = try al.alloc(u64, n);
-    defer al.free(phys_rows);
-    for (rows, 0..) |row, j| {
-        pks[j] = row[0];
-        okeys[j] = old_next_key + @as(u64, @intCast(j));
-        phys_rows[j] = old_next_row + @as(u64, @intCast(j));
-    }
-
-    // Property columns: append each property's values in batch order.
-    {
-        const col_vals = try al.alloc(u64, n);
-        defer al.free(col_vals);
-        var p: usize = 0;
-        while (p < prop_count) : (p += 1) {
-            for (rows, 0..) |row, j| col_vals[j] = row[p];
-            s.props[p].col = try Column.appendRun(txn, s.props[p].col, col_vals[0..n], al);
-        }
-    }
-
-    // Version and live columns: one stamp per row, matching rows.insert.
-    const stamps = try al.alloc(u64, n);
-    defer al.free(stamps);
-    @memset(stamps, txn.new_version);
-    s.version_col_ref = try Column.appendRun(txn, s.version_col_ref, stamps[0..n], al);
-    @memset(stamps, 1);
-    s.live_col_ref = try Column.appendRun(txn, s.live_col_ref, stamps[0..n], al);
-
-    // pk index (pk -> okey) and key->row index (okey -> physical row). Both runs
-    // land on the right edge: batch pks are ascending and above the current max,
-    // and okeys are consecutive from next_key (thus above every existing okey).
-    s.pk_index_ref = try Index.appendRun(txn, s.pk_index_ref, pks[0..n], okeys[0..n], al);
-    s.keyrow_index_ref = try Index.appendRun(txn, s.keyrow_index_ref, okeys[0..n], phys_rows[0..n], al);
-
-    s.next_row = old_next_row + @as(u64, @intCast(n));
-    s.next_key = old_next_key + @as(u64, @intCast(n));
-    return s.replace(txn);
 }
 
 // Try the right-edge fast path; on NotAppendable, fall back to row-by-row
