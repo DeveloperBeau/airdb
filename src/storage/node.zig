@@ -7,11 +7,11 @@ pub const NodeHeader = struct {
     element_count: u32,
     pub const size: usize = 5; // [kind:u8][element_count:u32 LE]
 
-    pub fn encode(buffer: []u8, h: NodeHeader) EncodeResult {
+    pub fn encode(buffer: []u8, header: NodeHeader) EncodeResult {
         // Caller must provide >= size bytes. Under ReleaseSafe (this project's build mode) this assert is a safe trap, not UB.
         std.debug.assert(buffer.len >= size);
-        buffer[0] = @intFromEnum(h.kind);
-        std.mem.writeInt(u32, buffer[1..5], h.element_count, .little);
+        buffer[0] = @intFromEnum(header.kind);
+        std.mem.writeInt(u32, buffer[1..5], header.element_count, .little);
         return .{ .header_len = size };
     }
     pub const EncodeResult = struct {
@@ -47,12 +47,12 @@ test "encode then decode node header round-trips for every kind" {
         .{ .kind = .inner_refs, .count = 300 },
         .{ .kind = .raw_bytes, .count = 4294967295 },
     };
-    for (cases) |c| {
+    for (cases) |testCase| {
         var buffer: [16]u8 = undefined;
-        const written = NodeHeader.encode(&buffer, .{ .kind = c.kind, .element_count = c.count });
+        const written = NodeHeader.encode(&buffer, .{ .kind = testCase.kind, .element_count = testCase.count });
         const view = try NodeView.parse(buffer[0..written.total_len_with_payload(0)]);
-        try testing.expectEqual(c.kind, view.header.kind);
-        try testing.expectEqual(c.count, view.header.element_count);
+        try testing.expectEqual(testCase.kind, view.header.kind);
+        try testing.expectEqual(testCase.count, view.header.element_count);
     }
 }
 

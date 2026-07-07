@@ -320,7 +320,7 @@ test "dict: insert, get, put, remove, count, collect" {
     var catalogRef = try catalog.createFromDefinitions(&w, &.{ .{ .kind = .int }, .{ .kind = .dict } });
     catalogRef = (try insertTyped(&w, catalogRef, &.{
         .{ .int = 1 },
-        .{ .dict_int = &.{ .{ .key = "apple", .val = 1 }, .{ .key = "banana", .val = 2 } } },
+        .{ .dict_int = &.{ .{ .key = "apple", .value = 1 }, .{ .key = "banana", .value = 2 } } },
     })).catalogRef;
     try testing.expectEqual(@as(?u64, 1), try dictGet(&w, catalogRef, 1, 1, "apple"));
     try testing.expectEqual(@as(?u64, null), try dictGet(&w, catalogRef, 1, 1, "missing"));
@@ -346,9 +346,9 @@ test "dict: insert, get, put, remove, count, collect" {
     try dictCollect(&w, catalogRef, 1, 1, &entries, testing.allocator);
     try testing.expectEqual(@as(usize, 2), entries.items.len);
     try testing.expectEqualStrings("apple", entries.items[0].key);
-    try testing.expectEqual(@as(u64, 9), entries.items[0].val);
+    try testing.expectEqual(@as(u64, 9), entries.items[0].value);
     try testing.expectEqualStrings("cherry", entries.items[1].key);
-    try testing.expectEqual(@as(u64, 3), entries.items[1].val);
+    try testing.expectEqual(@as(u64, 3), entries.items[1].value);
     w.deinit();
 }
 
@@ -406,7 +406,7 @@ test "dict and set-of-blob persist across reopen" {
         });
         catalogRef = (try insertTyped(&w, catalogRef, &.{
             .{ .int = 42 },
-            .{ .dict_int = &.{ .{ .key = "one", .val = 1 }, .{ .key = "two", .val = 2 } } },
+            .{ .dict_int = &.{ .{ .key = "one", .value = 1 }, .{ .key = "two", .value = 2 } } },
             .{ .set_blob = &.{ "alpha", "beta" } },
         })).catalogRef;
         catalogRef = try dictPut(&w, catalogRef, 42, 1, "three", 3);

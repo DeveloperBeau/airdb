@@ -139,9 +139,9 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
                 for (&blobBuffer, 0..) |*b, k| b.* = @truncate(iv +% k);
 
                 const dict_entries = [_]catalog.DictEntry{
-                    .{ .key = "alpha", .val = iv & 0xffff },
-                    .{ .key = "beta", .val = (iv >> 16) & 0xffff },
-                    .{ .key = "gamma", .val = (iv >> 32) & 0xffff },
+                    .{ .key = "alpha", .value = iv & 0xffff },
+                    .{ .key = "beta", .value = (iv >> 16) & 0xffff },
+                    .{ .key = "gamma", .value = (iv >> 32) & 0xffff },
                 };
                 const set_ints = [_]u64{ iv % 1000, (iv >> 10) % 1000, (iv >> 20) % 1000 };
                 const set_blobs = [_][]const u8{ "m0", "m1", "m2" };

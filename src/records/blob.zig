@@ -72,11 +72,11 @@ pub fn put(transaction: *WriteTransaction, bytes: []const u8) !Reference {
 
     if (bytes.len <= inline_max) {
         const total = inline_bytes_off + bytes.len;
-        const a = try transaction.alloc(total);
-        a.bytes[0] = tag_inline;
-        std.mem.writeInt(u32, a.bytes[inline_len_off..][0..4], @intCast(bytes.len), .little);
-        @memcpy(a.bytes[inline_bytes_off .. inline_bytes_off + bytes.len], bytes);
-        return a.ref;
+        const allocation = try transaction.alloc(total);
+        allocation.bytes[0] = tag_inline;
+        std.mem.writeInt(u32, allocation.bytes[inline_len_off..][0..4], @intCast(bytes.len), .little);
+        @memcpy(allocation.bytes[inline_bytes_off .. inline_bytes_off + bytes.len], bytes);
+        return allocation.ref;
     }
 
     const chunk_count = (bytes.len + chunk_size - 1) / chunk_size;
@@ -89,14 +89,14 @@ pub fn put(transaction: *WriteTransaction, bytes: []const u8) !Reference {
     std.mem.writeInt(u64, indexNode.bytes[totalLengthOffset..][0..8], @intCast(bytes.len), .little);
     std.mem.writeInt(u32, indexNode.bytes[chunkCountOffset..][0..4], @intCast(chunk_count), .little);
 
-    var i: usize = 0;
-    while (i < chunk_count) : (i += 1) {
-        const start = i * chunk_size;
+    var chunkIndex: usize = 0;
+    while (chunkIndex < chunk_count) : (chunkIndex += 1) {
+        const start = chunkIndex * chunk_size;
         const end = @min(start + chunk_size, bytes.len);
-        const c = try transaction.alloc(end - start);
+        const chunk = try transaction.alloc(end - start);
         // Copy this chunk's source bytes in immediately, before the next alloc.
-        @memcpy(c.bytes, bytes[start..end]);
-        std.mem.writeInt(u64, indexNode.bytes[chunkRefsOffset + 8 * i ..][0..8], c.ref, .little);
+        @memcpy(chunk.bytes, bytes[start..end]);
+        std.mem.writeInt(u64, indexNode.bytes[chunkRefsOffset + 8 * chunkIndex ..][0..8], chunk.ref, .little);
     }
 
     return indexNode.ref;
@@ -145,25 +145,25 @@ pub fn readInto(transaction: anytype, ref: Reference, out: []u8) !void {
         return;
     }
 
-    const h = try chunkedHeader(transaction, ref);
-    if (h.total_len != out.len) return error.Corrupt;
-    var i: usize = 0;
-    while (i < h.chunk_count) : (i += 1) {
-        const start = i * chunk_size;
-        const clen = @min(chunk_size, h.total_len - start);
+    const header = try chunkedHeader(transaction, ref);
+    if (header.total_len != out.len) return error.Corrupt;
+    var chunkIndex: usize = 0;
+    while (chunkIndex < header.chunk_count) : (chunkIndex += 1) {
+        const start = chunkIndex * chunk_size;
+        const chunkLength = @min(chunk_size, header.total_len - start);
         // Re-deref the index node each iteration so the read is independent of any
         // prior chunk deref slices.
-        const node = try transaction.deref(ref, h.node_size);
-        const chunk_ref = std.mem.readInt(u64, node[chunkRefsOffset + 8 * i ..][0..8], .little);
-        const chunk = try transaction.deref(chunk_ref, clen);
-        @memcpy(out[start .. start + clen], chunk);
+        const node = try transaction.deref(ref, header.node_size);
+        const chunk_ref = std.mem.readInt(u64, node[chunkRefsOffset + 8 * chunkIndex ..][0..8], .little);
+        const chunk = try transaction.deref(chunk_ref, chunkLength);
+        @memcpy(out[start .. start + chunkLength], chunk);
     }
 }
 
 /// Allocate a buffer, copy the blob at `ref` into it, and return it. Caller frees.
 pub fn getAlloc(transaction: anytype, ref: Reference, allocator: std.mem.Allocator) ![]u8 {
-    const n = try size(transaction, ref);
-    const buffer = try allocator.alloc(u8, n);
+    const byteCount = try size(transaction, ref);
+    const buffer = try allocator.alloc(u8, byteCount);
     errdefer allocator.free(buffer);
     try readInto(transaction, ref, buffer);
     return buffer;
@@ -174,9 +174,9 @@ pub fn getAlloc(transaction: anytype, ref: Reference, allocator: std.mem.Allocat
 /// Materializes the blob in RAM during the copy (acceptable for a maintenance
 /// op); a future optimization could stream chunks without buffering the whole
 /// blob. Accepts any source transaction exposing `deref(ref, length) ![]const u8`.
-pub fn copyInto(src: anytype, dst: *WriteTransaction, src_ref: Reference) !Reference {
+pub fn copyInto(source: anytype, dst: *WriteTransaction, src_ref: Reference) !Reference {
     if (src_ref == 0) return 0;
-    const buffer = try getAlloc(src, src_ref, dst.database.store.allocator);
+    const buffer = try getAlloc(source, src_ref, dst.database.store.allocator);
     defer dst.database.store.allocator.free(buffer);
     return try put(dst, buffer);
 }
@@ -194,21 +194,21 @@ pub fn free(transaction: *WriteTransaction, ref: Reference) !void {
         return;
     }
 
-    const h = try chunkedHeader(transaction, ref);
-    var i: usize = 0;
-    while (i < h.chunk_count) : (i += 1) {
-        const start = i * chunk_size;
-        const clen = @min(chunk_size, h.total_len - start);
+    const header = try chunkedHeader(transaction, ref);
+    var chunkIndex: usize = 0;
+    while (chunkIndex < header.chunk_count) : (chunkIndex += 1) {
+        const start = chunkIndex * chunk_size;
+        const chunkLength = @min(chunk_size, header.total_len - start);
         // Read the chunk ref from the still-intact index node, then free the chunk.
         // free() only updates the free list; it does not touch the index node's bytes.
-        const node = try transaction.deref(ref, h.node_size);
-        const chunk_ref = std.mem.readInt(u64, node[chunkRefsOffset + 8 * i ..][0..8], .little);
+        const node = try transaction.deref(ref, header.node_size);
+        const chunk_ref = std.mem.readInt(u64, node[chunkRefsOffset + 8 * chunkIndex ..][0..8], .little);
         // Bounds-validate the chunk ref before handing its extent to the free
         // list: a corrupt ref would poison the pool with live/garbage space.
-        _ = try transaction.deref(chunk_ref, clen);
-        try transaction.free(chunk_ref, clen);
+        _ = try transaction.deref(chunk_ref, chunkLength);
+        try transaction.free(chunk_ref, chunkLength);
     }
-    try transaction.free(ref, h.node_size);
+    try transaction.free(ref, header.node_size);
 }
 
 // ---------------------------------------------------------------------------
@@ -232,16 +232,16 @@ test "blob put then get round-trips bytes; empty is the null ref" {
     defer testing.allocator.free(path);
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
-    var w = try database.beginWrite();
-    const ref = try put(&w, "hello world");
+    var writeTransaction = try database.beginWrite();
+    const ref = try put(&writeTransaction, "hello world");
     try testing.expect(ref != 0);
-    try testing.expectEqualStrings("hello world", try get(&w, ref));
-    try testing.expectEqual(@as(usize, 11), try size(&w, ref));
-    const empty = try put(&w, "");
+    try testing.expectEqualStrings("hello world", try get(&writeTransaction, ref));
+    try testing.expectEqual(@as(usize, 11), try size(&writeTransaction, ref));
+    const empty = try put(&writeTransaction, "");
     try testing.expectEqual(@as(Reference, 0), empty);
-    try testing.expectEqualStrings("", try get(&w, empty));
-    try testing.expectEqual(@as(usize, 0), try size(&w, empty));
-    w.deinit();
+    try testing.expectEqualStrings("", try get(&writeTransaction, empty));
+    try testing.expectEqual(@as(usize, 0), try size(&writeTransaction, empty));
+    writeTransaction.deinit();
 }
 
 test "free releases a blob node" {
@@ -251,11 +251,11 @@ test "free releases a blob node" {
     defer testing.allocator.free(path);
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
-    var w = try database.beginWrite();
-    const ref = try put(&w, "data");
-    try free(&w, ref); // must not error
-    try free(&w, 0); // freeing the null ref is a no-op
-    w.deinit();
+    var writeTransaction = try database.beginWrite();
+    const ref = try put(&writeTransaction, "data");
+    try free(&writeTransaction, ref); // must not error
+    try free(&writeTransaction, 0); // freeing the null ref is a no-op
+    writeTransaction.deinit();
 }
 
 test "chunked blob over the inline cap round-trips" {
@@ -265,54 +265,54 @@ test "chunked blob over the inline cap round-trips" {
     defer testing.allocator.free(path);
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
-    var w = try database.beginWrite();
+    var writeTransaction = try database.beginWrite();
 
     // Just past the inline cap: forces the chunked representation (2 chunks).
     {
-        const n = inline_max + 1;
-        const src = try testing.allocator.alloc(u8, n);
-        defer testing.allocator.free(src);
-        for (src, 0..) |*b, i| b.* = @intCast(i % 251);
+        const byteCount = inline_max + 1;
+        const source = try testing.allocator.alloc(u8, byteCount);
+        defer testing.allocator.free(source);
+        for (source, 0..) |*byte, position| byte.* = @intCast(position % 251);
 
-        const ref = try put(&w, src);
+        const ref = try put(&writeTransaction, source);
         try testing.expect(ref != 0);
-        try testing.expectEqual(n, try size(&w, ref));
-        try testing.expectError(error.BlobChunked, get(&w, ref));
+        try testing.expectEqual(byteCount, try size(&writeTransaction, ref));
+        try testing.expectError(error.BlobChunked, get(&writeTransaction, ref));
 
-        const out = try getAlloc(&w, ref, testing.allocator);
+        const out = try getAlloc(&writeTransaction, ref, testing.allocator);
         defer testing.allocator.free(out);
-        try testing.expectEqualSlices(u8, src, out);
+        try testing.expectEqualSlices(u8, source, out);
 
-        try free(&w, ref);
+        try free(&writeTransaction, ref);
     }
 
     // A large blob spanning many chunks (~40 MiB).
     {
-        const n: usize = 40 * 1024 * 1024;
-        const src = try testing.allocator.alloc(u8, n);
-        defer testing.allocator.free(src);
-        for (src, 0..) |*b, i| b.* = @intCast(i % 251);
+        const byteCount: usize = 40 * 1024 * 1024;
+        const source = try testing.allocator.alloc(u8, byteCount);
+        defer testing.allocator.free(source);
+        for (source, 0..) |*byte, position| byte.* = @intCast(position % 251);
 
-        const ref = try put(&w, src);
+        const ref = try put(&writeTransaction, source);
         try testing.expect(ref != 0);
-        try testing.expectEqual(n, try size(&w, ref));
-        try testing.expectError(error.BlobChunked, get(&w, ref));
+        try testing.expectEqual(byteCount, try size(&writeTransaction, ref));
+        try testing.expectError(error.BlobChunked, get(&writeTransaction, ref));
 
-        const out = try testing.allocator.alloc(u8, try size(&w, ref));
+        const out = try testing.allocator.alloc(u8, try size(&writeTransaction, ref));
         defer testing.allocator.free(out);
-        try readInto(&w, ref, out);
+        try readInto(&writeTransaction, ref, out);
 
         // Full compare plus explicit checks at chunk boundaries.
-        try testing.expectEqualSlices(u8, src, out);
+        try testing.expectEqualSlices(u8, source, out);
         try testing.expectEqual(@as(u8, 0), out[0]);
         try testing.expectEqual(@as(u8, @intCast((chunk_size - 1) % 251)), out[chunk_size - 1]);
         try testing.expectEqual(@as(u8, @intCast(chunk_size % 251)), out[chunk_size]);
-        try testing.expectEqual(@as(u8, @intCast((n - 1) % 251)), out[n - 1]);
+        try testing.expectEqual(@as(u8, @intCast((byteCount - 1) % 251)), out[byteCount - 1]);
 
-        try free(&w, ref);
+        try free(&writeTransaction, ref);
     }
 
-    w.deinit();
+    writeTransaction.deinit();
 }
 
 test "a corrupt chunked header is an error, not a panic or a poisoned free list" {
@@ -322,31 +322,31 @@ test "a corrupt chunked header is an error, not a panic or a poisoned free list"
     defer testing.allocator.free(path);
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
-    var w = try database.beginWrite();
-    defer w.deinit();
+    var writeTransaction = try database.beginWrite();
+    defer writeTransaction.deinit();
 
-    const n = inline_max + 1; // 2 chunks
-    const src = try testing.allocator.alloc(u8, n);
-    defer testing.allocator.free(src);
-    @memset(src, 0xAB);
-    const ref = try put(&w, src);
+    const byteCount = inline_max + 1; // 2 chunks
+    const source = try testing.allocator.alloc(u8, byteCount);
+    defer testing.allocator.free(source);
+    @memset(source, 0xAB);
+    const ref = try put(&writeTransaction, source);
 
-    const off: usize = @intCast(ref);
+    const offset: usize = @intCast(ref);
     // (a) chunk_count inconsistent with total_len: previously underflowed
     // `total_len - start` (panic) and fed garbage extents to the free list.
-    std.mem.writeInt(u32, database.store.map[off + chunkCountOffset ..][0..4], 1000, .little);
-    try testing.expectError(error.Corrupt, size(&w, ref));
+    std.mem.writeInt(u32, database.store.map[offset + chunkCountOffset ..][0..4], 1000, .little);
+    try testing.expectError(error.Corrupt, size(&writeTransaction, ref));
     var outputBuffer: [16]u8 = undefined;
-    try testing.expectError(error.Corrupt, readInto(&w, ref, outputBuffer[0..]));
-    const frees_before = w.in_flight_frees.items.len + w.transactionReuse.extents.items.len;
-    try testing.expectError(error.Corrupt, free(&w, ref));
-    try testing.expectEqual(frees_before, w.in_flight_frees.items.len + w.transactionReuse.extents.items.len);
+    try testing.expectError(error.Corrupt, readInto(&writeTransaction, ref, outputBuffer[0..]));
+    const frees_before = writeTransaction.in_flight_frees.items.len + writeTransaction.transactionReuse.extents.items.len;
+    try testing.expectError(error.Corrupt, free(&writeTransaction, ref));
+    try testing.expectEqual(frees_before, writeTransaction.in_flight_frees.items.len + writeTransaction.transactionReuse.extents.items.len);
 
     // (b) an out-of-range tag byte is Corrupt everywhere.
-    database.store.map[off] = 7;
-    try testing.expectError(error.Corrupt, get(&w, ref));
-    try testing.expectError(error.Corrupt, size(&w, ref));
-    try testing.expectError(error.Corrupt, free(&w, ref));
+    database.store.map[offset] = 7;
+    try testing.expectError(error.Corrupt, get(&writeTransaction, ref));
+    try testing.expectError(error.Corrupt, size(&writeTransaction, ref));
+    try testing.expectError(error.Corrupt, free(&writeTransaction, ref));
 }
 
 test "free of a chunked blob" {
@@ -356,14 +356,14 @@ test "free of a chunked blob" {
     defer testing.allocator.free(path);
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
-    var w = try database.beginWrite();
+    var writeTransaction = try database.beginWrite();
 
-    const n = inline_max + chunk_size + 7; // 3 chunks
-    const src = try testing.allocator.alloc(u8, n);
-    defer testing.allocator.free(src);
-    for (src, 0..) |*b, i| b.* = @intCast(i % 251);
+    const byteCount = inline_max + chunk_size + 7; // 3 chunks
+    const source = try testing.allocator.alloc(u8, byteCount);
+    defer testing.allocator.free(source);
+    for (source, 0..) |*byte, position| byte.* = @intCast(position % 251);
 
-    const ref = try put(&w, src);
-    try free(&w, ref); // must not error
-    w.deinit();
+    const ref = try put(&writeTransaction, source);
+    try free(&writeTransaction, ref); // must not error
+    writeTransaction.deinit();
 }

@@ -11,7 +11,7 @@ pub const DeletionRule = enum(u8) { nullify = 0, cascade = 1, block = 2 };
 pub const PropertyDefinition = struct { kind: PropertyKind, element: ElementKind = .int, link_target: u16 = 0, del_rule: DeletionRule = .nullify, indexed: bool = false };
 // A single byte-keyed dictionary entry: a byte-string key mapped to a u64 value
 // (an int, or an object key for a "dict of links" -- u64 covers both).
-pub const DictEntry = struct { key: []const u8, val: u64 };
+pub const DictEntry = struct { key: []const u8, value: u64 };
 pub const Value = union(enum) {
     int: u64,
     // A blob property decodes to one of two read-side shapes:
@@ -107,36 +107,36 @@ pub fn writeCatalog(
     value_index_refs: []const Reference,
     indexed_flags: []const bool,
 ) !Reference {
-    const a = try transaction.alloc(catalogSize(propertyCount));
-    std.mem.writeInt(u16, a.bytes[propertyCountOffset..][0..2], propertyCount, .little);
-    std.mem.writeInt(u64, a.bytes[off_next_row..][0..8], next_row, .little);
-    std.mem.writeInt(u64, a.bytes[off_keyrow_index_ref..][0..8], keyrow_index_ref, .little);
-    std.mem.writeInt(u64, a.bytes[off_next_key..][0..8], next_key, .little);
-    std.mem.writeInt(u64, a.bytes[primaryKeyIndexRefOffset..][0..8], primaryKeyIndexRef, .little);
-    std.mem.writeInt(u64, a.bytes[off_version_col_ref..][0..8], version_col_ref, .little);
-    std.mem.writeInt(u64, a.bytes[off_live_col_ref..][0..8], live_col_ref, .little);
-    for (propertyColumnRefs, 0..) |ref, i| {
-        std.mem.writeInt(u64, a.bytes[propertyColumnsOffset + i * 8 ..][0..8], ref, .little);
+    const allocation = try transaction.alloc(catalogSize(propertyCount));
+    std.mem.writeInt(u16, allocation.bytes[propertyCountOffset..][0..2], propertyCount, .little);
+    std.mem.writeInt(u64, allocation.bytes[off_next_row..][0..8], next_row, .little);
+    std.mem.writeInt(u64, allocation.bytes[off_keyrow_index_ref..][0..8], keyrow_index_ref, .little);
+    std.mem.writeInt(u64, allocation.bytes[off_next_key..][0..8], next_key, .little);
+    std.mem.writeInt(u64, allocation.bytes[primaryKeyIndexRefOffset..][0..8], primaryKeyIndexRef, .little);
+    std.mem.writeInt(u64, allocation.bytes[off_version_col_ref..][0..8], version_col_ref, .little);
+    std.mem.writeInt(u64, allocation.bytes[off_live_col_ref..][0..8], live_col_ref, .little);
+    for (propertyColumnRefs, 0..) |ref, propertyIndex| {
+        std.mem.writeInt(u64, allocation.bytes[propertyColumnsOffset + propertyIndex * 8 ..][0..8], ref, .little);
     }
-    const ko = kindsOffset(propertyCount);
-    for (kinds, 0..) |k, i| a.bytes[ko + i] = @intFromEnum(k);
-    const eo = elemsOffset(propertyCount);
-    for (elements, 0..) |e, i| a.bytes[eo + i] = @intFromEnum(e);
+    const kindsBase = kindsOffset(propertyCount);
+    for (kinds, 0..) |kind, propertyIndex| allocation.bytes[kindsBase + propertyIndex] = @intFromEnum(kind);
+    const elementsBase = elemsOffset(propertyCount);
+    for (elements, 0..) |element, propertyIndex| allocation.bytes[elementsBase + propertyIndex] = @intFromEnum(element);
     const blo = backlinksOffset(propertyCount);
-    for (backlinks, 0..) |bref, i| {
-        std.mem.writeInt(u64, a.bytes[blo + i * 8 ..][0..8], bref, .little);
+    for (backlinks, 0..) |bref, propertyIndex| {
+        std.mem.writeInt(u64, allocation.bytes[blo + propertyIndex * 8 ..][0..8], bref, .little);
     }
-    const to = targetsOffset(propertyCount);
-    for (targets, 0..) |t, i| std.mem.writeInt(u16, a.bytes[to + i * 2 ..][0..2], t, .little);
-    const ro = rulesOffset(propertyCount);
-    for (rules, 0..) |r, i| a.bytes[ro + i] = @intFromEnum(r);
+    const targetsBase = targetsOffset(propertyCount);
+    for (targets, 0..) |target, propertyIndex| std.mem.writeInt(u16, allocation.bytes[targetsBase + propertyIndex * 2 ..][0..2], target, .little);
+    const rulesBase = rulesOffset(propertyCount);
+    for (rules, 0..) |rule, propertyIndex| allocation.bytes[rulesBase + propertyIndex] = @intFromEnum(rule);
     const valueIndexOffset = valueIndexRefsOffset(propertyCount);
-    for (value_index_refs, 0..) |vref, i| {
-        std.mem.writeInt(u64, a.bytes[valueIndexOffset + i * 8 ..][0..8], vref, .little);
+    for (value_index_refs, 0..) |vref, propertyIndex| {
+        std.mem.writeInt(u64, allocation.bytes[valueIndexOffset + propertyIndex * 8 ..][0..8], vref, .little);
     }
     const ifo = indexedFlagsOffset(propertyCount);
-    for (indexed_flags, 0..) |flag, i| a.bytes[ifo + i] = @intFromBool(flag);
-    return a.ref;
+    for (indexed_flags, 0..) |flag, propertyIndex| allocation.bytes[ifo + propertyIndex] = @intFromBool(flag);
+    return allocation.ref;
 }
 
 // createFromDefinitions allocates columns, a primaryKey index, version/live columns, and a catalog
@@ -153,16 +153,16 @@ pub fn createFromDefinitions(transaction: *WriteTransaction, definitions: []cons
     var rules: [maxPropertyCount]DeletionRule = undefined;
     var value_index_refs: [maxPropertyCount]Reference = undefined;
     var indexed_flags: [maxPropertyCount]bool = undefined;
-    var i: usize = 0;
-    while (i < propertyCount) : (i += 1) {
-        propertyColumnRefs[i] = try Column.create(transaction);
-        kinds[i] = definitions[i].kind;
-        elements[i] = definitions[i].element;
-        backlinks[i] = if (definitions[i].kind == .link or definitions[i].kind == .link_set) try Index.create(transaction) else 0;
-        targets[i] = definitions[i].link_target;
-        rules[i] = definitions[i].del_rule;
-        indexed_flags[i] = definitions[i].indexed;
-        value_index_refs[i] = if (definitions[i].indexed) try Index.create(transaction) else 0;
+    var propertyIndex: usize = 0;
+    while (propertyIndex < propertyCount) : (propertyIndex += 1) {
+        propertyColumnRefs[propertyIndex] = try Column.create(transaction);
+        kinds[propertyIndex] = definitions[propertyIndex].kind;
+        elements[propertyIndex] = definitions[propertyIndex].element;
+        backlinks[propertyIndex] = if (definitions[propertyIndex].kind == .link or definitions[propertyIndex].kind == .link_set) try Index.create(transaction) else 0;
+        targets[propertyIndex] = definitions[propertyIndex].link_target;
+        rules[propertyIndex] = definitions[propertyIndex].del_rule;
+        indexed_flags[propertyIndex] = definitions[propertyIndex].indexed;
+        value_index_refs[propertyIndex] = if (definitions[propertyIndex].indexed) try Index.create(transaction) else 0;
     }
     const version_col_ref = try Column.create(transaction);
     const live_col_ref = try Column.create(transaction);
@@ -194,8 +194,8 @@ pub fn createTyped(transaction: *WriteTransaction, kinds: []const PropertyKind) 
     const propertyCount: PropertyCount = @intCast(kinds.len);
     std.debug.assert(propertyCount <= maxPropertyCount);
     var definitions: [maxPropertyCount]PropertyDefinition = undefined;
-    var i: usize = 0;
-    while (i < propertyCount) : (i += 1) definitions[i] = .{ .kind = kinds[i], .element = .int };
+    var propertyIndex: usize = 0;
+    while (propertyIndex < propertyCount) : (propertyIndex += 1) definitions[propertyIndex] = .{ .kind = kinds[propertyIndex], .element = .int };
     return createFromDefinitions(transaction, definitions[0..propertyCount]);
 }
 
@@ -204,8 +204,8 @@ pub fn createTyped(transaction: *WriteTransaction, kinds: []const PropertyKind) 
 pub fn create(transaction: *WriteTransaction, propertyCount: PropertyCount) !Reference {
     std.debug.assert(propertyCount <= maxPropertyCount);
     var all_int: [maxPropertyCount]PropertyKind = undefined;
-    var i: usize = 0;
-    while (i < propertyCount) : (i += 1) all_int[i] = .int;
+    var propertyIndex: usize = 0;
+    while (propertyIndex < propertyCount) : (propertyIndex += 1) all_int[propertyIndex] = .int;
     return createTyped(transaction, all_int[0..propertyCount]);
 }
 
@@ -219,43 +219,43 @@ pub const CatalogView = struct {
     live_col_ref: Reference,
     bytes: []const u8,
 
-    pub fn propertyColumnRef(self: CatalogView, i: usize) Reference {
-        return std.mem.readInt(u64, self.bytes[propertyColumnsOffset + i * 8 ..][0..8], .little);
+    pub fn propertyColumnRef(self: CatalogView, propertyIndex: usize) Reference {
+        return std.mem.readInt(u64, self.bytes[propertyColumnsOffset + propertyIndex * 8 ..][0..8], .little);
     }
 
-    pub fn kind(self: CatalogView, i: usize) PropertyKind {
+    pub fn kind(self: CatalogView, propertyIndex: usize) PropertyKind {
         const kinds_offset = propertyColumnsOffset + @as(usize, self.propertyCount) * 8;
-        return @enumFromInt(self.bytes[kinds_offset + i]);
+        return @enumFromInt(self.bytes[kinds_offset + propertyIndex]);
     }
 
-    pub fn elementKind(self: CatalogView, i: usize) ElementKind {
-        const eo = propertyColumnsOffset + @as(usize, self.propertyCount) * 8 + self.propertyCount;
-        return @enumFromInt(self.bytes[eo + i]);
+    pub fn elementKind(self: CatalogView, propertyIndex: usize) ElementKind {
+        const elementsBase = propertyColumnsOffset + @as(usize, self.propertyCount) * 8 + self.propertyCount;
+        return @enumFromInt(self.bytes[elementsBase + propertyIndex]);
     }
 
-    pub fn backlinkRef(self: CatalogView, i: usize) Reference {
+    pub fn backlinkRef(self: CatalogView, propertyIndex: usize) Reference {
         const blo = propertyColumnsOffset + @as(usize, self.propertyCount) * 8 + @as(usize, self.propertyCount) * 2;
-        return std.mem.readInt(u64, self.bytes[blo + i * 8 ..][0..8], .little);
+        return std.mem.readInt(u64, self.bytes[blo + propertyIndex * 8 ..][0..8], .little);
     }
 
-    pub fn linkTarget(self: CatalogView, i: usize) u16 {
-        const to = propertyColumnsOffset + @as(usize, self.propertyCount) * 8 + @as(usize, self.propertyCount) * 2 + @as(usize, self.propertyCount) * 8;
-        return std.mem.readInt(u16, self.bytes[to + i * 2 ..][0..2], .little);
+    pub fn linkTarget(self: CatalogView, propertyIndex: usize) u16 {
+        const targetsBase = propertyColumnsOffset + @as(usize, self.propertyCount) * 8 + @as(usize, self.propertyCount) * 2 + @as(usize, self.propertyCount) * 8;
+        return std.mem.readInt(u16, self.bytes[targetsBase + propertyIndex * 2 ..][0..2], .little);
     }
 
-    pub fn delRule(self: CatalogView, i: usize) DeletionRule {
-        const ro = propertyColumnsOffset + @as(usize, self.propertyCount) * 8 + @as(usize, self.propertyCount) * 2 + @as(usize, self.propertyCount) * 8 + @as(usize, self.propertyCount) * 2;
-        return @enumFromInt(self.bytes[ro + i]);
+    pub fn delRule(self: CatalogView, propertyIndex: usize) DeletionRule {
+        const rulesBase = propertyColumnsOffset + @as(usize, self.propertyCount) * 8 + @as(usize, self.propertyCount) * 2 + @as(usize, self.propertyCount) * 8 + @as(usize, self.propertyCount) * 2;
+        return @enumFromInt(self.bytes[rulesBase + propertyIndex]);
     }
 
-    pub fn valueIndexRef(self: CatalogView, i: usize) Reference {
+    pub fn valueIndexRef(self: CatalogView, propertyIndex: usize) Reference {
         const valueIndexOffset = valueIndexRefsOffset(self.propertyCount);
-        return std.mem.readInt(u64, self.bytes[valueIndexOffset + i * 8 ..][0..8], .little);
+        return std.mem.readInt(u64, self.bytes[valueIndexOffset + propertyIndex * 8 ..][0..8], .little);
     }
 
-    pub fn indexed(self: CatalogView, i: usize) bool {
+    pub fn indexed(self: CatalogView, propertyIndex: usize) bool {
         const ifo = indexedFlagsOffset(self.propertyCount);
-        return self.bytes[ifo + i] != 0;
+        return self.bytes[ifo + propertyIndex] != 0;
     }
 };
 
@@ -274,14 +274,14 @@ pub fn loadCatalog(transaction: anytype, catalogRef: Reference) !CatalogView {
     if (propertyCount > maxPropertyCount) return error.Corrupt;
     const bytes = try transaction.deref(catalogRef, catalogSize(propertyCount));
     {
-        const ko = kindsOffset(propertyCount);
-        const eo = elemsOffset(propertyCount);
-        const ro = rulesOffset(propertyCount);
-        var p: usize = 0;
-        while (p < propertyCount) : (p += 1) {
-            if (std.enums.fromInt(PropertyKind, bytes[ko + p]) == null) return error.Corrupt;
-            if (std.enums.fromInt(ElementKind, bytes[eo + p]) == null) return error.Corrupt;
-            if (std.enums.fromInt(DeletionRule, bytes[ro + p]) == null) return error.Corrupt;
+        const kindsBase = kindsOffset(propertyCount);
+        const elementsBase = elemsOffset(propertyCount);
+        const rulesBase = rulesOffset(propertyCount);
+        var propertyIndex: usize = 0;
+        while (propertyIndex < propertyCount) : (propertyIndex += 1) {
+            if (std.enums.fromInt(PropertyKind, bytes[kindsBase + propertyIndex]) == null) return error.Corrupt;
+            if (std.enums.fromInt(ElementKind, bytes[elementsBase + propertyIndex]) == null) return error.Corrupt;
+            if (std.enums.fromInt(DeletionRule, bytes[rulesBase + propertyIndex]) == null) return error.Corrupt;
         }
     }
     return CatalogView{
@@ -331,31 +331,31 @@ pub const CatalogSnapshot = struct {
     source_len: usize,
 
     pub fn load(transaction: anytype, catalogRef: Reference) !CatalogSnapshot {
-        const v = try loadCatalog(transaction, catalogRef);
-        var s: CatalogSnapshot = undefined;
-        s.source = catalogRef;
-        s.source_len = catalogSize(v.propertyCount);
-        s.propertyCount = v.propertyCount;
-        s.next_row = v.next_row;
-        s.keyrow_index_ref = v.keyrow_index_ref;
-        s.next_key = v.next_key;
-        s.primaryKeyIndexRef = v.primaryKeyIndexRef;
-        s.version_col_ref = v.version_col_ref;
-        s.live_col_ref = v.live_col_ref;
-        var j: usize = 0;
-        while (j < v.propertyCount) : (j += 1) {
-            s.properties[j] = .{
-                .col = v.propertyColumnRef(j),
-                .kind = v.kind(j),
-                .element = v.elementKind(j),
-                .backlink = v.backlinkRef(j),
-                .target = v.linkTarget(j),
-                .rule = v.delRule(j),
-                .value_index = v.valueIndexRef(j),
-                .indexed = v.indexed(j),
+        const view = try loadCatalog(transaction, catalogRef);
+        var snapshot: CatalogSnapshot = undefined;
+        snapshot.source = catalogRef;
+        snapshot.source_len = catalogSize(view.propertyCount);
+        snapshot.propertyCount = view.propertyCount;
+        snapshot.next_row = view.next_row;
+        snapshot.keyrow_index_ref = view.keyrow_index_ref;
+        snapshot.next_key = view.next_key;
+        snapshot.primaryKeyIndexRef = view.primaryKeyIndexRef;
+        snapshot.version_col_ref = view.version_col_ref;
+        snapshot.live_col_ref = view.live_col_ref;
+        var propertyIndex: usize = 0;
+        while (propertyIndex < view.propertyCount) : (propertyIndex += 1) {
+            snapshot.properties[propertyIndex] = .{
+                .col = view.propertyColumnRef(propertyIndex),
+                .kind = view.kind(propertyIndex),
+                .element = view.elementKind(propertyIndex),
+                .backlink = view.backlinkRef(propertyIndex),
+                .target = view.linkTarget(propertyIndex),
+                .rule = view.delRule(propertyIndex),
+                .value_index = view.valueIndexRef(propertyIndex),
+                .indexed = view.indexed(propertyIndex),
             };
         }
-        return s;
+        return snapshot;
     }
 
     /// Allocate and encode a fresh catalog node from this snapshot.
@@ -367,19 +367,19 @@ pub const CatalogSnapshot = struct {
         var targets: [maxPropertyCount]u16 = undefined;
         var rules: [maxPropertyCount]DeletionRule = undefined;
         var valueIndexRefs: [maxPropertyCount]Reference = undefined;
-        var idxf: [maxPropertyCount]bool = undefined;
+        var indexedFlags: [maxPropertyCount]bool = undefined;
         const propertyCount = self.propertyCount;
-        var j: usize = 0;
-        while (j < propertyCount) : (j += 1) {
-            const p = self.properties[j];
-            cols[j] = p.col;
-            kinds[j] = p.kind;
-            elements[j] = p.element;
-            backlinks[j] = p.backlink;
-            targets[j] = p.target;
-            rules[j] = p.rule;
-            valueIndexRefs[j] = p.value_index;
-            idxf[j] = p.indexed;
+        var propertyIndex: usize = 0;
+        while (propertyIndex < propertyCount) : (propertyIndex += 1) {
+            const property = self.properties[propertyIndex];
+            cols[propertyIndex] = property.col;
+            kinds[propertyIndex] = property.kind;
+            elements[propertyIndex] = property.element;
+            backlinks[propertyIndex] = property.backlink;
+            targets[propertyIndex] = property.target;
+            rules[propertyIndex] = property.rule;
+            valueIndexRefs[propertyIndex] = property.value_index;
+            indexedFlags[propertyIndex] = property.indexed;
         }
         return writeCatalog(
             transaction,
@@ -397,7 +397,7 @@ pub const CatalogSnapshot = struct {
             targets[0..propertyCount],
             rules[0..propertyCount],
             valueIndexRefs[0..propertyCount],
-            idxf[0..propertyCount],
+            indexedFlags[0..propertyCount],
         );
     }
 
@@ -428,56 +428,56 @@ pub fn liveCount(transaction: anytype, catalogRef: Reference) !u64 {
 // Resolve an object key to its physical row via the key-to-row index.
 // Returns null if the objectKey has no mapping.
 pub fn objectKeyToRow(transaction: anytype, catalogRef: Reference, objectKey: u64) !?u64 {
-    const v = try loadCatalog(transaction, catalogRef);
-    return Index.get(transaction, v.keyrow_index_ref, objectKey);
+    const view = try loadCatalog(transaction, catalogRef);
+    return Index.get(transaction, view.keyrow_index_ref, objectKey);
 }
 
 // Resolve a primary key to its stable object key via the primaryKey index.
 // Returns null if the primaryKey has no mapping.
 pub fn primaryKeyToObjectKey(transaction: anytype, catalogRef: Reference, primaryKey: u64) !?u64 {
-    const v = try loadCatalog(transaction, catalogRef);
-    return Index.get(transaction, v.primaryKeyIndexRef, primaryKey);
+    const view = try loadCatalog(transaction, catalogRef);
+    return Index.get(transaction, view.primaryKeyIndexRef, primaryKey);
 }
 
 // Resolve (catalogRef, primaryKey, property) to the property column ref and the row;
 // null if primaryKey absent or row tombstoned. The primaryKey index maps primaryKey -> objectKey, and the
 // keyrow index maps objectKey -> physical row.
 pub fn resolveProperty(transaction: anytype, catalogRef: Reference, primaryKey: u64, property: usize) !?struct { row: u64, propertyColumn: Reference } {
-    const v = try loadCatalog(transaction, catalogRef);
-    const objectKey = (try Index.get(transaction, v.primaryKeyIndexRef, primaryKey)) orelse return null;
-    const row = (try Index.get(transaction, v.keyrow_index_ref, objectKey)) orelse return null;
-    if ((try Column.get(transaction, v.live_col_ref, row)) == 0) return null;
-    return .{ .row = row, .propertyColumn = v.propertyColumnRef(property) };
+    const view = try loadCatalog(transaction, catalogRef);
+    const objectKey = (try Index.get(transaction, view.primaryKeyIndexRef, primaryKey)) orelse return null;
+    const row = (try Index.get(transaction, view.keyrow_index_ref, objectKey)) orelse return null;
+    if ((try Column.get(transaction, view.live_col_ref, row)) == 0) return null;
+    return .{ .row = row, .propertyColumn = view.propertyColumnRef(property) };
 }
 
 // Write new_root into property `property` at `row`, bump that row's version stamp,
 // return the new catalog ref.
 pub fn replaceCollRoot(transaction: *WriteTransaction, catalogRef: Reference, row: u64, property: usize, new_root: Reference) !Reference {
-    var s = try CatalogSnapshot.load(transaction, catalogRef);
-    s.properties[property].col = try Column.set(transaction, s.properties[property].col, row, new_root);
-    s.version_col_ref = try Column.set(transaction, s.version_col_ref, row, transaction.new_version);
-    return s.replace(transaction);
+    var snapshot = try CatalogSnapshot.load(transaction, catalogRef);
+    snapshot.properties[property].col = try Column.set(transaction, snapshot.properties[property].col, row, new_root);
+    snapshot.version_col_ref = try Column.set(transaction, snapshot.version_col_ref, row, transaction.new_version);
+    return snapshot.replace(transaction);
 }
 
 // Write a new backlink ref into property `p`, preserving everything else.
-pub fn setBacklinkRef(transaction: *WriteTransaction, catalogRef: Reference, p: usize, new_bl: Reference) !Reference {
-    var s = try CatalogSnapshot.load(transaction, catalogRef);
-    s.properties[p].backlink = new_bl;
-    return s.replace(transaction);
+pub fn setBacklinkRef(transaction: *WriteTransaction, catalogRef: Reference, propertyIndex: usize, newBacklink: Reference) !Reference {
+    var snapshot = try CatalogSnapshot.load(transaction, catalogRef);
+    snapshot.properties[propertyIndex].backlink = newBacklink;
+    return snapshot.replace(transaction);
 }
 
 // Write a new value-index ref into property `p`, preserving everything else.
-pub fn setValueIndexRef(transaction: *WriteTransaction, catalogRef: Reference, p: usize, new_vi: Reference) !Reference {
-    var s = try CatalogSnapshot.load(transaction, catalogRef);
-    s.properties[p].value_index = new_vi;
-    return s.replace(transaction);
+pub fn setValueIndexRef(transaction: *WriteTransaction, catalogRef: Reference, propertyIndex: usize, newValueIndex: Reference) !Reference {
+    var snapshot = try CatalogSnapshot.load(transaction, catalogRef);
+    snapshot.properties[propertyIndex].value_index = newValueIndex;
+    return snapshot.replace(transaction);
 }
 
 // Write a new column ref into property `p`, preserving everything else.
-pub fn setPropertyColumnRef(transaction: *WriteTransaction, catalogRef: Reference, p: usize, new_col: Reference) !Reference {
-    var s = try CatalogSnapshot.load(transaction, catalogRef);
-    s.properties[p].col = new_col;
-    return s.replace(transaction);
+pub fn setPropertyColumnRef(transaction: *WriteTransaction, catalogRef: Reference, propertyIndex: usize, newColumn: Reference) !Reference {
+    var snapshot = try CatalogSnapshot.load(transaction, catalogRef);
+    snapshot.properties[propertyIndex].col = newColumn;
+    return snapshot.replace(transaction);
 }
 
 // ---------------------------------------------------------------------------
@@ -500,11 +500,11 @@ test "create allocates an empty type and load reads it back" {
     defer testing.allocator.free(path);
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
-    var w = try database.beginWrite();
-    const catalogRef = try create(&w, 3);
-    try testing.expectEqual(@as(PropertyCount, 3), try loadPropertyCount(&w, catalogRef));
-    try testing.expectEqual(@as(u64, 0), try liveCount(&w, catalogRef));
-    w.deinit();
+    var writeTransaction = try database.beginWrite();
+    const catalogRef = try create(&writeTransaction, 3);
+    try testing.expectEqual(@as(PropertyCount, 3), try loadPropertyCount(&writeTransaction, catalogRef));
+    try testing.expectEqual(@as(u64, 0), try liveCount(&writeTransaction, catalogRef));
+    writeTransaction.deinit();
 }
 
 test "CatalogSnapshot round-trips every field through load and write" {
@@ -514,35 +514,35 @@ test "CatalogSnapshot round-trips every field through load and write" {
     defer testing.allocator.free(path);
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
-    var w = try database.beginWrite();
-    defer w.deinit();
-    const catalogRef = try createFromDefinitions(&w, &.{
+    var writeTransaction = try database.beginWrite();
+    defer writeTransaction.deinit();
+    const catalogRef = try createFromDefinitions(&writeTransaction, &.{
         .{ .kind = .int },
         .{ .kind = .int, .indexed = true },
         .{ .kind = .link, .link_target = 3, .del_rule = .cascade },
         .{ .kind = .list, .element = .blob },
     });
-    const s = try CatalogSnapshot.load(&w, catalogRef);
-    const copy_ref = try s.write(&w);
-    const v0 = try loadCatalog(&w, catalogRef);
-    const v1 = try loadCatalog(&w, copy_ref);
-    try testing.expectEqual(v0.propertyCount, v1.propertyCount);
-    try testing.expectEqual(v0.next_row, v1.next_row);
-    try testing.expectEqual(v0.next_key, v1.next_key);
-    try testing.expectEqual(v0.primaryKeyIndexRef, v1.primaryKeyIndexRef);
-    try testing.expectEqual(v0.keyrow_index_ref, v1.keyrow_index_ref);
-    try testing.expectEqual(v0.version_col_ref, v1.version_col_ref);
-    try testing.expectEqual(v0.live_col_ref, v1.live_col_ref);
-    var j: usize = 0;
-    while (j < v0.propertyCount) : (j += 1) {
-        try testing.expectEqual(v0.propertyColumnRef(j), v1.propertyColumnRef(j));
-        try testing.expectEqual(v0.kind(j), v1.kind(j));
-        try testing.expectEqual(v0.elementKind(j), v1.elementKind(j));
-        try testing.expectEqual(v0.backlinkRef(j), v1.backlinkRef(j));
-        try testing.expectEqual(v0.linkTarget(j), v1.linkTarget(j));
-        try testing.expectEqual(v0.delRule(j), v1.delRule(j));
-        try testing.expectEqual(v0.valueIndexRef(j), v1.valueIndexRef(j));
-        try testing.expectEqual(v0.indexed(j), v1.indexed(j));
+    const snapshot = try CatalogSnapshot.load(&writeTransaction, catalogRef);
+    const copy_ref = try snapshot.write(&writeTransaction);
+    const view0 = try loadCatalog(&writeTransaction, catalogRef);
+    const view1 = try loadCatalog(&writeTransaction, copy_ref);
+    try testing.expectEqual(view0.propertyCount, view1.propertyCount);
+    try testing.expectEqual(view0.next_row, view1.next_row);
+    try testing.expectEqual(view0.next_key, view1.next_key);
+    try testing.expectEqual(view0.primaryKeyIndexRef, view1.primaryKeyIndexRef);
+    try testing.expectEqual(view0.keyrow_index_ref, view1.keyrow_index_ref);
+    try testing.expectEqual(view0.version_col_ref, view1.version_col_ref);
+    try testing.expectEqual(view0.live_col_ref, view1.live_col_ref);
+    var propertyIndex: usize = 0;
+    while (propertyIndex < view0.propertyCount) : (propertyIndex += 1) {
+        try testing.expectEqual(view0.propertyColumnRef(propertyIndex), view1.propertyColumnRef(propertyIndex));
+        try testing.expectEqual(view0.kind(propertyIndex), view1.kind(propertyIndex));
+        try testing.expectEqual(view0.elementKind(propertyIndex), view1.elementKind(propertyIndex));
+        try testing.expectEqual(view0.backlinkRef(propertyIndex), view1.backlinkRef(propertyIndex));
+        try testing.expectEqual(view0.linkTarget(propertyIndex), view1.linkTarget(propertyIndex));
+        try testing.expectEqual(view0.delRule(propertyIndex), view1.delRule(propertyIndex));
+        try testing.expectEqual(view0.valueIndexRef(propertyIndex), view1.valueIndexRef(propertyIndex));
+        try testing.expectEqual(view0.indexed(propertyIndex), view1.indexed(propertyIndex));
     }
 }
 
@@ -553,23 +553,23 @@ test "loadCatalog rejects corrupt disk values instead of panicking" {
     defer testing.allocator.free(path);
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
-    var w = try database.beginWrite();
-    defer w.deinit();
-    const catalogRef = try create(&w, 2);
-    _ = try loadCatalog(&w, catalogRef); // clean before corruption
+    var writeTransaction = try database.beginWrite();
+    defer writeTransaction.deinit();
+    const catalogRef = try create(&writeTransaction, 2);
+    _ = try loadCatalog(&writeTransaction, catalogRef); // clean before corruption
 
     // Corrupt a kind byte (out-of-range enum value) directly in the mapping.
     const catalogOffset: usize = @intCast(catalogRef);
     const kind_byte_off = catalogOffset + propertyColumnsOffset + 2 * 8; // kindsOffset(2), property 0
     const saved_kind = database.store.map[kind_byte_off];
     database.store.map[kind_byte_off] = 200;
-    try testing.expectError(error.Corrupt, loadCatalog(&w, catalogRef));
+    try testing.expectError(error.Corrupt, loadCatalog(&writeTransaction, catalogRef));
     database.store.map[kind_byte_off] = saved_kind;
-    _ = try loadCatalog(&w, catalogRef); // restored
+    _ = try loadCatalog(&writeTransaction, catalogRef); // restored
 
     // Corrupt the property count to an implausible value.
     std.mem.writeInt(u16, database.store.map[catalogOffset..][0..2], 6000, .little);
-    try testing.expectError(error.Corrupt, loadCatalog(&w, catalogRef));
+    try testing.expectError(error.Corrupt, loadCatalog(&writeTransaction, catalogRef));
 }
 
 test "createTyped records property kinds; create defaults to all int" {
@@ -579,17 +579,17 @@ test "createTyped records property kinds; create defaults to all int" {
     defer testing.allocator.free(path);
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
-    var w = try database.beginWrite();
-    const catalogRef = try createTyped(&w, &.{ .int, .blob, .int });
-    const v = try loadCatalog(&w, catalogRef);
-    try testing.expectEqual(PropertyKind.int, v.kind(0));
-    try testing.expectEqual(PropertyKind.blob, v.kind(1));
-    try testing.expectEqual(PropertyKind.int, v.kind(2));
-    const catalog2 = try create(&w, 2);
-    const v2 = try loadCatalog(&w, catalog2);
+    var writeTransaction = try database.beginWrite();
+    const catalogRef = try createTyped(&writeTransaction, &.{ .int, .blob, .int });
+    const view = try loadCatalog(&writeTransaction, catalogRef);
+    try testing.expectEqual(PropertyKind.int, view.kind(0));
+    try testing.expectEqual(PropertyKind.blob, view.kind(1));
+    try testing.expectEqual(PropertyKind.int, view.kind(2));
+    const catalog2 = try create(&writeTransaction, 2);
+    const v2 = try loadCatalog(&writeTransaction, catalog2);
     try testing.expectEqual(PropertyKind.int, v2.kind(0));
     try testing.expectEqual(PropertyKind.int, v2.kind(1));
-    w.deinit();
+    writeTransaction.deinit();
 }
 
 test "createDefs records kind and element kind per property" {
@@ -599,27 +599,27 @@ test "createDefs records kind and element kind per property" {
     defer testing.allocator.free(path);
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
-    var w = try database.beginWrite();
-    const catalogRef = try createFromDefinitions(&w, &.{
+    var writeTransaction = try database.beginWrite();
+    const catalogRef = try createFromDefinitions(&writeTransaction, &.{
         .{ .kind = .int },
         .{ .kind = .list, .element = .int },
         .{ .kind = .set, .element = .int },
         .{ .kind = .list, .element = .blob },
     });
-    const v = try loadCatalog(&w, catalogRef);
-    try testing.expectEqual(@as(PropertyCount, 4), v.propertyCount);
-    try testing.expectEqual(PropertyKind.int, v.kind(0));
-    try testing.expectEqual(PropertyKind.list, v.kind(1));
-    try testing.expectEqual(ElementKind.int, v.elementKind(1));
-    try testing.expectEqual(PropertyKind.set, v.kind(2));
-    try testing.expectEqual(ElementKind.int, v.elementKind(2));
-    try testing.expectEqual(PropertyKind.list, v.kind(3));
-    try testing.expectEqual(ElementKind.blob, v.elementKind(3));
-    const catalog2 = try createTyped(&w, &.{ .int, .blob });
-    const v2 = try loadCatalog(&w, catalog2);
+    const view = try loadCatalog(&writeTransaction, catalogRef);
+    try testing.expectEqual(@as(PropertyCount, 4), view.propertyCount);
+    try testing.expectEqual(PropertyKind.int, view.kind(0));
+    try testing.expectEqual(PropertyKind.list, view.kind(1));
+    try testing.expectEqual(ElementKind.int, view.elementKind(1));
+    try testing.expectEqual(PropertyKind.set, view.kind(2));
+    try testing.expectEqual(ElementKind.int, view.elementKind(2));
+    try testing.expectEqual(PropertyKind.list, view.kind(3));
+    try testing.expectEqual(ElementKind.blob, view.elementKind(3));
+    const catalog2 = try createTyped(&writeTransaction, &.{ .int, .blob });
+    const v2 = try loadCatalog(&writeTransaction, catalog2);
     try testing.expectEqual(PropertyKind.blob, v2.kind(1));
     try testing.expectEqual(ElementKind.int, v2.elementKind(1));
-    w.deinit();
+    writeTransaction.deinit();
 }
 
 test "createDefs builds a backlink index for each link property" {
@@ -629,18 +629,18 @@ test "createDefs builds a backlink index for each link property" {
     defer testing.allocator.free(path);
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
-    var w = try database.beginWrite();
-    const catalogRef = try createFromDefinitions(&w, &.{
+    var writeTransaction = try database.beginWrite();
+    const catalogRef = try createFromDefinitions(&writeTransaction, &.{
         .{ .kind = .int },
         .{ .kind = .int },
         .{ .kind = .link },
     });
-    const v = try loadCatalog(&w, catalogRef);
-    try testing.expectEqual(PropertyKind.link, v.kind(2));
-    try testing.expect(v.backlinkRef(2) != 0);
-    try testing.expectEqual(@as(Reference, 0), v.backlinkRef(0));
-    try testing.expectEqual(@as(Reference, 0), v.backlinkRef(1));
-    w.deinit();
+    const view = try loadCatalog(&writeTransaction, catalogRef);
+    try testing.expectEqual(PropertyKind.link, view.kind(2));
+    try testing.expect(view.backlinkRef(2) != 0);
+    try testing.expectEqual(@as(Reference, 0), view.backlinkRef(0));
+    try testing.expectEqual(@as(Reference, 0), view.backlinkRef(1));
+    writeTransaction.deinit();
 }
 
 test "createDefs records a link target type id" {
@@ -650,17 +650,17 @@ test "createDefs records a link target type id" {
     defer testing.allocator.free(path);
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
-    var w = try database.beginWrite();
-    const catalogRef = try createFromDefinitions(&w, &.{
+    var writeTransaction = try database.beginWrite();
+    const catalogRef = try createFromDefinitions(&writeTransaction, &.{
         .{ .kind = .int },
         .{ .kind = .link, .link_target = 3 },
         .{ .kind = .link_set, .link_target = 7 },
     });
-    const v = try loadCatalog(&w, catalogRef);
-    try testing.expectEqual(@as(u16, 0), v.linkTarget(0));
-    try testing.expectEqual(@as(u16, 3), v.linkTarget(1));
-    try testing.expectEqual(@as(u16, 7), v.linkTarget(2));
-    w.deinit();
+    const view = try loadCatalog(&writeTransaction, catalogRef);
+    try testing.expectEqual(@as(u16, 0), view.linkTarget(0));
+    try testing.expectEqual(@as(u16, 3), view.linkTarget(1));
+    try testing.expectEqual(@as(u16, 7), view.linkTarget(2));
+    writeTransaction.deinit();
 }
 
 test "createDefs creates an empty key-to-row index and zero next_key" {
@@ -670,12 +670,12 @@ test "createDefs creates an empty key-to-row index and zero next_key" {
     defer testing.allocator.free(path);
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
-    var w = try database.beginWrite();
-    const catalogRef = try createFromDefinitions(&w, &.{ .{ .kind = .int }, .{ .kind = .int } });
-    const v = try loadCatalog(&w, catalogRef);
-    try testing.expect(v.keyrow_index_ref != 0);
-    try testing.expectEqual(@as(u64, 0), v.next_key);
-    w.deinit();
+    var writeTransaction = try database.beginWrite();
+    const catalogRef = try createFromDefinitions(&writeTransaction, &.{ .{ .kind = .int }, .{ .kind = .int } });
+    const view = try loadCatalog(&writeTransaction, catalogRef);
+    try testing.expect(view.keyrow_index_ref != 0);
+    try testing.expectEqual(@as(u64, 0), view.next_key);
+    writeTransaction.deinit();
 }
 
 test "catalog persists indexed flag and value index ref" {
@@ -685,31 +685,31 @@ test "catalog persists indexed flag and value index ref" {
     defer testing.allocator.free(path);
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
-    var w = try database.beginWrite();
-    const catalogRef = try createFromDefinitions(&w, &.{
+    var writeTransaction = try database.beginWrite();
+    const catalogRef = try createFromDefinitions(&writeTransaction, &.{
         .{ .kind = .int },
         .{ .kind = .int, .indexed = true },
         .{ .kind = .int },
     });
-    const v = try loadCatalog(&w, catalogRef);
-    try testing.expect(v.indexed(1));
-    try testing.expect(!v.indexed(0));
-    try testing.expect(!v.indexed(2));
-    try testing.expect(v.valueIndexRef(1) != 0);
-    try testing.expectEqual(@as(Reference, 0), v.valueIndexRef(0));
-    try testing.expectEqual(@as(Reference, 0), v.valueIndexRef(2));
-    const vidx1 = v.valueIndexRef(1);
+    const view = try loadCatalog(&writeTransaction, catalogRef);
+    try testing.expect(view.indexed(1));
+    try testing.expect(!view.indexed(0));
+    try testing.expect(!view.indexed(2));
+    try testing.expect(view.valueIndexRef(1) != 0);
+    try testing.expectEqual(@as(Reference, 0), view.valueIndexRef(0));
+    try testing.expectEqual(@as(Reference, 0), view.valueIndexRef(2));
+    const vidx1 = view.valueIndexRef(1);
     // Round-trip through a full catalog rebuild (setPropertyColumnRef rewrites every
     // field) and assert both the flag and the value-index ref survive.
-    const catalog2 = try setPropertyColumnRef(&w, catalogRef, 2, v.propertyColumnRef(2));
-    const v2 = try loadCatalog(&w, catalog2);
+    const catalog2 = try setPropertyColumnRef(&writeTransaction, catalogRef, 2, view.propertyColumnRef(2));
+    const v2 = try loadCatalog(&writeTransaction, catalog2);
     try testing.expect(v2.indexed(1));
     try testing.expect(!v2.indexed(0));
     try testing.expect(!v2.indexed(2));
     try testing.expectEqual(vidx1, v2.valueIndexRef(1));
     try testing.expectEqual(@as(Reference, 0), v2.valueIndexRef(0));
     try testing.expectEqual(@as(Reference, 0), v2.valueIndexRef(2));
-    w.deinit();
+    writeTransaction.deinit();
 }
 
 test "non-indexed catalog: value index refs zero and existing fields intact" {
@@ -719,34 +719,34 @@ test "non-indexed catalog: value index refs zero and existing fields intact" {
     defer testing.allocator.free(path);
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
-    var w = try database.beginWrite();
-    const catalogRef = try createFromDefinitions(&w, &.{
+    var writeTransaction = try database.beginWrite();
+    const catalogRef = try createFromDefinitions(&writeTransaction, &.{
         .{ .kind = .int },
         .{ .kind = .list, .element = .blob },
         .{ .kind = .link, .link_target = 4, .del_rule = .cascade },
     });
-    const v = try loadCatalog(&w, catalogRef);
-    var i: usize = 0;
-    while (i < v.propertyCount) : (i += 1) {
-        try testing.expect(!v.indexed(i));
-        try testing.expectEqual(@as(Reference, 0), v.valueIndexRef(i));
+    const view = try loadCatalog(&writeTransaction, catalogRef);
+    var propertyIndex: usize = 0;
+    while (propertyIndex < view.propertyCount) : (propertyIndex += 1) {
+        try testing.expect(!view.indexed(propertyIndex));
+        try testing.expectEqual(@as(Reference, 0), view.valueIndexRef(propertyIndex));
     }
     // Every pre-existing accessor must still read the right field: this guards
     // that appending the new arrays did not disturb the earlier offset math.
-    try testing.expectEqual(PropertyKind.int, v.kind(0));
-    try testing.expectEqual(PropertyKind.list, v.kind(1));
-    try testing.expectEqual(ElementKind.blob, v.elementKind(1));
-    try testing.expectEqual(PropertyKind.link, v.kind(2));
-    try testing.expect(v.propertyColumnRef(0) != 0);
-    try testing.expect(v.propertyColumnRef(1) != 0);
-    try testing.expect(v.backlinkRef(2) != 0); // link property got a backlink index
-    try testing.expectEqual(@as(Reference, 0), v.backlinkRef(0));
-    try testing.expectEqual(@as(Reference, 0), v.backlinkRef(1));
-    try testing.expectEqual(@as(u16, 4), v.linkTarget(2));
-    try testing.expectEqual(@as(u16, 0), v.linkTarget(0));
-    try testing.expectEqual(DeletionRule.cascade, v.delRule(2));
-    try testing.expectEqual(DeletionRule.nullify, v.delRule(0));
-    w.deinit();
+    try testing.expectEqual(PropertyKind.int, view.kind(0));
+    try testing.expectEqual(PropertyKind.list, view.kind(1));
+    try testing.expectEqual(ElementKind.blob, view.elementKind(1));
+    try testing.expectEqual(PropertyKind.link, view.kind(2));
+    try testing.expect(view.propertyColumnRef(0) != 0);
+    try testing.expect(view.propertyColumnRef(1) != 0);
+    try testing.expect(view.backlinkRef(2) != 0); // link property got a backlink index
+    try testing.expectEqual(@as(Reference, 0), view.backlinkRef(0));
+    try testing.expectEqual(@as(Reference, 0), view.backlinkRef(1));
+    try testing.expectEqual(@as(u16, 4), view.linkTarget(2));
+    try testing.expectEqual(@as(u16, 0), view.linkTarget(0));
+    try testing.expectEqual(DeletionRule.cascade, view.delRule(2));
+    try testing.expectEqual(DeletionRule.nullify, view.delRule(0));
+    writeTransaction.deinit();
 }
 
 test "createDefs records a per-property deletion rule" {
@@ -756,17 +756,17 @@ test "createDefs records a per-property deletion rule" {
     defer testing.allocator.free(path);
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
-    var w = try database.beginWrite();
-    const catalogRef = try createFromDefinitions(&w, &.{
+    var writeTransaction = try database.beginWrite();
+    const catalogRef = try createFromDefinitions(&writeTransaction, &.{
         .{ .kind = .int },
         .{ .kind = .link, .link_target = 2, .del_rule = .cascade },
         .{ .kind = .link, .link_target = 3, .del_rule = .block },
     });
-    const v = try loadCatalog(&w, catalogRef);
-    try testing.expectEqual(DeletionRule.nullify, v.delRule(0));
-    try testing.expectEqual(DeletionRule.cascade, v.delRule(1));
-    try testing.expectEqual(DeletionRule.block, v.delRule(2));
+    const view = try loadCatalog(&writeTransaction, catalogRef);
+    try testing.expectEqual(DeletionRule.nullify, view.delRule(0));
+    try testing.expectEqual(DeletionRule.cascade, view.delRule(1));
+    try testing.expectEqual(DeletionRule.block, view.delRule(2));
     // existing per-property data still intact
-    try testing.expectEqual(@as(u16, 2), v.linkTarget(1));
-    w.deinit();
+    try testing.expectEqual(@as(u16, 2), view.linkTarget(1));
+    writeTransaction.deinit();
 }

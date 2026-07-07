@@ -45,14 +45,14 @@ pub fn packLeaves(
     std.debug.assert(keys.len == values.len);
     var out = std.ArrayList(Child).empty;
     errdefer out.deinit(allocator);
-    const cap: usize = leafCap;
-    var i: usize = 0;
-    while (i < keys.len) {
-        const end = @min(i + cap, keys.len);
-        const a = try transaction.alloc(leaf_node_size);
-        _ = encodeLeaf(a.bytes, keys[i..end], values[i..end]);
-        try out.append(allocator, .{ .ref = a.ref, .low = keys[i], .count = @intCast(end - i) });
-        i = end;
+    const capacity: usize = leafCap;
+    var start: usize = 0;
+    while (start < keys.len) {
+        const end = @min(start + capacity, keys.len);
+        const allocation = try transaction.alloc(leaf_node_size);
+        _ = encodeLeaf(allocation.bytes, keys[start..end], values[start..end]);
+        try out.append(allocator, .{ .ref = allocation.ref, .low = keys[start], .count = @intCast(end - start) });
+        start = end;
     }
     return out;
 }
@@ -67,26 +67,26 @@ pub fn stackInner(
 ) !std.ArrayList(Child) {
     var out = std.ArrayList(Child).empty;
     errdefer out.deinit(allocator);
-    const fan: usize = fanout;
+    const width: usize = fanout;
     var refs: [fanout]u64 = undefined;
     var lows: [fanout]u64 = undefined;
     var counts: [fanout]u64 = undefined;
-    var j: usize = 0;
-    while (j < children.len) {
-        const end = @min(j + fan, children.len);
+    var runStart: usize = 0;
+    while (runStart < children.len) {
+        const end = @min(runStart + width, children.len);
         var total: u64 = 0;
-        var k: usize = j;
-        while (k < end) : (k += 1) {
-            refs[k - j] = children[k].ref;
-            lows[k - j] = children[k].low;
-            counts[k - j] = children[k].count;
-            total += children[k].count;
+        var childPosition: usize = runStart;
+        while (childPosition < end) : (childPosition += 1) {
+            refs[childPosition - runStart] = children[childPosition].ref;
+            lows[childPosition - runStart] = children[childPosition].low;
+            counts[childPosition - runStart] = children[childPosition].count;
+            total += children[childPosition].count;
         }
-        const cnt = end - j;
-        const a = try transaction.alloc(inner_node_size);
-        _ = encodeInner(a.bytes, refs[0..cnt], lows[0..cnt], counts[0..cnt]);
-        try out.append(allocator, .{ .ref = a.ref, .low = children[j].low, .count = total });
-        j = end;
+        const runLength = end - runStart;
+        const allocation = try transaction.alloc(inner_node_size);
+        _ = encodeInner(allocation.bytes, refs[0..runLength], lows[0..runLength], counts[0..runLength]);
+        try out.append(allocator, .{ .ref = allocation.ref, .low = children[runStart].low, .count = total });
+        runStart = end;
     }
     return out;
 }
@@ -113,21 +113,21 @@ fn descendRightEdge(
     transaction: anytype,
     root: Reference,
     path_refs: *std.ArrayList(Reference),
-    path_ridx: *std.ArrayList(usize),
+    path_rightmost: *std.ArrayList(usize),
     allocator: std.mem.Allocator,
 ) !Reference {
-    var cur: Reference = root;
+    var currentRef: Reference = root;
     var hops: usize = 0;
     while (true) : (hops += 1) {
         if (hops >= max_depth) return error.Corrupt; // ref cycle guard
-        const nb = try derefNode(transaction, cur);
-        if (nb[0] == kind_leaf) return cur;
-        const iv = try parseInner(nb);
-        const ri: usize = iv.child_count - 1;
-        const child = iv.childRef(ri);
-        try path_refs.append(allocator, cur);
-        try path_ridx.append(allocator, ri);
-        cur = child;
+        const nodeBytes = try derefNode(transaction, currentRef);
+        if (nodeBytes[0] == kind_leaf) return currentRef;
+        const innerView = try parseInner(nodeBytes);
+        const rightmostIndex: usize = innerView.child_count - 1;
+        const child = innerView.childRef(rightmostIndex);
+        try path_refs.append(allocator, currentRef);
+        try path_rightmost.append(allocator, rightmostIndex);
+        currentRef = child;
     }
 }
 
@@ -146,25 +146,25 @@ fn combineLeafAndRun(
     values: []const u64,
     allocator: std.mem.Allocator,
 ) !CombinedRun {
-    const lv = try parseLeaf(try derefNode(transaction, leaf_ref));
-    if (std.debug.runtime_safety and lv.count > 0) {
-        std.debug.assert(keys[0] > lv.key(lv.count - 1));
+    const leafView = try parseLeaf(try derefNode(transaction, leaf_ref));
+    if (std.debug.runtime_safety and leafView.count > 0) {
+        std.debug.assert(keys[0] > leafView.key(leafView.count - 1));
     }
-    const total: usize = @as(usize, lv.count) + keys.len;
-    const ck = try allocator.alloc(u64, total);
-    errdefer allocator.free(ck);
-    const cv = try allocator.alloc(u64, total);
-    var t: usize = 0;
-    while (t < lv.count) : (t += 1) {
-        ck[t] = lv.key(t);
-        cv[t] = lv.value(t);
+    const total: usize = @as(usize, leafView.count) + keys.len;
+    const combinedKeys = try allocator.alloc(u64, total);
+    errdefer allocator.free(combinedKeys);
+    const combinedValues = try allocator.alloc(u64, total);
+    var cursor: usize = 0;
+    while (cursor < leafView.count) : (cursor += 1) {
+        combinedKeys[cursor] = leafView.key(cursor);
+        combinedValues[cursor] = leafView.value(cursor);
     }
-    for (keys, values) |key, val| {
-        ck[t] = key;
-        cv[t] = val;
-        t += 1;
+    for (keys, values) |key, value| {
+        combinedKeys[cursor] = key;
+        combinedValues[cursor] = value;
+        cursor += 1;
     }
-    return .{ .keys = ck, .values = cv };
+    return .{ .keys = combinedKeys, .values = combinedValues };
 }
 
 /// Rebuild the rightmost inner spine bottom-up. At each recorded path level,
@@ -176,22 +176,22 @@ fn combineLeafAndRun(
 fn rebuildRightSpine(
     transaction: anytype,
     path_refs: []const Reference,
-    path_ridx: []const usize,
+    path_rightmost: []const usize,
     level: *std.ArrayList(Child),
     allocator: std.mem.Allocator,
 ) !void {
-    var i: usize = path_refs.len;
-    while (i > 0) {
-        i -= 1;
-        const iv = try parseInner(try derefNode(transaction, path_refs[i]));
-        const ri = path_ridx[i];
+    var levelIndex: usize = path_refs.len;
+    while (levelIndex > 0) {
+        levelIndex -= 1;
+        const innerView = try parseInner(try derefNode(transaction, path_refs[levelIndex]));
+        const rightmostIndex = path_rightmost[levelIndex];
         var full = std.ArrayList(Child).empty;
         defer full.deinit(allocator);
-        var j: usize = 0;
-        while (j < ri) : (j += 1) {
-            try full.append(allocator, .{ .ref = iv.childRef(j), .low = iv.lowKey(j), .count = iv.subtreeCount(j) });
+        var childIndex: usize = 0;
+        while (childIndex < rightmostIndex) : (childIndex += 1) {
+            try full.append(allocator, .{ .ref = innerView.childRef(childIndex), .low = innerView.lowKey(childIndex), .count = innerView.subtreeCount(childIndex) });
         }
-        for (level.items) |c| try full.append(allocator, c);
+        for (level.items) |child| try full.append(allocator, child);
         const next = try stackInner(transaction, full.items, allocator);
         level.deinit(allocator);
         level.* = next;
@@ -218,16 +218,16 @@ pub fn appendRun(
     std.debug.assert(keys.len == values.len);
     if (keys.len == 0) return root;
     if (std.debug.runtime_safety) {
-        var q: usize = 1;
-        while (q < keys.len) : (q += 1) std.debug.assert(keys[q] > keys[q - 1]);
+        var keyIndex: usize = 1;
+        while (keyIndex < keys.len) : (keyIndex += 1) std.debug.assert(keys[keyIndex] > keys[keyIndex - 1]);
     }
 
     // 1. Record the rightmost path: it is the only part of the tree rebuilt.
     var path_refs = std.ArrayList(Reference).empty;
     defer path_refs.deinit(allocator);
-    var path_ridx = std.ArrayList(usize).empty;
-    defer path_ridx.deinit(allocator);
-    const leaf_ref = try descendRightEdge(transaction, root, &path_refs, &path_ridx, allocator);
+    var path_rightmost = std.ArrayList(usize).empty;
+    defer path_rightmost.deinit(allocator);
+    const leaf_ref = try descendRightEdge(transaction, root, &path_refs, &path_rightmost, allocator);
 
     // 2. Combine the rightmost leaf's pairs with the run, then pack the
     //    combined run into leaves filled to leafCap: the first new leaf reuses
@@ -243,7 +243,7 @@ pub fn appendRun(
     //    levels until a single root remains (the rebuilt root level may have
     //    overflowed fanout into several nodes), growing the tree height by one
     //    or more as needed.
-    try rebuildRightSpine(transaction, path_refs.items, path_ridx.items, &level, allocator);
+    try rebuildRightSpine(transaction, path_refs.items, path_rightmost.items, &level, allocator);
     try collapseToRoot(transaction, &level, allocator);
 
     const result = level.items[0].ref;

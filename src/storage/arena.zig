@@ -23,10 +23,10 @@ pub const Arena = struct {
     /// The caller guarantees `[off, off + length)` does not cross a section boundary and
     /// that the section exists (true for any alloc result and any freed extent, since
     /// no allocation crosses a boundary).
-    fn translate(self: *Arena, off: usize, length: usize) []u8 {
-        const s = off >> section_shift;
-        const w = off & section_mask;
-        return self.sections[s].map[w .. w + length];
+    fn translate(self: *Arena, offset: usize, length: usize) []u8 {
+        const sectionIndex = offset >> section_shift;
+        const withinSection = offset & section_mask;
+        return self.sections[sectionIndex].map[withinSection .. withinSection + length];
     }
 
     pub fn alloc(self: *Arena, size: usize) error{ OutOfSpace, AllocTooLarge }!Allocation {
@@ -38,8 +38,8 @@ pub const Arena = struct {
         if ((aligned & section_mask) + size > section_size) {
             aligned = std.mem.alignForward(usize, aligned, section_size);
         }
-        const s = aligned >> section_shift;
-        if (s >= self.sections.len) return error.OutOfSpace; // caller grows + maps, then retries
+        const sectionIndex = aligned >> section_shift;
+        if (sectionIndex >= self.sections.len) return error.OutOfSpace; // caller grows + maps, then retries
         const ref: Reference = @intCast(aligned);
         self.top = aligned + size;
         return .{ .ref = ref, .bytes = self.translate(aligned, size) };
@@ -49,25 +49,25 @@ pub const Arena = struct {
     // (no bump fallback, no carving). Exact-size matching keeps fixed-size node allocation
     // fragment-free and the pool scan short. For a transaction-private pool (always safe to
     // reuse) pass horizon = maxInt; for the committed pool pass the reclaim horizon.
-    pub fn allocFromPool(self: *Arena, fl: *FreeList, size: usize, horizon: u64) ?Allocation {
-        if (fl.reuseExact(@intCast(size), horizon)) |off| {
-            const offu: usize = @intCast(off);
-            return .{ .ref = off, .bytes = self.translate(offu, size) };
+    pub fn allocFromPool(self: *Arena, pool: *FreeList, size: usize, horizon: u64) ?Allocation {
+        if (pool.reuseExact(@intCast(size), horizon)) |offset| {
+            const offu: usize = @intCast(offset);
+            return .{ .ref = offset, .bytes = self.translate(offu, size) };
         }
         return null;
     }
 
     // The single bounds-checked chokepoint. All reads go through here.
     pub fn deref(self: *Arena, ref: Reference, length: usize) error{BadRef}![]const u8 {
-        const off: usize = @intCast(ref);
-        if (off == 0) return error.BadRef; // null ref
-        if (off % 8 != 0) return error.BadRef; // misaligned
+        const offset: usize = @intCast(ref);
+        if (offset == 0) return error.BadRef; // null ref
+        if (offset % 8 != 0) return error.BadRef; // misaligned
         if (length > section_size) return error.BadRef; // cannot span a section
-        const s = off >> section_shift;
-        const w = off & section_mask;
-        if (s >= self.sections.len) return error.BadRef; // section not mapped
-        if (w + length > section_size) return error.BadRef; // would cross a section boundary
-        return self.sections[s].map[w .. w + length];
+        const sectionIndex = offset >> section_shift;
+        const withinSection = offset & section_mask;
+        if (sectionIndex >= self.sections.len) return error.BadRef; // section not mapped
+        if (withinSection + length > section_size) return error.BadRef; // would cross a section boundary
+        return self.sections[sectionIndex].map[withinSection .. withinSection + length];
     }
 };
 
@@ -90,9 +90,9 @@ test "alloc returns a writable slice that deref reads back" {
     defer testing.allocator.free(backing);
     var secs = [_]platform.Section{testSection(backing)};
     var arena = Arena.init(&secs, 4096); // data starts after the first (header) page
-    const a = try arena.alloc(8);
-    @memcpy(a.bytes, "ABCDEFGH");
-    const got = try arena.deref(a.ref, 8);
+    const allocation = try arena.alloc(8);
+    @memcpy(allocation.bytes, "ABCDEFGH");
+    const got = try arena.deref(allocation.ref, 8);
     try testing.expectEqualStrings("ABCDEFGH", got);
 }
 
@@ -119,20 +119,20 @@ test "alloc fails cleanly when the arena is full" {
 }
 
 test "alloc pads across a section boundary and AllocTooLarge on oversize" {
-    const b0 = try testing.allocator.alignedAlloc(u8, page_align, 4096);
-    defer testing.allocator.free(b0);
-    const b1 = try testing.allocator.alignedAlloc(u8, page_align, 4096);
-    defer testing.allocator.free(b1);
-    var secs = [_]platform.Section{ testSection(b0), testSection(b1) };
+    const firstBuffer = try testing.allocator.alignedAlloc(u8, page_align, 4096);
+    defer testing.allocator.free(firstBuffer);
+    const secondBuffer = try testing.allocator.alignedAlloc(u8, page_align, 4096);
+    defer testing.allocator.free(secondBuffer);
+    var secs = [_]platform.Section{ testSection(firstBuffer), testSection(secondBuffer) };
     var arena = Arena.init(&secs, 0);
 
     // Place top near the end of section 0 so the next alloc cannot fit and must pad
     // to section 1's base.
     arena.top = section_size - 16;
-    const a = try arena.alloc(32);
-    try testing.expectEqual(@as(Reference, @intCast(section_size)), a.ref); // landed at section 1 base
-    @memcpy(a.bytes, "0123456789ABCDEF0123456789ABCDEF");
-    const got = try arena.deref(a.ref, 32);
+    const allocation = try arena.alloc(32);
+    try testing.expectEqual(@as(Reference, @intCast(section_size)), allocation.ref); // landed at section 1 base
+    @memcpy(allocation.bytes, "0123456789ABCDEF0123456789ABCDEF");
+    const got = try arena.deref(allocation.ref, 32);
     try testing.expectEqualStrings("0123456789ABCDEF0123456789ABCDEF", got);
 
     // A single allocation larger than a section is rejected.

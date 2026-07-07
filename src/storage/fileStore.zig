@@ -96,7 +96,7 @@ pub const FileStore = struct {
         });
         errdefer file.close(io);
 
-        var fs = FileStore{
+        var store = FileStore{
             .allocator = allocator,
             .file = file,
             .map = undefined, // set by ensureMapped below
@@ -112,17 +112,17 @@ pub const FileStore = struct {
             .header_checksum_ok = false, // set to true after writeHeader below
         };
         errdefer {
-            for (fs.sections.items) |*s| s.unmap();
-            fs.sections.deinit(allocator);
+            for (store.sections.items) |*section| section.unmap();
+            store.sections.deinit(allocator);
         }
 
         // Extend the file to one section and map it; header + commit slots live here.
-        try fs.ensureMapped(platform.section_size);
+        try store.ensureMapped(platform.section_size);
 
-        fs.writeHeader();
-        fs.header_checksum_ok = true;
-        try fs.syncer.flush(fs.file);
-        return fs;
+        store.writeHeader();
+        store.header_checksum_ok = true;
+        try store.syncer.flush(store.file);
+        return store;
     }
 
     /// Open an existing database file at the given absolute path.
@@ -139,7 +139,7 @@ pub const FileStore = struct {
         const file_len = try file.length(io);
         if (file_len < default_page_size) return error.Corrupt;
 
-        var fs = FileStore{
+        var store = FileStore{
             .allocator = allocator,
             .file = file,
             .map = undefined, // set by ensureMapped below
@@ -149,22 +149,22 @@ pub const FileStore = struct {
             .header_checksum_ok = false, // set by readHeader below
         };
         errdefer {
-            for (fs.sections.items) |*s| s.unmap();
-            fs.sections.deinit(allocator);
+            for (store.sections.items) |*section| section.unmap();
+            store.sections.deinit(allocator);
         }
 
         // Map all sections covering the existing file. ensureMapped rounds the file up to
         // a whole-section multiple first (an old file whose length is not a section
         // multiple is extended via setLength before mapping), so every section is fully
         // backed before any deref.
-        try fs.ensureMapped(@intCast(file_len));
-        try fs.readHeader();
-        return fs;
+        try store.ensureMapped(@intCast(file_len));
+        try store.readHeader();
+        return store;
     }
 
     /// Unmap every section and close the file.
     pub fn deinit(self: *FileStore) void {
-        for (self.sections.items) |*s| s.unmap();
+        for (self.sections.items) |*section| section.unmap();
         self.sections.deinit(self.allocator);
         self.file.close(sysIo());
     }
@@ -179,7 +179,7 @@ pub const FileStore = struct {
     //   [24..28] reserved     (zero, covered by checksum)
     //   [28..32] checksum     CRC32 of [0..28], u32 LE
 
-    const off = struct {
+    const offset = struct {
         const magic: usize = 0;
         const page_size: usize = 8;
         const endianness: usize = 12;
@@ -190,41 +190,41 @@ pub const FileStore = struct {
     };
 
     fn writeHeader(self: *FileStore) void {
-        std.mem.writeInt(u64, self.map[off.magic..][0..8], self.header.magic, .little);
-        std.mem.writeInt(u32, self.map[off.page_size..][0..4], self.header.page_size, .little);
-        self.map[off.endianness] = @intFromEnum(self.header.endianness);
-        self.map[off.active_slot] = self.header.active_slot;
+        std.mem.writeInt(u64, self.map[offset.magic..][0..8], self.header.magic, .little);
+        std.mem.writeInt(u32, self.map[offset.page_size..][0..4], self.header.page_size, .little);
+        self.map[offset.endianness] = @intFromEnum(self.header.endianness);
+        self.map[offset.active_slot] = self.header.active_slot;
         // [14..16] reserved -- zero explicitly so the CRC is deterministic
         @memset(self.map[14..16], 0);
-        std.mem.writeInt(u64, self.map[off.logical_size..][0..8], self.header.logical_size, .little);
+        std.mem.writeInt(u64, self.map[offset.logical_size..][0..8], self.header.logical_size, .little);
         // [24..28] reserved -- zero explicitly so the CRC is deterministic
         @memset(self.map[24..28], 0);
         // CRC32 over [0..28] written little-endian at [28..32]
         const crc = std.hash.Crc32.hash(self.map[0..28]);
-        std.mem.writeInt(u32, self.map[off.checksum..][0..4], crc, .little);
+        std.mem.writeInt(u32, self.map[offset.checksum..][0..4], crc, .little);
     }
 
     pub fn readHeader(self: *FileStore) !void {
         if (self.map.len < default_page_size) return error.Corrupt;
 
-        const magic = std.mem.readInt(u64, self.map[off.magic..][0..8], .little);
+        const magic = std.mem.readInt(u64, self.map[offset.magic..][0..8], .little);
         if (magic != airdb_magic) return error.BadMagic;
 
-        const page_size = std.mem.readInt(u32, self.map[off.page_size..][0..4], .little);
+        const page_size = std.mem.readInt(u32, self.map[offset.page_size..][0..4], .little);
 
-        const endianness_byte = self.map[off.endianness];
+        const endianness_byte = self.map[offset.endianness];
         // Zig 0.16: std.meta.intToEnum removed; use std.enums.fromInt instead.
         const endianness = std.enums.fromInt(Endianness, endianness_byte) orelse
             return error.UnsupportedEndianness;
         if (endianness != .little) return error.UnsupportedEndianness;
 
-        const active_slot = self.map[off.active_slot];
-        const logical_size = std.mem.readInt(u64, self.map[off.logical_size..][0..8], .little);
+        const active_slot = self.map[offset.active_slot];
+        const logical_size = std.mem.readInt(u64, self.map[offset.logical_size..][0..8], .little);
 
         // Validate header CRC32: hash [0..28], compare to stored u32 at [28..32].
         // A mismatch sets header_checksum_ok = false but does NOT hard-fail;
         // database.zig openWith decides how to recover.
-        const stored_crc = std.mem.readInt(u32, self.map[off.checksum..][0..4], .little);
+        const stored_crc = std.mem.readInt(u32, self.map[offset.checksum..][0..4], .little);
         const computed_crc = std.hash.Crc32.hash(self.map[0..28]);
         self.header_checksum_ok = (stored_crc == computed_crc);
 
@@ -257,10 +257,10 @@ pub const FileStore = struct {
             self.setlength_calls += 1;
         }
 
-        var i: usize = self.sections.items.len;
-        while (i < needed) : (i += 1) {
-            const s = try platform.mapSection(self.file, @as(u64, i) << platform.section_shift, platform.section_size);
-            try self.sections.append(self.allocator, s);
+        var sectionIndex: usize = self.sections.items.len;
+        while (sectionIndex < needed) : (sectionIndex += 1) {
+            const section = try platform.mapSection(self.file, @as(u64, sectionIndex) << platform.section_shift, platform.section_size);
+            try self.sections.append(self.allocator, section);
         }
         self.map = self.sections.items[0].map;
     }
@@ -335,9 +335,9 @@ test "real syncer flush succeeds (exercises the platform durability path)" {
     const dir_path = pathBuffer[0..path_len];
     const file_path = try std.fs.path.join(testing.allocator, &.{ dir_path, "fsync.airdb" });
     defer testing.allocator.free(file_path);
-    var fs = try FileStore.create(testing.allocator, file_path, FileSyncer.any());
-    defer fs.deinit();
-    try fs.syncer.flush(fs.file); // explicit second flush must also succeed
+    var store = try FileStore.create(testing.allocator, file_path, FileSyncer.any());
+    defer store.deinit();
+    try store.syncer.flush(store.file); // explicit second flush must also succeed
 }
 
 test "header checksum validates on a clean file and fails when the header is tampered" {
@@ -348,17 +348,17 @@ test "header checksum validates on a clean file and fails when the header is tam
     const file_path = try std.fs.path.join(testing.allocator, &.{ pathBuffer[0..path_len], "hcrc.airdb" });
     defer testing.allocator.free(file_path);
     {
-        var fs = try FileStore.create(testing.allocator, file_path, FileSyncer.any());
-        defer fs.deinit();
-        try testing.expect(fs.header_checksum_ok);
+        var store = try FileStore.create(testing.allocator, file_path, FileSyncer.any());
+        defer store.deinit();
+        try testing.expect(store.header_checksum_ok);
     }
     {
-        var fs = try FileStore.open(testing.allocator, file_path, FileSyncer.any());
-        defer fs.deinit();
-        try testing.expect(fs.header_checksum_ok);
-        fs.map[13] ^= 0xFF; // scramble active_slot byte
-        try fs.reReadHeaderForTest();
-        try testing.expect(!fs.header_checksum_ok);
+        var store = try FileStore.open(testing.allocator, file_path, FileSyncer.any());
+        defer store.deinit();
+        try testing.expect(store.header_checksum_ok);
+        store.map[13] ^= 0xFF; // scramble active_slot byte
+        try store.reReadHeaderForTest();
+        try testing.expect(!store.header_checksum_ok);
     }
 }
 
@@ -376,15 +376,15 @@ test "create writes a header that reopen reads back" {
     defer testing.allocator.free(file_path);
 
     {
-        var fs = try FileStore.create(testing.allocator, file_path, FileSyncer.any());
-        defer fs.deinit();
-        try testing.expectEqual(@as(u32, default_page_size), fs.header.page_size);
-        try testing.expectEqual(Endianness.little, fs.header.endianness);
+        var store = try FileStore.create(testing.allocator, file_path, FileSyncer.any());
+        defer store.deinit();
+        try testing.expectEqual(@as(u32, default_page_size), store.header.page_size);
+        try testing.expectEqual(Endianness.little, store.header.endianness);
     }
     {
-        var fs = try FileStore.open(testing.allocator, file_path, FileSyncer.any());
-        defer fs.deinit();
-        try testing.expectEqual(airdb_magic, fs.header.magic);
+        var store = try FileStore.open(testing.allocator, file_path, FileSyncer.any());
+        defer store.deinit();
+        try testing.expectEqual(airdb_magic, store.header.magic);
     }
 }
 
@@ -395,17 +395,17 @@ test "grow adds sections, section 0 base stable, existing bytes preserved" {
     const dlen = try tmp.dir.realPath(testing.io, &pathBuffer);
     const fpath = try std.fs.path.join(testing.allocator, &.{ pathBuffer[0..dlen], "grow.airdb" });
     defer testing.allocator.free(fpath);
-    var fs = try FileStore.create(testing.allocator, fpath, FileSyncer.any());
-    defer fs.deinit();
-    const sections_before = fs.sections.items.len;
-    const base_before = @intFromPtr(fs.map.ptr);
-    fs.map[4096] = 0xAB;
+    var store = try FileStore.create(testing.allocator, fpath, FileSyncer.any());
+    defer store.deinit();
+    const sections_before = store.sections.items.len;
+    const base_before = @intFromPtr(store.map.ptr);
+    store.map[4096] = 0xAB;
     // Cross into a second section.
-    try fs.grow(platform.section_size + 4096 * 10);
-    try testing.expect(fs.sections.items.len > sections_before);
+    try store.grow(platform.section_size + 4096 * 10);
+    try testing.expect(store.sections.items.len > sections_before);
     // Section 0 (where `map` points) is never remapped or moved.
-    try testing.expectEqual(base_before, @intFromPtr(fs.map.ptr));
-    try testing.expectEqual(@as(u8, 0xAB), fs.map[4096]);
+    try testing.expectEqual(base_before, @intFromPtr(store.map.ptr));
+    try testing.expectEqual(@as(u8, 0xAB), store.map[4096]);
 }
 
 test "grow beyond the reservation fails cleanly" {
@@ -415,8 +415,8 @@ test "grow beyond the reservation fails cleanly" {
     const dlen = try tmp.dir.realPath(testing.io, &pathBuffer);
     const fpath = try std.fs.path.join(testing.allocator, &.{ pathBuffer[0..dlen], "toobig.airdb" });
     defer testing.allocator.free(fpath);
-    var fs = try FileStore.create(testing.allocator, fpath, FileSyncer.any());
-    defer fs.deinit();
+    var store = try FileStore.create(testing.allocator, fpath, FileSyncer.any());
+    defer store.deinit();
     // The check rejects before any setLength, so no oversized file is created.
-    try testing.expectError(error.FileTooLarge, fs.grow(FileStore.max_reserved + default_page_size));
+    try testing.expectError(error.FileTooLarge, store.grow(FileStore.max_reserved + default_page_size));
 }

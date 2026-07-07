@@ -700,7 +700,7 @@ test "deleteTyped frees the row's collection storage" {
             .{ .int = 1 },
             .{ .list_blob = &.{ "alpha", "beta" } },
             .{ .set_int = &.{ 1, 2, 3 } },
-            .{ .dict_int = &.{ .{ .key = "k1", .val = 10 }, .{ .key = "k2", .val = 20 } } },
+            .{ .dict_int = &.{ .{ .key = "k1", .value = 10 }, .{ .key = "k2", .value = 20 } } },
         })).catalogRef;
         w.setRoot(catalogRef);
         _ = try w.commit();

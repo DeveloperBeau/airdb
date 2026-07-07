@@ -38,9 +38,9 @@ pub const section_mask: usize = section_size - 1;
 // Windows API bindings, declared locally so the module is self-contained. Gated so
 // the .winapi externs are only present when compiling for Windows.
 const win = if (is_windows) struct {
-    const w = std.os.windows;
-    const HANDLE = w.HANDLE;
-    const DWORD = w.DWORD;
+    const windows = std.os.windows;
+    const HANDLE = windows.HANDLE;
+    const DWORD = windows.DWORD;
     // Win32 BOOL is a plain 32-bit int (std's Bool is a distinct enum; use the raw
     // ABI type so comparisons against 0 and passing 0/1 work directly).
     const BOOL = c_int;
@@ -74,18 +74,18 @@ const win = if (is_windows) struct {
     extern "kernel32" fn CreateFileMappingW(hFile: HANDLE, lpAttrs: ?*anyopaque, flProtect: DWORD, dwMaxHigh: DWORD, dwMaxLow: DWORD, lpName: ?[*:0]const u16) callconv(.winapi) ?HANDLE;
     extern "kernel32" fn MapViewOfFile(hMap: HANDLE, access: DWORD, offHigh: DWORD, offLow: DWORD, bytes: usize) callconv(.winapi) ?*anyopaque;
     extern "kernel32" fn UnmapViewOfFile(base: ?*const anyopaque) callconv(.winapi) BOOL;
-    extern "kernel32" fn CloseHandle(h: HANDLE) callconv(.winapi) BOOL;
-    extern "kernel32" fn LockFileEx(h: HANDLE, flags: DWORD, reserved: DWORD, low: DWORD, high: DWORD, ov: *OVERLAPPED) callconv(.winapi) BOOL;
-    extern "kernel32" fn UnlockFileEx(h: HANDLE, reserved: DWORD, low: DWORD, high: DWORD, ov: *OVERLAPPED) callconv(.winapi) BOOL;
+    extern "kernel32" fn CloseHandle(handle: HANDLE) callconv(.winapi) BOOL;
+    extern "kernel32" fn LockFileEx(handle: HANDLE, flags: DWORD, reserved: DWORD, low: DWORD, high: DWORD, overlapped: *OVERLAPPED) callconv(.winapi) BOOL;
+    extern "kernel32" fn UnlockFileEx(handle: HANDLE, reserved: DWORD, low: DWORD, high: DWORD, overlapped: *OVERLAPPED) callconv(.winapi) BOOL;
     extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) DWORD;
     extern "kernel32" fn OpenProcess(access: DWORD, inherit: BOOL, pid: DWORD) callconv(.winapi) ?HANDLE;
-    extern "kernel32" fn WaitForSingleObject(h: HANDLE, ms: DWORD) callconv(.winapi) DWORD;
+    extern "kernel32" fn WaitForSingleObject(handle: HANDLE, milliseconds: DWORD) callconv(.winapi) DWORD;
     extern "kernel32" fn GetCurrentProcess() callconv(.winapi) HANDLE;
-    extern "kernel32" fn GetProcessTimes(h: HANDLE, creation: *FILETIME, exit: *FILETIME, kernel: *FILETIME, user: *FILETIME) callconv(.winapi) BOOL;
+    extern "kernel32" fn GetProcessTimes(handle: HANDLE, creation: *FILETIME, exit: *FILETIME, kernel: *FILETIME, user: *FILETIME) callconv(.winapi) BOOL;
 
     // PROCESS_MEMORY_COUNTERS: SIZE_T fields are usize; cb/PageFaultCount are DWORD.
     const PROCESS_MEMORY_COUNTERS = extern struct {
-        cb: DWORD,
+        byteCount: DWORD,
         PageFaultCount: DWORD,
         PeakWorkingSetSize: usize,
         WorkingSetSize: usize,
@@ -96,7 +96,7 @@ const win = if (is_windows) struct {
         PagefileUsage: usize,
         PeakPagefileUsage: usize,
     };
-    extern "psapi" fn GetProcessMemoryInfo(process: HANDLE, counters: *PROCESS_MEMORY_COUNTERS, cb: DWORD) callconv(.winapi) BOOL;
+    extern "psapi" fn GetProcessMemoryInfo(process: HANDLE, counters: *PROCESS_MEMORY_COUNTERS, byteCount: DWORD) callconv(.winapi) BOOL;
 } else struct {};
 
 /// Windows peak working set size in bytes, from GetProcessMemoryInfo. Returns 0 if
@@ -139,15 +139,15 @@ pub fn mapSection(file: std.Io.File, file_offset: u64, length: usize) !Section {
         // One file-mapping object per section. Passing max-size 0 makes the object track
         // the current file size; the view starts at the section's file offset. The file
         // has already been extended to cover this section, so the view is fully backed.
-        const h = win.CreateFileMappingW(file.handle, null, win.PAGE_READWRITE, 0, 0, null) orelse return error.MapFailed;
-        errdefer _ = win.CloseHandle(h);
+        const mappingHandle = win.CreateFileMappingW(file.handle, null, win.PAGE_READWRITE, 0, 0, null) orelse return error.MapFailed;
+        errdefer _ = win.CloseHandle(mappingHandle);
         const off_high: win.DWORD = @intCast(file_offset >> 32);
         const off_low: win.DWORD = @intCast(file_offset & 0xFFFFFFFF);
-        const ptr = win.MapViewOfFile(h, win.FILE_MAP_READ | win.FILE_MAP_WRITE, off_high, off_low, length) orelse return error.MapFailed;
+        const ptr = win.MapViewOfFile(mappingHandle, win.FILE_MAP_READ | win.FILE_MAP_WRITE, off_high, off_low, length) orelse return error.MapFailed;
         const base: [*]align(page) u8 = @ptrCast(@alignCast(ptr));
-        return .{ .map = base[0..length], .handle = h };
+        return .{ .map = base[0..length], .handle = mappingHandle };
     } else {
-        const m = try std.posix.mmap(
+        const mapped = try std.posix.mmap(
             null,
             length,
             .{ .READ = true, .WRITE = true },
@@ -155,7 +155,7 @@ pub fn mapSection(file: std.Io.File, file_offset: u64, length: usize) !Section {
             file.handle,
             file_offset,
         );
-        return .{ .map = m, .handle = {} };
+        return .{ .map = mapped, .handle = {} };
     }
 }
 
@@ -168,10 +168,10 @@ pub fn mapSection(file: std.Io.File, file_offset: u64, length: usize) !Section {
 /// owns the lock, returns false immediately instead of blocking. Other failures error.
 pub fn lockFileExclusive(file: std.Io.File, blocking: bool) !bool {
     if (is_windows) {
-        var ov = std.mem.zeroes(win.OVERLAPPED);
+        var overlapped = std.mem.zeroes(win.OVERLAPPED);
         var flags: win.DWORD = win.LOCKFILE_EXCLUSIVE_LOCK;
         if (!blocking) flags |= win.LOCKFILE_FAIL_IMMEDIATELY;
-        if (win.LockFileEx(file.handle, flags, 0, win.lock_all_low, win.lock_all_high, &ov) != 0) return true;
+        if (win.LockFileEx(file.handle, flags, 0, win.lock_all_low, win.lock_all_high, &overlapped) != 0) return true;
         if (!blocking) return false; // contended (ERROR_LOCK_VIOLATION / IO_PENDING)
         return error.LockFailed;
     } else {
@@ -179,11 +179,11 @@ pub fn lockFileExclusive(file: std.Io.File, blocking: bool) !bool {
             std.posix.LOCK.EX
         else
             std.posix.LOCK.EX | std.posix.LOCK.NB;
-        const rc = std.c.flock(file.handle, operation);
-        switch (std.c.errno(rc)) {
+        const resultCode = std.c.flock(file.handle, operation);
+        switch (std.c.errno(resultCode)) {
             .SUCCESS => return true,
             .AGAIN => return false, // only reachable in the non-blocking case
-            else => |e| return std.posix.unexpectedErrno(e),
+            else => |errno| return std.posix.unexpectedErrno(errno),
         }
     }
 }
@@ -191,8 +191,8 @@ pub fn lockFileExclusive(file: std.Io.File, blocking: bool) !bool {
 /// Release the advisory lock held on `file`.
 pub fn unlockFile(file: std.Io.File) void {
     if (is_windows) {
-        var ov = std.mem.zeroes(win.OVERLAPPED);
-        _ = win.UnlockFileEx(file.handle, 0, win.lock_all_low, win.lock_all_high, &ov);
+        var overlapped = std.mem.zeroes(win.OVERLAPPED);
+        _ = win.UnlockFileEx(file.handle, 0, win.lock_all_low, win.lock_all_high, &overlapped);
     } else {
         _ = std.c.flock(file.handle, std.posix.LOCK.UN);
     }
@@ -220,13 +220,13 @@ pub fn currentPid() u32 {
 pub fn processStartToken(pid: u32) ?u64 {
     if (pid == 0) return null;
     if (is_windows) {
-        const h = win.OpenProcess(win.PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) orelse return null;
-        defer _ = win.CloseHandle(h);
+        const processHandle = win.OpenProcess(win.PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) orelse return null;
+        defer _ = win.CloseHandle(processHandle);
         var creation: win.FILETIME = undefined;
         var exit: win.FILETIME = undefined;
         var kernel: win.FILETIME = undefined;
         var user: win.FILETIME = undefined;
-        if (win.GetProcessTimes(h, &creation, &exit, &kernel, &user) == 0) return null;
+        if (win.GetProcessTimes(processHandle, &creation, &exit, &kernel, &user) == 0) return null;
         return (@as(u64, creation.dwHighDateTime) << 32) | creation.dwLowDateTime;
     } else if (comptime builtin.target.os.tag.isDarwin()) {
         // kinfo_proc's first field is the extern_proc union whose overlay is
@@ -235,8 +235,8 @@ pub fn processStartToken(pid: u32) ?u64 {
         var buffer: [1024]u8 align(8) = undefined;
         var length: usize = buffer.len;
         var mib = [4]c_int{ 1, 14, 1, @intCast(pid) }; // CTL_KERN, KERN_PROC, KERN_PROC_PID, pid
-        const rc = std.c.sysctl(&mib, 4, &buffer, &length, null, 0);
-        if (std.c.errno(rc) != .SUCCESS or length < 16) return null;
+        const resultCode = std.c.sysctl(&mib, 4, &buffer, &length, null, 0);
+        if (std.c.errno(resultCode) != .SUCCESS or length < 16) return null;
         const sec = std.mem.readInt(i64, buffer[0..8], .little);
         const usec = std.mem.readInt(i32, buffer[8..12], .little);
         return @as(u64, @bitCast(sec)) *% 1_000_000 +% @as(u32, @bitCast(usec));
@@ -245,17 +245,17 @@ pub fn processStartToken(pid: u32) ?u64 {
         var pathBuffer: [64]u8 = undefined;
         const path = std.fmt.bufPrint(&pathBuffer, "/proc/{d}/stat", .{pid}) catch return null;
         const io = std.Io.Threaded.global_single_threaded.io();
-        var f = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return null;
-        defer f.close(io);
+        var file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return null;
+        defer file.close(io);
         var statBuffer: [512]u8 = undefined;
-        const n = f.readPositionalAll(io, &statBuffer, 0) catch return null;
-        const content = statBuffer[0..n];
+        const bytesRead = file.readPositionalAll(io, &statBuffer, 0) catch return null;
+        const content = statBuffer[0..bytesRead];
         // comm can contain spaces/parens: skip past the LAST ')'.
         const close = std.mem.lastIndexOfScalar(u8, content, ')') orelse return null;
-        var it = std.mem.tokenizeScalar(u8, content[close + 1 ..], ' ');
+        var iterator = std.mem.tokenizeScalar(u8, content[close + 1 ..], ' ');
         // The token after ')' is field 3 (state); starttime is field 22.
         var field: usize = 3;
-        while (it.next()) |tok| : (field += 1) {
+        while (iterator.next()) |tok| : (field += 1) {
             if (field == 22) return std.fmt.parseInt(u64, tok, 10) catch null;
         }
         return null;
@@ -267,16 +267,16 @@ pub fn processStartToken(pid: u32) ?u64 {
 pub fn processAlive(pid: u32) bool {
     if (pid == 0) return false;
     if (is_windows) {
-        const h = win.OpenProcess(win.SYNCHRONIZE, 0, pid) orelse return false; // gone
-        defer _ = win.CloseHandle(h);
+        const processHandle = win.OpenProcess(win.SYNCHRONIZE, 0, pid) orelse return false; // gone
+        defer _ = win.CloseHandle(processHandle);
         // Alive if it has not become signaled (exited) within a 0ms wait.
-        return win.WaitForSingleObject(h, 0) == win.WAIT_TIMEOUT;
+        return win.WaitForSingleObject(processHandle, 0) == win.WAIT_TIMEOUT;
     } else {
         // kill(pid, 0): success or EPERM means alive; ESRCH means dead.
         std.posix.kill(
             @as(std.posix.pid_t, @intCast(pid)),
             @as(std.posix.SIG, @enumFromInt(0)),
-        ) catch |e| switch (e) {
+        ) catch |err| switch (err) {
             error.ProcessNotFound => return false, // ESRCH: no such process
             error.PermissionDenied => return true, // EPERM: alive, not ours
             else => return true, // conservative: treat unknown errors as alive
@@ -331,7 +331,7 @@ pub fn pageFaults() struct { minor: u64, major: u64 } {
 }
 
 test "pageFaults returns plausible values" {
-    const pf = pageFaults();
+    const faults = pageFaults();
     // A running process has taken at least some minor faults to map its image.
-    try std.testing.expect(pf.minor > 0);
+    try std.testing.expect(faults.minor > 0);
 }

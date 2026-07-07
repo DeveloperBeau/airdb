@@ -17,19 +17,19 @@ pub fn encodeLeaf(buffer: []u8, values: []const u64) usize {
     std.debug.assert(values.len <= leafCap);
     buffer[0] = kind_leaf;
     std.mem.writeInt(u16, buffer[1..3], @intCast(values.len), .little);
-    var off: usize = leaf_header;
-    for (values) |v| {
-        std.mem.writeInt(u64, buffer[off..][0..8], v, .little);
-        off += 8;
+    var offset: usize = leaf_header;
+    for (values) |value| {
+        std.mem.writeInt(u64, buffer[offset..][0..8], value, .little);
+        offset += 8;
     }
-    return off;
+    return offset;
 }
 
 pub const LeafView = struct {
     bytes: []const u8,
     count: u16,
-    pub fn value(self: LeafView, i: usize) u64 {
-        return std.mem.readInt(u64, self.bytes[leaf_header + i * 8 ..][0..8], .little);
+    pub fn value(self: LeafView, entryIndex: usize) u64 {
+        return std.mem.readInt(u64, self.bytes[leaf_header + entryIndex * 8 ..][0..8], .little);
     }
 };
 
@@ -47,24 +47,24 @@ pub fn encodeInner(buffer: []u8, child_refs: []const u64, child_counts: []const 
     std.debug.assert(child_refs.len <= fanout);
     buffer[0] = kind_inner;
     std.mem.writeInt(u16, buffer[1..3], @intCast(child_refs.len), .little);
-    var off: usize = inner_header;
-    for (child_refs, child_counts) |r, c| {
-        std.mem.writeInt(u64, buffer[off..][0..8], r, .little);
-        off += 8;
-        std.mem.writeInt(u64, buffer[off..][0..8], c, .little);
-        off += 8;
+    var offset: usize = inner_header;
+    for (child_refs, child_counts) |ref, count| {
+        std.mem.writeInt(u64, buffer[offset..][0..8], ref, .little);
+        offset += 8;
+        std.mem.writeInt(u64, buffer[offset..][0..8], count, .little);
+        offset += 8;
     }
-    return off;
+    return offset;
 }
 
 pub const InnerView = struct {
     bytes: []const u8,
     child_count: u16,
-    pub fn childRef(self: InnerView, i: usize) u64 {
-        return std.mem.readInt(u64, self.bytes[inner_header + i * 16 ..][0..8], .little);
+    pub fn childRef(self: InnerView, entryIndex: usize) u64 {
+        return std.mem.readInt(u64, self.bytes[inner_header + entryIndex * 16 ..][0..8], .little);
     }
-    pub fn childCount(self: InnerView, i: usize) u64 {
-        return std.mem.readInt(u64, self.bytes[inner_header + i * 16 + 8 ..][0..8], .little);
+    pub fn childCount(self: InnerView, entryIndex: usize) u64 {
+        return std.mem.readInt(u64, self.bytes[inner_header + entryIndex * 16 + 8 ..][0..8], .little);
     }
 };
 

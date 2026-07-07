@@ -61,8 +61,8 @@ pub const get = Tree.get;
 
 /// Insert or update key->val in the tree rooted at root.
 /// Returns the (possibly new) root Reference. Grows the tree height on root split.
-pub fn insert(transaction: anytype, root: Reference, key: u64, val: u64) !Reference {
-    return Tree.insert(transaction, root, key, key, val);
+pub fn insert(transaction: anytype, root: Reference, key: u64, value: u64) !Reference {
+    return Tree.insert(transaction, root, key, key, value);
 }
 
 /// Remove key from the tree rooted at root.
@@ -96,21 +96,21 @@ pub const forEachEntry = Tree.forEachEntry;
 /// admit a batch whose keys do not clear the true maximum, corrupting the primaryKey
 /// index with duplicates and broken ordering.
 pub fn maxKey(transaction: anytype, root: Reference) !?u64 {
-    var cur: Reference = root;
+    var currentRef: Reference = root;
     var depth: usize = 0;
     while (depth < max_depth) : (depth += 1) {
-        const bytes = try derefNode(transaction, cur);
+        const bytes = try derefNode(transaction, currentRef);
         if (bytes[0] == kind_leaf) {
-            const v = try parseLeaf(bytes);
-            if (v.count == 0) return null; // only the empty root reaches here
-            return v.key(v.count - 1);
+            const view = try parseLeaf(bytes);
+            if (view.count == 0) return null; // only the empty root reaches here
+            return view.key(view.count - 1);
         }
-        const v = try parseInner(bytes);
-        var i: usize = v.child_count;
-        cur = blk: {
-            while (i > 0) {
-                i -= 1;
-                if (v.subtreeCount(i) > 0) break :blk v.childRef(i);
+        const view = try parseInner(bytes);
+        var childIndex: usize = view.child_count;
+        currentRef = blk: {
+            while (childIndex > 0) {
+                childIndex -= 1;
+                if (view.subtreeCount(childIndex) > 0) break :blk view.childRef(childIndex);
             }
             return null; // every subtree is empty
         };
@@ -147,42 +147,42 @@ pub const appendRun = bulkBuild.appendRun;
 pub fn forEachEntryInRange(
     transaction: anytype,
     root: Reference,
-    lo: u64,
-    hi: u64,
+    low: u64,
+    high: u64,
     ctx: anytype,
     comptime onEntry: fn (@TypeOf(ctx), u64, u64) anyerror!void,
 ) !void {
-    return forEachEntryInRangeAt(transaction, root, lo, hi, ctx, onEntry, 0);
+    return forEachEntryInRangeAt(transaction, root, low, high, ctx, onEntry, 0);
 }
 
 fn forEachEntryInRangeAt(
     transaction: anytype,
     root: Reference,
-    lo: u64,
-    hi: u64,
+    low: u64,
+    high: u64,
     ctx: anytype,
     comptime onEntry: fn (@TypeOf(ctx), u64, u64) anyerror!void,
     depth: usize,
 ) !void {
-    if (root == 0 or lo > hi) return;
+    if (root == 0 or low > high) return;
     if (depth >= max_depth) return error.Corrupt;
     const bytes = try derefNode(transaction, root);
     if (bytes[0] == kind_leaf) {
         const leaf = try parseLeaf(bytes);
-        var i: usize = leaf.lowerBound(lo);
-        while (i < leaf.count) : (i += 1) {
-            const k = leaf.key(i);
-            if (k > hi) return;
-            try onEntry(ctx, k, leaf.value(i));
+        var childIndex: usize = leaf.lowerBound(low);
+        while (childIndex < leaf.count) : (childIndex += 1) {
+            const key = leaf.key(childIndex);
+            if (key > high) return;
+            try onEntry(ctx, key, leaf.value(childIndex));
         }
         return;
     }
     const inner = try parseInner(bytes);
-    var i: usize = try Tree.childIndexForKey(transaction, inner, lo);
-    while (i < inner.child_count) : (i += 1) {
-        if (inner.lowKey(i) > hi) return;
-        const child_ref: Reference = inner.childRef(i);
-        try forEachEntryInRangeAt(transaction, child_ref, lo, hi, ctx, onEntry, depth + 1);
+    var childIndex: usize = try Tree.childIndexForKey(transaction, inner, low);
+    while (childIndex < inner.child_count) : (childIndex += 1) {
+        if (inner.lowKey(childIndex) > high) return;
+        const child_ref: Reference = inner.childRef(childIndex);
+        try forEachEntryInRangeAt(transaction, child_ref, low, high, ctx, onEntry, depth + 1);
     }
 }
 
@@ -191,37 +191,37 @@ pub fn makeInnerForTest(transaction: anytype, children: []const struct { ref: u6
     var refs: [fanout]u64 = undefined;
     var lows: [fanout]u64 = undefined;
     var counts: [fanout]u64 = undefined;
-    for (children, 0..) |c, i| {
-        refs[i] = c.ref;
-        lows[i] = c.low;
-        counts[i] = c.count;
+    for (children, 0..) |child, childIndex| {
+        refs[childIndex] = child.ref;
+        lows[childIndex] = child.low;
+        counts[childIndex] = child.count;
     }
-    const a = try transaction.alloc(inner_node_size);
-    _ = encodeInner(a.bytes, refs[0..children.len], lows[0..children.len], counts[0..children.len]);
-    return a.ref;
+    const allocation = try transaction.alloc(inner_node_size);
+    _ = encodeInner(allocation.bytes, refs[0..children.len], lows[0..children.len], counts[0..children.len]);
+    return allocation.ref;
 }
 
 test "leaf encode/decode round-trips sorted pairs" {
     var buffer: [leaf_node_size]u8 = undefined;
     const keys = [_]u64{ 1, 5, 9 };
     const vals = [_]u64{ 10, 50, 90 };
-    const n = encodeLeaf(&buffer, &keys, &vals);
-    const v = try parseLeaf(buffer[0..n]);
-    try std.testing.expectEqual(@as(u16, 3), v.count);
-    try std.testing.expectEqual(@as(u64, 5), v.key(1));
-    try std.testing.expectEqual(@as(u64, 90), v.value(2));
+    const encodedLength = encodeLeaf(&buffer, &keys, &vals);
+    const view = try parseLeaf(buffer[0..encodedLength]);
+    try std.testing.expectEqual(@as(u16, 3), view.count);
+    try std.testing.expectEqual(@as(u64, 5), view.key(1));
+    try std.testing.expectEqual(@as(u64, 90), view.value(2));
 }
 
 test "lowerBound finds the first index whose key is >= the search key" {
     var buffer: [leaf_node_size]u8 = undefined;
     const keys = [_]u64{ 2, 4, 6, 8 };
     const vals = [_]u64{ 0, 0, 0, 0 };
-    const n = encodeLeaf(&buffer, &keys, &vals);
-    const v = try parseLeaf(buffer[0..n]);
-    try std.testing.expectEqual(@as(usize, 0), v.lowerBound(1));
-    try std.testing.expectEqual(@as(usize, 1), v.lowerBound(4));
-    try std.testing.expectEqual(@as(usize, 2), v.lowerBound(5));
-    try std.testing.expectEqual(@as(usize, 4), v.lowerBound(9));
+    const encodedLength = encodeLeaf(&buffer, &keys, &vals);
+    const view = try parseLeaf(buffer[0..encodedLength]);
+    try std.testing.expectEqual(@as(usize, 0), view.lowerBound(1));
+    try std.testing.expectEqual(@as(usize, 1), view.lowerBound(4));
+    try std.testing.expectEqual(@as(usize, 2), view.lowerBound(5));
+    try std.testing.expectEqual(@as(usize, 4), view.lowerBound(9));
 }
 
 test {

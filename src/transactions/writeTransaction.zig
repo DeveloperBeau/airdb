@@ -53,7 +53,7 @@ pub const WriteTransaction = struct {
     }
 
     fn reclaimHorizon(self: *WriteTransaction) u64 {
-        const h = self.cached_horizon orelse blk: {
+        const horizon = self.cached_horizon orelse blk: {
             // Horizon-gated reuse is only safe when no reader in ANY live
             // process pins a version below the extent's freeing version.
             // globalHorizon = min of live processes' min-pinned versions,
@@ -61,16 +61,16 @@ pub const WriteTransaction = struct {
             // slot this process cannot advertise its readers, so it stays
             // bump-only (Database.open/create refuse slotless attaches, so this is
             // pure defense).
-            const gh: u64 = if (self.database.participant_slot == null) 0 else self.database.coord.globalHorizon(self.database.active_version);
-            self.cached_horizon = gh;
-            break :blk gh;
+            const globalHorizon: u64 = if (self.database.participant_slot == null) 0 else self.database.coord.globalHorizon(self.database.active_version);
+            self.cached_horizon = globalHorizon;
+            break :blk globalHorizon;
         };
         // Clamp by the retention window ON EVERY ALLOCATION (a single atomic
         // load from the shared header page). Another process may raise the
         // floor mid-transaction and immediately admit a point-in-time reader
         // under it; a cached window would let this writer keep reusing space
         // that reader's snapshot references.
-        return @min(h, self.database.active_version -| self.database.retainVersions());
+        return @min(horizon, self.database.active_version -| self.database.retainVersions());
     }
 
     pub fn alloc(self: *WriteTransaction, size: usize) !Allocation {
@@ -78,9 +78,9 @@ pub const WriteTransaction = struct {
         //    uncommitted transaction; no committed version or reader can reference it, so
         //    reusing it is always safe and keeps single-transaction bulk writes space-bounded).
         //    Exact-size match: no carving, so fixed-size node churn never fragments the pool.
-        if (self.database.arena.allocFromPool(&self.transactionReuse, size, std.math.maxInt(u64))) |a| return a;
+        if (self.database.arena.allocFromPool(&self.transactionReuse, size, std.math.maxInt(u64))) |allocation| return allocation;
         // 2. Reuse a committed-free node, gated by the per-transaction reclaim horizon.
-        if (self.database.arena.allocFromPool(&self.work_freelist, size, self.reclaimHorizon())) |a| return a;
+        if (self.database.arena.allocFromPool(&self.work_freelist, size, self.reclaimHorizon())) |allocation| return allocation;
         // 3. Bump-allocate, growing the file if the arena is full.
         return self.database.bumpGrowing(size);
     }
@@ -222,12 +222,12 @@ pub const WriteTransaction = struct {
         const rebuild_io = std.Io.Threaded.global_single_threaded.io();
         const rebuild_start = Io.Clock.now(.awake, rebuild_io).nanoseconds;
         // 1. Copy extents that work_freelist still holds (i.e. not reused this transaction).
-        for (self.work_freelist.extents.items) |e| {
-            try new_fl.add(e);
+        for (self.work_freelist.extents.items) |extent| {
+            try new_fl.add(extent);
         }
         // 2. Append in-flight frees (tagged with new_version; not yet reusable).
-        for (self.in_flight_frees.items) |e| {
-            try new_fl.add(e);
+        for (self.in_flight_frees.items) |extent| {
+            try new_fl.add(extent);
         }
         // 3. Reclaim the OLD free-list chain so its space re-enters the free
         //    pool. Every chunk is walked: reclaiming only the head would leak
@@ -238,14 +238,14 @@ pub const WriteTransaction = struct {
             while (cref != 0) : (hops += 1) {
                 if (hops >= FreeList.max_chunks) return error.Corrupt;
                 const header = try self.deref(cref, FreeList.chunk_header_bytes);
-                const cnt = std.mem.readInt(u32, header[0..4], .little);
+                const extentCount = std.mem.readInt(u32, header[0..4], .little);
                 const next = std.mem.readInt(u64, header[4..12], .little);
                 // Legitimate chains strictly decrease (written back-to-front);
                 // anything else is corruption and must not feed the free list.
                 if (next != 0 and next >= cref) return error.Corrupt;
                 try new_fl.add(.{
                     .offset = cref,
-                    .len = @intCast(FreeList.chunkByteLen(cnt)),
+                    .len = @intCast(FreeList.chunkByteLen(extentCount)),
                     .freed_version = self.new_version,
                 });
                 cref = next;
@@ -254,8 +254,8 @@ pub const WriteTransaction = struct {
         // 3b. Reclaim any leftover transaction-private nodes that were freed but not reused
         //     within this transaction. They are committed-but-unreferenced space; tag them
         //     with this version so the committed free list can reclaim them (no leak).
-        for (self.transactionReuse.extents.items) |e| {
-            try new_fl.add(.{ .offset = e.offset, .len = e.len, .freed_version = self.new_version });
+        for (self.transactionReuse.extents.items) |extent| {
+            try new_fl.add(.{ .offset = extent.offset, .len = extent.len, .freed_version = self.new_version });
         }
         database.fl_rebuild_ns += @intCast(Io.Clock.now(.awake, rebuild_io).nanoseconds - rebuild_start);
         return new_fl;
@@ -278,18 +278,18 @@ pub const WriteTransaction = struct {
         const enc_io = std.Io.Threaded.global_single_threaded.io();
         const enc_start = Io.Clock.now(.awake, enc_io).nanoseconds;
         const items = new_fl.extents.items;
-        const nchunks = @max(1, (items.len + FreeList.chunk_extent_cap - 1) / FreeList.chunk_extent_cap);
+        const chunkCount = @max(1, (items.len + FreeList.chunk_extent_cap - 1) / FreeList.chunk_extent_cap);
         var head_ref: u64 = 0;
         var head_len: usize = 0;
         {
-            var ci = nchunks;
-            while (ci > 0) {
-                ci -= 1;
-                const lo = ci * FreeList.chunk_extent_cap;
-                const hi = @min(lo + FreeList.chunk_extent_cap, items.len);
-                const chunk_len = FreeList.chunkByteLen(hi - lo);
+            var chunkIndex = chunkCount;
+            while (chunkIndex > 0) {
+                chunkIndex -= 1;
+                const chunkStart = chunkIndex * FreeList.chunk_extent_cap;
+                const chunkEnd = @min(chunkStart + FreeList.chunk_extent_cap, items.len);
+                const chunk_len = FreeList.chunkByteLen(chunkEnd - chunkStart);
                 const node = try database.bumpGrowing(chunk_len);
-                const written = FreeList.encodeChunk(items[lo..hi], head_ref, node.bytes);
+                const written = FreeList.encodeChunk(items[chunkStart..chunkEnd], head_ref, node.bytes);
                 std.debug.assert(written == chunk_len);
                 head_ref = node.ref;
                 head_len = chunk_len;
@@ -331,9 +331,9 @@ pub const WriteTransaction = struct {
         // and self-overwriting, so we never revert it.
         const head = std.mem.readInt(u64, database.store.map[ring_head_off..][0..8], .little);
         const ringIndex: usize = @intCast(head % ring_capacity);
-        const e = ring_off + ringIndex * 16;
-        std.mem.writeInt(u64, database.store.map[e..][0..8], self.new_version, .little);
-        std.mem.writeInt(u64, database.store.map[e + 8 ..][0..8], self.new_root, .little);
+        const entryOffset = ring_off + ringIndex * 16;
+        std.mem.writeInt(u64, database.store.map[entryOffset..][0..8], self.new_version, .little);
+        std.mem.writeInt(u64, database.store.map[entryOffset + 8 ..][0..8], self.new_root, .little);
         std.mem.writeInt(u64, database.store.map[ring_head_off..][0..8], head + 1, .little);
 
         return inactiveSlotIndex;

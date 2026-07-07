@@ -46,9 +46,9 @@ pub fn selectActiveSlot(database: *Database) !Slot {
         // fallback silently resumes from the previous version, so it is recorded
         // on the Database and surfaced via metrics().
         return Slot.decode(database.store.map[primary_off..][0..Slot.size]) catch {
-            const s = Slot.decode(database.store.map[other_off..][0..Slot.size]) catch return error.Corrupt;
+            const slot = Slot.decode(database.store.map[other_off..][0..Slot.size]) catch return error.Corrupt;
             database.recovered_fallback = true;
-            return s;
+            return slot;
         };
     } else {
         // Header checksum failed: the authoritative active_slot pointer is unreadable,
@@ -77,14 +77,14 @@ pub fn selectActiveSlot(database: *Database) !Slot {
 /// have version <= lv, returns the one with the highest version. Returns null
 /// if no qualifying slot exists. Slots with version > lv are in-flight or
 /// aborted and must never be returned.
-fn selectPublishedSlot(database: *Database, lv: u64) ?Slot {
+fn selectPublishedSlot(database: *Database, latestVersion: u64) ?Slot {
     const maybe_a: ?Slot = Slot.decode(database.store.map[slot_a_off..][0..Slot.size]) catch null;
     const maybe_b: ?Slot = Slot.decode(database.store.map[slot_b_off..][0..Slot.size]) catch null;
     var best: ?Slot = null;
-    for ([_]?Slot{ maybe_a, maybe_b }) |ms| {
-        const s = ms orelse continue;
-        if (s.version > lv) continue;
-        if (best == null or s.version > best.?.version) best = s;
+    for ([_]?Slot{ maybe_a, maybe_b }) |maybeSlot| {
+        const slot = maybeSlot orelse continue;
+        if (slot.version > latestVersion) continue;
+        if (best == null or slot.version > best.?.version) best = slot;
     }
     return best;
 }
@@ -98,8 +98,8 @@ fn selectPublishedSlot(database: *Database, lv: u64) ?Slot {
 /// It is called at the start of beginRead and beginWrite (before any transaction
 /// state is built), which is safe.
 pub fn refreshToLatest(database: *Database) !void {
-    const lv = database.coord.latestVersion(); // acquire-load of the published version
-    if (lv <= database.active_version) return; // nothing newer has been published
+    const latestVersion = database.coord.latestVersion(); // acquire-load of the published version
+    if (latestVersion <= database.active_version) return; // nothing newer has been published
     try database.store.readHeader(); // refresh header_checksum_ok / mapping view (for integrity use elsewhere)
     // If another process extended the file, map the new sections before dereferencing
     // slot descriptors or free-list nodes that may live in the grown region.
@@ -109,7 +109,7 @@ pub fn refreshToLatest(database: *Database) !void {
         try database.store.grow(@intCast(flen));
         database.arena.sections = database.store.sectionsView();
     }
-    const published = selectPublishedSlot(database, lv) orelse return; // no qualifying published slot visible yet
+    const published = selectPublishedSlot(database, latestVersion) orelse return; // no qualifying published slot visible yet
     if (published.version <= database.active_version) return;
     // Decode the published free list into a temporary FIRST. A decode
     // failure must leave this instance's committed state (version, root,
@@ -135,8 +135,8 @@ pub fn refreshToLatest(database: *Database) !void {
 /// Returns the minimum pinned version among all active readers, or sentinel_max if none.
 fn localMinPinned(database: *Database) u64 {
     var min: ?u64 = null;
-    var it = database.pins.iterator();
-    while (it.next()) |entry| {
+    var iterator = database.pins.iterator();
+    while (iterator.next()) |entry| {
         if (entry.value_ptr.* == 0) continue;
         if (min == null or entry.key_ptr.* < min.?) min = entry.key_ptr.*;
     }
@@ -153,8 +153,8 @@ pub fn publishPins(database: *Database) void {
 /// version if no reader is open.
 pub fn horizon(database: *Database) u64 {
     var min: ?u64 = null;
-    var it = database.pins.iterator();
-    while (it.next()) |entry| {
+    var iterator = database.pins.iterator();
+    while (iterator.next()) |entry| {
         if (entry.value_ptr.* == 0) continue;
         if (min == null or entry.key_ptr.* < min.?) min = entry.key_ptr.*;
     }
@@ -176,8 +176,8 @@ pub fn retainVersions(database: *Database) u64 {
 /// process honors it immediately, and it is carried to disk by the next
 /// commit's flush. Lowering the window while point-in-time readers are
 /// active in other processes is unsafe; raise-only while readers may exist.
-pub fn setRetainVersions(database: *Database, n: u64) void {
-    @atomicStore(u64, retainPtr(database), n, .release);
+pub fn setRetainVersions(database: *Database, count: u64) void {
+    @atomicStore(u64, retainPtr(database), count, .release);
 }
 
 /// Root ref for a committed version, or null if not retained / not yet committed.
@@ -194,13 +194,13 @@ pub fn versionRoot(database: *Database, version: u64) ?u64 {
     if (version > database.active_version) return null;
     const map = database.store.map;
     const head = std.mem.readInt(u64, map[ring_head_off..][0..8], .little);
-    const n = @min(head, ring_capacity);
-    var j: u64 = 0;
-    while (j < n) : (j += 1) {
-        const slotIndex: usize = @intCast((head - 1 - j) % ring_capacity);
-        const e = ring_off + slotIndex * 16;
-        const v = std.mem.readInt(u64, map[e..][0..8], .little);
-        if (v == version) return std.mem.readInt(u64, map[e + 8 ..][0..8], .little);
+    const entryCount = @min(head, ring_capacity);
+    var entryIndex: u64 = 0;
+    while (entryIndex < entryCount) : (entryIndex += 1) {
+        const slotIndex: usize = @intCast((head - 1 - entryIndex) % ring_capacity);
+        const entryOffset = ring_off + slotIndex * 16;
+        const entryVersion = std.mem.readInt(u64, map[entryOffset..][0..8], .little);
+        if (entryVersion == version) return std.mem.readInt(u64, map[entryOffset + 8 ..][0..8], .little);
     }
     return null;
 }
@@ -211,14 +211,14 @@ pub fn versionRoot(database: *Database, version: u64) ?u64 {
 pub fn oldestRetainedVersion(database: *Database) u64 {
     const map = database.store.map;
     const head = std.mem.readInt(u64, map[ring_head_off..][0..8], .little);
-    const n = @min(head, ring_capacity);
-    var i: u64 = 0;
+    const entryCount = @min(head, ring_capacity);
+    var entryIndex: u64 = 0;
     var min: ?u64 = null;
-    while (i < n) : (i += 1) {
-        const e = ring_off + @as(usize, @intCast(i)) * 16;
-        const v = std.mem.readInt(u64, map[e..][0..8], .little);
-        if (v > database.active_version) continue;
-        if (min == null or v < min.?) min = v;
+    while (entryIndex < entryCount) : (entryIndex += 1) {
+        const entryOffset = ring_off + @as(usize, @intCast(entryIndex)) * 16;
+        const entryVersion = std.mem.readInt(u64, map[entryOffset..][0..8], .little);
+        if (entryVersion > database.active_version) continue;
+        if (min == null or entryVersion < min.?) min = entryVersion;
     }
     return min orelse database.active_version;
 }
@@ -248,11 +248,11 @@ test "refresh does not advance to a durable-but-unpublished (aborted) slot" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     {
-        var w = try database.beginWrite();
-        const a = try w.alloc(8);
-        @memcpy(a.bytes, "PUBLISH_");
-        w.setRoot(a.ref);
-        _ = try w.commit(); // publishes; coord.latest_version advances to this version
+        var writeTransaction = try database.beginWrite();
+        const allocation = try writeTransaction.alloc(8);
+        @memcpy(allocation.bytes, "PUBLISH_");
+        writeTransaction.setRoot(allocation.ref);
+        _ = try writeTransaction.commit(); // publishes; coord.latest_version advances to this version
     }
     const published_version = database.active_version;
     // Forge a VALID slot with a much higher version into the inactive slot bytes,
@@ -309,11 +309,11 @@ test "falling back past a corrupt primary slot is surfaced in metrics" {
     {
         var database = try Database.create(testing.allocator, path);
         defer database.deinit();
-        var w = try database.beginWrite();
-        const a = try w.alloc(8);
-        @memcpy(a.bytes, "VERSION2");
-        w.setRoot(a.ref);
-        _ = try w.commit();
+        var writeTransaction = try database.beginWrite();
+        const allocation = try writeTransaction.alloc(8);
+        @memcpy(allocation.bytes, "VERSION2");
+        writeTransaction.setRoot(allocation.ref);
+        _ = try writeTransaction.commit();
         try testing.expect(!database.metrics().recovered_fallback); // clean session
         // Corrupt the PRIMARY (active) slot's checksum region on disk.
         const primary_off: usize = if (database.store.header.active_slot == 0) slot_a_off else slot_b_off;

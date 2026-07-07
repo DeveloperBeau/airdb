@@ -29,8 +29,8 @@ fn fullSync(file: Io.File) !void {
     if (comptime builtin.target.os.tag.isDarwin()) {
         // F_FULLFSYNC (51) forces the drive's write cache to platter, unlike plain fsync.
         // Fall back to file.sync if the underlying filesystem does not support it (e.g. tmpfs).
-        const rc = std.c.fcntl(file.handle, std.c.F.FULLFSYNC, @as(c_int, 0));
-        if (std.c.errno(rc) != .SUCCESS) {
+        const resultCode = std.c.fcntl(file.handle, std.c.F.FULLFSYNC, @as(c_int, 0));
+        if (std.c.errno(resultCode) != .SUCCESS) {
             try file.sync(std.Io.Threaded.global_single_threaded.io());
         }
     } else {

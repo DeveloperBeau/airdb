@@ -42,9 +42,9 @@ pub fn decodeFreeListNode(database: *Database, free_list_ref: Reference, out: *F
     // free-list chunks carry no checksum of their own, and the reuse path
     // translates offsets without bounds checks -- a bit-rotted extent
     // would silently hand out live or out-of-bounds bytes as free space.
-    for (out.extents.items) |ex| {
-        if (ex.len == 0 or ex.offset % 8 != 0) return error.Corrupt;
-        if (ex.offset > limit or ex.len > limit - ex.offset) return error.Corrupt;
+    for (out.extents.items) |extent| {
+        if (extent.len == 0 or extent.offset % 8 != 0) return error.Corrupt;
+        if (extent.offset > limit or extent.len > limit - extent.offset) return error.Corrupt;
     }
     return head_len;
 }

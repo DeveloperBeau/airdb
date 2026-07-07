@@ -58,9 +58,9 @@ pub const get = Tree.get;
 /// exists (exact bytes), its value is overwritten in place and no duplicate is
 /// added; otherwise the key bytes are stored in the blob heap and a new entry
 /// is inserted in byte-sorted order. Returns the (possibly new) root.
-pub fn insert(transaction: anytype, root: Reference, key: []const u8, val: u64) !Reference {
+pub fn insert(transaction: anytype, root: Reference, key: []const u8, value: u64) !Reference {
     const key_ref = try blob.put(transaction, key);
-    return Tree.insert(transaction, root, key, key_ref, val);
+    return Tree.insert(transaction, root, key, key_ref, value);
 }
 
 /// Remove `key` from the tree rooted at `root`. Frees the key's blob node when
@@ -85,7 +85,7 @@ pub fn forEachEntry(
     transaction: anytype,
     root: Reference,
     ctx: anytype,
-    comptime onEntry: fn (@TypeOf(ctx), key: []const u8, val: u64) anyerror!void,
+    comptime onEntry: fn (@TypeOf(ctx), key: []const u8, value: u64) anyerror!void,
 ) !void {
     // Adapt the core's raw (storedKey, value) walker: each stored key is a
     // blob ref, dereferenced here before reaching the caller's callback.

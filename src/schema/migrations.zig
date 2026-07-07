@@ -28,8 +28,8 @@ const maxPropertyCount = catalog.maxPropertyCount;
 // `default_value` for every existing row (live or tombstoned). For a link or
 // link_set property a fresh backlink index is created. Returns the new catalog.
 pub fn addProperty(transaction: *WriteTransaction, catalogRef: Reference, def: PropertyDefinition, default_value: u64) !Reference {
-    var s = try catalog.CatalogSnapshot.load(transaction, catalogRef);
-    const propertyCount = s.propertyCount;
+    var snapshot = try catalog.CatalogSnapshot.load(transaction, catalogRef);
+    const propertyCount = snapshot.propertyCount;
     std.debug.assert(propertyCount + 1 <= maxPropertyCount);
 
     const is_collection = switch (def.kind) {
@@ -40,10 +40,10 @@ pub fn addProperty(transaction: *WriteTransaction, catalogRef: Reference, def: P
     // meaningless as values and impossible to backfill coherently.
     if (def.indexed and is_collection) return error.Unsupported;
 
-    const new_col = try buildBackfilledColumn(transaction, &s, def, default_value, is_collection);
-    const valueIndexRef: Reference = if (def.indexed) try backfillValueIndex(transaction, s.keyrow_index_ref, new_col) else 0;
+    const new_col = try buildBackfilledColumn(transaction, &snapshot, def, default_value, is_collection);
+    const valueIndexRef: Reference = if (def.indexed) try backfillValueIndex(transaction, snapshot.keyrow_index_ref, new_col) else 0;
 
-    s.properties[propertyCount] = .{
+    snapshot.properties[propertyCount] = .{
         .col = new_col,
         .kind = def.kind,
         .element = def.element,
@@ -53,8 +53,8 @@ pub fn addProperty(transaction: *WriteTransaction, catalogRef: Reference, def: P
         .value_index = valueIndexRef,
         .indexed = def.indexed,
     };
-    s.propertyCount = propertyCount + 1;
-    return s.replace(transaction);
+    snapshot.propertyCount = propertyCount + 1;
+    return snapshot.replace(transaction);
 }
 
 // Build the new property's column, filled with the default for every existing
@@ -70,15 +70,15 @@ pub fn addProperty(transaction: *WriteTransaction, catalogRef: Reference, def: P
 // rows get 0 for both; nothing ever dereferences a tombstoned row's columns.
 fn buildBackfilledColumn(
     transaction: *WriteTransaction,
-    s: *const catalog.CatalogSnapshot,
+    snapshot: *const catalog.CatalogSnapshot,
     def: PropertyDefinition,
     default_value: u64,
     is_collection: bool,
 ) !Reference {
     var new_col = try Column.create(transaction);
-    var i: u64 = 0;
-    while (i < s.next_row) : (i += 1) {
-        const live = (try Column.get(transaction, s.live_col_ref, i)) != 0;
+    var row: u64 = 0;
+    while (row < snapshot.next_row) : (row += 1) {
+        const live = (try Column.get(transaction, snapshot.live_col_ref, row)) != 0;
         const fill: u64 = if (def.kind == .blob)
             (if (live and default_value != 0) try blobDup(transaction, default_value) else if (live) default_value else 0)
         else if (!is_collection)
@@ -128,12 +128,12 @@ fn blobDup(transaction: *WriteTransaction, ref: u64) !u64 {
         return blob.put(transaction, bytes);
     } else |err| switch (err) {
         error.BlobChunked => {
-            const alloc = transaction.database.store.allocator;
-            const bytes = try blob.getAlloc(transaction, ref, alloc);
-            defer alloc.free(bytes);
+            const scratchAllocator = transaction.database.store.allocator;
+            const bytes = try blob.getAlloc(transaction, ref, scratchAllocator);
+            defer scratchAllocator.free(bytes);
             return blob.put(transaction, bytes);
         },
-        else => |e| return e,
+        else => return err,
     }
 }
 
@@ -141,12 +141,12 @@ fn blobDup(transaction: *WriteTransaction, ref: u64) !u64 {
 // The dropped column is left for compaction to reclaim. Returns the new catalog.
 pub fn removeProperty(transaction: *WriteTransaction, catalogRef: Reference, property: usize) !Reference {
     std.debug.assert(property >= 1);
-    var s = try catalog.CatalogSnapshot.load(transaction, catalogRef);
-    std.debug.assert(property < s.propertyCount);
-    var j: usize = property;
-    while (j + 1 < s.propertyCount) : (j += 1) s.properties[j] = s.properties[j + 1];
-    s.propertyCount -= 1;
-    return s.replace(transaction);
+    var snapshot = try catalog.CatalogSnapshot.load(transaction, catalogRef);
+    std.debug.assert(property < snapshot.propertyCount);
+    var propertyIndex: usize = property;
+    while (propertyIndex + 1 < snapshot.propertyCount) : (propertyIndex += 1) snapshot.properties[propertyIndex] = snapshot.properties[propertyIndex + 1];
+    snapshot.propertyCount -= 1;
+    return snapshot.replace(transaction);
 }
 
 test {

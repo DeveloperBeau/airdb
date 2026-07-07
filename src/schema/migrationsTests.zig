@@ -119,10 +119,10 @@ test "addProperty(indexed) backfills the value index for existing rows" {
     defer r.end();
     var hits = std.ArrayList(u64).empty;
     defer hits.deinit(testing.allocator);
-    try query.where(&r, r.root(), &.{.{ .property = 2, .op = .eq, .value = 7 }}, &hits, testing.allocator);
+    try query.where(&r, r.root(), &.{.{ .property = 2, .operator = .eq, .value = 7 }}, &hits, testing.allocator);
     try testing.expectEqual(@as(usize, 2), hits.items.len); // both pre-migration rows
     hits.clearRetainingCapacity();
-    try query.where(&r, r.root(), &.{.{ .property = 2, .op = .eq, .value = 9 }}, &hits, testing.allocator);
+    try query.where(&r, r.root(), &.{.{ .property = 2, .operator = .eq, .value = 9 }}, &hits, testing.allocator);
     try testing.expectEqual(@as(usize, 1), hits.items.len);
 }
 

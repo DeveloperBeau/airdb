@@ -38,8 +38,8 @@ const testing = std.testing;
 
 test "slot encode/decode round-trips and checksum validates" {
     var buffer: [Slot.size]u8 = undefined;
-    const s = Slot{ .version = 7, .root_ref = 4096, .free_list_ref = 8192, .logical_size = 12288 };
-    s.encode(&buffer);
+    const slot = Slot{ .version = 7, .root_ref = 4096, .free_list_ref = 8192, .logical_size = 12288 };
+    slot.encode(&buffer);
     const decoded = try Slot.decode(&buffer);
     try testing.expectEqual(@as(u64, 7), decoded.version);
     try testing.expectEqual(@as(u64, 4096), decoded.root_ref);

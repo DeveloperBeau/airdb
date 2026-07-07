@@ -2,7 +2,7 @@ const std = @import("std");
 const testing = std.testing;
 const coord = @import("coordination.zig");
 const platform = @import("../platform.zig");
-const Coord = coord.Coord;
+const Coordination = coord.Coordination;
 const coordIo = coord.coordIo;
 const sentinel_max = coord.sentinel_max;
 
@@ -14,9 +14,9 @@ test "coord create initializes magic and zero attach count, reopen reads them" {
     const cpath = try std.fs.path.join(testing.allocator, &.{ pathBuffer[0..dlen], "x.coord" });
     defer testing.allocator.free(cpath);
 
-    var c1 = try Coord.openOrCreate(cpath);
+    var c1 = try Coordination.openOrCreate(cpath);
     try testing.expectEqual(@as(u32, 1), c1.attach());
-    var c2 = try Coord.openOrCreate(cpath);
+    var c2 = try Coordination.openOrCreate(cpath);
     try testing.expectEqual(@as(u32, 2), c2.attach());
     try testing.expectEqual(@as(u32, 1), c2.detach());
     c2.deinit();
@@ -35,14 +35,14 @@ test "a second openOrCreate preserves live coordination state" {
     const cpath = try std.fs.path.join(testing.allocator, &.{ pathBuffer[0..dlen], "keep.coord" });
     defer testing.allocator.free(cpath);
 
-    var c1 = try Coord.openOrCreate(cpath);
+    var c1 = try Coordination.openOrCreate(cpath);
     defer c1.deinit();
     _ = c1.attach();
     const slot = (try c1.claimSlot()).?;
     c1.publishMinPinned(slot, 7);
     c1.setLatestVersion(42);
 
-    var c2 = try Coord.openOrCreate(cpath);
+    var c2 = try Coordination.openOrCreate(cpath);
     defer c2.deinit();
     try testing.expectEqual(@as(u32, 1), c2.attachCount());
     try testing.expectEqual(@as(u64, 7), c2.slotMinPinnedForTest(slot));
@@ -61,11 +61,11 @@ test "openOrCreate succeeds while another holder owns the coord flock" {
     const cpath = try std.fs.path.join(testing.allocator, &.{ pathBuffer[0..dlen], "locked.coord" });
     defer testing.allocator.free(cpath);
 
-    var a = try Coord.openOrCreate(cpath);
+    var a = try Coordination.openOrCreate(cpath);
     defer a.deinit();
     try a.lockExclusive(); // simulate a writer mid-transaction
 
-    var b = try Coord.openOrCreate(cpath); // must not deadlock
+    var b = try Coordination.openOrCreate(cpath); // must not deadlock
     b.deinit();
     a.unlock();
 }
@@ -77,7 +77,7 @@ test "latest_version round-trips through the mapping" {
     const dlen = try tmp.dir.realPath(coordIo(), &pathBuffer);
     const cpath = try std.fs.path.join(testing.allocator, &.{ pathBuffer[0..dlen], "y.coord" });
     defer testing.allocator.free(cpath);
-    var c = try Coord.openOrCreate(cpath);
+    var c = try Coordination.openOrCreate(cpath);
     defer c.deinit();
     c.setLatestVersion(42);
     try testing.expectEqual(@as(u64, 42), c.latestVersion());
@@ -91,9 +91,9 @@ test "exclusive lock blocks a second holder via the same coord file" {
     const cpath = try std.fs.path.join(testing.allocator, &.{ pathBuffer[0..dlen], "z.coord" });
     defer testing.allocator.free(cpath);
 
-    var a = try Coord.openOrCreate(cpath);
+    var a = try Coordination.openOrCreate(cpath);
     defer a.deinit();
-    var b = try Coord.openOrCreate(cpath); // separate open file description -> independent flock that contends
+    var b = try Coordination.openOrCreate(cpath); // separate open file description -> independent flock that contends
     defer b.deinit();
 
     try a.lockExclusive();
@@ -110,7 +110,7 @@ test "claim returns a slot index, publish and read back min_pinned, release free
     const dlen = try tmp.dir.realPath(coordIo(), &pathBuffer);
     const cpath = try std.fs.path.join(testing.allocator, &.{ pathBuffer[0..dlen], "p.coord" });
     defer testing.allocator.free(cpath);
-    var c = try Coord.openOrCreate(cpath);
+    var c = try Coordination.openOrCreate(cpath);
     defer c.deinit();
     const slotIndex = (try c.claimSlot()).?;
     c.publishMinPinned(slotIndex, 7);
@@ -126,7 +126,7 @@ test "two claims get distinct slots" {
     const dlen = try tmp.dir.realPath(coordIo(), &pathBuffer);
     const cpath = try std.fs.path.join(testing.allocator, &.{ pathBuffer[0..dlen], "p2.coord" });
     defer testing.allocator.free(cpath);
-    var c = try Coord.openOrCreate(cpath);
+    var c = try Coordination.openOrCreate(cpath);
     defer c.deinit();
     const a = (try c.claimSlot()).?;
     const b = (try c.claimSlot()).?;
@@ -142,7 +142,7 @@ test "globalHorizon is the min of live slots min_pinned, clamped to fallback" {
     const dlen = try tmp.dir.realPath(coordIo(), &pathBuffer);
     const cpath = try std.fs.path.join(testing.allocator, &.{ pathBuffer[0..dlen], "gh.coord" });
     defer testing.allocator.free(cpath);
-    var c = try Coord.openOrCreate(cpath);
+    var c = try Coordination.openOrCreate(cpath);
     defer c.deinit();
     const a = (try c.claimSlot()).?;
     c.publishMinPinned(a, 5);
@@ -159,7 +159,7 @@ test "globalHorizon ignores and reclaims a dead-pid slot" {
     const dlen = try tmp.dir.realPath(coordIo(), &pathBuffer);
     const cpath = try std.fs.path.join(testing.allocator, &.{ pathBuffer[0..dlen], "dead.coord" });
     defer testing.allocator.free(cpath);
-    var c = try Coord.openOrCreate(cpath);
+    var c = try Coordination.openOrCreate(cpath);
     defer c.deinit();
     const live = (try c.claimSlot()).?;
     c.publishMinPinned(live, sentinel_max);
@@ -179,7 +179,7 @@ test "globalHorizon reclaims a slot whose live pid has the wrong incarnation tok
     const dlen = try tmp.dir.realPath(coordIo(), &pathBuffer);
     const cpath = try std.fs.path.join(testing.allocator, &.{ pathBuffer[0..dlen], "recycled.coord" });
     defer testing.allocator.free(cpath);
-    var c = try Coord.openOrCreate(cpath);
+    var c = try Coordination.openOrCreate(cpath);
     defer c.deinit();
 
     const my_pid: u32 = @intCast(platform.currentPid());
@@ -205,7 +205,7 @@ test "globalHorizon keeps a live-pid slot whose stored token is zero" {
     const dlen = try tmp.dir.realPath(coordIo(), &pathBuffer);
     const cpath = try std.fs.path.join(testing.allocator, &.{ pathBuffer[0..dlen], "zerotoken.coord" });
     defer testing.allocator.free(cpath);
-    var c = try Coord.openOrCreate(cpath);
+    var c = try Coordination.openOrCreate(cpath);
     defer c.deinit();
 
     const my_pid: u32 = @intCast(platform.currentPid());

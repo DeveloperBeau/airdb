@@ -17,7 +17,7 @@ const Allocation = @import("storage/arena.zig").Allocation;
 const Reference = @import("storage/reference.zig").Reference;
 const Slot = @import("storage/slots.zig").Slot;
 const FreeList = @import("storage/freeList.zig").FreeList;
-const Coord = @import("transactions/coordination.zig").Coord;
+const Coordination = @import("transactions/coordination.zig").Coordination;
 const coord_mod = @import("transactions/coordination.zig");
 const versioning = @import("transactions/versioning.zig");
 const freeListRecovery = @import("storage/freeListRecovery.zig");
@@ -89,7 +89,7 @@ pub const Database = struct {
     /// Byte length of the live free-list node on disk (0 if none).
     free_list_node_len: usize,
     /// Coordination file for multi-process attach count and latest-version signal.
-    coord: Coord,
+    coord: Coordination,
     /// Index into the coord participant slot array claimed by this Database instance, or null
     /// if all 64 slots were occupied at open/create time.
     participant_slot: ?usize,
@@ -162,10 +162,10 @@ pub const Database = struct {
         // Coord setup -- done last so the errdefer has no further try-s after it.
         const coord_path = try std.fmt.allocPrint(allocator, "{s}.coord", .{path});
         defer allocator.free(coord_path);
-        var coord = try Coord.openOrCreate(coord_path);
+        var coord = try Coordination.openOrCreate(coord_path);
         var slot: ?usize = null;
         errdefer {
-            if (slot) |s| coord.releaseSlot(s);
+            if (slot) |claimed| coord.releaseSlot(claimed);
             _ = coord.detach();
             coord.deinit();
         }
@@ -235,10 +235,10 @@ pub const Database = struct {
         // Coord setup -- done last so the errdefer has no further try-s after it.
         const coord_path = try std.fmt.allocPrint(allocator, "{s}.coord", .{path});
         defer allocator.free(coord_path);
-        var coord = try Coord.openOrCreate(coord_path);
+        var coord = try Coordination.openOrCreate(coord_path);
         var slot: ?usize = null;
         errdefer {
-            if (slot) |s| coord.releaseSlot(s);
+            if (slot) |claimed| coord.releaseSlot(claimed);
             _ = coord.detach();
             coord.deinit();
         }
@@ -280,27 +280,27 @@ pub const Database = struct {
         var prev_v: ?u64 = null;
         while (true) {
             try versioning.refreshToLatest(self);
-            const v = self.active_version;
+            const activeVersion = self.active_version;
             const root = self.active_root;
             // A retry that made no progress means the published version keeps
             // running ahead of anything this instance can adopt (e.g. newer
             // slots do not decode). Fail rather than spin forever.
-            if (prev_v != null and prev_v.? == v) return error.Corrupt;
-            prev_v = v;
-            if (self.pins.getPtr(v)) |ptr| {
+            if (prev_v != null and prev_v.? == activeVersion) return error.Corrupt;
+            prev_v = activeVersion;
+            if (self.pins.getPtr(activeVersion)) |ptr| {
                 ptr.* += 1;
             } else {
-                try self.pins.put(v, 1);
+                try self.pins.put(activeVersion, 1);
             }
             self.publishPins();
-            const lv = self.coord.latestVersion();
+            const latestVersion = self.coord.latestVersion();
             const retain = self.retainVersions();
-            const floor = if (retain == coord_mod.sentinel_max) 0 else lv -| retain;
-            if (v >= floor) {
-                return ReadTransaction{ .database = self, .root_ref = root, .version = v };
+            const floor = if (retain == coord_mod.sentinel_max) 0 else latestVersion -| retain;
+            if (activeVersion >= floor) {
+                return ReadTransaction{ .database = self, .root_ref = root, .version = activeVersion };
             }
             // The pin landed too late; release it and pin the newer version.
-            var stale = ReadTransaction{ .database = self, .root_ref = root, .version = v };
+            var stale = ReadTransaction{ .database = self, .root_ref = root, .version = activeVersion };
             stale.end();
         }
     }
@@ -337,8 +337,8 @@ pub const Database = struct {
         // writer can have reused a node this snapshot references. Otherwise
         // unpin and refuse the read rather than risk a corrupt snapshot.
         if (retain != coord_mod.sentinel_max) {
-            const lv = self.coord.latestVersion();
-            if (version < lv -| retain) {
+            const latestVersion = self.coord.latestVersion();
+            if (version < latestVersion -| retain) {
                 var transaction = ReadTransaction{ .database = self, .root_ref = root, .version = version };
                 transaction.end(); // unpin
                 return error.VersionUnavailable;
@@ -382,8 +382,8 @@ pub const Database = struct {
 
     /// Withhold recently-freed space from reuse for the most recent `n` versions.
     /// Shared and durable; see versioning.setRetainVersions for the safety rules.
-    pub fn setRetainVersions(self: *Database, n: u64) void {
-        versioning.setRetainVersions(self, n);
+    pub fn setRetainVersions(self: *Database, count: u64) void {
+        versioning.setRetainVersions(self, count);
     }
 
     /// Root ref for a committed version, or null if not retained / not yet
@@ -423,8 +423,8 @@ pub const Database = struct {
         // list. No behavior change; counter lives on the Database.
         const clone_io = std.Io.Threaded.global_single_threaded.io();
         const clone_start = Io.Clock.now(.awake, clone_io).nanoseconds;
-        for (self.free_list.extents.items) |e| {
-            try work_freelist.add(e);
+        for (self.free_list.extents.items) |extent| {
+            try work_freelist.add(extent);
         }
         self.fl_clone_ns += @intCast(Io.Clock.now(.awake, clone_io).nanoseconds - clone_start);
         return WriteTransaction{
@@ -461,10 +461,10 @@ pub const Database = struct {
     /// always enough: a single allocation never crosses more than one section boundary.
     pub fn bumpGrowing(self: *Database, size: usize) !Allocation {
         while (true) {
-            if (self.arena.alloc(size)) |a| {
-                return a;
-            } else |e| switch (e) {
-                error.AllocTooLarge => return e,
+            if (self.arena.alloc(size)) |allocation| {
+                return allocation;
+            } else |err| switch (err) {
+                error.AllocTooLarge => return err,
                 error.OutOfSpace => {
                     const target = (self.store.sectionsView().len + 1) << platform.section_shift;
                     try self.store.ensureMapped(target);
@@ -503,7 +503,7 @@ pub const Database = struct {
 
     pub fn metrics(self: *Database) Metrics {
         var reclaimable: u64 = 0;
-        for (self.free_list.extents.items) |e| reclaimable += e.len;
+        for (self.free_list.extents.items) |extent| reclaimable += extent.len;
         return .{
             .mapped_len = @intCast(self.store.sectionsView().len * platform.section_size),
             .latest_version = self.active_version,

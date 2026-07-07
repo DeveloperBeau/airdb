@@ -11,26 +11,26 @@ const maxPropertyCount: usize = 256;
 // slot), updating the key->row index so the key and all links stay valid. Does
 // not shrink columns. Returns the new catalog ref.
 pub fn relocateRow(transaction: *WriteTransaction, catalogRef: Reference, objectKey: u64, new_row: u64) !Reference {
-    var s = try catalog.CatalogSnapshot.load(transaction, catalogRef);
-    const old_row = (try Index.get(transaction, s.keyrow_index_ref, objectKey)) orelse return catalogRef;
+    var snapshot = try catalog.CatalogSnapshot.load(transaction, catalogRef);
+    const old_row = (try Index.get(transaction, snapshot.keyrow_index_ref, objectKey)) orelse return catalogRef;
     if (old_row == new_row) return catalogRef;
     // Bijection / safety guards.
-    std.debug.assert((try Column.get(transaction, s.live_col_ref, old_row)) == 1);
-    std.debug.assert((try Column.get(transaction, s.live_col_ref, new_row)) == 0);
+    std.debug.assert((try Column.get(transaction, snapshot.live_col_ref, old_row)) == 1);
+    std.debug.assert((try Column.get(transaction, snapshot.live_col_ref, new_row)) == 0);
 
     // Copy each property cell + the version cell from old_row to new_row.
-    var i: usize = 0;
-    while (i < s.propertyCount) : (i += 1) {
-        const cell = try Column.get(transaction, s.properties[i].col, old_row);
-        s.properties[i].col = try Column.set(transaction, s.properties[i].col, new_row, cell);
+    var propertyIndex: usize = 0;
+    while (propertyIndex < snapshot.propertyCount) : (propertyIndex += 1) {
+        const cell = try Column.get(transaction, snapshot.properties[propertyIndex].col, old_row);
+        snapshot.properties[propertyIndex].col = try Column.set(transaction, snapshot.properties[propertyIndex].col, new_row, cell);
     }
-    const oldver = try Column.get(transaction, s.version_col_ref, old_row);
-    s.version_col_ref = try Column.set(transaction, s.version_col_ref, new_row, oldver);
-    s.live_col_ref = try Column.set(transaction, s.live_col_ref, new_row, 1);
-    s.live_col_ref = try Column.set(transaction, s.live_col_ref, old_row, 0);
-    s.keyrow_index_ref = try Index.insert(transaction, s.keyrow_index_ref, objectKey, new_row);
+    const oldver = try Column.get(transaction, snapshot.version_col_ref, old_row);
+    snapshot.version_col_ref = try Column.set(transaction, snapshot.version_col_ref, new_row, oldver);
+    snapshot.live_col_ref = try Column.set(transaction, snapshot.live_col_ref, new_row, 1);
+    snapshot.live_col_ref = try Column.set(transaction, snapshot.live_col_ref, old_row, 0);
+    snapshot.keyrow_index_ref = try Index.insert(transaction, snapshot.keyrow_index_ref, objectKey, new_row);
 
-    return s.replace(transaction);
+    return snapshot.replace(transaction);
 }
 
 // ---------------------------------------------------------------------------
@@ -56,43 +56,43 @@ test "relocateRow moves a row and keeps key, primaryKey, and value" {
     defer testing.allocator.free(path);
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
-    var w = try database.beginWrite();
+    var writeTransaction = try database.beginWrite();
 
-    var catalogRef = try catalog.create(&w, 2);
-    const r1 = try rows.insert(&w, catalogRef, &.{ 1, 100 });
+    var catalogRef = try catalog.create(&writeTransaction, 2);
+    const r1 = try rows.insert(&writeTransaction, catalogRef, &.{ 1, 100 });
     catalogRef = r1.catalogRef;
-    const r2 = try rows.insert(&w, catalogRef, &.{ 2, 200 });
+    const r2 = try rows.insert(&writeTransaction, catalogRef, &.{ 2, 200 });
     catalogRef = r2.catalogRef;
     const objectKeyB = r2.row;
-    const r3 = try rows.insert(&w, catalogRef, &.{ 3, 300 });
+    const r3 = try rows.insert(&writeTransaction, catalogRef, &.{ 3, 300 });
     catalogRef = r3.catalogRef;
     const objectKeyC = r3.row;
 
     // Free b's physical slot by deleting primaryKey 2.
-    const b_row = (try catalog.objectKeyToRow(&w, catalogRef, objectKeyB)).?;
+    const b_row = (try catalog.objectKeyToRow(&writeTransaction, catalogRef, objectKeyB)).?;
     var valuesOut: [2]u64 = undefined;
-    const v2 = (try rows.getByPrimaryKey(&w, catalogRef, 2, &valuesOut)).?;
-    const del = try rows.delete(&w, catalogRef, 2, v2);
+    const v2 = (try rows.getByPrimaryKey(&writeTransaction, catalogRef, 2, &valuesOut)).?;
+    const del = try rows.delete(&writeTransaction, catalogRef, 2, v2);
     catalogRef = del.ok;
-    try testing.expectEqual(@as(u64, 2), try catalog.liveCount(&w, catalogRef));
+    try testing.expectEqual(@as(u64, 2), try catalog.liveCount(&writeTransaction, catalogRef));
 
     // Relocate c into b's now-dead slot.
-    catalogRef = try relocateRow(&w, catalogRef, objectKeyC, b_row);
+    catalogRef = try relocateRow(&writeTransaction, catalogRef, objectKeyC, b_row);
 
     var out: [2]u64 = undefined;
-    try testing.expect((try rows.getByObjectKey(&w, catalogRef, objectKeyC, &out)) != null);
+    try testing.expect((try rows.getByObjectKey(&writeTransaction, catalogRef, objectKeyC, &out)) != null);
     try testing.expectEqual(@as(u64, 3), out[0]);
     try testing.expectEqual(@as(u64, 300), out[1]);
 
-    try testing.expect((try rows.getByPrimaryKey(&w, catalogRef, 3, &out)) != null);
+    try testing.expect((try rows.getByPrimaryKey(&writeTransaction, catalogRef, 3, &out)) != null);
     try testing.expectEqual(@as(u64, 3), out[0]);
     try testing.expectEqual(@as(u64, 300), out[1]);
 
     // Live count is unchanged: relocation does not add or remove live rows.
-    try testing.expectEqual(@as(u64, 2), try catalog.liveCount(&w, catalogRef));
+    try testing.expectEqual(@as(u64, 2), try catalog.liveCount(&writeTransaction, catalogRef));
     // c now lives in b's old slot.
-    try testing.expectEqual(@as(?u64, b_row), try catalog.objectKeyToRow(&w, catalogRef, objectKeyC));
-    w.deinit();
+    try testing.expectEqual(@as(?u64, b_row), try catalog.objectKeyToRow(&writeTransaction, catalogRef, objectKeyC));
+    writeTransaction.deinit();
 }
 
 test "setLink after relocating the SOURCE keeps the backlink graph exact" {
@@ -107,46 +107,46 @@ test "setLink after relocating the SOURCE keeps the backlink graph exact" {
     defer testing.allocator.free(path);
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
-    var w = try database.beginWrite();
-    defer w.deinit();
+    var writeTransaction = try database.beginWrite();
+    defer writeTransaction.deinit();
 
-    var catalogRef = try catalog.createFromDefinitions(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
+    var catalogRef = try catalog.createFromDefinitions(&writeTransaction, &.{ .{ .kind = .int }, .{ .kind = .link } });
 
     // Throwaway opens a dead slot; then two targets and the source.
-    const dead = try rows.insert(&w, catalogRef, &.{ 99, 0 });
+    const dead = try rows.insert(&writeTransaction, catalogRef, &.{ 99, 0 });
     catalogRef = dead.catalogRef;
-    const t1 = try rows.insert(&w, catalogRef, &.{ 1, 0 });
+    const t1 = try rows.insert(&writeTransaction, catalogRef, &.{ 1, 0 });
     catalogRef = t1.catalogRef;
-    const t2 = try rows.insert(&w, catalogRef, &.{ 2, 0 });
+    const t2 = try rows.insert(&writeTransaction, catalogRef, &.{ 2, 0 });
     catalogRef = t2.catalogRef;
-    const src = try rows.insert(&w, catalogRef, &.{ 3, 0 });
+    const src = try rows.insert(&writeTransaction, catalogRef, &.{ 3, 0 });
     catalogRef = src.catalogRef;
 
     // Free the throwaway's physical slot and relocate the SOURCE into it, so
     // the source's row and objectKey diverge.
-    const dead_row = (try catalog.objectKeyToRow(&w, catalogRef, dead.row)).?;
+    const dead_row = (try catalog.objectKeyToRow(&writeTransaction, catalogRef, dead.row)).?;
     var out: [2]u64 = undefined;
-    const dv = (try rows.getByPrimaryKey(&w, catalogRef, 99, &out)).?;
-    catalogRef = (try rows.delete(&w, catalogRef, 99, dv)).ok;
-    catalogRef = try relocateRow(&w, catalogRef, src.row, dead_row);
-    try testing.expect((try catalog.objectKeyToRow(&w, catalogRef, src.row)).? != src.row);
+    const dv = (try rows.getByPrimaryKey(&writeTransaction, catalogRef, 99, &out)).?;
+    catalogRef = (try rows.delete(&writeTransaction, catalogRef, 99, dv)).ok;
+    catalogRef = try relocateRow(&writeTransaction, catalogRef, src.row, dead_row);
+    try testing.expect((try catalog.objectKeyToRow(&writeTransaction, catalogRef, src.row)).? != src.row);
 
     // Link src -> t1, then move it to t2: counts must track exactly.
-    catalogRef = try links.setLink(&w, catalogRef, 3, 1, t1.row);
-    try testing.expectEqual(@as(u64, 1), try links.backlinkCount(&w, catalogRef, 1, t1.row));
-    catalogRef = try links.setLink(&w, catalogRef, 3, 1, t2.row);
-    try testing.expectEqual(@as(u64, 0), try links.backlinkCount(&w, catalogRef, 1, t1.row));
-    try testing.expectEqual(@as(u64, 1), try links.backlinkCount(&w, catalogRef, 1, t2.row));
+    catalogRef = try links.setLink(&writeTransaction, catalogRef, 3, 1, t1.row);
+    try testing.expectEqual(@as(u64, 1), try links.backlinkCount(&writeTransaction, catalogRef, 1, t1.row));
+    catalogRef = try links.setLink(&writeTransaction, catalogRef, 3, 1, t2.row);
+    try testing.expectEqual(@as(u64, 0), try links.backlinkCount(&writeTransaction, catalogRef, 1, t1.row));
+    try testing.expectEqual(@as(u64, 1), try links.backlinkCount(&writeTransaction, catalogRef, 1, t2.row));
 
     // Deleting t2 must nullify the relocated source's link (backlink resolves
     // through the objectKey), leaving t1 and the source's other data untouched.
-    const t2v = (try rows.getByPrimaryKey(&w, catalogRef, 2, &out)).?;
-    catalogRef = switch (try objects.deleteAndNullify(&w, catalogRef, 2, t2v)) {
-        .ok => |c| c,
+    const t2v = (try rows.getByPrimaryKey(&writeTransaction, catalogRef, 2, &out)).?;
+    catalogRef = switch (try objects.deleteAndNullify(&writeTransaction, catalogRef, 2, t2v)) {
+        .ok => |newCatalog| newCatalog,
         else => unreachable,
     };
-    try testing.expectEqual(@as(?u64, null), try links.getLink(&w, catalogRef, 3, 1));
-    try testing.expect((try rows.getByPrimaryKey(&w, catalogRef, 1, &out)) != null);
+    try testing.expectEqual(@as(?u64, null), try links.getLink(&writeTransaction, catalogRef, 3, 1));
+    try testing.expect((try rows.getByPrimaryKey(&writeTransaction, catalogRef, 1, &out)) != null);
 }
 
 test "a same-type link to a relocated object still resolves" {
@@ -156,46 +156,46 @@ test "a same-type link to a relocated object still resolves" {
     defer testing.allocator.free(path);
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
-    var w = try database.beginWrite();
+    var writeTransaction = try database.beginWrite();
 
     // primaryKey + a single .link property (property index 1).
-    var catalogRef = try catalog.createFromDefinitions(&w, &.{
+    var catalogRef = try catalog.createFromDefinitions(&writeTransaction, &.{
         .{ .kind = .int },
         .{ .kind = .link },
     });
 
     // Throwaway object to free a dead slot.
-    const rd = try rows.insert(&w, catalogRef, &.{ 10, 0 });
+    const rd = try rows.insert(&writeTransaction, catalogRef, &.{ 10, 0 });
     catalogRef = rd.catalogRef;
     const objectKeyD = rd.row;
 
-    const rt = try rows.insert(&w, catalogRef, &.{ 1, 0 });
+    const rt = try rows.insert(&writeTransaction, catalogRef, &.{ 1, 0 });
     catalogRef = rt.catalogRef;
     const targetObjectKey = rt.row;
 
-    const rs = try rows.insert(&w, catalogRef, &.{ 2, 0 });
+    const rs = try rows.insert(&writeTransaction, catalogRef, &.{ 2, 0 });
     catalogRef = rs.catalogRef;
 
     // S (primaryKey 2) links to T.
-    catalogRef = try links.setLink(&w, catalogRef, 2, 1, targetObjectKey);
-    try testing.expectEqual(@as(?u64, targetObjectKey), try links.getLink(&w, catalogRef, 2, 1));
-    try testing.expectEqual(@as(u64, 1), try links.backlinkCount(&w, catalogRef, 1, targetObjectKey));
+    catalogRef = try links.setLink(&writeTransaction, catalogRef, 2, 1, targetObjectKey);
+    try testing.expectEqual(@as(?u64, targetObjectKey), try links.getLink(&writeTransaction, catalogRef, 2, 1));
+    try testing.expectEqual(@as(u64, 1), try links.backlinkCount(&writeTransaction, catalogRef, 1, targetObjectKey));
 
     // Free the throwaway's slot.
-    const d_row = (try catalog.objectKeyToRow(&w, catalogRef, objectKeyD)).?;
+    const d_row = (try catalog.objectKeyToRow(&writeTransaction, catalogRef, objectKeyD)).?;
     var valuesOut: [2]u64 = undefined;
-    const v10 = (try rows.getByPrimaryKey(&w, catalogRef, 10, &valuesOut)).?;
-    const del = try rows.delete(&w, catalogRef, 10, v10);
+    const v10 = (try rows.getByPrimaryKey(&writeTransaction, catalogRef, 10, &valuesOut)).?;
+    const del = try rows.delete(&writeTransaction, catalogRef, 10, v10);
     catalogRef = del.ok;
 
     // Relocate T into the freed slot.
-    catalogRef = try relocateRow(&w, catalogRef, targetObjectKey, d_row);
+    catalogRef = try relocateRow(&writeTransaction, catalogRef, targetObjectKey, d_row);
 
     // Link, value, and backlink all still resolve through the stable objectKey.
-    try testing.expectEqual(@as(?u64, targetObjectKey), try links.getLink(&w, catalogRef, 2, 1));
+    try testing.expectEqual(@as(?u64, targetObjectKey), try links.getLink(&writeTransaction, catalogRef, 2, 1));
     var out: [2]u64 = undefined;
-    try testing.expect((try rows.getByObjectKey(&w, catalogRef, targetObjectKey, &out)) != null);
+    try testing.expect((try rows.getByObjectKey(&writeTransaction, catalogRef, targetObjectKey, &out)) != null);
     try testing.expectEqual(@as(u64, 1), out[0]);
-    try testing.expectEqual(@as(u64, 1), try links.backlinkCount(&w, catalogRef, 1, targetObjectKey));
-    w.deinit();
+    try testing.expectEqual(@as(u64, 1), try links.backlinkCount(&writeTransaction, catalogRef, 1, targetObjectKey));
+    writeTransaction.deinit();
 }

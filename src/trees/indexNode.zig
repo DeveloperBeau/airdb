@@ -18,32 +18,32 @@ pub fn encodeLeaf(buffer: []u8, keys: []const u64, vals: []const u64) usize {
     std.debug.assert(keys.len == vals.len and keys.len <= leafCap);
     buffer[0] = kind_leaf;
     std.mem.writeInt(u16, buffer[1..3], @intCast(keys.len), .little);
-    var off: usize = headerSize;
-    for (keys, vals) |k, v| {
-        std.mem.writeInt(u64, buffer[off..][0..8], k, .little);
-        std.mem.writeInt(u64, buffer[off + 8 ..][0..8], v, .little);
-        off += 16;
+    var offset: usize = headerSize;
+    for (keys, vals) |key, value| {
+        std.mem.writeInt(u64, buffer[offset..][0..8], key, .little);
+        std.mem.writeInt(u64, buffer[offset + 8 ..][0..8], value, .little);
+        offset += 16;
     }
-    return off;
+    return offset;
 }
 
 pub const LeafView = struct {
     bytes: []const u8,
     count: u16,
-    pub fn key(self: LeafView, i: usize) u64 {
-        return std.mem.readInt(u64, self.bytes[headerSize + i * 16 ..][0..8], .little);
+    pub fn key(self: LeafView, entryIndex: usize) u64 {
+        return std.mem.readInt(u64, self.bytes[headerSize + entryIndex * 16 ..][0..8], .little);
     }
-    pub fn value(self: LeafView, i: usize) u64 {
-        return std.mem.readInt(u64, self.bytes[headerSize + i * 16 + 8 ..][0..8], .little);
+    pub fn value(self: LeafView, entryIndex: usize) u64 {
+        return std.mem.readInt(u64, self.bytes[headerSize + entryIndex * 16 + 8 ..][0..8], .little);
     }
-    pub fn lowerBound(self: LeafView, k: u64) usize {
-        var lo: usize = 0;
-        var hi: usize = self.count;
-        while (lo < hi) {
-            const mid = lo + (hi - lo) / 2;
-            if (self.key(mid) < k) lo = mid + 1 else hi = mid;
+    pub fn lowerBound(self: LeafView, searchKey: u64) usize {
+        var low: usize = 0;
+        var high: usize = self.count;
+        while (low < high) {
+            const midpoint = low + (high - low) / 2;
+            if (self.key(midpoint) < searchKey) low = midpoint + 1 else high = midpoint;
         }
-        return lo;
+        return low;
     }
 };
 
@@ -64,33 +64,33 @@ pub fn encodeInner(buffer: []u8, refs: []const u64, lows: []const u64, counts: [
     std.debug.assert(refs.len == lows.len and refs.len == counts.len and refs.len <= fanout);
     buffer[0] = kind_inner;
     std.mem.writeInt(u16, buffer[1..3], @intCast(refs.len), .little);
-    var off: usize = headerSize;
-    for (refs, lows, counts) |r, l, c| {
-        std.mem.writeInt(u64, buffer[off..][0..8], r, .little);
-        std.mem.writeInt(u64, buffer[off + 8 ..][0..8], l, .little);
-        std.mem.writeInt(u64, buffer[off + 16 ..][0..8], c, .little);
-        off += inner_stride;
+    var offset: usize = headerSize;
+    for (refs, lows, counts) |ref, lowKey, count| {
+        std.mem.writeInt(u64, buffer[offset..][0..8], ref, .little);
+        std.mem.writeInt(u64, buffer[offset + 8 ..][0..8], lowKey, .little);
+        std.mem.writeInt(u64, buffer[offset + 16 ..][0..8], count, .little);
+        offset += inner_stride;
     }
-    return off;
+    return offset;
 }
 
 pub const InnerView = struct {
     bytes: []const u8,
     child_count: u16,
-    pub fn childRef(self: InnerView, i: usize) u64 {
-        return std.mem.readInt(u64, self.bytes[headerSize + i * inner_stride ..][0..8], .little);
+    pub fn childRef(self: InnerView, entryIndex: usize) u64 {
+        return std.mem.readInt(u64, self.bytes[headerSize + entryIndex * inner_stride ..][0..8], .little);
     }
-    pub fn lowKey(self: InnerView, i: usize) u64 {
-        return std.mem.readInt(u64, self.bytes[headerSize + i * inner_stride + 8 ..][0..8], .little);
+    pub fn lowKey(self: InnerView, entryIndex: usize) u64 {
+        return std.mem.readInt(u64, self.bytes[headerSize + entryIndex * inner_stride + 8 ..][0..8], .little);
     }
-    pub fn subtreeCount(self: InnerView, i: usize) u64 {
-        return std.mem.readInt(u64, self.bytes[headerSize + i * inner_stride + 16 ..][0..8], .little);
+    pub fn subtreeCount(self: InnerView, entryIndex: usize) u64 {
+        return std.mem.readInt(u64, self.bytes[headerSize + entryIndex * inner_stride + 16 ..][0..8], .little);
     }
     /// Total entries under this node: the sum of its children's subtree counts.
     pub fn totalCount(self: InnerView) u64 {
         var total: u64 = 0;
-        var i: usize = 0;
-        while (i < self.child_count) : (i += 1) total += self.subtreeCount(i);
+        var entryIndex: usize = 0;
+        while (entryIndex < self.child_count) : (entryIndex += 1) total += self.subtreeCount(entryIndex);
         return total;
     }
 };

@@ -446,13 +446,13 @@ test "compaction preserves dict and set-of-blob" {
 
         const r1 = try typeRouting.insert(&w, dir, 0, &.{
             .{ .int = 1 },
-            .{ .dict_int = &.{ .{ .key = "a", .val = 1 }, .{ .key = "b", .val = 2 } } },
+            .{ .dict_int = &.{ .{ .key = "a", .value = 1 }, .{ .key = "b", .value = 2 } } },
             .{ .set_blob = &.{ "x", "yy" } },
         });
         dir = r1.dir;
         const r2 = try typeRouting.insert(&w, dir, 0, &.{
             .{ .int = 2 },
-            .{ .dict_int = &.{.{ .key = "c", .val = 3 }} },
+            .{ .dict_int = &.{.{ .key = "c", .value = 3 }} },
             .{ .set_blob = &.{"zzz"} },
         });
         dir = r2.dir;
@@ -915,7 +915,7 @@ test "compactInPlace preserves value indexes and passes verifyIntegrity" {
     const catalogRef = try typedir.catalogRef(&r, r.root(), 0);
     var hits = std.ArrayList(u64).empty;
     defer hits.deinit(testing.allocator);
-    try query.where(&r, catalogRef, &.{.{ .property = 1, .op = .eq, .value = 3 }}, &hits, testing.allocator);
+    try query.where(&r, catalogRef, &.{.{ .property = 1, .operator = .eq, .value = 3 }}, &hits, testing.allocator);
     try testing.expectEqual(@as(usize, 10), hits.items.len);
 }
 

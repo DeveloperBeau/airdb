@@ -446,8 +446,8 @@ test "bulkImport equals row-by-row for a scalar indexed type" {
         defer sa.deinit(testing.allocator);
         var sb = std.ArrayList(u64).empty;
         defer sb.deinit(testing.allocator);
-        try query.where(&ra, catalogA, &.{.{ .property = 2, .op = .eq, .value = 7 }}, &sa, testing.allocator);
-        try query.where(&rb, catalogB, &.{.{ .property = 2, .op = .eq, .value = 7 }}, &sb, testing.allocator);
+        try query.where(&ra, catalogA, &.{.{ .property = 2, .operator = .eq, .value = 7 }}, &sa, testing.allocator);
+        try query.where(&rb, catalogB, &.{.{ .property = 2, .operator = .eq, .value = 7 }}, &sb, testing.allocator);
         std.mem.sort(u64, sa.items, {}, std.sort.asc(u64));
         std.mem.sort(u64, sb.items, {}, std.sort.asc(u64));
         try testing.expectEqualSlices(u64, sb.items, sa.items);

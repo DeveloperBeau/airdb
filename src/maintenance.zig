@@ -21,17 +21,17 @@ pub const CompactStepResult = struct { ran: bool, moved: usize, done: bool };
 /// this loop; the function itself does not check it. Does I/O: commits a
 /// write transaction when a step runs.
 pub fn maybeCompactStep(database: *Database, type_id: u16, budget: usize) !CompactStepResult {
-    var w = try database.beginWrite();
-    errdefer w.deinit();
+    var writeTransaction = try database.beginWrite();
+    errdefer writeTransaction.deinit();
     const dir = database.active_root;
-    const catalogRef = try typedir.catalogRef(&w, dir, type_id);
-    if (!try compaction.shouldCompact(&w, catalogRef)) {
-        w.deinit();
+    const catalogRef = try typedir.catalogRef(&writeTransaction, dir, type_id);
+    if (!try compaction.shouldCompact(&writeTransaction, catalogRef)) {
+        writeTransaction.deinit();
         return .{ .ran = false, .moved = 0, .done = false };
     }
-    const step = try compaction.compactStep(&w, catalogRef, type_id, budget);
-    const new_dir = try typedir.setCatalogRef(&w, dir, type_id, step.catalogRef);
-    w.setRoot(new_dir);
-    _ = try w.commit();
+    const step = try compaction.compactStep(&writeTransaction, catalogRef, type_id, budget);
+    const new_dir = try typedir.setCatalogRef(&writeTransaction, dir, type_id, step.catalogRef);
+    writeTransaction.setRoot(new_dir);
+    _ = try writeTransaction.commit();
     return .{ .ran = true, .moved = step.moved, .done = step.done };
 }
