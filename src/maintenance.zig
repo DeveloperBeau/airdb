@@ -1,7 +1,7 @@
-// maintenance.zig -- caller-driven background upkeep for a database instance.
-//
-// Edge-level entry points that sequence inner-layer machinery (compaction,
-// the type directory) over a Database. Nothing inner imports this file.
+//! Caller-driven background upkeep for a database instance.
+//!
+//! Edge-level entry points that sequence inner-layer machinery (compaction,
+//! the type directory) over a Database. Nothing inner imports this file.
 
 const Database = @import("database.zig").Database;
 const typedir = @import("schema/typeDirectory.zig");

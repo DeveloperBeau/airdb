@@ -1,13 +1,13 @@
-// platform.zig -- OS-specific operations (memory mapping, file locking, process checks).
-//
-// This module isolates every syscall whose shape differs between POSIX and Windows
-// so the rest of airdb can stay platform-neutral. Both paths are implemented; the
-// branch is selected at comptime on builtin.os.tag.
-//
-// Zig 0.16 types mirror the call sites this replaced:
-//   - std.Io.File for file handles (flock/mmap take file.handle / fd_t; on Windows
-//     file.handle is a windows.HANDLE)
-//   - page alignment via std.heap.page_size_min (compile-time lower bound)
+//! OS-specific operations (memory mapping, file locking, process checks).
+//!
+//! This module isolates every syscall whose shape differs between POSIX and Windows
+//! so the rest of airdb can stay platform-neutral. Both paths are implemented; the
+//! branch is selected at comptime on builtin.os.tag.
+//!
+//! Zig 0.16 types mirror the call sites this replaced:
+//!   - std.Io.File for file handles (flock/mmap take file.handle / fd_t; on Windows
+//!     file.handle is a windows.HANDLE)
+//!   - page alignment via std.heap.page_size_min (compile-time lower bound)
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -32,7 +32,9 @@ pub const maxReserved: usize = if (@bitSizeOf(usize) >= 64) (1 << 40) else (1 <<
 /// so every live pointer stays valid. No single allocation may cross a section boundary,
 /// which also makes sectionSize the maximum single allocation size.
 pub const sectionShift: u6 = 24;
-pub const sectionSize: usize = 1 << sectionShift; // 16 MiB
+/// Bytes per mapped section (16 MiB) -- also the maximum single allocation.
+pub const sectionSize: usize = 1 << sectionShift;
+/// Mask extracting the within-section offset from a ref.
 pub const sectionMask: usize = sectionSize - 1;
 
 // Windows API bindings, declared locally so the module is self-contained. Gated so
@@ -289,9 +291,10 @@ pub fn processAlive(pid: u32) bool {
 // Memory
 // ---------------------------------------------------------------------------
 
-// Peak resident set size of the current process, in bytes. The bench harness
-// uses this as its memory signal. getrusage reports ru_maxrss in KiB on Linux
-// and in bytes on Darwin; Windows reports PeakWorkingSetSize in bytes.
+/// Peak resident set size of the current process, in bytes; a syscall per
+/// call. The bench harness uses this as its memory signal. getrusage reports
+/// ru_maxrss in KiB on Linux and in bytes on Darwin; Windows reports
+/// PeakWorkingSetSize in bytes.
 pub fn peakResidentBytes() usize {
     if (isWindows) return windowsPeakWorkingSet();
     const usage = std.posix.getrusage(std.posix.rusage.SELF);
@@ -311,12 +314,13 @@ test "peakResidentBytes returns a plausible nonzero value" {
     try std.testing.expect(rss > 64 * 1024);
 }
 
-// Cumulative page-fault counts for the current process. `minor` is soft faults
-// served without disk I/O (ru_minflt); `major` is hard faults that required a
-// disk read (ru_majflt). The bench harness samples this before/after a phase and
-// reports the delta as a memory-latency signal. On Windows getrusage is not
-// available, so this reports the single PageFaultCount (which does not split
-// minor/major) as `minor` and 0 as `major`.
+/// Cumulative page-fault counts for the current process; a syscall per call.
+/// `minor` is soft faults served without disk I/O (ru_minflt); `major` is
+/// hard faults that required a disk read (ru_majflt). The bench harness
+/// samples this before/after a phase and reports the delta as a
+/// memory-latency signal. On Windows getrusage is not available, so this
+/// reports the single PageFaultCount (which does not split minor/major) as
+/// `minor` and 0 as `major`.
 pub fn pageFaults() struct { minor: u64, major: u64 } {
     if (isWindows) {
         var counters = std.mem.zeroes(win.PROCESS_MEMORY_COUNTERS);
