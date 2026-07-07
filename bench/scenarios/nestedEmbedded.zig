@@ -31,7 +31,7 @@ const harness = @import("../harness.zig");
 
 const Io = std.Io;
 const catalog = airdb.catalog;
-const typedir = airdb.typedir;
+const typeDirectory = airdb.typeDirectory;
 const typeRouting = airdb.typeRouting;
 const Value = catalog.Value;
 
@@ -86,7 +86,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
 
     {
         var w = try database.beginWrite();
-        const dir = try typedir.createTypes(&w, &chainSchema, &chainEmbedded);
+        const dir = try typeDirectory.createTypes(&w, &chainSchema, &chainEmbedded);
         w.setRoot(dir);
         _ = try w.commit();
     }
@@ -132,7 +132,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
                             .{ .{ .int = key }, .{ .int = key *% 2654435761 } }
                         else
                             .{ .{ .int = key }, .{ .link = null } };
-                        dir = try typedir.insertEmbedded(&w, dir, level, key, linkProperty, &childVals);
+                        dir = try typeDirectory.insertEmbedded(&w, dir, level, key, linkProperty, &childVals);
                     }
                     const dt: u64 = @intCast(nowNs(io) - t0);
                     try createLat.add(alloc, dt);

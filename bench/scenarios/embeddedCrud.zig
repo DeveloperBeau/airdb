@@ -24,7 +24,7 @@ const harness = @import("../harness.zig");
 const Io = std.Io;
 const Reference = airdb.Reference;
 const catalog = airdb.catalog;
-const typedir = airdb.typedir;
+const typeDirectory = airdb.typeDirectory;
 const typeRouting = airdb.typeRouting;
 const Value = catalog.Value;
 
@@ -76,7 +76,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     // Build the directory: non-embedded owner + embedded child.
     {
         var w = try database.beginWrite();
-        const dir = try typedir.createTypes(&w, &ownerSchema, &.{ false, true });
+        const dir = try typeDirectory.createTypes(&w, &ownerSchema, &.{ false, true });
         w.setRoot(dir);
         _ = try w.commit();
     }
@@ -107,7 +107,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
                 const primaryKey: u64 = inserted + j;
                 const t0 = nowNs(io);
                 dir = (try typeRouting.insert(&w, dir, ownerType, &.{ .{ .int = primaryKey }, .{ .link = null } })).dir;
-                dir = try typedir.insertEmbedded(&w, dir, ownerType, primaryKey, embeddedProperty, &.{ .{ .int = primaryKey }, .{ .int = primaryKey *% 2654435761 } });
+                dir = try typeDirectory.insertEmbedded(&w, dir, ownerType, primaryKey, embeddedProperty, &.{ .{ .int = primaryKey }, .{ .int = primaryKey *% 2654435761 } });
                 const dt: u64 = @intCast(nowNs(io) - t0);
                 try createLat.add(alloc, dt);
                 try combined.add(alloc, dt);
@@ -158,8 +158,8 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
             while (j < thisBatch) : (j += 1) {
                 const primaryKey: u64 = ((done + j) * updateStride) % owners;
                 const t0 = nowNs(io);
-                dir = try typedir.clearEmbedded(&w, dir, ownerType, primaryKey, embeddedProperty);
-                dir = try typedir.insertEmbedded(&w, dir, ownerType, primaryKey, embeddedProperty, &.{ .{ .int = primaryKey }, .{ .int = primaryKey *% 40503 } });
+                dir = try typeDirectory.clearEmbedded(&w, dir, ownerType, primaryKey, embeddedProperty);
+                dir = try typeDirectory.insertEmbedded(&w, dir, ownerType, primaryKey, embeddedProperty, &.{ .{ .int = primaryKey }, .{ .int = primaryKey *% 40503 } });
                 const dt: u64 = @intCast(nowNs(io) - t0);
                 try updateLat.add(alloc, dt);
                 try combined.add(alloc, dt);
@@ -185,7 +185,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
                 const primaryKey: u64 = ((done + j) * deleteStride) % owners;
                 const hadChild = (try typeRouting.getLink(&w, dir, ownerType, primaryKey, embeddedProperty)) != null;
                 const t0 = nowNs(io);
-                dir = try typedir.clearEmbedded(&w, dir, ownerType, primaryKey, embeddedProperty);
+                dir = try typeDirectory.clearEmbedded(&w, dir, ownerType, primaryKey, embeddedProperty);
                 const dt: u64 = @intCast(nowNs(io) - t0);
                 if (hadChild) {
                     deleted += 1;
