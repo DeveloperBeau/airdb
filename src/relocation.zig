@@ -40,6 +40,7 @@ pub fn relocateRow(txn: *WriteTxn, cat: Ref, okey: u64, new_row: u64) !Ref {
 const Db = @import("db.zig").Db;
 const testing = std.testing;
 const objects = @import("objects.zig");
+const rows = @import("rows.zig");
 const links = @import("links.zig");
 
 fn objTmpPath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const u8) ![]const u8 {
@@ -58,20 +59,20 @@ test "relocateRow moves a row and keeps key, pk, and value" {
     var w = try db.beginWrite();
 
     var cat = try catalog.create(&w, 2);
-    const r1 = try objects.insert(&w, cat, &.{ 1, 100 });
+    const r1 = try rows.insert(&w, cat, &.{ 1, 100 });
     cat = r1.cat;
-    const r2 = try objects.insert(&w, cat, &.{ 2, 200 });
+    const r2 = try rows.insert(&w, cat, &.{ 2, 200 });
     cat = r2.cat;
     const b_okey = r2.row;
-    const r3 = try objects.insert(&w, cat, &.{ 3, 300 });
+    const r3 = try rows.insert(&w, cat, &.{ 3, 300 });
     cat = r3.cat;
     const c_okey = r3.row;
 
     // Free b's physical slot by deleting pk 2.
     const b_row = (try catalog.okeyToRow(&w, cat, b_okey)).?;
     var ver_out: [2]u64 = undefined;
-    const v2 = (try objects.getByPk(&w, cat, 2, &ver_out)).?;
-    const del = try objects.delete(&w, cat, 2, v2);
+    const v2 = (try rows.getByPk(&w, cat, 2, &ver_out)).?;
+    const del = try rows.delete(&w, cat, 2, v2);
     cat = del.ok;
     try testing.expectEqual(@as(u64, 2), try catalog.liveCount(&w, cat));
 
@@ -79,11 +80,11 @@ test "relocateRow moves a row and keeps key, pk, and value" {
     cat = try relocateRow(&w, cat, c_okey, b_row);
 
     var out: [2]u64 = undefined;
-    try testing.expect((try objects.getByObjectKey(&w, cat, c_okey, &out)) != null);
+    try testing.expect((try rows.getByObjectKey(&w, cat, c_okey, &out)) != null);
     try testing.expectEqual(@as(u64, 3), out[0]);
     try testing.expectEqual(@as(u64, 300), out[1]);
 
-    try testing.expect((try objects.getByPk(&w, cat, 3, &out)) != null);
+    try testing.expect((try rows.getByPk(&w, cat, 3, &out)) != null);
     try testing.expectEqual(@as(u64, 3), out[0]);
     try testing.expectEqual(@as(u64, 300), out[1]);
 
@@ -112,21 +113,21 @@ test "setLink after relocating the SOURCE keeps the backlink graph exact" {
     var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
 
     // Throwaway opens a dead slot; then two targets and the source.
-    const dead = try objects.insert(&w, cat, &.{ 99, 0 });
+    const dead = try rows.insert(&w, cat, &.{ 99, 0 });
     cat = dead.cat;
-    const t1 = try objects.insert(&w, cat, &.{ 1, 0 });
+    const t1 = try rows.insert(&w, cat, &.{ 1, 0 });
     cat = t1.cat;
-    const t2 = try objects.insert(&w, cat, &.{ 2, 0 });
+    const t2 = try rows.insert(&w, cat, &.{ 2, 0 });
     cat = t2.cat;
-    const src = try objects.insert(&w, cat, &.{ 3, 0 });
+    const src = try rows.insert(&w, cat, &.{ 3, 0 });
     cat = src.cat;
 
     // Free the throwaway's physical slot and relocate the SOURCE into it, so
     // the source's row and okey diverge.
     const dead_row = (try catalog.okeyToRow(&w, cat, dead.row)).?;
     var out: [2]u64 = undefined;
-    const dv = (try objects.getByPk(&w, cat, 99, &out)).?;
-    cat = (try objects.delete(&w, cat, 99, dv)).ok;
+    const dv = (try rows.getByPk(&w, cat, 99, &out)).?;
+    cat = (try rows.delete(&w, cat, 99, dv)).ok;
     cat = try relocateRow(&w, cat, src.row, dead_row);
     try testing.expect((try catalog.okeyToRow(&w, cat, src.row)).? != src.row);
 
@@ -139,13 +140,13 @@ test "setLink after relocating the SOURCE keeps the backlink graph exact" {
 
     // Deleting t2 must nullify the relocated source's link (backlink resolves
     // through the okey), leaving t1 and the source's other data untouched.
-    const t2v = (try objects.getByPk(&w, cat, 2, &out)).?;
+    const t2v = (try rows.getByPk(&w, cat, 2, &out)).?;
     cat = switch (try objects.deleteAndNullify(&w, cat, 2, t2v)) {
         .ok => |c| c,
         else => unreachable,
     };
     try testing.expectEqual(@as(?u64, null), try links.getLink(&w, cat, 3, 1));
-    try testing.expect((try objects.getByPk(&w, cat, 1, &out)) != null);
+    try testing.expect((try rows.getByPk(&w, cat, 1, &out)) != null);
 }
 
 test "a same-type link to a relocated object still resolves" {
@@ -164,15 +165,15 @@ test "a same-type link to a relocated object still resolves" {
     });
 
     // Throwaway object to free a dead slot.
-    const rd = try objects.insert(&w, cat, &.{ 10, 0 });
+    const rd = try rows.insert(&w, cat, &.{ 10, 0 });
     cat = rd.cat;
     const d_okey = rd.row;
 
-    const rt = try objects.insert(&w, cat, &.{ 1, 0 });
+    const rt = try rows.insert(&w, cat, &.{ 1, 0 });
     cat = rt.cat;
     const t_okey = rt.row;
 
-    const rs = try objects.insert(&w, cat, &.{ 2, 0 });
+    const rs = try rows.insert(&w, cat, &.{ 2, 0 });
     cat = rs.cat;
 
     // S (pk 2) links to T.
@@ -183,8 +184,8 @@ test "a same-type link to a relocated object still resolves" {
     // Free the throwaway's slot.
     const d_row = (try catalog.okeyToRow(&w, cat, d_okey)).?;
     var ver_out: [2]u64 = undefined;
-    const v10 = (try objects.getByPk(&w, cat, 10, &ver_out)).?;
-    const del = try objects.delete(&w, cat, 10, v10);
+    const v10 = (try rows.getByPk(&w, cat, 10, &ver_out)).?;
+    const del = try rows.delete(&w, cat, 10, v10);
     cat = del.ok;
 
     // Relocate T into the freed slot.
@@ -193,7 +194,7 @@ test "a same-type link to a relocated object still resolves" {
     // Link, value, and backlink all still resolve through the stable okey.
     try testing.expectEqual(@as(?u64, t_okey), try links.getLink(&w, cat, 2, 1));
     var out: [2]u64 = undefined;
-    try testing.expect((try objects.getByObjectKey(&w, cat, t_okey, &out)) != null);
+    try testing.expect((try rows.getByObjectKey(&w, cat, t_okey, &out)) != null);
     try testing.expectEqual(@as(u64, 1), out[0]);
     try testing.expectEqual(@as(u64, 1), try links.backlinkCount(&w, cat, 1, t_okey));
     w.deinit();

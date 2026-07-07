@@ -772,7 +772,7 @@ test "a retried commit's ring entry wins over the aborted duplicate" {
 }
 
 test "beginReadAt opens a past version within the retention window" {
-    const objects = @import("objects.zig");
+    const rows = @import("rows.zig");
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try tmpFilePath(testing.allocator, &tmp, "pit.airdb");
@@ -788,19 +788,19 @@ test "beginReadAt opens a past version within the retention window" {
     {
         var w = try db.beginWrite();
         var cat = try catalog.create(&w, 2);
-        cat = (try objects.insert(&w, cat, &.{ 1, 100 })).cat;
+        cat = (try rows.insert(&w, cat, &.{ 1, 100 })).cat;
         w.setRoot(cat);
         va = try w.commit();
     }
     {
         var w = try db.beginWrite();
-        const cat = (try objects.insert(&w, w.new_root, &.{ 2, 200 })).cat;
+        const cat = (try rows.insert(&w, w.new_root, &.{ 2, 200 })).cat;
         w.setRoot(cat);
         vb = try w.commit();
     }
     {
         var w = try db.beginWrite();
-        const cat = (try objects.insert(&w, w.new_root, &.{ 3, 300 })).cat;
+        const cat = (try rows.insert(&w, w.new_root, &.{ 3, 300 })).cat;
         w.setRoot(cat);
         vc = try w.commit();
     }
@@ -811,8 +811,8 @@ test "beginReadAt opens a past version within the retention window" {
         var r = try db.beginReadAt(va);
         defer r.end();
         try testing.expectEqual(@as(u64, 1), try compaction.liveCount(&r, r.root()));
-        try testing.expect((try objects.getByPk(&r, r.root(), 1, &out)) != null);
-        try testing.expectEqual(@as(?u64, null), try objects.getByPk(&r, r.root(), 2, &out));
+        try testing.expect((try rows.getByPk(&r, r.root(), 1, &out)) != null);
+        try testing.expectEqual(@as(?u64, null), try rows.getByPk(&r, r.root(), 2, &out));
     }
     // Past snapshot at v_b: pk 1 and 2.
     {
@@ -898,7 +898,7 @@ test "a writer honors a retention floor raised by another instance" {
 }
 
 test "beginReadAt rejects a version aged out of the retention window" {
-    const objects = @import("objects.zig");
+    const rows = @import("rows.zig");
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try tmpFilePath(testing.allocator, &tmp, "pit2.airdb");
@@ -910,13 +910,13 @@ test "beginReadAt rejects a version aged out of the retention window" {
     {
         var w = try db.beginWrite();
         var cat = try catalog.create(&w, 2);
-        cat = (try objects.insert(&w, cat, &.{ 1, 100 })).cat;
+        cat = (try rows.insert(&w, cat, &.{ 1, 100 })).cat;
         w.setRoot(cat);
         va = try w.commit();
     }
     {
         var w = try db.beginWrite();
-        const cat = (try objects.insert(&w, w.new_root, &.{ 2, 200 })).cat;
+        const cat = (try rows.insert(&w, w.new_root, &.{ 2, 200 })).cat;
         w.setRoot(cat);
         _ = try w.commit();
     }

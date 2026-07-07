@@ -6,6 +6,7 @@ const catalog = @import("catalog.zig");
 const collections = @import("collections.zig");
 const links = @import("links.zig");
 const Objects = @import("objects.zig");
+const rows = @import("rows.zig");
 const PropKind = catalog.PropKind;
 const Value = typedir.Value;
 const createTypes = typedir.createTypes;
@@ -716,7 +717,7 @@ test "a directory delete frees the row's collection storage" {
     var w = try db.beginWrite();
     defer w.deinit();
     var raw: [3]u64 = undefined;
-    _ = (try Objects.getByPk(&w, try catalogRef(&w, w.new_root, 0), 1, &raw)).?;
+    _ = (try rows.getByPk(&w, try catalogRef(&w, w.new_root, 0), 1, &raw)).?;
     var out: [3]Value = undefined;
     const ver = (try get(&w, w.new_root, 0, 1, &out)).?;
     const res = try deleteNullifyX(&w, w.new_root, 0, 1, ver);
@@ -760,7 +761,7 @@ test "a cascade delete frees the child's collection storage" {
     var w = try db.beginWrite();
     defer w.deinit();
     var raw: [2]u64 = undefined;
-    _ = (try Objects.getByPk(&w, try catalogRef(&w, w.new_root, 1), 100, &raw)).?;
+    _ = (try rows.getByPk(&w, try catalogRef(&w, w.new_root, 1), 100, &raw)).?;
     var out: [2]Value = undefined;
     const ver = (try get(&w, w.new_root, 0, 1, &out)).?;
     const res = try deleteNullifyX(&w, w.new_root, 0, 1, ver);

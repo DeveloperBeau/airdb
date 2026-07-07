@@ -2,7 +2,7 @@ const std = @import("std");
 const testing = std.testing;
 const query = @import("query.zig");
 const catalog = @import("catalog.zig");
-const objects = @import("objects.zig");
+const rows = @import("rows.zig");
 const index = @import("index.zig");
 const Ref = @import("ref.zig").Ref;
 const Db = @import("db.zig").Db;
@@ -29,14 +29,14 @@ fn seedPlannerCat(w: *@import("db.zig").WriteTxn, idx: bool, n: u64) !Ref {
     };
     var cat = try catalog.createDefs(w, &defs);
     var i: u64 = 0;
-    while (i < n) : (i += 1) cat = (try objects.insert(w, cat, &.{ i, i % 100, i })).cat;
+    while (i < n) : (i += 1) cat = (try rows.insert(w, cat, &.{ i, i % 100, i })).cat;
     return cat;
 }
 
 // Build a type with pk(int) + age(int) and insert (pk, age) rows.
 fn seed(w: anytype, pairs: []const [2]u64) !Ref {
     var cat = try catalog.create(w, 2);
-    for (pairs) |p| cat = (try objects.insert(w, cat, &.{ p[0], p[1] })).cat;
+    for (pairs) |p| cat = (try rows.insert(w, cat, &.{ p[0], p[1] })).cat;
     return cat;
 }
 
@@ -64,8 +64,8 @@ test "where filters live rows by ANDed predicates" {
     try testing.expectEqual(@as(usize, 2), r2.items.len);
     // delete pk 2, re-query age==30 -> only pk4
     var out: [2]u64 = undefined;
-    const vv = (try objects.getByPk(&w, cat, 2, &out)).?;
-    cat = (try objects.delete(&w, cat, 2, vv)).ok;
+    const vv = (try rows.getByPk(&w, cat, 2, &out)).?;
+    cat = (try rows.delete(&w, cat, 2, vv)).ok;
     var r3 = std.ArrayList(u64).empty;
     defer r3.deinit(testing.allocator);
     try where(&w, cat, &.{.{ .prop = 1, .op = .eq, .value = 30 }}, &r3, testing.allocator);
@@ -105,8 +105,8 @@ test "streamed full scan agrees with where on count and aggregate" {
     var cat = try seed(&w, &.{ .{ 1, 20 }, .{ 2, 30 }, .{ 3, 40 }, .{ 4, 30 }, .{ 5, 25 } });
     // Tombstone one matching row so the live filter is exercised mid-stream.
     var out: [2]u64 = undefined;
-    const ver = (try objects.getByPk(&w, cat, 4, &out)).?;
-    cat = (try objects.delete(&w, cat, 4, ver)).ok;
+    const ver = (try rows.getByPk(&w, cat, 4, &out)).?;
+    cat = (try rows.delete(&w, cat, 4, ver)).ok;
 
     const preds = [_]Predicate{.{ .prop = 1, .op = .ge, .value = 25 }};
     var okeys = std.ArrayList(u64).empty;
@@ -160,11 +160,11 @@ test "rangeInclusive and sortByPropAsc" {
     // sort the matching okeys by pk ascending, then verify the pk order is 3,5,7
     try sortByPropAsc(&w, cat, rng.items, 0, testing.allocator);
     var out: [2]u64 = undefined;
-    _ = try objects.getByObjectKey(&w, cat, rng.items[0], &out);
+    _ = try rows.getByObjectKey(&w, cat, rng.items[0], &out);
     try testing.expectEqual(@as(u64, 3), out[0]);
-    _ = try objects.getByObjectKey(&w, cat, rng.items[1], &out);
+    _ = try rows.getByObjectKey(&w, cat, rng.items[1], &out);
     try testing.expectEqual(@as(u64, 5), out[0]);
-    _ = try objects.getByObjectKey(&w, cat, rng.items[2], &out);
+    _ = try rows.getByObjectKey(&w, cat, rng.items[2], &out);
     try testing.expectEqual(@as(u64, 7), out[0]);
     w.deinit();
 }
@@ -179,7 +179,7 @@ test "scan over 100k rows finds the matching slice" {
     var w = try db.beginWrite();
     var cat = try catalog.create(&w, 2);
     var i: u64 = 0;
-    while (i < 100_000) : (i += 1) cat = (try objects.insert(&w, cat, &.{ i, i % 100 })).cat;
+    while (i < 100_000) : (i += 1) cat = (try rows.insert(&w, cat, &.{ i, i % 100 })).cat;
     // 1000 rows have (i % 100 == 7)
     try testing.expectEqual(@as(u64, 1000), try countWhere(&w, cat, &.{.{ .prop = 1, .op = .eq, .value = 7 }}, testing.allocator));
     w.deinit();
@@ -196,17 +196,17 @@ test "query returns stable object keys after relocation" {
 
     // pk + age. Insert a throwaway first to open up a dead slot, then the target.
     var cat = try catalog.create(&w, 2);
-    const throwaway = try objects.insert(&w, cat, &.{ 1, 99 });
+    const throwaway = try rows.insert(&w, cat, &.{ 1, 99 });
     cat = throwaway.cat;
-    const target = try objects.insert(&w, cat, &.{ 2, 30 });
+    const target = try rows.insert(&w, cat, &.{ 2, 30 });
     cat = target.cat;
     const target_okey = target.row;
 
     // Free the throwaway's physical slot.
     const dead_row = (try catalog.okeyToRow(&w, cat, throwaway.row)).?;
     var vbuf: [2]u64 = undefined;
-    const tv = (try objects.getByPk(&w, cat, 1, &vbuf)).?;
-    cat = (try objects.delete(&w, cat, 1, tv)).ok;
+    const tv = (try rows.getByPk(&w, cat, 1, &vbuf)).?;
+    cat = (try rows.delete(&w, cat, 1, tv)).ok;
 
     // Relocate the target into the freed slot; its okey is unchanged.
     cat = try relocation.relocateRow(&w, cat, target_okey, dead_row);
@@ -220,7 +220,7 @@ test "query returns stable object keys after relocation" {
     try testing.expectEqual(target_okey, hits.items[0]);
 
     var out: [2]u64 = undefined;
-    try testing.expect((try objects.getByObjectKey(&w, cat, hits.items[0], &out)) != null);
+    try testing.expect((try rows.getByObjectKey(&w, cat, hits.items[0], &out)) != null);
     try testing.expectEqual(@as(u64, 2), out[0]); // pk
     try testing.expectEqual(@as(u64, 30), out[1]); // age
     w.deinit();
@@ -420,10 +420,10 @@ test "index path equals full scan after deletes" {
     var out: [3]u64 = undefined;
     var pk: u64 = 0;
     while (pk < 2000) : (pk += 7) {
-        const vi = (try objects.getByPk(&w, cat_idx, pk, &out)).?;
-        cat_idx = (try objects.delete(&w, cat_idx, pk, vi)).ok;
-        const vs = (try objects.getByPk(&w, cat_scan, pk, &out)).?;
-        cat_scan = (try objects.delete(&w, cat_scan, pk, vs)).ok;
+        const vi = (try rows.getByPk(&w, cat_idx, pk, &out)).?;
+        cat_idx = (try rows.delete(&w, cat_idx, pk, vi)).ok;
+        const vs = (try rows.getByPk(&w, cat_scan, pk, &out)).?;
+        cat_scan = (try rows.delete(&w, cat_scan, pk, vs)).ok;
     }
     try expectSameWhere(&w, cat_idx, cat_scan, &.{.{ .prop = 1, .op = .eq, .value = 42 }});
     try expectSameWhere(&w, cat_idx, cat_scan, &.{ .{ .prop = 1, .op = .ge, .value = 40 }, .{ .prop = 1, .op = .le, .value = 45 } });

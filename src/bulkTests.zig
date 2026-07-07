@@ -8,6 +8,7 @@ const cnode = @import("column_node.zig");
 const inode = @import("index_node.zig");
 const catalog = @import("catalog.zig");
 const objects = @import("objects.zig");
+const rawRows = @import("rows.zig");
 const ValueOkeys = bulk.ValueOkeys;
 const bulkColumn = bulk.bulkColumn;
 const bulkIndex = bulk.bulkIndex;
@@ -49,12 +50,12 @@ test "bulk append is refused when the batch does not clear the true max pk" {
 
     var cat = try catalog.create(&w, 2);
     var pk: u64 = 0;
-    while (pk <= 64) : (pk += 1) cat = (try objects.insert(&w, cat, &.{ pk, pk })).cat; // pk index splits
+    while (pk <= 64) : (pk += 1) cat = (try rawRows.insert(&w, cat, &.{ pk, pk })).cat; // pk index splits
     var out: [2]u64 = undefined;
     pk = 32;
     while (pk <= 64) : (pk += 1) {
-        const ver = (try objects.getByPk(&w, cat, pk, &out)).?;
-        cat = (try objects.delete(&w, cat, pk, ver)).ok;
+        const ver = (try rawRows.getByPk(&w, cat, pk, &out)).?;
+        cat = (try rawRows.delete(&w, cat, pk, ver)).ok;
     }
     // pks 0..31 survive; a batch starting at 10 must NOT take the fast path.
     const rows = [_][]const u64{ &.{ 10, 1 }, &.{ 11, 2 } };
@@ -64,8 +65,8 @@ test "bulk append is refused when the batch does not clear the true max pk" {
     // A batch that truly clears the surviving max qualifies.
     const ok_rows = [_][]const u64{ &.{ 100, 1 }, &.{ 101, 2 } };
     cat = try bulkAppend(&w, cat, &ok_rows);
-    try testing.expect((try objects.getByPk(&w, cat, 100, &out)) != null);
-    try testing.expect((try objects.getByPk(&w, cat, 31, &out)) != null);
+    try testing.expect((try rawRows.getByPk(&w, cat, 100, &out)) != null);
+    try testing.expect((try rawRows.getByPk(&w, cat, 31, &out)) != null);
 }
 
 test "bulk append into a pk-history gap takes the fallback" {
@@ -86,14 +87,14 @@ test "bulk append into a pk-history gap takes the fallback" {
 
     var cat = try catalog.create(&w, 2);
     var pk: u64 = 0;
-    while (pk <= 31) : (pk += 1) cat = (try objects.insert(&w, cat, &.{ pk, pk })).cat;
+    while (pk <= 31) : (pk += 1) cat = (try rawRows.insert(&w, cat, &.{ pk, pk })).cat;
     pk = 40;
-    while (pk <= 104) : (pk += 1) cat = (try objects.insert(&w, cat, &.{ pk, pk })).cat;
+    while (pk <= 104) : (pk += 1) cat = (try rawRows.insert(&w, cat, &.{ pk, pk })).cat;
     var out: [2]u64 = undefined;
     pk = 40;
     while (pk <= 104) : (pk += 1) {
-        const ver = (try objects.getByPk(&w, cat, pk, &out)).?;
-        cat = (try objects.delete(&w, cat, pk, ver)).ok;
+        const ver = (try rawRows.getByPk(&w, cat, pk, &out)).?;
+        cat = (try rawRows.delete(&w, cat, pk, ver)).ok;
     }
 
     // Below the stale low: NotAppendable; the orchestrator's fallback must
@@ -101,12 +102,12 @@ test "bulk append into a pk-history gap takes the fallback" {
     const gap_rows = [_][]const u64{ &.{ 33, 1 }, &.{ 34, 2 } };
     try testing.expectError(error.NotAppendable, bulkAppend(&w, cat, &gap_rows));
     cat = try bulkAppendOrInsert(&w, cat, &gap_rows);
-    try testing.expect((try objects.getByPk(&w, cat, 33, &out)) != null);
-    try testing.expect((try objects.getByPk(&w, cat, 34, &out)) != null);
+    try testing.expect((try rawRows.getByPk(&w, cat, 33, &out)) != null);
+    try testing.expect((try rawRows.getByPk(&w, cat, 34, &out)) != null);
 
     // Every surviving pk still resolves (routing lows intact).
     pk = 0;
-    while (pk <= 31) : (pk += 1) try testing.expect((try objects.getByPk(&w, cat, pk, &out)) != null);
+    while (pk <= 31) : (pk += 1) try testing.expect((try rawRows.getByPk(&w, cat, pk, &out)) != null);
 }
 
 test "bulk append fallback refuses link-bearing schemas" {
@@ -139,7 +140,7 @@ test "bulk append frees the replaced right-edge nodes" {
         var w = try db.beginWrite();
         var cat = try catalog.create(&w, 2);
         var pk: u64 = 0;
-        while (pk < 200) : (pk += 1) cat = (try objects.insert(&w, cat, &.{ pk, pk })).cat;
+        while (pk < 200) : (pk += 1) cat = (try rawRows.insert(&w, cat, &.{ pk, pk })).cat;
         w.setRoot(cat);
         _ = try w.commit();
     }
@@ -310,7 +311,7 @@ test "bulkValueIndex equals sequential maintenance" {
     const built = try bulkValueIndex(&w, entries.items);
 
     // Sequential maintenance mirror: for each (value, okey) add okey to the inner
-    // set for value, exactly as objects.viAdd does.
+    // set for value, exactly as rows.viAdd does.
     var seq = try Index.create(&w);
     var i: u64 = 0;
     while (i < N) : (i += 1) {
@@ -394,7 +395,7 @@ test "bulkImport equals row-by-row for a scalar indexed type" {
         var w = try db.beginWrite();
         var cat = try catalog.createDefs(&w, &import_defs);
         var pk: u64 = 0;
-        while (pk < N) : (pk += 1) cat = (try objects.insert(&w, cat, &.{ pk, pk * 3, pk % 50 })).cat;
+        while (pk < N) : (pk += 1) cat = (try rawRows.insert(&w, cat, &.{ pk, pk * 3, pk % 50 })).cat;
         w.setRoot(cat);
         _ = try w.commit();
     }
@@ -423,8 +424,8 @@ test "bulkImport equals row-by-row for a scalar indexed type" {
     while (pk < N) : (pk += 1) {
         var oa: [3]u64 = undefined;
         var ob: [3]u64 = undefined;
-        const va = try objects.getByPk(&ra, cat_a, pk, &oa);
-        const vb = try objects.getByPk(&rb, cat_b, pk, &ob);
+        const va = try rawRows.getByPk(&ra, cat_a, pk, &oa);
+        const vb = try rawRows.getByPk(&rb, cat_b, pk, &ob);
         try testing.expectEqual(vb, va);
         try testing.expectEqualSlices(u64, &ob, &oa);
     }
@@ -464,7 +465,7 @@ test "bulkImport rejects a non-empty type" {
     defer db.deinit();
     var w = try db.beginWrite();
     var cat = try catalog.createDefs(&w, &import_defs);
-    cat = (try objects.insert(&w, cat, &.{ 1, 3, 1 })).cat;
+    cat = (try rawRows.insert(&w, cat, &.{ 1, 3, 1 })).cat;
 
     const more = [_][]const u64{ &.{ 10, 30, 5 }, &.{ 11, 33, 6 } };
     try testing.expectError(error.TypeNotEmpty, bulkImport(&w, cat, &more, .{}));
@@ -472,7 +473,7 @@ test "bulkImport rejects a non-empty type" {
     // The type is unchanged: still one live row, intact.
     try testing.expectEqual(@as(u64, 1), try catalog.liveCount(&w, cat));
     var out: [3]u64 = undefined;
-    try testing.expect((try objects.getByPk(&w, cat, 1, &out)) != null);
+    try testing.expect((try rawRows.getByPk(&w, cat, 1, &out)) != null);
     try testing.expectEqual(@as(u64, 1), out[0]);
     try testing.expectEqual(@as(u64, 3), out[1]);
     try testing.expectEqual(@as(u64, 1), out[2]);
@@ -559,7 +560,7 @@ test "bulkImport edge sizes: empty, single, LEAF_CAP" {
         if (n > 0) {
             var out: [3]u64 = undefined;
             const last = n - 1;
-            try testing.expect((try objects.getByPk(&r, cat, last, &out)) != null);
+            try testing.expect((try rawRows.getByPk(&r, cat, last, &out)) != null);
             try testing.expectEqual(last, out[0]);
             try testing.expectEqual(last * 3, out[1]);
             try testing.expectEqual(last % 7, out[2]);
@@ -844,7 +845,7 @@ test "bulkAppend equals row-by-row for a contiguous monotonic batch" {
         const dir = try typedir.createTypes(&w, &.{&append_defs}, &.{false});
         var cat = try typedir.catalogRef(&w, dir, 0);
         var pk: u64 = 0;
-        while (pk < BASE) : (pk += 1) cat = (try objects.insert(&w, cat, &.{ pk, pk * 3 })).cat;
+        while (pk < BASE) : (pk += 1) cat = (try rawRows.insert(&w, cat, &.{ pk, pk * 3 })).cat;
         const new_cat = try bulkAppend(&w, cat, batch);
         const new_dir = try typedir.setCatalogRef(&w, dir, 0, new_cat);
         w.setRoot(new_dir);
@@ -859,7 +860,7 @@ test "bulkAppend equals row-by-row for a contiguous monotonic batch" {
         var w = try db.beginWrite();
         var cat = try catalog.createDefs(&w, &append_defs);
         var pk: u64 = 0;
-        while (pk < TOTAL) : (pk += 1) cat = (try objects.insert(&w, cat, &.{ pk, pk * 3 })).cat;
+        while (pk < TOTAL) : (pk += 1) cat = (try rawRows.insert(&w, cat, &.{ pk, pk * 3 })).cat;
         w.setRoot(cat);
         _ = try w.commit();
     }
@@ -888,8 +889,8 @@ test "bulkAppend equals row-by-row for a contiguous monotonic batch" {
     while (pk < TOTAL) : (pk += 1) {
         var oa: [2]u64 = undefined;
         var ob: [2]u64 = undefined;
-        const va = try objects.getByPk(&ra, cat_a, pk, &oa);
-        const vb = try objects.getByPk(&rb, cat_b, pk, &ob);
+        const va = try rawRows.getByPk(&ra, cat_a, pk, &oa);
+        const vb = try rawRows.getByPk(&rb, cat_b, pk, &ob);
         try testing.expectEqual(vb, va);
         try testing.expectEqualSlices(u64, &ob, &oa);
     }
@@ -916,11 +917,11 @@ test "bulkAppend returns NotAppendable for a scattered batch" {
     var w = try db.beginWrite();
     var cat = try catalog.createDefs(&w, &append_defs);
     var pk: u64 = 0;
-    while (pk < 100) : (pk += 1) cat = (try objects.insert(&w, cat, &.{ pk, pk * 3 })).cat;
+    while (pk < 100) : (pk += 1) cat = (try rawRows.insert(&w, cat, &.{ pk, pk * 3 })).cat;
 
     const before = try catalog.liveCount(&w, cat);
     var before_row: [2]u64 = undefined;
-    try testing.expect((try objects.getByPk(&w, cat, 50, &before_row)) != null);
+    try testing.expect((try rawRows.getByPk(&w, cat, 50, &before_row)) != null);
 
     // First batch pk (50) is <= the current max (99): not a right-edge append.
     const batch = [_][]const u64{ &.{ 50, 150 }, &.{ 200, 600 }, &.{ 201, 603 } };
@@ -929,7 +930,7 @@ test "bulkAppend returns NotAppendable for a scattered batch" {
     // The type is byte-unchanged: same count, and the sampled row is intact.
     try testing.expectEqual(before, try catalog.liveCount(&w, cat));
     var after_row: [2]u64 = undefined;
-    try testing.expect((try objects.getByPk(&w, cat, 50, &after_row)) != null);
+    try testing.expect((try rawRows.getByPk(&w, cat, 50, &after_row)) != null);
     try testing.expectEqualSlices(u64, &before_row, &after_row);
     w.deinit();
 }
@@ -943,7 +944,7 @@ test "bulkAppend returns NotAppendable for an indexed type" {
     defer db.deinit();
     var w = try db.beginWrite();
     var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .int, .indexed = true } });
-    cat = (try objects.insert(&w, cat, &.{ 1, 10 })).cat;
+    cat = (try rawRows.insert(&w, cat, &.{ 1, 10 })).cat;
 
     // Even an ascending batch above the max is rejected: a pure right-edge append
     // cannot maintain the value index.
@@ -961,7 +962,7 @@ test "bulkAppend returns NotAppendable for a link-bearing type" {
     defer db.deinit();
     var w = try db.beginWrite();
     var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link, .link_target = 0 } });
-    cat = (try objects.insert(&w, cat, &.{ 1, 0 })).cat;
+    cat = (try rawRows.insert(&w, cat, &.{ 1, 0 })).cat;
 
     const batch = [_][]const u64{ &.{ 100, 0 }, &.{ 101, 0 } };
     try testing.expectError(error.NotAppendable, bulkAppend(&w, cat, &batch));
@@ -977,7 +978,7 @@ test "bulkAppend returns NotAppendable for a non-ascending or duplicate batch" {
     defer db.deinit();
     var w = try db.beginWrite();
     var cat = try catalog.createDefs(&w, &append_defs);
-    cat = (try objects.insert(&w, cat, &.{ 1, 3 })).cat;
+    cat = (try rawRows.insert(&w, cat, &.{ 1, 3 })).cat;
 
     // Non-ascending batch (both pks above the max, but out of order).
     const desc = [_][]const u64{ &.{ 200, 600 }, &.{ 150, 450 } };
@@ -1019,7 +1020,7 @@ test "bulkAppendOrInsert falls back and equals row-by-row for a scattered batch"
         const dir = try typedir.createTypes(&w, &.{&append_defs}, &.{false});
         var cat = try typedir.catalogRef(&w, dir, 0);
         var pk: u64 = 0;
-        while (pk < BASE) : (pk += 1) cat = (try objects.insert(&w, cat, &.{ pk, pk * 3 })).cat;
+        while (pk < BASE) : (pk += 1) cat = (try rawRows.insert(&w, cat, &.{ pk, pk * 3 })).cat;
         const new_cat = try bulkAppendOrInsert(&w, cat, &batch);
         const new_dir = try typedir.setCatalogRef(&w, dir, 0, new_cat);
         w.setRoot(new_dir);
@@ -1035,8 +1036,8 @@ test "bulkAppendOrInsert falls back and equals row-by-row for a scattered batch"
         var w = try db.beginWrite();
         var cat = try catalog.createDefs(&w, &append_defs);
         var pk: u64 = 0;
-        while (pk < BASE) : (pk += 1) cat = (try objects.insert(&w, cat, &.{ pk, pk * 3 })).cat;
-        for (scattered_pks) |spk| cat = (try objects.insert(&w, cat, &.{ spk, spk * 3 })).cat;
+        while (pk < BASE) : (pk += 1) cat = (try rawRows.insert(&w, cat, &.{ pk, pk * 3 })).cat;
+        for (scattered_pks) |spk| cat = (try rawRows.insert(&w, cat, &.{ spk, spk * 3 })).cat;
         w.setRoot(cat);
         _ = try w.commit();
     }
@@ -1063,8 +1064,8 @@ test "bulkAppendOrInsert falls back and equals row-by-row for a scattered batch"
     while (pk <= 401) : (pk += 1) {
         var oa: [2]u64 = undefined;
         var ob: [2]u64 = undefined;
-        const va = try objects.getByPk(&ra, cat_a, pk, &oa);
-        const vb = try objects.getByPk(&rb, cat_b, pk, &ob);
+        const va = try rawRows.getByPk(&ra, cat_a, pk, &oa);
+        const vb = try rawRows.getByPk(&rb, cat_b, pk, &ob);
         try testing.expectEqual(vb, va);
         if (vb != null) try testing.expectEqualSlices(u64, &ob, &oa);
     }
@@ -1090,7 +1091,7 @@ test "bulkAppendOrInsert empty batch is a no-op" {
     defer db.deinit();
     var w = try db.beginWrite();
     var cat = try catalog.createDefs(&w, &append_defs);
-    cat = (try objects.insert(&w, cat, &.{ 1, 3 })).cat;
+    cat = (try rawRows.insert(&w, cat, &.{ 1, 3 })).cat;
 
     const before = try catalog.liveCount(&w, cat);
     const after = try bulkAppendOrInsert(&w, cat, &.{});

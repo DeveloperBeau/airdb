@@ -1,6 +1,7 @@
 pub const blob = @import("blob.zig");
 pub const typedir = @import("typedir.zig");
 pub const objects = @import("objects.zig");
+pub const rows = @import("rows.zig");
 pub const catalog = @import("catalog.zig");
 pub const collections = @import("collections.zig");
 pub const links = @import("links.zig");

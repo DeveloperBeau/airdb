@@ -24,7 +24,7 @@ const Io = std.Io;
 const Ref = airdb.Ref;
 const blob = airdb.blob;
 const catalog = airdb.catalog;
-const objects = airdb.objects;
+const rows = airdb.rows;
 
 pub const name = "blobs_pitr";
 
@@ -143,7 +143,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         var j: usize = 0;
         while (j < this_batch) : (j += 1) {
             const pk: u64 = inserted + j;
-            const r = try objects.insert(&w, cat, &.{ pk, pk *% 7 });
+            const r = try rows.insert(&w, cat, &.{ pk, pk *% 7 });
             cat = r.cat;
         }
         w.setRoot(cat);
@@ -171,7 +171,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
             const pk: u64 = x % pk_mod;
             var out: [2]u64 = undefined;
             const t0 = nowNs(io);
-            _ = try objects.getByPk(&rl, cat, pk, &out);
+            _ = try rows.getByPk(&rl, cat, pk, &out);
             const dt: u64 = @intCast(nowNs(io) - t0);
             try lat_latest.add(alloc, dt);
         }
@@ -193,7 +193,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
             const pk: u64 = x % pk_mod;
             var out: [2]u64 = undefined;
             const t0 = nowNs(io);
-            _ = try objects.getByPk(&rh, cat, pk, &out);
+            _ = try rows.getByPk(&rh, cat, pk, &out);
             const dt: u64 = @intCast(nowNs(io) - t0);
             try lat_hist.add(alloc, dt);
         }

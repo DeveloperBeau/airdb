@@ -16,9 +16,9 @@ const create = catalog.create;
 
 const propCount = catalog.propCount;
 
-const insert = @import("objects.zig").insert;
+const insert = @import("rows.zig").insert;
 
-const getByPk = @import("objects.zig").getByPk;
+const getByPk = @import("rows.zig").getByPk;
 
 const getLink = @import("links.zig").getLink;
 

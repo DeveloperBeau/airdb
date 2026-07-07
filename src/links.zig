@@ -1,5 +1,5 @@
 const std = @import("std");
-const WriteTxn = @import("db.zig").WriteTxn;
+const WriteTxn = @import("write_txn.zig").WriteTxn;
 const Ref = @import("ref.zig").Ref;
 const Column = @import("column.zig");
 const Index = @import("index.zig");
