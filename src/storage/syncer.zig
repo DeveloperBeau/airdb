@@ -59,12 +59,12 @@ pub const FileSyncer = struct {
 /// at a precise commit step. Non-failing calls perform the real sync.
 pub const FailingSyncer = struct {
     count: usize = 0,
-    fail_on: usize,
+    failOn: usize,
 
     pub fn flushImpl(ptr: *anyopaque, file: Io.File) anyerror!void {
         const self: *FailingSyncer = @ptrCast(@alignCast(ptr));
         self.count += 1;
-        if (self.count == self.fail_on) return error.SimulatedCrash;
+        if (self.count == self.failOn) return error.SimulatedCrash;
         try fullSync(file);
     }
 

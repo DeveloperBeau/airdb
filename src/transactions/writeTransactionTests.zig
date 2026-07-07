@@ -10,9 +10,9 @@ const rows = @import("../records/rows.zig");
 
 fn tmpFilePath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const u8) ![]const u8 {
     var pathBuffer: [Io.Dir.max_path_bytes]u8 = undefined;
-    const path_len = try tmp.dir.realPath(testing.io, &pathBuffer);
-    const dir_path = pathBuffer[0..path_len];
-    return std.fs.path.join(allocator, &.{ dir_path, name });
+    const pathLen = try tmp.dir.realPath(testing.io, &pathBuffer);
+    const dirPath = pathBuffer[0..pathLen];
+    return std.fs.path.join(allocator, &.{ dirPath, name });
 }
 
 // Churn a single-row int type across `n` commits: each iteration commits an insert
@@ -35,7 +35,7 @@ fn churnLogicalSize(path: []const u8, retain: u64, n: u64) !u64 {
     while (i < n) : (i += 1) {
         {
             var w = try database.beginWrite();
-            catalogRef = database.active_root; // reload the committed catalog ref
+            catalogRef = database.activeRoot; // reload the committed catalog ref
             const r = try rows.insert(&w, catalogRef, &.{i});
             catalogRef = r.catalogRef;
             w.setRoot(catalogRef);
@@ -43,7 +43,7 @@ fn churnLogicalSize(path: []const u8, retain: u64, n: u64) !u64 {
         }
         {
             var w = try database.beginWrite();
-            catalogRef = database.active_root;
+            catalogRef = database.activeRoot;
             var out: [1]u64 = undefined;
             const version = (try rows.getByPrimaryKey(&w, catalogRef, i, &out)).?;
             catalogRef = switch (try rows.delete(&w, catalogRef, i, version)) {
@@ -76,14 +76,14 @@ test "steady-state batched inserts keep the free list bounded" {
         _ = try w.commit();
     }
     const batches: usize = 10;
-    const inserts_per_batch: usize = 500;
+    const insertsPerBatch: usize = 500;
     var primaryKey: u64 = 0;
     var batch: usize = 0;
     while (batch < batches) : (batch += 1) {
         var w = try database.beginWrite();
-        var catalogRef = w.new_root;
+        var catalogRef = w.newRoot;
         var i: usize = 0;
-        while (i < inserts_per_batch) : (i += 1) {
+        while (i < insertsPerBatch) : (i += 1) {
             catalogRef = (try rows.insert(&w, catalogRef, &.{ primaryKey, primaryKey })).catalogRef;
             primaryKey += 1;
         }
@@ -95,10 +95,10 @@ test "steady-state batched inserts keep the free list bounded" {
     // plateaus. The failure mode this guards against is unusable extents
     // accumulating at roughly one per insert PER BATCH (the fragmentation
     // death spiral): after `batches` rounds that lands near
-    // inserts_per_batch * batches, while the healthy working set stays under
+    // insertsPerBatch * batches, while the healthy working set stays under
     // one batch's width. Deriving the bound from the loop constant keeps the
     // assertion honest if someone retunes the batch size.
-    try testing.expect(database.freeListLenForTest() < inserts_per_batch);
+    try testing.expect(database.freeListLenForTest() < insertsPerBatch);
 }
 
 test "an abandoned transaction's bump allocations are rolled back" {
@@ -117,7 +117,7 @@ test "an abandoned transaction's bump allocations are rolled back" {
         w.setRoot(a.ref);
         _ = try w.commit();
     }
-    const size_before = database.logicalSize();
+    const sizeBefore = database.logicalSize();
 
     // Abort a transaction that bump-allocated a lot.
     {
@@ -126,7 +126,7 @@ test "an abandoned transaction's bump allocations are rolled back" {
         while (i < 200) : (i += 1) _ = try w.alloc(4096);
         w.deinit(); // abort
     }
-    try testing.expectEqual(size_before, database.logicalSize());
+    try testing.expectEqual(sizeBefore, database.logicalSize());
 
     // The next commit must not durably absorb the aborted region either.
     {
@@ -138,7 +138,7 @@ test "an abandoned transaction's bump allocations are rolled back" {
     }
     // One 8-byte node plus the free-list node: logical size grows by well under
     // the ~800 KiB the aborted transaction touched.
-    try testing.expect(database.logicalSize() - size_before < 4096);
+    try testing.expect(database.logicalSize() - sizeBefore < 4096);
 }
 
 test "retention window withholds recently freed space from reuse" {
@@ -173,8 +173,8 @@ test "writableCopy allocates a new node, copies bytes, and records the old as fr
     try testing.expect(copy.ref != a.ref);
     try testing.expectEqualStrings("ORIGINAL", copy.bytes);
     // The old node was allocated within this same uncommitted transaction, so freeing it
-    // routes to the transaction-private reuse pool (immediately reusable), not in_flight_frees.
-    try testing.expectEqual(@as(usize, 0), w.in_flight_frees.items.len);
+    // routes to the transaction-private reuse pool (immediately reusable), not inFlightFrees.
+    try testing.expectEqual(@as(usize, 0), w.inFlightFrees.items.len);
     try testing.expectEqual(@as(usize, 1), w.transactionReuse.extents.items.len);
     try testing.expectEqual(a.ref, w.transactionReuse.extents.items[0].offset);
     w.deinit(); // releases the transaction-private pools without committing
@@ -209,14 +209,14 @@ test "a committed node freed within a transaction is not reused mid-transaction"
         w0.setRoot(a.ref);
         _ = try w0.commit();
     }
-    const committed_ref = database.active_root;
+    const committedRef = database.activeRoot;
     var w = try database.beginWrite();
-    try w.free(committed_ref, 64); // committed node -> deferred reclaim, NOT transaction-private
+    try w.free(committedRef, 64); // committed node -> deferred reclaim, NOT transaction-private
     const b = try w.alloc(64);
     // A committed node a reader might still pin must not be reused within this transaction.
-    try testing.expect(b.ref != committed_ref);
+    try testing.expect(b.ref != committedRef);
     try testing.expectEqual(@as(usize, 0), w.transactionReuse.extents.items.len);
-    try testing.expectEqual(@as(usize, 1), w.in_flight_frees.items.len);
+    try testing.expectEqual(@as(usize, 1), w.inFlightFrees.items.len);
     w.deinit();
 }
 
@@ -234,19 +234,19 @@ test "single instance reuse works through the global horizon" {
         w.setRoot(a.ref);
         _ = try w.commit();
     }
-    const old_root = database.active_root;
+    const oldRoot = database.activeRoot;
     {
         var w = try database.beginWrite();
         const b = try w.alloc(8);
         @memcpy(b.bytes, "BBBBBBBB");
-        try w.free(old_root, 8);
+        try w.free(oldRoot, 8);
         w.setRoot(b.ref);
         _ = try w.commit();
     }
     {
         var w = try database.beginWrite();
         const c = try w.alloc(8);
-        try testing.expectEqual(old_root, c.ref);
+        try testing.expectEqual(oldRoot, c.ref);
         w.deinit();
     }
 }

@@ -126,11 +126,11 @@ test "addProperty(indexed) backfills the value index for existing rows" {
     try testing.expectEqual(@as(usize, 1), hits.items.len);
 }
 
-test "addProperty(link_set) leaves pre-migration rows deletable" {
+test "addProperty(linkSet) leaves pre-migration rows deletable" {
     // Regression: collection kinds were backfilled with a raw 0 root, which
     // broke every collection accessor on migrated rows and made them
     // undeletable through the graph-safe delete (its outbound cleanup walks
-    // link_set roots and hit error.BadRef).
+    // linkSet roots and hit error.BadRef).
     const typedir = @import("typeDirectory.zig");
     const typeRouting = @import("typeRouting.zig");
     var tmp = testing.tmpDir(.{});
@@ -143,9 +143,9 @@ test "addProperty(link_set) leaves pre-migration rows deletable" {
         var w = try database.beginWrite();
         var dir = try typedir.createTypes(&w, &.{&.{.{ .kind = .int }}}, &.{false});
         dir = (try typeRouting.insert(&w, dir, 0, &.{.{ .int = 1 }})).dir;
-        // Migrate: add a link_set property targeting the same type.
+        // Migrate: add a linkSet property targeting the same type.
         const catalogRef = try typedir.catalogRef(&w, dir, 0);
-        const newCatalog = try addProperty(&w, catalogRef, .{ .kind = .link_set, .link_target = 0 }, 0);
+        const newCatalog = try addProperty(&w, catalogRef, .{ .kind = .linkSet, .linkTarget = 0 }, 0);
         dir = try typedir.setCatalogRef(&w, dir, 0, newCatalog);
         w.setRoot(dir);
         _ = try w.commit();
@@ -154,8 +154,8 @@ test "addProperty(link_set) leaves pre-migration rows deletable" {
     {
         var w = try database.beginWrite();
         var out: [2]catalog.Value = undefined;
-        const version = (try typeRouting.get(&w, w.new_root, 0, 1, &out)).?;
-        const res = try typeRouting.deleteNullifyX(&w, w.new_root, 0, 1, version);
+        const version = (try typeRouting.get(&w, w.newRoot, 0, 1, &out)).?;
+        const res = try typeRouting.deleteNullifyX(&w, w.newRoot, 0, 1, version);
         try testing.expect(res == .ok); // previously error.BadRef
         w.setRoot(res.ok);
         _ = try w.commit();
@@ -221,13 +221,13 @@ test "addProperty copies a blob default per row instead of sharing one node" {
     // Every row reads the default bytes, but from its OWN node.
     var raw1: [3]u64 = undefined;
     var raw2: [3]u64 = undefined;
-    const v1 = (try getByPrimaryKey(&w, w.new_root, 1, &raw1)).?;
-    const v2 = (try getByPrimaryKey(&w, w.new_root, 2, &raw2)).?;
+    const v1 = (try getByPrimaryKey(&w, w.newRoot, 1, &raw1)).?;
+    const v2 = (try getByPrimaryKey(&w, w.newRoot, 2, &raw2)).?;
     try testing.expectEqualStrings("default-bytes", try blob.get(&w, raw1[2]));
     try testing.expectEqualStrings("default-bytes", try blob.get(&w, raw2[2]));
     try testing.expect(raw1[2] != raw2[2]);
     // Deleting both rows must not free any extent twice.
-    var catalogRef = w.new_root;
+    var catalogRef = w.newRoot;
     switch (try objects.deleteTyped(&w, catalogRef, 1, v1)) {
         .ok => |c| catalogRef = c,
         else => return error.TestUnexpectedResult,
@@ -242,7 +242,7 @@ test "addProperty copies a blob default per row instead of sharing one node" {
         const gop = try seen.getOrPut(e.offset);
         try testing.expect(!gop.found_existing); // duplicate free
     }
-    for (w.in_flight_frees.items) |e| {
+    for (w.inFlightFrees.items) |e| {
         const gop = try seen.getOrPut(e.offset);
         try testing.expect(!gop.found_existing);
     }

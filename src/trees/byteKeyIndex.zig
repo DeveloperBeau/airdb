@@ -2,7 +2,7 @@
 // instantiated with blob-ref keys. Same on-disk node layout as index.zig
 // (see indexNode.zig). The ONLY difference from index.zig: the u64 stored in
 // a leaf key slot is a blob ref to the key bytes (not the key itself), and
-// the "low_key" of an inner pair is a blob ref to the smallest key in that
+// the "lowKey" of an inner pair is a blob ref to the smallest key in that
 // subtree. All ordering compares the dereferenced bytes with std.mem.order;
 // keys live in the blob heap. See bTreeCore.zig for the transaction
 // capability the `transaction` parameters must satisfy (WriteTransaction in production;
@@ -59,8 +59,8 @@ pub const get = Tree.get;
 /// added; otherwise the key bytes are stored in the blob heap and a new entry
 /// is inserted in byte-sorted order. Returns the (possibly new) root.
 pub fn insert(transaction: anytype, root: Reference, key: []const u8, value: u64) !Reference {
-    const key_ref = try blob.put(transaction, key);
-    return Tree.insert(transaction, root, key, key_ref, value);
+    const keyRef = try blob.put(transaction, key);
+    return Tree.insert(transaction, root, key, keyRef, value);
 }
 
 /// Remove `key` from the tree rooted at `root`. Frees the key's blob node when
@@ -78,7 +78,7 @@ pub const freeTree = Tree.freeTree;
 pub const count = Tree.count;
 
 /// Visit every (key, value) entry in ascending byte-key order, dereferencing
-/// each leaf entry's key blob and calling onEntry(ctx, key_bytes, value).
+/// each leaf entry's key blob and calling onEntry(ctx, keyBytes, value).
 /// The key slice points into mapped storage and is only valid for the duration
 /// of the callback; copy it if it must outlive the call.
 pub fn forEachEntry(

@@ -31,24 +31,24 @@ const Value = catalog.Value;
 pub const name = "embedded_crud";
 
 // Owner rows committed per write transaction across create/update/delete.
-const batch_size: usize = 5_000;
+const batchSize: usize = 5_000;
 
 // Embedded rows are heavier than plain ints (two objects + a link per owner),
 // so cap the dataset to keep a 1m-scale run well under a minute.
-const max_owners: usize = 200_000;
+const maxOwners: usize = 200_000;
 
 // Per-phase sample ceilings for read/update/delete.
-const max_samples: usize = 50_000;
+const maxSamples: usize = 50_000;
 
 // Directory type ids and the owner's embedded-link property index.
-const owner_type: u16 = 0;
-const child_type: u16 = 1;
+const ownerType: u16 = 0;
+const childType: u16 = 1;
 const embeddedProperty: usize = 1;
 const childProperties: usize = 2;
 
 // Owner: {int primaryKey, link(cascade -> child)}. Child: {int primaryKey, int value}, embedded.
-const owner_schema = [_][]const catalog.PropertyDefinition{
-    &.{ .{ .kind = .int }, .{ .kind = .link, .link_target = child_type, .del_rule = .cascade } },
+const ownerSchema = [_][]const catalog.PropertyDefinition{
+    &.{ .{ .kind = .int }, .{ .kind = .link, .linkTarget = childType, .delRule = .cascade } },
     &.{ .{ .kind = .int }, .{ .kind = .int } },
 };
 
@@ -64,7 +64,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     const alloc = ctx.alloc;
     const io = sysIo();
 
-    const owners = @min(ctx.n, max_owners);
+    const owners = @min(ctx.n, maxOwners);
 
     const path = try harness.scratchPath(ctx.*, name ++ ".airdb");
     defer alloc.free(path);
@@ -76,143 +76,143 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     // Build the directory: non-embedded owner + embedded child.
     {
         var w = try database.beginWrite();
-        const dir = try typedir.createTypes(&w, &owner_schema, &.{ false, true });
+        const dir = try typedir.createTypes(&w, &ownerSchema, &.{ false, true });
         w.setRoot(dir);
         _ = try w.commit();
     }
 
     var combined = harness.Latencies.init();
     defer combined.deinit(alloc);
-    var create_lat = harness.Latencies.init();
-    defer create_lat.deinit(alloc);
-    var read_lat = harness.Latencies.init();
-    defer read_lat.deinit(alloc);
-    var update_lat = harness.Latencies.init();
-    defer update_lat.deinit(alloc);
-    var delete_lat = harness.Latencies.init();
-    defer delete_lat.deinit(alloc);
+    var createLat = harness.Latencies.init();
+    defer createLat.deinit(alloc);
+    var readLat = harness.Latencies.init();
+    defer readLat.deinit(alloc);
+    var updateLat = harness.Latencies.init();
+    defer updateLat.deinit(alloc);
+    var deleteLat = harness.Latencies.init();
+    defer deleteLat.deinit(alloc);
 
-    var total_ns: u64 = 0;
+    var totalNs: u64 = 0;
 
     // --- CREATE phase: owner row + one embedded child ------------------------
     {
-        const phase_start = nowNs(io);
+        const phaseStart = nowNs(io);
         var inserted: usize = 0;
         while (inserted < owners) {
-            const this_batch = @min(batch_size, owners - inserted);
+            const thisBatch = @min(batchSize, owners - inserted);
             var w = try database.beginWrite();
-            var dir = w.new_root;
+            var dir = w.newRoot;
             var j: usize = 0;
-            while (j < this_batch) : (j += 1) {
+            while (j < thisBatch) : (j += 1) {
                 const primaryKey: u64 = inserted + j;
                 const t0 = nowNs(io);
-                dir = (try typeRouting.insert(&w, dir, owner_type, &.{ .{ .int = primaryKey }, .{ .link = null } })).dir;
-                dir = try typedir.insertEmbedded(&w, dir, owner_type, primaryKey, embeddedProperty, &.{ .{ .int = primaryKey }, .{ .int = primaryKey *% 2654435761 } });
+                dir = (try typeRouting.insert(&w, dir, ownerType, &.{ .{ .int = primaryKey }, .{ .link = null } })).dir;
+                dir = try typedir.insertEmbedded(&w, dir, ownerType, primaryKey, embeddedProperty, &.{ .{ .int = primaryKey }, .{ .int = primaryKey *% 2654435761 } });
                 const dt: u64 = @intCast(nowNs(io) - t0);
-                try create_lat.add(alloc, dt);
+                try createLat.add(alloc, dt);
                 try combined.add(alloc, dt);
             }
             w.setRoot(dir);
             _ = try w.commit();
-            inserted += this_batch;
+            inserted += thisBatch;
         }
-        total_ns += @intCast(nowNs(io) - phase_start);
+        totalNs += @intCast(nowNs(io) - phaseStart);
     }
 
     // Sampling strides spread picks evenly across the owner key space.
-    const read_n = @min(owners, max_samples);
-    const update_n = @min(owners, max_samples);
-    const delete_n = @min(owners, max_samples);
-    const read_stride = @max(@as(usize, 1), owners / read_n);
-    const update_stride = @max(@as(usize, 1), owners / update_n);
-    const delete_stride = @max(@as(usize, 1), owners / delete_n);
+    const readN = @min(owners, maxSamples);
+    const updateN = @min(owners, maxSamples);
+    const deleteN = @min(owners, maxSamples);
+    const readStride = @max(@as(usize, 1), owners / readN);
+    const updateStride = @max(@as(usize, 1), owners / updateN);
+    const deleteStride = @max(@as(usize, 1), owners / deleteN);
 
     // --- READ phase: materialize the embedded child --------------------------
     {
-        const phase_start = nowNs(io);
+        const phaseStart = nowNs(io);
         var r = try database.beginRead();
         const dir = r.root();
         var out: [childProperties]Value = undefined;
         var k: usize = 0;
-        while (k < read_n) : (k += 1) {
-            const primaryKey: u64 = (k * read_stride) % owners;
+        while (k < readN) : (k += 1) {
+            const primaryKey: u64 = (k * readStride) % owners;
             const t0 = nowNs(io);
-            _ = try typeRouting.getLinked(&r, dir, owner_type, primaryKey, embeddedProperty, &out);
+            _ = try typeRouting.getLinked(&r, dir, ownerType, primaryKey, embeddedProperty, &out);
             const dt: u64 = @intCast(nowNs(io) - t0);
-            try read_lat.add(alloc, dt);
+            try readLat.add(alloc, dt);
             try combined.add(alloc, dt);
         }
         r.end();
-        total_ns += @intCast(nowNs(io) - phase_start);
+        totalNs += @intCast(nowNs(io) - phaseStart);
     }
 
     // --- UPDATE phase: replace the embedded child (clear + insert) -----------
     {
-        const phase_start = nowNs(io);
+        const phaseStart = nowNs(io);
         var done: usize = 0;
-        while (done < update_n) {
-            const this_batch = @min(batch_size, update_n - done);
+        while (done < updateN) {
+            const thisBatch = @min(batchSize, updateN - done);
             var w = try database.beginWrite();
-            var dir = w.new_root;
+            var dir = w.newRoot;
             var j: usize = 0;
-            while (j < this_batch) : (j += 1) {
-                const primaryKey: u64 = ((done + j) * update_stride) % owners;
+            while (j < thisBatch) : (j += 1) {
+                const primaryKey: u64 = ((done + j) * updateStride) % owners;
                 const t0 = nowNs(io);
-                dir = try typedir.clearEmbedded(&w, dir, owner_type, primaryKey, embeddedProperty);
-                dir = try typedir.insertEmbedded(&w, dir, owner_type, primaryKey, embeddedProperty, &.{ .{ .int = primaryKey }, .{ .int = primaryKey *% 40503 } });
+                dir = try typedir.clearEmbedded(&w, dir, ownerType, primaryKey, embeddedProperty);
+                dir = try typedir.insertEmbedded(&w, dir, ownerType, primaryKey, embeddedProperty, &.{ .{ .int = primaryKey }, .{ .int = primaryKey *% 40503 } });
                 const dt: u64 = @intCast(nowNs(io) - t0);
-                try update_lat.add(alloc, dt);
+                try updateLat.add(alloc, dt);
                 try combined.add(alloc, dt);
             }
             w.setRoot(dir);
             _ = try w.commit();
-            done += this_batch;
+            done += thisBatch;
         }
-        total_ns += @intCast(nowNs(io) - phase_start);
+        totalNs += @intCast(nowNs(io) - phaseStart);
     }
 
     // --- DELETE phase: clearEmbedded (drops the child, keeps the owner) -------
     var deleted: u64 = 0;
     {
-        const phase_start = nowNs(io);
+        const phaseStart = nowNs(io);
         var done: usize = 0;
-        while (done < delete_n) {
-            const this_batch = @min(batch_size, delete_n - done);
+        while (done < deleteN) {
+            const thisBatch = @min(batchSize, deleteN - done);
             var w = try database.beginWrite();
-            var dir = w.new_root;
+            var dir = w.newRoot;
             var j: usize = 0;
-            while (j < this_batch) : (j += 1) {
-                const primaryKey: u64 = ((done + j) * delete_stride) % owners;
-                const had_child = (try typeRouting.getLink(&w, dir, owner_type, primaryKey, embeddedProperty)) != null;
+            while (j < thisBatch) : (j += 1) {
+                const primaryKey: u64 = ((done + j) * deleteStride) % owners;
+                const hadChild = (try typeRouting.getLink(&w, dir, ownerType, primaryKey, embeddedProperty)) != null;
                 const t0 = nowNs(io);
-                dir = try typedir.clearEmbedded(&w, dir, owner_type, primaryKey, embeddedProperty);
+                dir = try typedir.clearEmbedded(&w, dir, ownerType, primaryKey, embeddedProperty);
                 const dt: u64 = @intCast(nowNs(io) - t0);
-                if (had_child) {
+                if (hadChild) {
                     deleted += 1;
-                    try delete_lat.add(alloc, dt);
+                    try deleteLat.add(alloc, dt);
                     try combined.add(alloc, dt);
                 }
             }
             w.setRoot(dir);
             _ = try w.commit();
-            done += this_batch;
+            done += thisBatch;
         }
-        total_ns += @intCast(nowNs(io) - phase_start);
+        totalNs += @intCast(nowNs(io) - phaseStart);
     }
 
-    const file_bytes = try database.fileSize();
-    const logical_bytes = database.logicalSize();
+    const fileBytes = try database.fileSize();
+    const logicalBytes = database.logicalSize();
 
-    const ops: u64 = @as(u64, owners) + read_n + update_n + deleted;
+    const ops: u64 = @as(u64, owners) + readN + updateN + deleted;
 
     const note = try std.fmt.allocPrint(
         alloc,
         "create_p50_us={d:.1} read_p50_us={d:.1} update_p50_us={d:.1} delete_p50_us={d:.1} owners={d} child_props={d}",
         .{
-            @as(f64, @floatFromInt(create_lat.percentile(50))) / 1000.0,
-            @as(f64, @floatFromInt(read_lat.percentile(50))) / 1000.0,
-            @as(f64, @floatFromInt(update_lat.percentile(50))) / 1000.0,
-            @as(f64, @floatFromInt(delete_lat.percentile(50))) / 1000.0,
+            @as(f64, @floatFromInt(createLat.percentile(50))) / 1000.0,
+            @as(f64, @floatFromInt(readLat.percentile(50))) / 1000.0,
+            @as(f64, @floatFromInt(updateLat.percentile(50))) / 1000.0,
+            @as(f64, @floatFromInt(deleteLat.percentile(50))) / 1000.0,
             owners,
             childProperties,
         },
@@ -221,13 +221,13 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     const result = harness.Result{
         .name = name,
         .ops = ops,
-        .wall_ns = total_ns,
-        .p50_ns = combined.percentile(50),
-        .p99_ns = combined.percentile(99),
-        .max_ns = combined.percentile(100),
-        .file_bytes = file_bytes,
-        .logical_bytes = logical_bytes,
-        .peak_rss_bytes = airdb.peakResidentBytes(),
+        .wallNs = totalNs,
+        .p50Ns = combined.percentile(50),
+        .p99Ns = combined.percentile(99),
+        .maxNs = combined.percentile(100),
+        .fileBytes = fileBytes,
+        .logicalBytes = logicalBytes,
+        .peakRssBytes = airdb.peakResidentBytes(),
         .note = note,
     };
 

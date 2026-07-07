@@ -4,7 +4,7 @@ const coord = @import("coordination.zig");
 const platform = @import("../platform.zig");
 const Coordination = coord.Coordination;
 const coordIo = coord.coordIo;
-const sentinel_max = coord.sentinel_max;
+const sentinelMax = coord.sentinelMax;
 
 test "coord create initializes magic and zero attach count, reopen reads them" {
     var tmp = testing.tmpDir(.{});
@@ -70,7 +70,7 @@ test "openOrCreate succeeds while another holder owns the coord flock" {
     a.unlock();
 }
 
-test "latest_version round-trips through the mapping" {
+test "latestVersion round-trips through the mapping" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var pathBuffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
@@ -103,7 +103,7 @@ test "exclusive lock blocks a second holder via the same coord file" {
     b.unlock();
 }
 
-test "claim returns a slot index, publish and read back min_pinned, release frees it" {
+test "claim returns a slot index, publish and read back minPinned, release frees it" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var pathBuffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
@@ -135,7 +135,7 @@ test "two claims get distinct slots" {
     c.releaseSlot(b);
 }
 
-test "globalHorizon is the min of live slots min_pinned, clamped to fallback" {
+test "globalHorizon is the min of live slots minPinned, clamped to fallback" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var pathBuffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
@@ -147,7 +147,7 @@ test "globalHorizon is the min of live slots min_pinned, clamped to fallback" {
     const a = (try c.claimSlot()).?;
     c.publishMinPinned(a, 5);
     try testing.expectEqual(@as(u64, 5), c.globalHorizon(100));
-    c.publishMinPinned(a, sentinel_max);
+    c.publishMinPinned(a, sentinelMax);
     try testing.expectEqual(@as(u64, 100), c.globalHorizon(100));
     c.releaseSlot(a);
 }
@@ -162,8 +162,8 @@ test "globalHorizon ignores and reclaims a dead-pid slot" {
     var c = try Coordination.openOrCreate(cpath);
     defer c.deinit();
     const live = (try c.claimSlot()).?;
-    c.publishMinPinned(live, sentinel_max);
-    c.forgeSlotForTest(1, 0x7fffffff, 0, 3); // an almost-certainly-dead pid with a low min_pinned
+    c.publishMinPinned(live, sentinelMax);
+    c.forgeSlotForTest(1, 0x7fffffff, 0, 3); // an almost-certainly-dead pid with a low minPinned
     try testing.expectEqual(@as(u64, 50), c.globalHorizon(50));
     try testing.expectEqual(@as(u32, 0), c.slotPidForTest(1)); // reclaimed
     c.releaseSlot(live);
@@ -182,9 +182,9 @@ test "globalHorizon reclaims a slot whose live pid has the wrong incarnation tok
     var c = try Coordination.openOrCreate(cpath);
     defer c.deinit();
 
-    const my_pid: u32 = @intCast(platform.currentPid());
-    const my_token: u32 = @truncate(platform.processStartToken(my_pid) orelse return error.SkipZigTest);
-    c.forgeSlotForTest(2, my_pid, my_token +% 1, 3); // alive pid, wrong incarnation
+    const myPid: u32 = @intCast(platform.currentPid());
+    const myToken: u32 = @truncate(platform.processStartToken(myPid) orelse return error.SkipZigTest);
+    c.forgeSlotForTest(2, myPid, myToken +% 1, 3); // alive pid, wrong incarnation
     try testing.expectEqual(@as(u64, 50), c.globalHorizon(50));
     try testing.expectEqual(@as(u32, 0), c.slotPidForTest(2)); // reclaimed
 
@@ -208,9 +208,9 @@ test "globalHorizon keeps a live-pid slot whose stored token is zero" {
     var c = try Coordination.openOrCreate(cpath);
     defer c.deinit();
 
-    const my_pid: u32 = @intCast(platform.currentPid());
-    c.forgeSlotForTest(1, my_pid, 0, 5); // alive pid, unknown incarnation
+    const myPid: u32 = @intCast(platform.currentPid());
+    c.forgeSlotForTest(1, myPid, 0, 5); // alive pid, unknown incarnation
     try testing.expectEqual(@as(u64, 5), c.globalHorizon(50));
-    try testing.expectEqual(my_pid, c.slotPidForTest(1)); // not reclaimed
+    try testing.expectEqual(myPid, c.slotPidForTest(1)); // not reclaimed
     c.releaseSlot(1);
 }

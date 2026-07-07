@@ -5,7 +5,7 @@ const Database = @import("../database.zig").Database;
 
 pub const ReadTransaction = struct {
     database: *Database,
-    root_ref: Reference,
+    rootRef: Reference,
     version: u64,
     /// Set by end(). A second end() must be a no-op: decrementing the pin count
     /// again would release another reader's pin at the same version and expose
@@ -13,7 +13,7 @@ pub const ReadTransaction = struct {
     ended: bool = false,
 
     pub fn root(self: ReadTransaction) Reference {
-        return self.root_ref;
+        return self.rootRef;
     }
 
     pub fn deref(self: *ReadTransaction, ref: Reference, length: usize) ![]const u8 {

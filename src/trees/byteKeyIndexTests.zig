@@ -15,7 +15,7 @@ const count = bindex.count;
 const freeTree = bindex.freeTree;
 const forEachEntry = bindex.forEachEntry;
 
-const inner_node_size = node.inner_node_size;
+const innerNodeSize = node.innerNodeSize;
 const encodeInner = node.encodeInner;
 
 fn bidxTmpPath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const u8) ![]const u8 {
@@ -36,9 +36,9 @@ test "a bindex ref cycle fails with error.Corrupt" {
 
     // Inner node whose only child is itself; its low key is a real blob so the
     // ordering compare succeeds and the walk descends into the cycle.
-    const key_ref = try blob.put(&w, "k");
-    const a = try w.alloc(inner_node_size);
-    _ = encodeInner(a.bytes, &.{a.ref}, &.{key_ref}, &.{1});
+    const keyRef = try blob.put(&w, "k");
+    const a = try w.alloc(innerNodeSize);
+    _ = encodeInner(a.bytes, &.{a.ref}, &.{keyRef}, &.{1});
     try testing.expectError(error.Corrupt, get(&w, a.ref, "k"));
     try testing.expectError(error.Corrupt, insert(&w, a.ref, "x", 1));
     try testing.expectError(error.Corrupt, remove(&w, a.ref, "k"));
@@ -81,7 +81,7 @@ test "freeTree over a three-level tree frees every blob exactly once" {
         const gop = try seen.getOrPut(e.offset);
         try testing.expect(!gop.found_existing); // duplicate free
     }
-    for (w.in_flight_frees.items) |e| {
+    for (w.inFlightFrees.items) |e| {
         const gop = try seen.getOrPut(e.offset);
         try testing.expect(!gop.found_existing);
     }
@@ -192,12 +192,12 @@ test "keys iterate in ascending byte order" {
     try forEachEntry(&w, root, Collector{ .keys = &keys, .vals = &vals }, Collector.onEntry);
 
     // Expected ascending byte order: "app" < "apple" < "banana" < "cherry".
-    const expect_keys = [_][]const u8{ "app", "apple", "banana", "cherry" };
-    const expect_vals = [_]u64{ 40, 20, 10, 30 };
-    try testing.expectEqual(expect_keys.len, keys.items.len);
+    const expectKeys = [_][]const u8{ "app", "apple", "banana", "cherry" };
+    const expectVals = [_]u64{ 40, 20, 10, 30 };
+    try testing.expectEqual(expectKeys.len, keys.items.len);
     for (keys.items, vals.items, 0..) |k, val, index| {
-        try testing.expectEqualStrings(expect_keys[index], k);
-        try testing.expectEqual(expect_vals[index], val);
+        try testing.expectEqualStrings(expectKeys[index], k);
+        try testing.expectEqual(expectVals[index], val);
     }
     // And explicitly assert the collected keys are sorted by std.mem.order.
     var i: usize = 1;

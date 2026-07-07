@@ -98,7 +98,7 @@ test "update applies on a matching version" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var catalogRef: Reference = undefined;
-    var fetched_version: u64 = undefined;
+    var fetchedVersion: u64 = undefined;
     {
         var w = try database.beginWrite();
         catalogRef = try create(&w, 3);
@@ -109,12 +109,12 @@ test "update applies on a matching version" {
     {
         var r = try database.beginRead();
         var out: [3]u64 = undefined;
-        fetched_version = (try getByPrimaryKey(&r, r.root(), 100, &out)).?;
+        fetchedVersion = (try getByPrimaryKey(&r, r.root(), 100, &out)).?;
         r.end();
     }
     {
         var w = try database.beginWrite();
-        const res = try update(&w, w.new_root, 100, &.{ 100, 77, 1 }, fetched_version);
+        const res = try update(&w, w.newRoot, 100, &.{ 100, 77, 1 }, fetchedVersion);
         try testing.expect(res == .ok);
         catalogRef = res.ok.catalogRef;
         w.setRoot(catalogRef);
@@ -171,7 +171,7 @@ test "update conflicts on a stale version" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var catalogRef: Reference = undefined;
-    var fetched_version: u64 = undefined;
+    var fetchedVersion: u64 = undefined;
     {
         var w = try database.beginWrite();
         catalogRef = try create(&w, 3);
@@ -182,15 +182,15 @@ test "update conflicts on a stale version" {
     {
         var r = try database.beginRead();
         var out: [3]u64 = undefined;
-        fetched_version = (try getByPrimaryKey(&r, r.root(), 100, &out)).?;
+        fetchedVersion = (try getByPrimaryKey(&r, r.root(), 100, &out)).?;
         r.end();
     }
     {
         var w = try database.beginWrite();
-        const res = try update(&w, w.new_root, 100, &.{ 100, 77, 1 }, fetched_version);
+        const res = try update(&w, w.newRoot, 100, &.{ 100, 77, 1 }, fetchedVersion);
         try testing.expect(res == .ok);
         catalogRef = res.ok.catalogRef;
-        const res2 = try update(&w, catalogRef, 100, &.{ 100, 88, 1 }, fetched_version); // stale now
+        const res2 = try update(&w, catalogRef, 100, &.{ 100, 88, 1 }, fetchedVersion); // stale now
         try testing.expect(res2 == .conflict);
         w.deinit();
     }
@@ -458,7 +458,7 @@ test "a large blob property decodes to a ref and materializes; small stays inlin
     var w = try database.beginWrite();
     var catalogRef = try createTyped(&w, &.{ .int, .blob });
 
-    // A blob well past the inline cap (section_size is 16 MiB) forces chunking.
+    // A blob well past the inline cap (sectionSize is 16 MiB) forces chunking.
     const n: usize = 20 * 1024 * 1024;
     const big = try testing.allocator.alloc(u8, n);
     defer testing.allocator.free(big);
@@ -470,10 +470,10 @@ test "a large blob property decodes to a ref and materializes; small stays inlin
     // The large blob decodes to a ref, not an inline slice.
     var out: [2]Value = undefined;
     try testing.expect((try getTyped(&w, catalogRef, 1, &out)) != null);
-    try testing.expect(out[1] == .blob_ref);
+    try testing.expect(out[1] == .blobRef);
 
     // Materialize it and verify length + sampled offsets + first/last KB.
-    const got = try blob.getAlloc(&w, out[1].blob_ref, testing.allocator);
+    const got = try blob.getAlloc(&w, out[1].blobRef, testing.allocator);
     defer testing.allocator.free(got);
     try testing.expectEqual(n, got.len);
     try testing.expectEqualSlices(u8, big[0..1024], got[0..1024]);
@@ -663,7 +663,7 @@ test "updateTyped carries collection properties through unchanged" {
     var w = try database.beginWrite();
     defer w.deinit();
     var catalogRef = try catalog.createFromDefinitions(&w, &.{ .{ .kind = .int }, .{ .kind = .int }, .{ .kind = .list, .element = .int } });
-    catalogRef = (try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .int = 10 }, .{ .list_int = &.{ 7, 8, 9 } } })).catalogRef;
+    catalogRef = (try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .int = 10 }, .{ .listInt = &.{ 7, 8, 9 } } })).catalogRef;
 
     var out: [3]Value = undefined;
     const version = (try getTyped(&w, catalogRef, 1, &out)).?;
@@ -698,9 +698,9 @@ test "deleteTyped frees the row's collection storage" {
         });
         catalogRef = (try insertTyped(&w, catalogRef, &.{
             .{ .int = 1 },
-            .{ .list_blob = &.{ "alpha", "beta" } },
-            .{ .set_int = &.{ 1, 2, 3 } },
-            .{ .dict_int = &.{ .{ .key = "k1", .value = 10 }, .{ .key = "k2", .value = 20 } } },
+            .{ .listBlob = &.{ "alpha", "beta" } },
+            .{ .setInt = &.{ 1, 2, 3 } },
+            .{ .dictInt = &.{ .{ .key = "k1", .value = 10 }, .{ .key = "k2", .value = 20 } } },
         })).catalogRef;
         w.setRoot(catalogRef);
         _ = try w.commit();
@@ -709,13 +709,13 @@ test "deleteTyped frees the row's collection storage" {
     var w = try database.beginWrite();
     defer w.deinit();
     var out: [4]Value = undefined;
-    const version = (try getTyped(&w, w.new_root, 1, &out)).?;
-    const before = w.in_flight_frees.items.len;
-    const res = try deleteTyped(&w, w.new_root, 1, version);
+    const version = (try getTyped(&w, w.newRoot, 1, &out)).?;
+    const before = w.inFlightFrees.items.len;
+    const res = try deleteTyped(&w, w.newRoot, 1, version);
     try testing.expect(res == .ok);
     // list tree + 2 element blobs + set tree + dict tree + 2 key blobs, plus
     // the COW frees of the delete itself: well above the tombstone-only count.
-    try testing.expect(w.in_flight_frees.items.len >= before + 7);
+    try testing.expect(w.inFlightFrees.items.len >= before + 7);
 }
 
 test "updateTyped moves backlinks when a link value changes" {
@@ -744,9 +744,9 @@ test "updateTyped moves backlinks when a link value changes" {
     try testing.expect(res == .ok);
     catalogRef = res.ok.catalogRef;
 
-    const links_mod = @import("links.zig");
-    try testing.expectEqual(@as(u64, 0), try links_mod.backlinkCount(&w, catalogRef, 1, a.row));
-    try testing.expectEqual(@as(u64, 1), try links_mod.backlinkCount(&w, catalogRef, 1, b.row));
+    const linksMod = @import("links.zig");
+    try testing.expectEqual(@as(u64, 0), try linksMod.backlinkCount(&w, catalogRef, 1, a.row));
+    try testing.expectEqual(@as(u64, 1), try linksMod.backlinkCount(&w, catalogRef, 1, b.row));
     // Deleting the NEW target nullifies the source's link.
     var raw: [2]u64 = undefined;
     const bv = (try getByPrimaryKey(&w, catalogRef, 2, &raw)).?;
@@ -754,7 +754,7 @@ test "updateTyped moves backlinks when a link value changes" {
         .ok => |x| x,
         else => unreachable,
     };
-    try testing.expectEqual(@as(?u64, null), try links_mod.getLink(&w, catalogRef, 3, 1));
+    try testing.expectEqual(@as(?u64, null), try linksMod.getLink(&w, catalogRef, 3, 1));
 }
 
 test "a multi-leaf value-index set is pruned and freed when emptied" {
@@ -860,8 +860,8 @@ test "reinserting a primary key after delete yields a new object key" {
     w.deinit();
 }
 
-test "deleteTyped frees a self-referencing link_set root exactly once" {
-    // Regression: deleting a row whose link_set contained its own objectKey freed
+test "deleteTyped frees a self-referencing linkSet root exactly once" {
+    // Regression: deleting a row whose linkSet contained its own objectKey freed
     // the set root twice. The inbound nullify removed objectKey from the row's own
     // set -- a COW whose Index.remove freed the old root -- and the delete's
     // storage reclamation then freed the same root again from the captured
@@ -878,9 +878,9 @@ test "deleteTyped frees a self-referencing link_set root exactly once" {
         var w = try database.beginWrite();
         var catalogRef = try catalog.createFromDefinitions(&w, &.{
             .{ .kind = .int },
-            .{ .kind = .link_set },
+            .{ .kind = .linkSet },
         });
-        const ins = try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .link_set = &.{} } });
+        const ins = try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .linkSet = &.{} } });
         catalogRef = ins.catalogRef;
         catalogRef = try links.linkSetAdd(&w, catalogRef, 1, 1, ins.row); // set contains own objectKey
         w.setRoot(catalogRef);
@@ -889,8 +889,8 @@ test "deleteTyped frees a self-referencing link_set root exactly once" {
     var w = try database.beginWrite();
     defer w.deinit();
     var out: [2]Value = undefined;
-    const version = (try getTyped(&w, w.new_root, 1, &out)).?;
-    const res = try deleteTyped(&w, w.new_root, 1, version);
+    const version = (try getTyped(&w, w.newRoot, 1, &out)).?;
+    const res = try deleteTyped(&w, w.newRoot, 1, version);
     try testing.expect(res == .ok);
     var seen = std.AutoHashMap(u64, void).init(testing.allocator);
     defer seen.deinit();
@@ -898,7 +898,7 @@ test "deleteTyped frees a self-referencing link_set root exactly once" {
         const gop = try seen.getOrPut(e.offset);
         try testing.expect(!gop.found_existing); // duplicate free
     }
-    for (w.in_flight_frees.items) |e| {
+    for (w.inFlightFrees.items) |e| {
         const gop = try seen.getOrPut(e.offset);
         try testing.expect(!gop.found_existing);
     }

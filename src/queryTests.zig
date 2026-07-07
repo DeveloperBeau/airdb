@@ -15,8 +15,8 @@ const sortByPropertyAscending = query.sortByPropertyAscending;
 
 fn qTmpPath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const u8) ![]const u8 {
     var pathBuffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const path_len = try tmp.dir.realPath(testing.io, &pathBuffer);
-    return std.fs.path.join(allocator, &.{ pathBuffer[0..path_len], name });
+    const pathLen = try tmp.dir.realPath(testing.io, &pathBuffer);
+    return std.fs.path.join(allocator, &.{ pathBuffer[0..pathLen], name });
 }
 
 // Build a 3-property type: property0 = primaryKey, property1 = value (indexed iff `indexed`), property2 =
@@ -203,13 +203,13 @@ test "query returns stable object keys after relocation" {
     const targetObjectKey = target.row;
 
     // Free the throwaway's physical slot.
-    const dead_row = (try catalog.objectKeyToRow(&w, catalogRef, throwaway.row)).?;
+    const deadRow = (try catalog.objectKeyToRow(&w, catalogRef, throwaway.row)).?;
     var vbuf: [2]u64 = undefined;
     const tv = (try rows.getByPrimaryKey(&w, catalogRef, 1, &vbuf)).?;
     catalogRef = (try rows.delete(&w, catalogRef, 1, tv)).ok;
 
     // Relocate the target into the freed slot; its objectKey is unchanged.
-    catalogRef = try relocation.relocateRow(&w, catalogRef, targetObjectKey, dead_row);
+    catalogRef = try relocation.relocateRow(&w, catalogRef, targetObjectKey, deadRow);
 
     // A query that matches the relocated row must return its stable objectKey, and
     // that objectKey must resolve to the right values.
@@ -360,15 +360,15 @@ test "countWhere rangeInclusive aggregateInt match between index path and full s
     );
 
     // rangeInclusive over the indexed property.
-    var ri_idx = std.ArrayList(u64).empty;
-    defer ri_idx.deinit(testing.allocator);
-    var ri_scan = std.ArrayList(u64).empty;
-    defer ri_scan.deinit(testing.allocator);
-    try rangeInclusive(&w, indexedCatalog, 1, 10, 20, &ri_idx, testing.allocator);
-    try rangeInclusive(&w, scanCatalog, 1, 10, 20, &ri_scan, testing.allocator);
-    std.mem.sort(u64, ri_idx.items, {}, std.sort.asc(u64));
-    std.mem.sort(u64, ri_scan.items, {}, std.sort.asc(u64));
-    try testing.expectEqualSlices(u64, ri_scan.items, ri_idx.items);
+    var riIdx = std.ArrayList(u64).empty;
+    defer riIdx.deinit(testing.allocator);
+    var riScan = std.ArrayList(u64).empty;
+    defer riScan.deinit(testing.allocator);
+    try rangeInclusive(&w, indexedCatalog, 1, 10, 20, &riIdx, testing.allocator);
+    try rangeInclusive(&w, scanCatalog, 1, 10, 20, &riScan, testing.allocator);
+    std.mem.sort(u64, riIdx.items, {}, std.sort.asc(u64));
+    std.mem.sort(u64, riScan.items, {}, std.sort.asc(u64));
+    try testing.expectEqualSlices(u64, riScan.items, riIdx.items);
 
     // aggregateInt over the indexed property with an indexed driver.
     const a = try aggregateInt(&w, indexedCatalog, 1, &.{.{ .property = 1, .operator = .eq, .value = 50 }}, testing.allocator);

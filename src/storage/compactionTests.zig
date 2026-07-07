@@ -58,7 +58,7 @@ test "compactType packs live rows and drops dead ones" {
 
     catalogRef = try compactType(&w, catalogRef);
 
-    try testing.expectEqual(@as(u64, 7), (try catalog.loadCatalog(&w, catalogRef)).next_row);
+    try testing.expectEqual(@as(u64, 7), (try catalog.loadCatalog(&w, catalogRef)).nextRow);
     try testing.expectEqual(@as(u64, 7), try liveCount(&w, catalogRef));
 
     primaryKey = 0;
@@ -102,8 +102,8 @@ test "compactType frees the replaced column set" {
     // as in-flight frees rather than leaving them as unreclaimable garbage.
     var w = try database.beginWrite();
     defer w.deinit();
-    _ = try compactType(&w, w.new_root);
-    try testing.expect(w.in_flight_frees.items.len > 0);
+    _ = try compactType(&w, w.newRoot);
+    try testing.expect(w.inFlightFrees.items.len > 0);
 }
 
 test "object keys and links survive compaction" {
@@ -194,10 +194,10 @@ test "compaction reclaims under churn (scale)" {
         catalogRef = r.catalogRef;
     }
 
-    // delete every even primaryKey; all rows carry version == w.new_version this transaction
+    // delete every even primaryKey; all rows carry version == w.newVersion this transaction
     i = 0;
     while (i < n) : (i += 2) {
-        catalogRef = switch (try rows.delete(&w, catalogRef, i, w.new_version)) {
+        catalogRef = switch (try rows.delete(&w, catalogRef, i, w.newVersion)) {
             .ok => |c| c,
             else => unreachable,
         };
@@ -205,7 +205,7 @@ test "compaction reclaims under churn (scale)" {
 
     catalogRef = try compactType(&w, catalogRef);
 
-    try testing.expectEqual(@as(u64, 100_000), (try catalog.loadCatalog(&w, catalogRef)).next_row);
+    try testing.expectEqual(@as(u64, 100_000), (try catalog.loadCatalog(&w, catalogRef)).nextRow);
     try testing.expectEqual(@as(u64, 100_000), try liveCount(&w, catalogRef));
 
     var out: [2]u64 = undefined;
@@ -221,18 +221,18 @@ test "compaction reclaims under churn (scale)" {
 test "all value kinds deep-copy across databases preserving keys" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const src_path = try cmpTmpPath(testing.allocator, &tmp, "src.airdb");
-    defer testing.allocator.free(src_path);
-    const dst_path = try cmpTmpPath(testing.allocator, &tmp, "dst.airdb");
-    defer testing.allocator.free(dst_path);
+    const srcPath = try cmpTmpPath(testing.allocator, &tmp, "src.airdb");
+    defer testing.allocator.free(srcPath);
+    const dstPath = try cmpTmpPath(testing.allocator, &tmp, "dst.airdb");
+    defer testing.allocator.free(dstPath);
 
-    var sourceDatabase = try Database.create(testing.allocator, src_path);
+    var sourceDatabase = try Database.create(testing.allocator, srcPath);
     defer sourceDatabase.deinit();
-    var destinationDatabase = try Database.create(testing.allocator, dst_path);
+    var destinationDatabase = try Database.create(testing.allocator, dstPath);
     defer destinationDatabase.deinit();
 
     var primaryKey1ObjectKey: u64 = undefined;
-    var src_next_key: u64 = undefined;
+    var srcNextKey: u64 = undefined;
 
     // Build the source database: 3 rows across every value kind, then delete one.
     {
@@ -242,19 +242,19 @@ test "all value kinds deep-copy across databases preserving keys" {
             .{ .kind = .blob },
             .{ .kind = .list, .element = .int },
             .{ .kind = .set, .element = .int },
-            .{ .kind = .link, .link_target = 0 },
+            .{ .kind = .link, .linkTarget = 0 },
         });
         const r1 = try objects.insertTyped(&w, catalogRef, &.{
-            .{ .int = 1 }, .{ .bytes = "a" }, .{ .list_int = &.{ 10, 20 } }, .{ .set_int = &.{ 5, 6 } }, .{ .link = null },
+            .{ .int = 1 }, .{ .bytes = "a" }, .{ .listInt = &.{ 10, 20 } }, .{ .setInt = &.{ 5, 6 } }, .{ .link = null },
         });
         catalogRef = r1.catalogRef;
         primaryKey1ObjectKey = r1.row;
         const r2 = try objects.insertTyped(&w, catalogRef, &.{
-            .{ .int = 2 }, .{ .bytes = "bb" }, .{ .list_int = &.{} }, .{ .set_int = &.{7} }, .{ .link = primaryKey1ObjectKey },
+            .{ .int = 2 }, .{ .bytes = "bb" }, .{ .listInt = &.{} }, .{ .setInt = &.{7} }, .{ .link = primaryKey1ObjectKey },
         });
         catalogRef = r2.catalogRef;
         const r3 = try objects.insertTyped(&w, catalogRef, &.{
-            .{ .int = 3 }, .{ .bytes = "ccc" }, .{ .list_int = &.{ 1, 2, 3 } }, .{ .set_int = &.{} }, .{ .link = null },
+            .{ .int = 3 }, .{ .bytes = "ccc" }, .{ .listInt = &.{ 1, 2, 3 } }, .{ .setInt = &.{} }, .{ .link = null },
         });
         catalogRef = r3.catalogRef;
 
@@ -263,26 +263,26 @@ test "all value kinds deep-copy across databases preserving keys" {
         const v3 = (try objects.getTyped(&w, catalogRef, 3, &dout)).?;
         catalogRef = (try objects.deleteTyped(&w, catalogRef, 3, v3)).ok;
 
-        src_next_key = (try catalog.loadCatalog(&w, catalogRef)).next_key;
+        srcNextKey = (try catalog.loadCatalog(&w, catalogRef)).nextKey;
         w.setRoot(catalogRef);
         _ = try w.commit();
     }
 
     // Deep-copy the live rows into the destination database.
     {
-        var src_read = try sourceDatabase.beginRead();
-        const sourceCatalog = src_read.root();
-        var dst_w = try destinationDatabase.beginWrite();
-        var destinationCatalog = try copyTypeRows(&src_read, sourceCatalog, &dst_w);
-        destinationCatalog = try rebuildBacklinks(&dst_w, destinationCatalog);
-        dst_w.setRoot(destinationCatalog);
-        _ = try dst_w.commit();
-        src_read.end();
+        var srcRead = try sourceDatabase.beginRead();
+        const sourceCatalog = srcRead.root();
+        var dstW = try destinationDatabase.beginWrite();
+        var destinationCatalog = try copyTypeRows(&srcRead, sourceCatalog, &dstW);
+        destinationCatalog = try rebuildBacklinks(&dstW, destinationCatalog);
+        dstW.setRoot(destinationCatalog);
+        _ = try dstW.commit();
+        srcRead.end();
     }
 
     // Reopen the destination and verify every value kind round-tripped.
     {
-        var reopenedDestination = try Database.open(testing.allocator, dst_path);
+        var reopenedDestination = try Database.open(testing.allocator, dstPath);
         defer reopenedDestination.deinit();
         var r = try reopenedDestination.beginRead();
         defer r.end();
@@ -322,30 +322,30 @@ test "all value kinds deep-copy across databases preserving keys" {
         var o3: [5]catalog.Value = undefined;
         try testing.expect((try objects.getTyped(&r, catalogRef, 3, &o3)) == null);
 
-        // next_key preserved across the copy.
-        try testing.expectEqual(src_next_key, (try catalog.loadCatalog(&r, catalogRef)).next_key);
+        // nextKey preserved across the copy.
+        try testing.expectEqual(srcNextKey, (try catalog.loadCatalog(&r, catalogRef)).nextKey);
     }
 }
 
 test "compactToNewFile produces a verified, smaller, equivalent file" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const src_path = try cmpTmpPath(testing.allocator, &tmp, "fullsrc.airdb");
-    defer testing.allocator.free(src_path);
-    const dst_path = try cmpTmpPath(testing.allocator, &tmp, "fulldst.airdb");
-    defer testing.allocator.free(dst_path);
+    const srcPath = try cmpTmpPath(testing.allocator, &tmp, "fullsrc.airdb");
+    defer testing.allocator.free(srcPath);
+    const dstPath = try cmpTmpPath(testing.allocator, &tmp, "fulldst.airdb");
+    defer testing.allocator.free(dstPath);
 
     const PD = catalog.PropertyDefinition;
     var authorObjectKeys: [300]u64 = undefined;
 
     // Build the source: two types, ~300 authors + ~300 books, delete ~100 books.
     {
-        var database = try Database.create(testing.allocator, src_path);
+        var database = try Database.create(testing.allocator, srcPath);
         defer database.deinit();
         var w = try database.beginWrite();
         const schema = [_][]const PD{
             &.{ .{ .kind = .int }, .{ .kind = .blob } }, // 0: Author{int primaryKey, blob name}
-            &.{ .{ .kind = .int }, .{ .kind = .link, .link_target = 0 }, .{ .kind = .set, .element = .int } }, // 1: Book{int primaryKey, link author, set tags}
+            &.{ .{ .kind = .int }, .{ .kind = .link, .linkTarget = 0 }, .{ .kind = .set, .element = .int } }, // 1: Book{int primaryKey, link author, set tags}
         };
         var dir = try typedir.createTypes(&w, &schema, &.{ false, false });
 
@@ -360,7 +360,7 @@ test "compactToNewFile produces a verified, smaller, equivalent file" {
         i = 0;
         while (i < 300) : (i += 1) {
             const objectKeyA = authorObjectKeys[@intCast(i % 300)];
-            const r = try typeRouting.insert(&w, dir, 1, &.{ .{ .int = i }, .{ .link = objectKeyA }, .{ .set_int = &.{ i, i + 1000 } } });
+            const r = try typeRouting.insert(&w, dir, 1, &.{ .{ .int = i }, .{ .link = objectKeyA }, .{ .setInt = &.{ i, i + 1000 } } });
             dir = r.dir;
         }
         // Delete every third book (~100): primaryKeys 0,3,...,297.
@@ -376,25 +376,25 @@ test "compactToNewFile produces a verified, smaller, equivalent file" {
     }
 
     // Full-file compaction (opens src, writes + verifies + commits dst).
-    try compactToNewFile(testing.allocator, src_path, dst_path);
+    try compactToNewFile(testing.allocator, srcPath, dstPath);
 
     // The fresh file holds no garbage, so its live data footprint must be smaller
     // than the churned source's. Compare logical size (high-water of live bytes),
     // since the physical file length floors at the 1MB initial mmap for both.
-    var src_size: u64 = undefined;
-    var dst_size: u64 = undefined;
+    var srcSize: u64 = undefined;
+    var dstSize: u64 = undefined;
     {
-        var reopenedSource = try Database.open(testing.allocator, src_path);
-        src_size = reopenedSource.arena.top;
+        var reopenedSource = try Database.open(testing.allocator, srcPath);
+        srcSize = reopenedSource.arena.top;
         reopenedSource.deinit();
-        var reopenedDestination = try Database.open(testing.allocator, dst_path);
-        dst_size = reopenedDestination.arena.top;
+        var reopenedDestination = try Database.open(testing.allocator, dstPath);
+        dstSize = reopenedDestination.arena.top;
         reopenedDestination.deinit();
     }
-    try testing.expect(dst_size < src_size);
+    try testing.expect(dstSize < srcSize);
 
     // The destination is published; verify equivalence on the live data.
-    var reopenedDestination = try Database.open(testing.allocator, dst_path);
+    var reopenedDestination = try Database.open(testing.allocator, dstPath);
     defer reopenedDestination.deinit();
     var r = try reopenedDestination.beginRead();
     defer r.end();
@@ -426,17 +426,17 @@ test "compactToNewFile produces a verified, smaller, equivalent file" {
 test "compaction preserves dict and set-of-blob" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const src_path = try cmpTmpPath(testing.allocator, &tmp, "bindexsrc.airdb");
-    defer testing.allocator.free(src_path);
-    const dst_path = try cmpTmpPath(testing.allocator, &tmp, "bindexdst.airdb");
-    defer testing.allocator.free(dst_path);
+    const srcPath = try cmpTmpPath(testing.allocator, &tmp, "bindexsrc.airdb");
+    defer testing.allocator.free(srcPath);
+    const dstPath = try cmpTmpPath(testing.allocator, &tmp, "bindexdst.airdb");
+    defer testing.allocator.free(dstPath);
 
     const PD = catalog.PropertyDefinition;
 
     // Build the source: a type with {int primaryKey, dict, set(element=blob)}, two rows with
     // dict entries + blob-set members, then delete one row to leave a gap.
     {
-        var database = try Database.create(testing.allocator, src_path);
+        var database = try Database.create(testing.allocator, srcPath);
         defer database.deinit();
         var w = try database.beginWrite();
         const schema = [_][]const PD{
@@ -446,14 +446,14 @@ test "compaction preserves dict and set-of-blob" {
 
         const r1 = try typeRouting.insert(&w, dir, 0, &.{
             .{ .int = 1 },
-            .{ .dict_int = &.{ .{ .key = "a", .value = 1 }, .{ .key = "b", .value = 2 } } },
-            .{ .set_blob = &.{ "x", "yy" } },
+            .{ .dictInt = &.{ .{ .key = "a", .value = 1 }, .{ .key = "b", .value = 2 } } },
+            .{ .setBlob = &.{ "x", "yy" } },
         });
         dir = r1.dir;
         const r2 = try typeRouting.insert(&w, dir, 0, &.{
             .{ .int = 2 },
-            .{ .dict_int = &.{.{ .key = "c", .value = 3 }} },
-            .{ .set_blob = &.{"zzz"} },
+            .{ .dictInt = &.{.{ .key = "c", .value = 3 }} },
+            .{ .setBlob = &.{"zzz"} },
         });
         dir = r2.dir;
 
@@ -468,11 +468,11 @@ test "compaction preserves dict and set-of-blob" {
     }
 
     // Full-file compaction: opens src, deep-copies live rows, verifies, commits dst.
-    try compactToNewFile(testing.allocator, src_path, dst_path);
+    try compactToNewFile(testing.allocator, srcPath, dstPath);
 
     // Reopen the destination and verify the surviving row's dict + blob-set survived.
     {
-        var reopenedDestination = try Database.open(testing.allocator, dst_path);
+        var reopenedDestination = try Database.open(testing.allocator, dstPath);
         defer reopenedDestination.deinit();
         var r = try reopenedDestination.beginRead();
         defer r.end();
@@ -502,14 +502,14 @@ test "compaction preserves dict and set-of-blob" {
 test "compaction preserves a large (chunked) blob" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const src_path = try cmpTmpPath(testing.allocator, &tmp, "bigblobsrc.airdb");
-    defer testing.allocator.free(src_path);
-    const dst_path = try cmpTmpPath(testing.allocator, &tmp, "bigblobdst.airdb");
-    defer testing.allocator.free(dst_path);
+    const srcPath = try cmpTmpPath(testing.allocator, &tmp, "bigblobsrc.airdb");
+    defer testing.allocator.free(srcPath);
+    const dstPath = try cmpTmpPath(testing.allocator, &tmp, "bigblobdst.airdb");
+    defer testing.allocator.free(dstPath);
 
     const PD = catalog.PropertyDefinition;
 
-    // A blob well past the inline cap (section_size is 16 MiB) is stored chunked.
+    // A blob well past the inline cap (sectionSize is 16 MiB) is stored chunked.
     const n: usize = 20 * 1024 * 1024;
     const big = try testing.allocator.alloc(u8, n);
     defer testing.allocator.free(big);
@@ -517,7 +517,7 @@ test "compaction preserves a large (chunked) blob" {
 
     // Build the source: a type {int primaryKey, blob}, one large blob and one small.
     {
-        var database = try Database.create(testing.allocator, src_path);
+        var database = try Database.create(testing.allocator, srcPath);
         defer database.deinit();
         var w = try database.beginWrite();
         const schema = [_][]const PD{
@@ -531,11 +531,11 @@ test "compaction preserves a large (chunked) blob" {
     }
 
     // Full-file compaction: deep-copies live rows (incl. the chunked blob), verifies, commits.
-    try compactToNewFile(testing.allocator, src_path, dst_path);
+    try compactToNewFile(testing.allocator, srcPath, dstPath);
 
     // Reopen the destination and verify both blobs survived.
     {
-        var reopenedDestination = try Database.open(testing.allocator, dst_path);
+        var reopenedDestination = try Database.open(testing.allocator, dstPath);
         defer reopenedDestination.deinit();
         var r = try reopenedDestination.beginRead();
         defer r.end();
@@ -544,8 +544,8 @@ test "compaction preserves a large (chunked) blob" {
         // The large blob materializes byte-identical via its ref.
         var o1: [2]catalog.Value = undefined;
         try testing.expect((try typeRouting.get(&r, dir, 0, 1, &o1)) != null);
-        try testing.expect(o1[1] == .blob_ref);
-        const got = try blob.getAlloc(&r, o1[1].blob_ref, testing.allocator);
+        try testing.expect(o1[1] == .blobRef);
+        const got = try blob.getAlloc(&r, o1[1].blobRef, testing.allocator);
         defer testing.allocator.free(got);
         try testing.expectEqualSlices(u8, big, got);
 
@@ -597,19 +597,19 @@ test "compactStep packs a delete-heavy type across several small steps" {
         try testing.expect(guard < 100);
     }
 
-    // Fully packed: next_row == live count.
-    try testing.expectEqual(try liveCount(&w, catalogRef), (try catalog.loadCatalog(&w, catalogRef)).next_row);
+    // Fully packed: nextRow == live count.
+    try testing.expectEqual(try liveCount(&w, catalogRef), (try catalog.loadCatalog(&w, catalogRef)).nextRow);
 
     // Every survivor reads back its exact values; deleted keys are gone.
     primaryKey = 0;
     while (primaryKey < 12) : (primaryKey += 1) {
-        const is_del = blk: {
+        const isDel = blk: {
             for (dels) |d| if (d == primaryKey) break :blk true;
             break :blk false;
         };
         var out: [2]catalog.Value = undefined;
         const got = try objects.getTypedByObjectKey(&w, catalogRef, objectKeys[@intCast(primaryKey)], &out);
-        if (is_del) {
+        if (isDel) {
             try testing.expect(got == null);
         } else {
             try testing.expect(got != null);
@@ -654,7 +654,7 @@ test "compactStep on an all-dead type truncates to zero" {
         try testing.expect(guard < 100);
     }
 
-    try testing.expectEqual(@as(u64, 0), (try catalog.loadCatalog(&w, catalogRef)).next_row);
+    try testing.expectEqual(@as(u64, 0), (try catalog.loadCatalog(&w, catalogRef)).nextRow);
     try testing.expectEqual(@as(u64, 0), try liveCount(&w, catalogRef));
 }
 
@@ -695,10 +695,10 @@ test "compactStep is a no-op on an already-packed type" {
 test "compactStep cursor path packs identically to the scan path" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const step_path = try cmpTmpPath(testing.allocator, &tmp, "ident_step.airdb");
-    defer testing.allocator.free(step_path);
-    const ctrl_path = try cmpTmpPath(testing.allocator, &tmp, "ident_ctrl.airdb");
-    defer testing.allocator.free(ctrl_path);
+    const stepPath = try cmpTmpPath(testing.allocator, &tmp, "ident_step.airdb");
+    defer testing.allocator.free(stepPath);
+    const ctrlPath = try cmpTmpPath(testing.allocator, &tmp, "ident_ctrl.airdb");
+    defer testing.allocator.free(ctrlPath);
 
     // A scattered, delete-heavy pattern that strands live rows both below and
     // above the live-count boundary.
@@ -711,42 +711,42 @@ test "compactStep cursor path packs identically to the scan path" {
     }.f;
 
     // Build the SAME data in two databases.
-    var stepDatabase = try Database.create(testing.allocator, step_path);
+    var stepDatabase = try Database.create(testing.allocator, stepPath);
     defer stepDatabase.deinit();
-    var controlDatabase = try Database.create(testing.allocator, ctrl_path);
+    var controlDatabase = try Database.create(testing.allocator, ctrlPath);
     defer controlDatabase.deinit();
 
-    var step_w = try stepDatabase.beginWrite();
-    defer step_w.deinit();
-    var ctrl_w = try controlDatabase.beginWrite();
-    defer ctrl_w.deinit();
+    var stepW = try stepDatabase.beginWrite();
+    defer stepW.deinit();
+    var ctrlW = try controlDatabase.beginWrite();
+    defer ctrlW.deinit();
 
-    var stepCatalog = try catalog.create(&step_w, 2);
-    var controlCatalog = try catalog.create(&ctrl_w, 2);
+    var stepCatalog = try catalog.create(&stepW, 2);
+    var controlCatalog = try catalog.create(&ctrlW, 2);
     var stepObjectKeys: [20]u64 = undefined;
     var primaryKey: u64 = 0;
     while (primaryKey < 20) : (primaryKey += 1) {
-        const rs = try rows.insert(&step_w, stepCatalog, &.{ primaryKey, primaryKey * 100 });
+        const rs = try rows.insert(&stepW, stepCatalog, &.{ primaryKey, primaryKey * 100 });
         stepCatalog = rs.catalogRef;
         stepObjectKeys[@intCast(primaryKey)] = rs.row;
-        const rc = try rows.insert(&ctrl_w, controlCatalog, &.{ primaryKey, primaryKey * 100 });
+        const rc = try rows.insert(&ctrlW, controlCatalog, &.{ primaryKey, primaryKey * 100 });
         controlCatalog = rc.catalogRef;
     }
     for (dels) |deletedPrimaryKey| {
         var out: [2]u64 = undefined;
-        const vs = (try rows.getByPrimaryKey(&step_w, stepCatalog, deletedPrimaryKey, &out)).?;
-        stepCatalog = (try rows.delete(&step_w, stepCatalog, deletedPrimaryKey, vs)).ok;
-        const vc = (try rows.getByPrimaryKey(&ctrl_w, controlCatalog, deletedPrimaryKey, &out)).?;
-        controlCatalog = (try rows.delete(&ctrl_w, controlCatalog, deletedPrimaryKey, vc)).ok;
+        const vs = (try rows.getByPrimaryKey(&stepW, stepCatalog, deletedPrimaryKey, &out)).?;
+        stepCatalog = (try rows.delete(&stepW, stepCatalog, deletedPrimaryKey, vs)).ok;
+        const vc = (try rows.getByPrimaryKey(&ctrlW, controlCatalog, deletedPrimaryKey, &out)).?;
+        controlCatalog = (try rows.delete(&ctrlW, controlCatalog, deletedPrimaryKey, vc)).ok;
     }
 
     // Control: one full-pass compaction.
-    controlCatalog = try compactType(&ctrl_w, controlCatalog);
+    controlCatalog = try compactType(&ctrlW, controlCatalog);
 
     // Step path: budgeted cursor steps until done.
     var guard: usize = 0;
     while (true) {
-        const res = try compactStep(&step_w, stepCatalog, 0, 3);
+        const res = try compactStep(&stepW, stepCatalog, 0, 3);
         stepCatalog = res.catalogRef;
         try testing.expect(res.moved <= 3);
         if (res.done) break;
@@ -755,19 +755,19 @@ test "compactStep cursor path packs identically to the scan path" {
     }
 
     // Both fully packed to the same dense length.
-    const step_len = (try catalog.loadCatalog(&step_w, stepCatalog)).next_row;
-    try testing.expectEqual(try liveCount(&step_w, stepCatalog), step_len);
-    try testing.expectEqual((try catalog.loadCatalog(&ctrl_w, controlCatalog)).next_row, step_len);
-    try testing.expectEqual(try liveCount(&ctrl_w, controlCatalog), try liveCount(&step_w, stepCatalog));
+    const stepLen = (try catalog.loadCatalog(&stepW, stepCatalog)).nextRow;
+    try testing.expectEqual(try liveCount(&stepW, stepCatalog), stepLen);
+    try testing.expectEqual((try catalog.loadCatalog(&ctrlW, controlCatalog)).nextRow, stepLen);
+    try testing.expectEqual(try liveCount(&ctrlW, controlCatalog), try liveCount(&stepW, stepCatalog));
 
     // Every survivor reads its exact values via its stable object key in the
     // stepped database; deleted keys are gone. Cross-check primaryKey presence vs the control.
     primaryKey = 0;
     while (primaryKey < 20) : (primaryKey += 1) {
         var so: [2]catalog.Value = undefined;
-        const sg = try objects.getTypedByObjectKey(&step_w, stepCatalog, stepObjectKeys[@intCast(primaryKey)], &so);
+        const sg = try objects.getTypedByObjectKey(&stepW, stepCatalog, stepObjectKeys[@intCast(primaryKey)], &so);
         var co: [2]u64 = undefined;
-        const cg = try rows.getByPrimaryKey(&ctrl_w, controlCatalog, primaryKey, &co);
+        const cg = try rows.getByPrimaryKey(&ctrlW, controlCatalog, primaryKey, &co);
         if (isDel(primaryKey)) {
             try testing.expect(sg == null);
             try testing.expect(cg == null);
@@ -778,7 +778,7 @@ test "compactStep cursor path packs identically to the scan path" {
             try testing.expectEqual(primaryKey * 100, so[1].int);
             // Same primary key reads back in the control (survivor sets match).
             var sp: [2]u64 = undefined;
-            try testing.expect((try rows.getByPrimaryKey(&step_w, stepCatalog, primaryKey, &sp)) != null);
+            try testing.expect((try rows.getByPrimaryKey(&stepW, stepCatalog, primaryKey, &sp)) != null);
             try testing.expectEqual(primaryKey * 100, sp[1]);
         }
     }
@@ -795,7 +795,7 @@ test "compactStep truncation never drops a live row at the top" {
     defer w.deinit();
 
     // Insert 10 rows at physical 0..9, then delete the LOW primaryKeys (0..4). The five
-    // survivors (primaryKeys 5..9) all sit at physical rows >= live_count (=5): every
+    // survivors (primaryKeys 5..9) all sit at physical rows >= liveCount (=5): every
     // live row is a "high" row that must be relocated downward before truncation.
     var catalogRef = try catalog.create(&w, 2);
     var objectKeys: [10]u64 = undefined;
@@ -824,7 +824,7 @@ test "compactStep truncation never drops a live row at the top" {
         try testing.expect(guard < 100);
     }
 
-    try testing.expectEqual(@as(u64, 5), (try catalog.loadCatalog(&w, catalogRef)).next_row);
+    try testing.expectEqual(@as(u64, 5), (try catalog.loadCatalog(&w, catalogRef)).nextRow);
     // Every top-stranded survivor is intact with its exact values.
     primaryKey = 5;
     while (primaryKey < 10) : (primaryKey += 1) {
@@ -857,7 +857,7 @@ test "compactStep moves at most budget rows per call" {
     // Delete every even primaryKey -> ~200 holes scattered through the low half.
     primaryKey = 0;
     while (primaryKey < n) : (primaryKey += 2) {
-        catalogRef = switch (try rows.delete(&w, catalogRef, primaryKey, w.new_version)) {
+        catalogRef = switch (try rows.delete(&w, catalogRef, primaryKey, w.newVersion)) {
             .ok => |c| c,
             else => unreachable,
         };
@@ -865,19 +865,19 @@ test "compactStep moves at most budget rows per call" {
 
     const budget: usize = 7;
     var guard: usize = 0;
-    var saw_full_budget = false;
+    var sawFullBudget = false;
     while (true) {
         const res = try compactStep(&w, catalogRef, 0, budget);
         catalogRef = res.catalogRef;
         try testing.expect(res.moved <= budget);
-        if (res.moved == budget) saw_full_budget = true;
+        if (res.moved == budget) sawFullBudget = true;
         if (res.done) break;
         guard += 1;
         try testing.expect(guard < 1000);
     }
     // The set is large enough that at least one step hit the cap.
-    try testing.expect(saw_full_budget);
-    try testing.expectEqual(try liveCount(&w, catalogRef), (try catalog.loadCatalog(&w, catalogRef)).next_row);
+    try testing.expect(sawFullBudget);
+    try testing.expectEqual(try liveCount(&w, catalogRef), (try catalog.loadCatalog(&w, catalogRef)).nextRow);
 }
 
 test "compactInPlace preserves value indexes and passes verifyIntegrity" {
@@ -930,14 +930,14 @@ test "compactInPlace shrinks and preserves data" {
     // Build a churned database (two types) at `path`, then CLOSE it so no handle
     // remains while compactInPlace replaces the file. Capture the logical size
     // (arena high-water) before closing to compare against the compacted file.
-    var pre_top: u64 = undefined;
+    var preTop: u64 = undefined;
     var authorObjectKeys: [200]u64 = undefined;
     {
         var database = try Database.create(testing.allocator, path);
         var w = try database.beginWrite();
         const schema = [_][]const PD{
             &.{ .{ .kind = .int }, .{ .kind = .blob } }, // 0: Author{int primaryKey, blob name}
-            &.{ .{ .kind = .int }, .{ .kind = .link, .link_target = 0 } }, // 1: Book{int primaryKey, link author}
+            &.{ .{ .kind = .int }, .{ .kind = .link, .linkTarget = 0 } }, // 1: Book{int primaryKey, link author}
         };
         var dir = try typedir.createTypes(&w, &schema, &.{ false, false });
 
@@ -965,7 +965,7 @@ test "compactInPlace shrinks and preserves data" {
         w.setRoot(dir);
         _ = try w.commit();
 
-        pre_top = database.arena.top;
+        preTop = database.arena.top;
         database.deinit();
     }
 
@@ -974,10 +974,10 @@ test "compactInPlace shrinks and preserves data" {
 
     // The ".compacting" temp data file must have been renamed away.
     {
-        const temp_data = try std.fmt.allocPrint(testing.allocator, "{s}.compacting", .{path});
-        defer testing.allocator.free(temp_data);
+        const tempData = try std.fmt.allocPrint(testing.allocator, "{s}.compacting", .{path});
+        defer testing.allocator.free(tempData);
         const io = std.Io.Threaded.global_single_threaded.io();
-        try testing.expectError(error.FileNotFound, Io.Dir.openFileAbsolute(io, temp_data, .{}));
+        try testing.expectError(error.FileNotFound, Io.Dir.openFileAbsolute(io, tempData, .{}));
     }
 
     // Reopen the SAME path and verify the live data survived intact.
@@ -985,7 +985,7 @@ test "compactInPlace shrinks and preserves data" {
     defer database.deinit();
 
     // The compacted file's logical footprint must not exceed the churned source's.
-    try testing.expect(database.arena.top <= pre_top);
+    try testing.expect(database.arena.top <= preTop);
 
     var r = try database.beginRead();
     defer r.end();

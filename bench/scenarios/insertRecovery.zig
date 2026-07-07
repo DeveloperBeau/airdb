@@ -18,7 +18,7 @@ const rows = airdb.rows;
 pub const name = "insert_recovery";
 
 // Rows committed per write transaction.
-const batch_size: usize = 10_000;
+const batchSize: usize = 10_000;
 
 // Monotonic wall-clock instance, matching the convention in fileStore.zig.
 inline fn sysIo() Io {
@@ -38,8 +38,8 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     defer harness.removeScratch(ctx.*, path);
 
     // --- Insert phase --------------------------------------------------------
-    const pf_before = airdb.pageFaults();
-    const insert_start = nowNs(io);
+    const pfBefore = airdb.pageFaults();
+    const insertStart = nowNs(io);
 
     var database = try airdb.Database.create(alloc, path);
     errdefer database.deinit();
@@ -55,71 +55,71 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
 
     var inserted: usize = 0;
     while (inserted < ctx.n) {
-        const this_batch = @min(batch_size, ctx.n - inserted);
+        const thisBatch = @min(batchSize, ctx.n - inserted);
         var w = try database.beginWrite();
-        catalogRef = database.active_root; // reload the committed catalog ref
+        catalogRef = database.activeRoot; // reload the committed catalog ref
         var j: usize = 0;
-        while (j < this_batch) : (j += 1) {
+        while (j < thisBatch) : (j += 1) {
             const primaryKey: u64 = inserted + j;
             const r = try rows.insert(&w, catalogRef, &.{ primaryKey, primaryKey });
             catalogRef = r.catalogRef;
         }
         w.setRoot(catalogRef);
         _ = try w.commit();
-        inserted += this_batch;
+        inserted += thisBatch;
     }
 
-    const insert_ns: u64 = @intCast(nowNs(io) - insert_start);
-    const pf_after = airdb.pageFaults();
-    const minflt_delta = pf_after.minor - pf_before.minor;
-    const majflt_delta = pf_after.major - pf_before.major;
+    const insertNs: u64 = @intCast(nowNs(io) - insertStart);
+    const pfAfter = airdb.pageFaults();
+    const minfltDelta = pfAfter.minor - pfBefore.minor;
+    const majfltDelta = pfAfter.major - pfBefore.major;
 
     // --- Recovery signal: close, reopen, first read --------------------------
-    const file_bytes = try database.fileSize();
-    const logical_bytes = database.logicalSize();
+    const fileBytes = try database.fileSize();
+    const logicalBytes = database.logicalSize();
     const m = database.metrics(); // measurement-only commit/file-growth cost counters
     database.deinit();
 
-    const reopen_start = nowNs(io);
+    const reopenStart = nowNs(io);
     var reopened = try airdb.Database.open(alloc, path);
     defer reopened.deinit();
-    const reopen_ns: u64 = @intCast(nowNs(io) - reopen_start);
+    const reopenNs: u64 = @intCast(nowNs(io) - reopenStart);
 
     // First beginRead refreshes to the latest committed version and pins it,
     // forcing the freshly reopened mapping live. Time a single lookup with it.
-    const read_start = nowNs(io);
+    const readStart = nowNs(io);
     var r = try reopened.beginRead();
     catalogRef = r.root();
     var out: [2]u64 = undefined;
     _ = try rows.getByPrimaryKey(&r, catalogRef, 0, &out);
-    const first_read_ns: u64 = @intCast(nowNs(io) - read_start);
+    const firstReadNs: u64 = @intCast(nowNs(io) - readStart);
     r.end();
 
     const note = try std.fmt.allocPrint(
         alloc,
         "reopen={d}ms first_read={d}us fl_encode_ms={d} fl_extents_total={d} commits={d} setlength_ms={d} setlength_calls={d} fl_rebuild_ms={d} fl_clone_ms={d} minflt={d} majflt={d}",
         .{
-            reopen_ns / std.time.ns_per_ms,
-            first_read_ns / std.time.ns_per_us,
-            m.fl_encode_ns / std.time.ns_per_ms,
-            m.fl_extents_encoded,
-            m.commit_count,
-            m.setlength_ns / std.time.ns_per_ms,
-            m.setlength_calls,
-            m.fl_rebuild_ns / std.time.ns_per_ms,
-            m.fl_clone_ns / std.time.ns_per_ms,
-            minflt_delta,
-            majflt_delta,
+            reopenNs / std.time.ns_per_ms,
+            firstReadNs / std.time.ns_per_us,
+            m.flEncodeNs / std.time.ns_per_ms,
+            m.flExtentsEncoded,
+            m.commitCount,
+            m.setlengthNs / std.time.ns_per_ms,
+            m.setlengthCalls,
+            m.flRebuildNs / std.time.ns_per_ms,
+            m.flCloneNs / std.time.ns_per_ms,
+            minfltDelta,
+            majfltDelta,
         },
     );
 
     return .{
         .name = name,
         .ops = ctx.n,
-        .wall_ns = insert_ns,
-        .file_bytes = file_bytes,
-        .logical_bytes = logical_bytes,
-        .peak_rss_bytes = airdb.peakResidentBytes(),
+        .wallNs = insertNs,
+        .fileBytes = fileBytes,
+        .logicalBytes = logicalBytes,
+        .peakRssBytes = airdb.peakResidentBytes(),
         .note = note,
     };
 }

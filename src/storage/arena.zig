@@ -3,9 +3,9 @@ const Reference = @import("reference.zig").Reference;
 const FreeList = @import("freeList.zig").FreeList;
 const platform = @import("../platform.zig");
 
-const section_shift = platform.section_shift;
-const section_size = platform.section_size;
-const section_mask = platform.section_mask;
+const sectionShift = platform.sectionShift;
+const sectionSize = platform.sectionSize;
+const sectionMask = platform.sectionMask;
 
 pub const Allocation = struct { ref: Reference, bytes: []u8 };
 
@@ -15,8 +15,8 @@ pub const Arena = struct {
     sections: []const platform.Section,
     top: usize, // next free offset (append-only in Phase 1)
 
-    pub fn init(sections: []const platform.Section, data_start: usize) Arena {
-        return .{ .sections = sections, .top = data_start };
+    pub fn init(sections: []const platform.Section, dataStart: usize) Arena {
+        return .{ .sections = sections, .top = dataStart };
     }
 
     /// Translate an absolute offset to the mutable backing slice for its section.
@@ -24,28 +24,28 @@ pub const Arena = struct {
     /// that the section exists (true for any alloc result and any freed extent, since
     /// no allocation crosses a boundary).
     fn translate(self: *Arena, offset: usize, length: usize) []u8 {
-        const sectionIndex = offset >> section_shift;
-        const withinSection = offset & section_mask;
+        const sectionIndex = offset >> sectionShift;
+        const withinSection = offset & sectionMask;
         return self.sections[sectionIndex].map[withinSection .. withinSection + length];
     }
 
     pub fn alloc(self: *Arena, size: usize) error{ OutOfSpace, AllocTooLarge }!Allocation {
-        if (size > section_size) return error.AllocTooLarge;
+        if (size > sectionSize) return error.AllocTooLarge;
         var aligned = std.mem.alignForward(usize, self.top, 8);
         // No allocation may cross a section boundary: if it would, pad to the next
         // section base (the tail of the current section is skipped and intentionally
-        // lost). size <= section_size guarantees it then fits within one section.
-        if ((aligned & section_mask) + size > section_size) {
-            aligned = std.mem.alignForward(usize, aligned, section_size);
+        // lost). size <= sectionSize guarantees it then fits within one section.
+        if ((aligned & sectionMask) + size > sectionSize) {
+            aligned = std.mem.alignForward(usize, aligned, sectionSize);
         }
-        const sectionIndex = aligned >> section_shift;
+        const sectionIndex = aligned >> sectionShift;
         if (sectionIndex >= self.sections.len) return error.OutOfSpace; // caller grows + maps, then retries
         const ref: Reference = @intCast(aligned);
         self.top = aligned + size;
         return .{ .ref = ref, .bytes = self.translate(aligned, size) };
     }
 
-    // Reuse an EXACT-size node extent from a pool whose freed_version <= horizon, else null
+    // Reuse an EXACT-size node extent from a pool whose freedVersion <= horizon, else null
     // (no bump fallback, no carving). Exact-size matching keeps fixed-size node allocation
     // fragment-free and the pool scan short. For a transaction-private pool (always safe to
     // reuse) pass horizon = maxInt; for the committed pool pass the reclaim horizon.
@@ -62,22 +62,22 @@ pub const Arena = struct {
         const offset: usize = @intCast(ref);
         if (offset == 0) return error.BadRef; // null ref
         if (offset % 8 != 0) return error.BadRef; // misaligned
-        if (length > section_size) return error.BadRef; // cannot span a section
-        const sectionIndex = offset >> section_shift;
-        const withinSection = offset & section_mask;
+        if (length > sectionSize) return error.BadRef; // cannot span a section
+        const sectionIndex = offset >> sectionShift;
+        const withinSection = offset & sectionMask;
         if (sectionIndex >= self.sections.len) return error.BadRef; // section not mapped
-        if (withinSection + length > section_size) return error.BadRef; // would cross a section boundary
+        if (withinSection + length > sectionSize) return error.BadRef; // would cross a section boundary
         return self.sections[sectionIndex].map[withinSection .. withinSection + length];
     }
 };
 
 const testing = std.testing;
 const page = std.heap.page_size_min;
-const page_align = std.mem.Alignment.fromByteUnits(page);
+const pageAlign = std.mem.Alignment.fromByteUnits(page);
 
 // Build a single Section wrapping a page-aligned heap allocation, for unit tests that
 // only need a small backing region within section 0. The section's logical size is
-// still section_size for boundary math; tests keep their offsets within `backing.len`.
+// still sectionSize for boundary math; tests keep their offsets within `backing.len`.
 // The handle is never used here (these sections are not unmapped), so on Windows it is
 // left undefined; on POSIX it is the void sentinel.
 fn testSection(backing: []align(page) u8) platform.Section {
@@ -86,7 +86,7 @@ fn testSection(backing: []align(page) u8) platform.Section {
 }
 
 test "alloc returns a writable slice that deref reads back" {
-    const backing = try testing.allocator.alignedAlloc(u8, page_align, 4096 * 4);
+    const backing = try testing.allocator.alignedAlloc(u8, pageAlign, 4096 * 4);
     defer testing.allocator.free(backing);
     var secs = [_]platform.Section{testSection(backing)};
     var arena = Arena.init(&secs, 4096); // data starts after the first (header) page
@@ -97,44 +97,44 @@ test "alloc returns a writable slice that deref reads back" {
 }
 
 test "deref rejects an out-of-range or misaligned or null ref" {
-    const backing = try testing.allocator.alignedAlloc(u8, page_align, 4096 * 4);
+    const backing = try testing.allocator.alignedAlloc(u8, pageAlign, 4096 * 4);
     defer testing.allocator.free(backing);
     var secs = [_]platform.Section{testSection(backing)};
     var arena = Arena.init(&secs, 4096);
     // A ref in section 1, which is not mapped (only section 0 exists).
-    try testing.expectError(error.BadRef, arena.deref(section_size, 8));
+    try testing.expectError(error.BadRef, arena.deref(sectionSize, 8));
     try testing.expectError(error.BadRef, arena.deref(7, 8)); // misaligned
     try testing.expectError(error.BadRef, arena.deref(0, 8)); // null ref
 }
 
 test "alloc fails cleanly when the arena is full" {
-    const backing = try testing.allocator.alignedAlloc(u8, page_align, 4096);
+    const backing = try testing.allocator.alignedAlloc(u8, pageAlign, 4096);
     defer testing.allocator.free(backing);
     var secs = [_]platform.Section{testSection(backing)};
     var arena = Arena.init(&secs, 4096);
     // Drive top to the end of the only section; the next alloc must pad past the
     // section boundary into a section that does not exist -> OutOfSpace.
-    arena.top = section_size - 8;
+    arena.top = sectionSize - 8;
     try testing.expectError(error.OutOfSpace, arena.alloc(16));
 }
 
 test "alloc pads across a section boundary and AllocTooLarge on oversize" {
-    const firstBuffer = try testing.allocator.alignedAlloc(u8, page_align, 4096);
+    const firstBuffer = try testing.allocator.alignedAlloc(u8, pageAlign, 4096);
     defer testing.allocator.free(firstBuffer);
-    const secondBuffer = try testing.allocator.alignedAlloc(u8, page_align, 4096);
+    const secondBuffer = try testing.allocator.alignedAlloc(u8, pageAlign, 4096);
     defer testing.allocator.free(secondBuffer);
     var secs = [_]platform.Section{ testSection(firstBuffer), testSection(secondBuffer) };
     var arena = Arena.init(&secs, 0);
 
     // Place top near the end of section 0 so the next alloc cannot fit and must pad
     // to section 1's base.
-    arena.top = section_size - 16;
+    arena.top = sectionSize - 16;
     const allocation = try arena.alloc(32);
-    try testing.expectEqual(@as(Reference, @intCast(section_size)), allocation.ref); // landed at section 1 base
+    try testing.expectEqual(@as(Reference, @intCast(sectionSize)), allocation.ref); // landed at section 1 base
     @memcpy(allocation.bytes, "0123456789ABCDEF0123456789ABCDEF");
     const got = try arena.deref(allocation.ref, 32);
     try testing.expectEqualStrings("0123456789ABCDEF0123456789ABCDEF", got);
 
     // A single allocation larger than a section is rejected.
-    try testing.expectError(error.AllocTooLarge, arena.alloc(section_size + 1));
+    try testing.expectError(error.AllocTooLarge, arena.alloc(sectionSize + 1));
 }

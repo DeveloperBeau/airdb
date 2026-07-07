@@ -1,15 +1,15 @@
 // coordination.zig -- coordination file for multi-process attach/detach and latest-version signal.
 //
 // Layout (4096-byte mmap'd file):
-//   [0..8]   magic        u64 LE  (coord_magic)
-//   [8..12]  attach_count u32     (atomic, 4-aligned)
+//   [0..8]   magic        u64 LE  (coordMagic)
+//   [8..12]  attachCount u32     (atomic, 4-aligned)
 //   [12..16] reserved     (zero)
 //   [16..24] latestVersion   u64     (atomic, 8-aligned)
 //   [24..64] reserved     (zero)
 //   [64..1088] participant slots  64 x 16 bytes each
-//              slot layout: [pid u32 @+0][start_token u32 @+4][min_pinned u64 @+8]
-//              pid==0 means slot is free; min_pinned==sentinel_max means "pins
-//              nothing". start_token is the (truncated) process start time of
+//              slot layout: [pid u32 @+0][startToken u32 @+4][minPinned u64 @+8]
+//              pid==0 means slot is free; minPinned==sentinelMax means "pins
+//              nothing". startToken is the (truncated) process start time of
 //              the claimer: a recycled pid alone cannot keep a dead reader's
 //              slot alive, the incarnation must match too.
 //
@@ -27,16 +27,16 @@ pub fn coordIo() std.Io {
     return std.Io.Threaded.global_single_threaded.io();
 }
 
-pub const coord_magic: u64 = 0x6169726462_4300;
-const coord_size: usize = 4096;
-const off_magic: usize = 0; // u64
-const off_attach: usize = 8; // u32 atomic, 4-aligned
-const off_latest: usize = 16; // u64 atomic, 8-aligned
+pub const coordMagic: u64 = 0x6169726462_4300;
+const coordSize: usize = 4096;
+const offMagic: usize = 0; // u64
+const offAttach: usize = 8; // u32 atomic, 4-aligned
+const offLatest: usize = 16; // u64 atomic, 8-aligned
 
-pub const sentinel_max: u64 = std.math.maxInt(u64);
-const participant_slots: usize = 64;
-const participants_off: usize = 64;
-const slot_stride: usize = 16;
+pub const sentinelMax: u64 = std.math.maxInt(u64);
+const participantSlots: usize = 64;
+const participantsOff: usize = 64;
+const slotStride: usize = 16;
 
 fn currentPid() u32 {
     return platform.currentPid();
@@ -69,10 +69,10 @@ pub const Coordination = struct {
         errdefer file.close(io);
 
         const length = try file.length(io);
-        if (length < coord_size) try file.setLength(io, coord_size);
+        if (length < coordSize) try file.setLength(io, coordSize);
 
         // Fixed-size coord file: a single section covering the whole page. No growth.
-        var section = try platform.mapSection(file, 0, coord_size);
+        var section = try platform.mapSection(file, 0, coordSize);
         errdefer section.unmap();
         const map = section.map;
 
@@ -86,14 +86,14 @@ pub const Coordination = struct {
         // initialized page without taking the lock. The lock is only touched on
         // the magic-absent path, so opening an existing database never blocks
         // behind a writer holding the same flock for a transaction.
-        const magic_ptr: *u64 = @ptrCast(@alignCast(&map[off_magic]));
-        if (@atomicLoad(u64, magic_ptr, .acquire) != coord_magic) {
+        const magicPtr: *u64 = @ptrCast(@alignCast(&map[offMagic]));
+        if (@atomicLoad(u64, magicPtr, .acquire) != coordMagic) {
             _ = try platform.lockFileExclusive(file, true);
             defer platform.unlockFile(file);
-            if (@atomicLoad(u64, magic_ptr, .acquire) != coord_magic) {
+            if (@atomicLoad(u64, magicPtr, .acquire) != coordMagic) {
                 // New file: zero the entire page, then stamp the magic last.
-                @memset(map[0..coord_size], 0);
-                @atomicStore(u64, magic_ptr, coord_magic, .release);
+                @memset(map[0..coordSize], 0);
+                @atomicStore(u64, magicPtr, coordMagic, .release);
             }
         }
         // Existing file with correct magic: leave all fields as-is.
@@ -107,11 +107,11 @@ pub const Coordination = struct {
     }
 
     fn attachPtr(self: *Coordination) *u32 {
-        return @ptrCast(@alignCast(&self.map[off_attach]));
+        return @ptrCast(@alignCast(&self.map[offAttach]));
     }
 
     fn latestPtr(self: *Coordination) *u64 {
-        return @ptrCast(@alignCast(&self.map[off_latest]));
+        return @ptrCast(@alignCast(&self.map[offLatest]));
     }
 
     /// Atomically increment attach count, return new value.
@@ -156,15 +156,15 @@ pub const Coordination = struct {
     }
 
     fn slotPidPtr(self: *Coordination, slotIndex: usize) *u32 {
-        return @ptrCast(@alignCast(&self.map[participants_off + slotIndex * slot_stride]));
+        return @ptrCast(@alignCast(&self.map[participantsOff + slotIndex * slotStride]));
     }
 
     fn slotTokenPtr(self: *Coordination, slotIndex: usize) *u32 {
-        return @ptrCast(@alignCast(&self.map[participants_off + slotIndex * slot_stride + 4]));
+        return @ptrCast(@alignCast(&self.map[participantsOff + slotIndex * slotStride + 4]));
     }
 
     fn slotMinPtr(self: *Coordination, slotIndex: usize) *u64 {
-        return @ptrCast(@alignCast(&self.map[participants_off + slotIndex * slot_stride + 8]));
+        return @ptrCast(@alignCast(&self.map[participantsOff + slotIndex * slotStride + 8]));
     }
 
     // The (pid, token) pair viewed as one aligned u64 (LE: low 32 bits pid,
@@ -174,17 +174,17 @@ pub const Coordination = struct {
     // third process could re-claim the slot and the two owners overwrote each
     // other's pins, hiding a live reader from the reclaim horizon.
     fn slotClaimPtr(self: *Coordination, slotIndex: usize) *u64 {
-        return @ptrCast(@alignCast(&self.map[participants_off + slotIndex * slot_stride]));
+        return @ptrCast(@alignCast(&self.map[participantsOff + slotIndex * slotStride]));
     }
 
     /// Claim a free participant slot. Returns the slot index on success,
     /// or null if all 64 slots are occupied. Uses CAS to avoid races.
     pub fn claimSlot(self: *Coordination) !?usize {
-        const my_pid: u32 = @intCast(currentPid());
-        const my_token: u32 = @truncate(platform.processStartToken(my_pid) orelse 0);
-        const claim: u64 = (@as(u64, my_token) << 32) | my_pid;
+        const myPid: u32 = @intCast(currentPid());
+        const myToken: u32 = @truncate(platform.processStartToken(myPid) orelse 0);
+        const claim: u64 = (@as(u64, myToken) << 32) | myPid;
         var slotIndex: usize = 0;
-        while (slotIndex < participant_slots) : (slotIndex += 1) {
+        while (slotIndex < participantSlots) : (slotIndex += 1) {
             // The sentinel store below is LOAD-BEARING: a release-freed slot's
             // min is already sentinel, but a RECLAIM-freed slot keeps its dead
             // owner's min (reclaim touches only the claim word). Without the
@@ -193,23 +193,23 @@ pub const Coordination = struct {
             // lives. Between the CAS and the store a horizon scan can read the
             // stale min -- a too-low horizon, which is merely conservative.
             if (@cmpxchgStrong(u64, self.slotClaimPtr(slotIndex), 0, claim, .seq_cst, .seq_cst) == null) {
-                @atomicStore(u64, self.slotMinPtr(slotIndex), sentinel_max, .seq_cst);
+                @atomicStore(u64, self.slotMinPtr(slotIndex), sentinelMax, .seq_cst);
                 return slotIndex;
             }
         }
         return null;
     }
 
-    /// Release a previously claimed slot. Resets min_pinned first, then clears
-    /// pid+token in one store, so no reader observes a stale min_pinned after
+    /// Release a previously claimed slot. Resets minPinned first, then clears
+    /// pid+token in one store, so no reader observes a stale minPinned after
     /// the slot appears free.
     pub fn releaseSlot(self: *Coordination, slotIndex: usize) void {
-        @atomicStore(u64, self.slotMinPtr(slotIndex), sentinel_max, .seq_cst);
+        @atomicStore(u64, self.slotMinPtr(slotIndex), sentinelMax, .seq_cst);
         @atomicStore(u64, self.slotClaimPtr(slotIndex), 0, .seq_cst);
     }
 
     /// Publish the minimum pinned version for this slot. seq_cst, not release:
-    /// readers publish a pin and then VALIDATE by loading latest_version with
+    /// readers publish a pin and then VALIDATE by loading latestVersion with
     /// no intervening syscall. That store->load sequence is the classic
     /// store-buffering pattern -- with a plain release store, x86 may order the
     /// validating load before the pin store drains, letting a concurrent
@@ -228,7 +228,7 @@ pub const Coordination = struct {
         return @atomicLoad(u32, self.slotPidPtr(slotIndex), .seq_cst);
     }
 
-    /// Compute the global reclaim horizon: the minimum min_pinned across all
+    /// Compute the global reclaim horizon: the minimum minPinned across all
     /// live participant slots. Slots whose process no longer exists are
     /// reclaimed (pid zeroed) in the same pass. Returns `fallback` if no
     /// live slot publishes a pinned version below it.
@@ -241,18 +241,18 @@ pub const Coordination = struct {
     // a live reader from the reclaim horizon. The CAS makes a re-claimed slot
     // fail the exchange and survive untouched. (The whole word must clear,
     // not just the pid half: a leftover token kept the u64 nonzero and the
-    // packed claim CAS could never take the slot again.) min_pinned is left
+    // packed claim CAS could never take the slot again.) minPinned is left
     // alone: a free slot's min is never read (word == 0 is skipped), and the
     // next claimant sentinels it itself. Residual ABA -- the same pid AND the
     // same 32-bit start token re-claimed within the window -- is accepted.
-    fn reclaimSlot(self: *Coordination, slotIndex: usize, sampled_word: u64) void {
-        _ = @cmpxchgStrong(u64, self.slotClaimPtr(slotIndex), sampled_word, 0, .seq_cst, .seq_cst);
+    fn reclaimSlot(self: *Coordination, slotIndex: usize, sampledWord: u64) void {
+        _ = @cmpxchgStrong(u64, self.slotClaimPtr(slotIndex), sampledWord, 0, .seq_cst, .seq_cst);
     }
 
     pub fn globalHorizon(self: *Coordination, fallback: u64) u64 {
-        var min_v: u64 = fallback;
+        var minV: u64 = fallback;
         var slotIndex: usize = 0;
-        while (slotIndex < participant_slots) : (slotIndex += 1) {
+        while (slotIndex < participantSlots) : (slotIndex += 1) {
             // Sample pid and token as ONE word so the liveness verdict and the
             // guarded reclaim below all refer to the same claim -- separate
             // loads could pair one owner's pid with its successor's token.
@@ -268,26 +268,26 @@ pub const Coordination = struct {
             // otherwise pin the horizon forever. Unavailable tokens on EITHER
             // side (query failed here, or the claimer could not obtain one and
             // stored 0) are treated as a match -- conservative, never unsafe.
-            const stored_token: u32 = @truncate(word >> 32);
-            if (stored_token != 0) {
+            const storedToken: u32 = @truncate(word >> 32);
+            if (storedToken != 0) {
                 if (platform.processStartToken(pid)) |tok| {
-                    if (@as(u32, @truncate(tok)) != stored_token) {
+                    if (@as(u32, @truncate(tok)) != storedToken) {
                         self.reclaimSlot(slotIndex, word); // recycled pid
                         continue;
                     }
                 }
             }
             const minPinned = @atomicLoad(u64, self.slotMinPtr(slotIndex), .acquire);
-            if (minPinned < min_v) min_v = minPinned;
+            if (minPinned < minV) minV = minPinned;
         }
-        return min_v;
+        return minV;
     }
 
     /// Test helper: write a slot directly without going through claimSlot.
     /// Allows tests to simulate a slot owned by an arbitrary (possibly dead or
     /// recycled) pid with an arbitrary incarnation token.
-    pub fn forgeSlotForTest(self: *Coordination, slotIndex: usize, pid: u32, token: u32, min_pinned: u64) void {
-        @atomicStore(u64, self.slotMinPtr(slotIndex), min_pinned, .seq_cst);
+    pub fn forgeSlotForTest(self: *Coordination, slotIndex: usize, pid: u32, token: u32, minPinned: u64) void {
+        @atomicStore(u64, self.slotMinPtr(slotIndex), minPinned, .seq_cst);
         @atomicStore(u32, self.slotTokenPtr(slotIndex), token, .seq_cst);
         @atomicStore(u32, self.slotPidPtr(slotIndex), pid, .seq_cst);
     }
@@ -314,11 +314,11 @@ test "claimSlot publishes pid and incarnation token in one atomic word" {
 
     const slotIndex = (try coordination.claimSlot()).?;
     defer coordination.releaseSlot(slotIndex);
-    const my_pid: u32 = @intCast(platform.currentPid());
-    const my_token: u32 = @truncate(platform.processStartToken(my_pid) orelse 0);
+    const myPid: u32 = @intCast(platform.currentPid());
+    const myToken: u32 = @truncate(platform.processStartToken(myPid) orelse 0);
     const word = @atomicLoad(u64, coordination.slotClaimPtr(slotIndex), .seq_cst);
-    try testing.expectEqual((@as(u64, my_token) << 32) | my_pid, word);
-    try testing.expectEqual(sentinel_max, @atomicLoad(u64, coordination.slotMinPtr(slotIndex), .seq_cst));
+    try testing.expectEqual((@as(u64, myToken) << 32) | myPid, word);
+    try testing.expectEqual(sentinelMax, @atomicLoad(u64, coordination.slotMinPtr(slotIndex), .seq_cst));
 }
 
 test "a reclaimed slot becomes claimable again" {
@@ -339,7 +339,7 @@ test "a reclaimed slot becomes claimable again" {
     try testing.expectEqual(@as(u64, 50), coordination.globalHorizon(50));
     try testing.expectEqual(@as(u64, 0), @atomicLoad(u64, coordination.slotClaimPtr(0), .seq_cst));
     // Fill the whole table: every slot, including the reclaimed one, must land.
-    var claimed: [participant_slots]usize = undefined;
+    var claimed: [participantSlots]usize = undefined;
     for (&claimed) |*slot| slot.* = (try coordination.claimSlot()) orelse return error.SlotLeaked;
     try testing.expectEqual(@as(?usize, null), try coordination.claimSlot());
     for (claimed) |slotIndex| coordination.releaseSlot(slotIndex);
@@ -362,10 +362,10 @@ test "reclaim leaves a slot alone when its claim word changed since the sample" 
     coordination.forgeSlotForTest(2, 0x7fffffff, 0xbeef, 9); // the dead owner we sampled
     const sampled = @atomicLoad(u64, coordination.slotClaimPtr(2), .seq_cst);
     // The slot changes hands before the reclaim lands.
-    const my_pid: u32 = @intCast(platform.currentPid());
-    coordination.forgeSlotForTest(2, my_pid, 0xf00d, 5);
+    const myPid: u32 = @intCast(platform.currentPid());
+    coordination.forgeSlotForTest(2, myPid, 0xf00d, 5);
     coordination.reclaimSlot(2, sampled);
-    try testing.expectEqual(my_pid, coordination.slotPidForTest(2)); // new owner intact
+    try testing.expectEqual(myPid, coordination.slotPidForTest(2)); // new owner intact
     try testing.expectEqual(@as(u64, 5), @atomicLoad(u64, coordination.slotMinPtr(2), .seq_cst));
     // With the matching word, the reclaim goes through.
     const word2 = @atomicLoad(u64, coordination.slotClaimPtr(2), .seq_cst);

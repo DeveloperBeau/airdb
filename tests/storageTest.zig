@@ -5,9 +5,9 @@ const Io = std.Io;
 
 fn tmpFilePath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const u8) ![]const u8 {
     var pathBuffer: [Io.Dir.max_path_bytes]u8 = undefined;
-    const path_len = try tmp.dir.realPath(testing.io, &pathBuffer);
-    const dir_path = pathBuffer[0..path_len];
-    return std.fs.path.join(allocator, &.{ dir_path, name });
+    const pathLen = try tmp.dir.realPath(testing.io, &pathBuffer);
+    const dirPath = pathBuffer[0..pathLen];
+    return std.fs.path.join(allocator, &.{ dirPath, name });
 }
 
 test "recovery survives a corrupted header by falling back to the best valid slot" {
@@ -24,7 +24,7 @@ test "recovery survives a corrupted header by falling back to the best valid slo
         w.setRoot(a.ref);
         _ = try w.commit();
     }
-    { // scramble active_slot (offset 13) and the header crc (offset 28) on disk, leaving slots intact
+    { // scramble activeSlot (offset 13) and the header crc (offset 28) on disk, leaving slots intact
         const io = std.Io.Threaded.global_single_threaded.io();
         var f = try std.Io.Dir.openFileAbsolute(io, path, .{ .mode = .read_write });
         defer f.close(io);
@@ -56,18 +56,18 @@ test "data-barrier flush failure during commit leaves the prior version intact" 
         _ = try w.commit();
     }
     { // attempt v2; fail the FIRST flush of this session (the data barrier)
-        var fsync = airdb.FailingSyncer{ .fail_on = 1 };
+        var fsync = airdb.FailingSyncer{ .failOn = 1 };
         var database = try airdb.Database.openWith(testing.allocator, path, fsync.any());
         defer database.deinit();
         var w = try database.beginWrite();
         const b = try w.alloc(4);
         @memcpy(b.bytes, "v2!!");
         w.setRoot(b.ref);
-        const pre_version = database.active_version;
-        const pre_root = database.active_root;
+        const preVersion = database.activeVersion;
+        const preRoot = database.activeRoot;
         try testing.expectError(error.Durability, w.commit());
-        try testing.expectEqual(pre_version, database.active_version);
-        try testing.expectEqual(pre_root, database.active_root);
+        try testing.expectEqual(preVersion, database.activeVersion);
+        try testing.expectEqual(preRoot, database.activeRoot);
     }
     { // reopen with a real syncer: must still see v1
         var database = try airdb.Database.open(testing.allocator, path);
@@ -92,19 +92,19 @@ test "header-flush failure during commit does not publish v2" {
         _ = try w.commit();
     }
     {
-        // fail_on = 2: data barrier (1) succeeds, header flush (2) fails -> revert, no publish.
-        var fsync = airdb.FailingSyncer{ .fail_on = 2 };
+        // failOn = 2: data barrier (1) succeeds, header flush (2) fails -> revert, no publish.
+        var fsync = airdb.FailingSyncer{ .failOn = 2 };
         var database = try airdb.Database.openWith(testing.allocator, path, fsync.any());
         defer database.deinit();
         var w = try database.beginWrite();
         const b = try w.alloc(4);
         @memcpy(b.bytes, "v2!!");
         w.setRoot(b.ref);
-        const pre_version = database.active_version;
-        const pre_root = database.active_root;
+        const preVersion = database.activeVersion;
+        const preRoot = database.activeRoot;
         try testing.expectError(error.Durability, w.commit());
-        try testing.expectEqual(pre_version, database.active_version);
-        try testing.expectEqual(pre_root, database.active_root);
+        try testing.expectEqual(preVersion, database.activeVersion);
+        try testing.expectEqual(preRoot, database.activeRoot);
     }
     {
         var database = try airdb.Database.open(testing.allocator, path);
@@ -219,32 +219,32 @@ test "freed space is reused only after the pinning reader releases" {
         _ = try w.commit();
     }
     var reader = try database.beginRead();
-    const old_root = reader.root();
+    const oldRoot = reader.root();
 
     {
         var w = try database.beginWrite();
         const b = try w.alloc(8);
         @memcpy(b.bytes, "BBBBBBBB");
-        try w.free(old_root, 8);
+        try w.free(oldRoot, 8);
         w.setRoot(b.ref);
         _ = try w.commit();
     }
 
-    // Reader still pinned: a fresh allocation must NOT land on old_root yet.
+    // Reader still pinned: a fresh allocation must NOT land on oldRoot yet.
     {
         var w = try database.beginWrite();
         const c = try w.alloc(8);
-        try testing.expect(c.ref != old_root);
+        try testing.expect(c.ref != oldRoot);
         w.deinit(); // abandon the probe (no commit)
     }
 
     reader.end(); // horizon advances past the freed version
 
-    // Now a fresh allocation may reuse old_root.
+    // Now a fresh allocation may reuse oldRoot.
     {
         var w = try database.beginWrite();
         const d = try w.alloc(8);
-        try testing.expectEqual(old_root, d.ref);
+        try testing.expectEqual(oldRoot, d.ref);
         w.deinit();
     }
 }
@@ -264,7 +264,7 @@ test "after a data-barrier flush failure, the reopened database passes verifyInt
         _ = try w.commit();
     }
     {
-        var fsync = airdb.FailingSyncer{ .fail_on = 1 }; // fail the data barrier
+        var fsync = airdb.FailingSyncer{ .failOn = 1 }; // fail the data barrier
         var database = try airdb.Database.openWith(testing.allocator, path, fsync.any());
         defer database.deinit();
         var w = try database.beginWrite();
@@ -298,7 +298,7 @@ test "after a header-flush failure, the reopened database passes verifyIntegrity
         _ = try w.commit();
     }
     {
-        var fsync = airdb.FailingSyncer{ .fail_on = 2 }; // data barrier ok, header flush fails
+        var fsync = airdb.FailingSyncer{ .failOn = 2 }; // data barrier ok, header flush fails
         var database = try airdb.Database.openWith(testing.allocator, path, fsync.any());
         defer database.deinit();
         var w = try database.beginWrite();
@@ -335,15 +335,15 @@ test "a writer does not reuse space a reader in another instance still pins" {
     var b = try airdb.Database.open(testing.allocator, path);
     defer b.deinit();
     var rb = try b.beginRead(); // b pins the current version in its participant slot
-    const pinned_root = rb.root();
-    try testing.expectEqualStrings("AAAAAAAA", try rb.deref(pinned_root, 8));
+    const pinnedRoot = rb.root();
+    try testing.expectEqualStrings("AAAAAAAA", try rb.deref(pinnedRoot, 8));
 
     // a frees the old root at the new version and commits new data.
     {
         var w = try a.beginWrite();
         const y = try w.alloc(8);
         @memcpy(y.bytes, "BBBBBBBB");
-        try w.free(pinned_root, 8);
+        try w.free(pinnedRoot, 8);
         w.setRoot(y.ref);
         _ = try w.commit();
     }
@@ -353,19 +353,19 @@ test "a writer does not reuse space a reader in another instance still pins" {
     {
         var w = try a.beginWrite();
         const c = try w.alloc(8);
-        try testing.expect(c.ref != pinned_root);
+        try testing.expect(c.ref != pinnedRoot);
         w.deinit();
     }
 
     // b's data is intact (never overwritten).
-    try testing.expectEqualStrings("AAAAAAAA", try rb.deref(pinned_root, 8));
+    try testing.expectEqualStrings("AAAAAAAA", try rb.deref(pinnedRoot, 8));
     rb.end(); // b publishes the sentinel -> the freed extent becomes reclaimable
 
     // Now a may reuse the freed extent.
     {
         var w = try a.beginWrite();
         const d = try w.alloc(8);
-        try testing.expectEqual(pinned_root, d.ref);
+        try testing.expectEqual(pinnedRoot, d.ref);
         w.deinit();
     }
 }

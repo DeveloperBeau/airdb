@@ -38,71 +38,71 @@ pub fn buildSetInt(transaction: *WriteTransaction, items: []const u64) !Referenc
 
 pub fn listLen(transaction: anytype, catalogRef: Reference, primaryKey: u64, property: usize) !?u64 {
     const resolved = (try catalog.resolveProperty(transaction, catalogRef, primaryKey, property)) orelse return null;
-    const list_root = try Column.get(transaction, resolved.propertyColumn, resolved.row);
-    return try Column.length(transaction, list_root);
+    const listRoot = try Column.get(transaction, resolved.propertyColumn, resolved.row);
+    return try Column.length(transaction, listRoot);
 }
 
 pub fn listGetInt(transaction: anytype, catalogRef: Reference, primaryKey: u64, property: usize, index: u64) !u64 {
     const resolved = (try catalog.resolveProperty(transaction, catalogRef, primaryKey, property)) orelse return error.NotFound;
-    const list_root = try Column.get(transaction, resolved.propertyColumn, resolved.row);
-    return try Column.get(transaction, list_root, index);
+    const listRoot = try Column.get(transaction, resolved.propertyColumn, resolved.row);
+    return try Column.get(transaction, listRoot, index);
 }
 
 pub fn listGetBlob(transaction: anytype, catalogRef: Reference, primaryKey: u64, property: usize, index: u64) ![]const u8 {
     const resolved = (try catalog.resolveProperty(transaction, catalogRef, primaryKey, property)) orelse return error.NotFound;
-    const list_root = try Column.get(transaction, resolved.propertyColumn, resolved.row);
-    const blobRef = try Column.get(transaction, list_root, index);
+    const listRoot = try Column.get(transaction, resolved.propertyColumn, resolved.row);
+    const blobRef = try Column.get(transaction, listRoot, index);
     return try blob.get(transaction, blobRef);
 }
 
 pub fn listAppendInt(transaction: *WriteTransaction, catalogRef: Reference, primaryKey: u64, property: usize, value: u64) !Reference {
     const resolved = (try catalog.resolveProperty(transaction, catalogRef, primaryKey, property)) orelse return error.NotFound;
-    const old_root = try Column.get(transaction, resolved.propertyColumn, resolved.row);
-    const new_root = try Column.append(transaction, old_root, value);
-    return catalog.replaceCollRoot(transaction, catalogRef, resolved.row, property, new_root);
+    const oldRoot = try Column.get(transaction, resolved.propertyColumn, resolved.row);
+    const newRoot = try Column.append(transaction, oldRoot, value);
+    return catalog.replaceCollRoot(transaction, catalogRef, resolved.row, property, newRoot);
 }
 
 pub fn listSetInt(transaction: *WriteTransaction, catalogRef: Reference, primaryKey: u64, property: usize, index: u64, value: u64) !Reference {
     const resolved = (try catalog.resolveProperty(transaction, catalogRef, primaryKey, property)) orelse return error.NotFound;
-    const old_root = try Column.get(transaction, resolved.propertyColumn, resolved.row);
-    const new_root = try Column.set(transaction, old_root, index, value);
-    return catalog.replaceCollRoot(transaction, catalogRef, resolved.row, property, new_root);
+    const oldRoot = try Column.get(transaction, resolved.propertyColumn, resolved.row);
+    const newRoot = try Column.set(transaction, oldRoot, index, value);
+    return catalog.replaceCollRoot(transaction, catalogRef, resolved.row, property, newRoot);
 }
 
 pub fn listAppendBlob(transaction: *WriteTransaction, catalogRef: Reference, primaryKey: u64, property: usize, bytes: []const u8) !Reference {
     const resolved = (try catalog.resolveProperty(transaction, catalogRef, primaryKey, property)) orelse return error.NotFound;
-    const old_root = try Column.get(transaction, resolved.propertyColumn, resolved.row);
+    const oldRoot = try Column.get(transaction, resolved.propertyColumn, resolved.row);
     const blobRef = try blob.put(transaction, bytes);
-    const new_root = try Column.append(transaction, old_root, blobRef);
-    return catalog.replaceCollRoot(transaction, catalogRef, resolved.row, property, new_root);
+    const newRoot = try Column.append(transaction, oldRoot, blobRef);
+    return catalog.replaceCollRoot(transaction, catalogRef, resolved.row, property, newRoot);
 }
 
 pub fn setCountInt(transaction: anytype, catalogRef: Reference, primaryKey: u64, property: usize) !?u64 {
     const resolved = (try catalog.resolveProperty(transaction, catalogRef, primaryKey, property)) orelse return null;
-    const set_root = try Column.get(transaction, resolved.propertyColumn, resolved.row);
-    return try Index.count(transaction, set_root);
+    const setRoot = try Column.get(transaction, resolved.propertyColumn, resolved.row);
+    return try Index.count(transaction, setRoot);
 }
 
 pub fn setContainsInt(transaction: anytype, catalogRef: Reference, primaryKey: u64, property: usize, key: u64) !bool {
     const resolved = (try catalog.resolveProperty(transaction, catalogRef, primaryKey, property)) orelse return error.NotFound;
-    const set_root = try Column.get(transaction, resolved.propertyColumn, resolved.row);
-    return (try Index.get(transaction, set_root, key)) != null;
+    const setRoot = try Column.get(transaction, resolved.propertyColumn, resolved.row);
+    return (try Index.get(transaction, setRoot, key)) != null;
 }
 
 pub fn setAddInt(transaction: *WriteTransaction, catalogRef: Reference, primaryKey: u64, property: usize, key: u64) !Reference {
     const resolved = (try catalog.resolveProperty(transaction, catalogRef, primaryKey, property)) orelse return error.NotFound;
-    const old_root = try Column.get(transaction, resolved.propertyColumn, resolved.row);
-    if ((try Index.get(transaction, old_root, key)) != null) return catalogRef; // already a member, no version bump
-    const new_root = try Index.insert(transaction, old_root, key, 1);
-    return catalog.replaceCollRoot(transaction, catalogRef, resolved.row, property, new_root);
+    const oldRoot = try Column.get(transaction, resolved.propertyColumn, resolved.row);
+    if ((try Index.get(transaction, oldRoot, key)) != null) return catalogRef; // already a member, no version bump
+    const newRoot = try Index.insert(transaction, oldRoot, key, 1);
+    return catalog.replaceCollRoot(transaction, catalogRef, resolved.row, property, newRoot);
 }
 
 pub fn setRemoveInt(transaction: *WriteTransaction, catalogRef: Reference, primaryKey: u64, property: usize, key: u64) !Reference {
     const resolved = (try catalog.resolveProperty(transaction, catalogRef, primaryKey, property)) orelse return error.NotFound;
-    const old_root = try Column.get(transaction, resolved.propertyColumn, resolved.row);
-    if ((try Index.get(transaction, old_root, key)) == null) return catalogRef; // not a member, no version bump
-    const new_root = try Index.remove(transaction, old_root, key);
-    return catalog.replaceCollRoot(transaction, catalogRef, resolved.row, property, new_root);
+    const oldRoot = try Column.get(transaction, resolved.propertyColumn, resolved.row);
+    if ((try Index.get(transaction, oldRoot, key)) == null) return catalogRef; // not a member, no version bump
+    const newRoot = try Index.remove(transaction, oldRoot, key);
+    return catalog.replaceCollRoot(transaction, catalogRef, resolved.row, property, newRoot);
 }
 
 pub fn setCollectInt(
@@ -114,7 +114,7 @@ pub fn setCollectInt(
     allocator: std.mem.Allocator,
 ) !void {
     const resolved = (try catalog.resolveProperty(transaction, catalogRef, primaryKey, property)) orelse return error.NotFound;
-    const set_root = try Column.get(transaction, resolved.propertyColumn, resolved.row);
+    const setRoot = try Column.get(transaction, resolved.propertyColumn, resolved.row);
     const Sink = struct {
         list: *std.ArrayList(u64),
         alloc: std.mem.Allocator,
@@ -122,7 +122,7 @@ pub fn setCollectInt(
             try self.list.append(self.alloc, key);
         }
     };
-    try Index.forEachKey(transaction, set_root, Sink{ .list = out, .alloc = allocator }, Sink.onKey);
+    try Index.forEachKey(transaction, setRoot, Sink{ .list = out, .alloc = allocator }, Sink.onKey);
 }
 
 // ---------------------------------------------------------------------------
@@ -139,30 +139,30 @@ pub fn buildSetBlob(transaction: *WriteTransaction, items: []const []const u8) !
 
 pub fn setCountBlob(transaction: anytype, catalogRef: Reference, primaryKey: u64, property: usize) !?u64 {
     const resolved = (try catalog.resolveProperty(transaction, catalogRef, primaryKey, property)) orelse return null;
-    const set_root = try Column.get(transaction, resolved.propertyColumn, resolved.row);
-    return try bindex.count(transaction, set_root);
+    const setRoot = try Column.get(transaction, resolved.propertyColumn, resolved.row);
+    return try bindex.count(transaction, setRoot);
 }
 
 pub fn setContainsBlob(transaction: anytype, catalogRef: Reference, primaryKey: u64, property: usize, member: []const u8) !bool {
     const resolved = (try catalog.resolveProperty(transaction, catalogRef, primaryKey, property)) orelse return error.NotFound;
-    const set_root = try Column.get(transaction, resolved.propertyColumn, resolved.row);
-    return (try bindex.get(transaction, set_root, member)) != null;
+    const setRoot = try Column.get(transaction, resolved.propertyColumn, resolved.row);
+    return (try bindex.get(transaction, setRoot, member)) != null;
 }
 
 pub fn setAddBlob(transaction: *WriteTransaction, catalogRef: Reference, primaryKey: u64, property: usize, member: []const u8) !Reference {
     const resolved = (try catalog.resolveProperty(transaction, catalogRef, primaryKey, property)) orelse return error.NotFound;
-    const old_root = try Column.get(transaction, resolved.propertyColumn, resolved.row);
-    if ((try bindex.get(transaction, old_root, member)) != null) return catalogRef; // already a member, no version bump
-    const new_root = try bindex.insert(transaction, old_root, member, 1);
-    return catalog.replaceCollRoot(transaction, catalogRef, resolved.row, property, new_root);
+    const oldRoot = try Column.get(transaction, resolved.propertyColumn, resolved.row);
+    if ((try bindex.get(transaction, oldRoot, member)) != null) return catalogRef; // already a member, no version bump
+    const newRoot = try bindex.insert(transaction, oldRoot, member, 1);
+    return catalog.replaceCollRoot(transaction, catalogRef, resolved.row, property, newRoot);
 }
 
 pub fn setRemoveBlob(transaction: *WriteTransaction, catalogRef: Reference, primaryKey: u64, property: usize, member: []const u8) !Reference {
     const resolved = (try catalog.resolveProperty(transaction, catalogRef, primaryKey, property)) orelse return error.NotFound;
-    const old_root = try Column.get(transaction, resolved.propertyColumn, resolved.row);
-    if ((try bindex.get(transaction, old_root, member)) == null) return catalogRef; // not a member, no version bump
-    const new_root = try bindex.remove(transaction, old_root, member);
-    return catalog.replaceCollRoot(transaction, catalogRef, resolved.row, property, new_root);
+    const oldRoot = try Column.get(transaction, resolved.propertyColumn, resolved.row);
+    if ((try bindex.get(transaction, oldRoot, member)) == null) return catalogRef; // not a member, no version bump
+    const newRoot = try bindex.remove(transaction, oldRoot, member);
+    return catalog.replaceCollRoot(transaction, catalogRef, resolved.row, property, newRoot);
 }
 
 // Collect members in ascending byte order. forEachEntry hands the callback a key
@@ -178,7 +178,7 @@ pub fn setCollectBlob(
     allocator: std.mem.Allocator,
 ) !void {
     const resolved = (try catalog.resolveProperty(transaction, catalogRef, primaryKey, property)) orelse return error.NotFound;
-    const set_root = try Column.get(transaction, resolved.propertyColumn, resolved.row);
+    const setRoot = try Column.get(transaction, resolved.propertyColumn, resolved.row);
     const Sink = struct {
         list: *std.ArrayList([]const u8),
         alloc: std.mem.Allocator,
@@ -187,7 +187,7 @@ pub fn setCollectBlob(
             try self.list.append(self.alloc, try self.alloc.dupe(u8, key));
         }
     };
-    try bindex.forEachEntry(transaction, set_root, Sink{ .list = out, .alloc = allocator }, Sink.onEntry);
+    try bindex.forEachEntry(transaction, setRoot, Sink{ .list = out, .alloc = allocator }, Sink.onEntry);
 }
 
 // ---------------------------------------------------------------------------
@@ -203,29 +203,29 @@ pub fn buildDict(transaction: *WriteTransaction, entries: []const catalog.DictEn
 
 pub fn dictGet(transaction: anytype, catalogRef: Reference, primaryKey: u64, property: usize, key: []const u8) !?u64 {
     const resolved = (try catalog.resolveProperty(transaction, catalogRef, primaryKey, property)) orelse return error.NotFound;
-    const dict_root = try Column.get(transaction, resolved.propertyColumn, resolved.row);
-    return try bindex.get(transaction, dict_root, key);
+    const dictRoot = try Column.get(transaction, resolved.propertyColumn, resolved.row);
+    return try bindex.get(transaction, dictRoot, key);
 }
 
 pub fn dictCount(transaction: anytype, catalogRef: Reference, primaryKey: u64, property: usize) !?u64 {
     const resolved = (try catalog.resolveProperty(transaction, catalogRef, primaryKey, property)) orelse return null;
-    const dict_root = try Column.get(transaction, resolved.propertyColumn, resolved.row);
-    return try bindex.count(transaction, dict_root);
+    const dictRoot = try Column.get(transaction, resolved.propertyColumn, resolved.row);
+    return try bindex.count(transaction, dictRoot);
 }
 
 pub fn dictPut(transaction: *WriteTransaction, catalogRef: Reference, primaryKey: u64, property: usize, key: []const u8, value: u64) !Reference {
     const resolved = (try catalog.resolveProperty(transaction, catalogRef, primaryKey, property)) orelse return error.NotFound;
-    const old_root = try Column.get(transaction, resolved.propertyColumn, resolved.row);
-    const new_root = try bindex.insert(transaction, old_root, key, value); // overwrites existing key
-    return catalog.replaceCollRoot(transaction, catalogRef, resolved.row, property, new_root);
+    const oldRoot = try Column.get(transaction, resolved.propertyColumn, resolved.row);
+    const newRoot = try bindex.insert(transaction, oldRoot, key, value); // overwrites existing key
+    return catalog.replaceCollRoot(transaction, catalogRef, resolved.row, property, newRoot);
 }
 
 pub fn dictRemove(transaction: *WriteTransaction, catalogRef: Reference, primaryKey: u64, property: usize, key: []const u8) !Reference {
     const resolved = (try catalog.resolveProperty(transaction, catalogRef, primaryKey, property)) orelse return error.NotFound;
-    const old_root = try Column.get(transaction, resolved.propertyColumn, resolved.row);
-    if ((try bindex.get(transaction, old_root, key)) == null) return catalogRef; // absent, no version bump
-    const new_root = try bindex.remove(transaction, old_root, key);
-    return catalog.replaceCollRoot(transaction, catalogRef, resolved.row, property, new_root);
+    const oldRoot = try Column.get(transaction, resolved.propertyColumn, resolved.row);
+    if ((try bindex.get(transaction, oldRoot, key)) == null) return catalogRef; // absent, no version bump
+    const newRoot = try bindex.remove(transaction, oldRoot, key);
+    return catalog.replaceCollRoot(transaction, catalogRef, resolved.row, property, newRoot);
 }
 
 // Collect (key, val) pairs in ascending byte-key order. The key slice handed to
@@ -241,7 +241,7 @@ pub fn dictCollect(
     allocator: std.mem.Allocator,
 ) !void {
     const resolved = (try catalog.resolveProperty(transaction, catalogRef, primaryKey, property)) orelse return error.NotFound;
-    const dict_root = try Column.get(transaction, resolved.propertyColumn, resolved.row);
+    const dictRoot = try Column.get(transaction, resolved.propertyColumn, resolved.row);
     const Sink = struct {
         list: *std.ArrayList(catalog.DictEntry),
         alloc: std.mem.Allocator,
@@ -249,7 +249,7 @@ pub fn dictCollect(
             try self.list.append(self.alloc, .{ .key = try self.alloc.dupe(u8, key), .value = value });
         }
     };
-    try bindex.forEachEntry(transaction, dict_root, Sink{ .list = out, .alloc = allocator }, Sink.onEntry);
+    try bindex.forEachEntry(transaction, dictRoot, Sink{ .list = out, .alloc = allocator }, Sink.onEntry);
 }
 
 test {

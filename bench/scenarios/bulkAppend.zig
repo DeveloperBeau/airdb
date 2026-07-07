@@ -11,7 +11,7 @@
 // error.NotAppendable with nothing written, so bulkAppendOrInsert would replay
 // it row-by-row. That correctness smoke is recorded as fallback_ok in the note.
 //
-// Baseline choice: Path B uses batched commits (batch_size rows per commit), not
+// Baseline choice: Path B uses batched commits (batchSize rows per commit), not
 // auto-commit per row, because that is how a sane bulk loader would use the
 // row-by-row API today. It is the honest baseline bulkAppend competes against.
 
@@ -29,7 +29,7 @@ pub const name = "bulk_append";
 
 // Rows committed per write transaction on the row-by-row path. Matches
 // bulk_import / insert_recovery so the baseline is apples-to-apples.
-const batch_size: usize = 10_000;
+const batchSize: usize = 10_000;
 
 inline fn sysIo() Io {
     return std.Io.Threaded.global_single_threaded.io();
@@ -42,10 +42,10 @@ fn nowNs(io: Io) i96 {
 // Seed a fresh two-int type with `base` rows (primaryKeys 0..base-1, value = primaryKey) using
 // bulkImport in one transaction, so both databases start from an identical,
 // already-populated base. Returns nothing; the committed catalog is the root.
-fn seedBase(database: *airdb.Database, base_rows: []const []const u64) !void {
+fn seedBase(database: *airdb.Database, baseRows: []const []const u64) !void {
     var w = try database.beginWrite();
     const c = try catalog.create(&w, 2);
-    const seeded = try bulk.bulkImport(&w, c, base_rows, .{ .presorted = true });
+    const seeded = try bulk.bulkImport(&w, c, baseRows, .{ .presorted = true });
     w.setRoot(seeded);
     _ = try w.commit();
 }
@@ -57,133 +57,133 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     const base: usize = ctx.n / 2;
     const m: usize = ctx.n / 2;
 
-    const path_a = try harness.scratchPath(ctx.*, name ++ "_bulk.airdb");
-    defer alloc.free(path_a);
-    defer harness.removeScratch(ctx.*, path_a);
-    const path_b = try harness.scratchPath(ctx.*, name ++ "_rowwise.airdb");
-    defer alloc.free(path_b);
-    defer harness.removeScratch(ctx.*, path_b);
-    const path_c = try harness.scratchPath(ctx.*, name ++ "_fallback.airdb");
-    defer alloc.free(path_c);
-    defer harness.removeScratch(ctx.*, path_c);
+    const pathA = try harness.scratchPath(ctx.*, name ++ "_bulk.airdb");
+    defer alloc.free(pathA);
+    defer harness.removeScratch(ctx.*, pathA);
+    const pathB = try harness.scratchPath(ctx.*, name ++ "_rowwise.airdb");
+    defer alloc.free(pathB);
+    defer harness.removeScratch(ctx.*, pathB);
+    const pathC = try harness.scratchPath(ctx.*, name ++ "_fallback.airdb");
+    defer alloc.free(pathC);
+    defer harness.removeScratch(ctx.*, pathC);
 
     // --- Build the base rows (0..base-1) and the append batch (base..base+m-1).
     // Each is a flat backing buffer sliced into per-row []const u64 windows.
-    const base_storage = try alloc.alloc([2]u64, base);
-    defer alloc.free(base_storage);
-    const base_rows = try alloc.alloc([]const u64, base);
-    defer alloc.free(base_rows);
-    for (base_storage, base_rows, 0..) |*cells, *row, i| {
+    const baseStorage = try alloc.alloc([2]u64, base);
+    defer alloc.free(baseStorage);
+    const baseRows = try alloc.alloc([]const u64, base);
+    defer alloc.free(baseRows);
+    for (baseStorage, baseRows, 0..) |*cells, *row, i| {
         cells.* = .{ @intCast(i), @intCast(i) };
         row.* = &cells.*;
     }
 
-    const batch_storage = try alloc.alloc([2]u64, m);
-    defer alloc.free(batch_storage);
+    const batchStorage = try alloc.alloc([2]u64, m);
+    defer alloc.free(batchStorage);
     const batch = try alloc.alloc([]const u64, m);
     defer alloc.free(batch);
-    for (batch_storage, batch, 0..) |*cells, *row, i| {
+    for (batchStorage, batch, 0..) |*cells, *row, i| {
         const primaryKey: u64 = @intCast(base + i);
         cells.* = .{ primaryKey, primaryKey };
         row.* = &cells.*;
     }
 
     // --- Seed both databases identically with the populated base. ----------
-    var databaseA = try airdb.Database.create(alloc, path_a);
+    var databaseA = try airdb.Database.create(alloc, pathA);
     errdefer databaseA.deinit();
-    try seedBase(&databaseA, base_rows);
+    try seedBase(&databaseA, baseRows);
 
-    var databaseB = try airdb.Database.create(alloc, path_b);
+    var databaseB = try airdb.Database.create(alloc, pathB);
     errdefer databaseB.deinit();
-    try seedBase(&databaseB, base_rows);
+    try seedBase(&databaseB, baseRows);
 
     // --- Path A: bulk append the batch in one write transaction. -----------
-    const a_commits_before = databaseA.metrics().commit_count;
-    const a_pf_before = airdb.pageFaults();
-    const bulk_start = nowNs(io);
+    const aCommitsBefore = databaseA.metrics().commitCount;
+    const aPfBefore = airdb.pageFaults();
+    const bulkStart = nowNs(io);
     {
         var w = try databaseA.beginWrite();
-        const newCatalog = try bulk.bulkAppendOrInsert(&w, w.new_root, batch);
+        const newCatalog = try bulk.bulkAppendOrInsert(&w, w.newRoot, batch);
         w.setRoot(newCatalog);
         _ = try w.commit();
     }
-    const bulk_ns: u64 = @intCast(nowNs(io) - bulk_start);
-    const a_pf_after = airdb.pageFaults();
-    const bulk_faults = (a_pf_after.minor - a_pf_before.minor) + (a_pf_after.major - a_pf_before.major);
-    const bulk_commits = databaseA.metrics().commit_count - a_commits_before;
+    const bulkNs: u64 = @intCast(nowNs(io) - bulkStart);
+    const aPfAfter = airdb.pageFaults();
+    const bulkFaults = (aPfAfter.minor - aPfBefore.minor) + (aPfAfter.major - aPfBefore.major);
+    const bulkCommits = databaseA.metrics().commitCount - aCommitsBefore;
 
-    const file_bytes = try databaseA.fileSize();
-    const logical_bytes = databaseA.logicalSize();
+    const fileBytes = try databaseA.fileSize();
+    const logicalBytes = databaseA.logicalSize();
 
     // --- Path B: row-by-row inserts of the same batch in batched commits. --
-    const b_commits_before = databaseB.metrics().commit_count;
-    const b_pf_before = airdb.pageFaults();
-    const rowwise_start = nowNs(io);
+    const bCommitsBefore = databaseB.metrics().commitCount;
+    const bPfBefore = airdb.pageFaults();
+    const rowwiseStart = nowNs(io);
     var inserted: usize = 0;
     while (inserted < m) {
-        const this_batch = @min(batch_size, m - inserted);
+        const thisBatch = @min(batchSize, m - inserted);
         var w = try databaseB.beginWrite();
-        var catalogRef: Reference = databaseB.active_root; // reload the committed catalog ref
+        var catalogRef: Reference = databaseB.activeRoot; // reload the committed catalog ref
         var j: usize = 0;
-        while (j < this_batch) : (j += 1) {
+        while (j < thisBatch) : (j += 1) {
             const primaryKey: u64 = base + inserted + j;
             const r = try rows.insert(&w, catalogRef, &.{ primaryKey, primaryKey });
             catalogRef = r.catalogRef;
         }
         w.setRoot(catalogRef);
         _ = try w.commit();
-        inserted += this_batch;
+        inserted += thisBatch;
     }
-    const rowwise_ns: u64 = @intCast(nowNs(io) - rowwise_start);
-    const b_pf_after = airdb.pageFaults();
-    const rowwise_faults = (b_pf_after.minor - b_pf_before.minor) + (b_pf_after.major - b_pf_before.major);
-    const rowwise_commits = databaseB.metrics().commit_count - b_commits_before;
+    const rowwiseNs: u64 = @intCast(nowNs(io) - rowwiseStart);
+    const bPfAfter = airdb.pageFaults();
+    const rowwiseFaults = (bPfAfter.minor - bPfBefore.minor) + (bPfAfter.major - bPfBefore.major);
+    const rowwiseCommits = databaseB.metrics().commitCount - bCommitsBefore;
 
     // --- Fallback smoke: a scattered (non-ascending) batch must be rejected
     // with NotAppendable and nothing written. Kept cheap: a tiny seeded type.
-    var fallback_ok = false;
+    var fallbackOk = false;
     {
-        var databaseC = try airdb.Database.create(alloc, path_c);
+        var databaseC = try airdb.Database.create(alloc, pathC);
         defer databaseC.deinit();
-        var small_storage: [4][2]u64 = undefined;
-        var small_rows: [4][]const u64 = undefined;
-        for (&small_storage, &small_rows, 0..) |*cells, *row, i| {
+        var smallStorage: [4][2]u64 = undefined;
+        var smallRows: [4][]const u64 = undefined;
+        for (&smallStorage, &smallRows, 0..) |*cells, *row, i| {
             cells.* = .{ @intCast(i), @intCast(i) };
             row.* = &cells.*;
         }
-        try seedBase(&databaseC, &small_rows);
+        try seedBase(&databaseC, &smallRows);
 
         // primaryKeys 100, 102, 101: above the max but NOT strictly ascending.
         const scattered = [_][]const u64{ &.{ 100, 100 }, &.{ 102, 102 }, &.{ 101, 101 } };
         var w = try databaseC.beginWrite();
-        if (bulk.bulkAppend(&w, w.new_root, &scattered)) |_| {
-            // Unexpectedly appendable: leave fallback_ok false.
+        if (bulk.bulkAppend(&w, w.newRoot, &scattered)) |_| {
+            // Unexpectedly appendable: leave fallbackOk false.
         } else |e| switch (e) {
-            error.NotAppendable => fallback_ok = true,
+            error.NotAppendable => fallbackOk = true,
             else => return e,
         }
         w.deinit(); // abort: nothing should have been written anyway
     }
 
-    const speedup: f64 = if (bulk_ns == 0)
+    const speedup: f64 = if (bulkNs == 0)
         0
     else
-        @as(f64, @floatFromInt(rowwise_ns)) / @as(f64, @floatFromInt(bulk_ns));
+        @as(f64, @floatFromInt(rowwiseNs)) / @as(f64, @floatFromInt(bulkNs));
 
     const note = try std.fmt.allocPrint(
         alloc,
         "bulk_ms={d} rowwise_ms={d} speedup={d:.1}x bulk_faults={d} rowwise_faults={d} bulk_commits={d} rowwise_commits={d} base={d} m={d} fallback_ok={}",
         .{
-            bulk_ns / std.time.ns_per_ms,
-            rowwise_ns / std.time.ns_per_ms,
+            bulkNs / std.time.ns_per_ms,
+            rowwiseNs / std.time.ns_per_ms,
             speedup,
-            bulk_faults,
-            rowwise_faults,
-            bulk_commits,
-            rowwise_commits,
+            bulkFaults,
+            rowwiseFaults,
+            bulkCommits,
+            rowwiseCommits,
             base,
             m,
-            fallback_ok,
+            fallbackOk,
         },
     );
 
@@ -193,13 +193,13 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     return .{
         .name = name,
         .ops = m,
-        .wall_ns = bulk_ns,
-        .p50_ns = 0,
-        .p99_ns = 0,
-        .max_ns = 0,
-        .file_bytes = file_bytes,
-        .logical_bytes = logical_bytes,
-        .peak_rss_bytes = airdb.peakResidentBytes(),
+        .wallNs = bulkNs,
+        .p50Ns = 0,
+        .p99Ns = 0,
+        .maxNs = 0,
+        .fileBytes = fileBytes,
+        .logicalBytes = logicalBytes,
+        .peakRssBytes = airdb.peakResidentBytes(),
         .note = note,
     };
 }
