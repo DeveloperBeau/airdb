@@ -320,28 +320,28 @@ export fn airdb_bulk_append(handle: ?*Database, rows_flat: [*]const u64, row_cou
 // ---------------------------------------------------------------------------
 // Explicit multi-operation write transactions.
 //
-// A Txn holds one open WriteTransaction and threads the catalog ref across operations,
+// A Transaction holds one open WriteTransaction and threads the catalog ref across operations,
 // so a burst of writes commits as a SINGLE durable barrier instead of one
 // commit per call. The auto-commit functions above are unchanged.
 //
-// Lifecycle: a Txn handle returned by airdb_begin must be committed
+// Lifecycle: a Transaction handle returned by airdb_begin must be committed
 // (airdb_commit) or aborted (airdb_abort) exactly once. Both paths free the
 // handle and release the write lock; using the handle after either is undefined
-// behavior. A handle is single-threaded: do not drive one Txn from two threads.
+// behavior. A handle is single-threaded: do not drive one Transaction from two threads.
 //
 // The write lock is acquired in airdb_begin and released exactly once: by
 // airdb_commit (via WriteTransaction.commit, which unlocks on both its success and its
 // own error/revert paths) or by airdb_abort (via WriteTransaction.deinit).
 //
 // BENIGN op results (duplicate, not-found, conflict) are decided before any
-// mutation and leave the txn fully usable. A STRUCTURAL op failure (generic
+// mutation and leave the transaction fully usable. A STRUCTURAL op failure (generic
 // error mid-mutation) is different: the op may have freed tree nodes that the
 // unadvanced catalog ref still references, so committing afterwards would hand
-// live nodes to the free list. Such a failure poisons the txn -- only
+// live nodes to the free list. Such a failure poisons the transaction -- only
 // airdb_abort is accepted; airdb_commit refuses and aborts instead.
 // ---------------------------------------------------------------------------
 
-const Txn = struct {
+const Transaction = struct {
     dbh: *Database,
     w: WriteTransaction,
     cat: Reference, // current catalog ref, threaded across operations
@@ -349,11 +349,11 @@ const Txn = struct {
 };
 
 // Begin an explicit write transaction. Acquires the write lock. Returns null on
-// failure (null handle, or the write lock / txn could not be started). The
+// failure (null handle, or the write lock / transaction could not be started). The
 // returned handle must be passed to exactly one of airdb_commit / airdb_abort.
-export fn airdb_begin(handle: ?*Database) ?*Txn {
+export fn airdb_begin(handle: ?*Database) ?*Transaction {
     const self = handle orelse return null;
-    const t = alloc.create(Txn) catch return null;
+    const t = alloc.create(Transaction) catch return null;
     t.dbh = self;
     t.w = self.db.beginWrite() catch {
         alloc.destroy(t);
@@ -366,22 +366,22 @@ export fn airdb_begin(handle: ?*Database) ?*Txn {
 
 // Abort an open transaction: release the write lock without making anything
 // durable, then free the handle. Safe to call with null (no-op).
-export fn airdb_abort(txn: ?*Txn) void {
-    const t = txn orelse return;
+export fn airdb_abort(transaction: ?*Transaction) void {
+    const t = transaction orelse return;
     t.w.deinit(); // releases the write lock; makes nothing durable
     alloc.destroy(t);
 }
 
 // Stage an insert in the open transaction (no commit). vals has `len` u64
 // values (must equal prop_count; vals[0] is the primary key). Returns the new
-// object key on success. On error the txn stays open and the catalog ref is not
+// object key on success. On error the transaction stays open and the catalog ref is not
 // advanced, so the batch remains consistent.
-export fn airdb_txn_insert(txn: ?*Txn, vals: [*]const u64, len: usize) i64 {
-    const t = txn orelse return AIRDB_E_GENERIC;
+export fn airdb_txn_insert(transaction: ?*Transaction, vals: [*]const u64, len: usize) i64 {
+    const t = transaction orelse return AIRDB_E_GENERIC;
     if (t.poisoned) return AIRDB_E_GENERIC;
     if (len != t.dbh.prop_count) return AIRDB_E_BAD_ARGS;
     const r = rows.insert(&t.w, t.cat, vals[0..len]) catch |e| {
-        if (e == error.DuplicateKey) return AIRDB_E_DUPLICATE; // pre-mutation check: txn stays usable
+        if (e == error.DuplicateKey) return AIRDB_E_DUPLICATE; // pre-mutation check: transaction stays usable
         t.poisoned = true; // mid-mutation failure: the batch may reference freed nodes
         return AIRDB_E_GENERIC;
     };
@@ -391,9 +391,9 @@ export fn airdb_txn_insert(txn: ?*Txn, vals: [*]const u64, len: usize) i64 {
 
 // Stage an update in the open transaction (no commit). Mirrors airdb_update
 // against the threaded catalog ref. Returns AIRDB_OK or an error code; on error
-// the txn stays open and the catalog ref is not advanced.
-export fn airdb_txn_update(txn: ?*Txn, vals: [*]const u64, len: usize) i64 {
-    const t = txn orelse return AIRDB_E_GENERIC;
+// the transaction stays open and the catalog ref is not advanced.
+export fn airdb_txn_update(transaction: ?*Transaction, vals: [*]const u64, len: usize) i64 {
+    const t = transaction orelse return AIRDB_E_GENERIC;
     if (t.poisoned) return AIRDB_E_GENERIC;
     if (len != t.dbh.prop_count) return AIRDB_E_BAD_ARGS;
     const pk = vals[0];
@@ -416,9 +416,9 @@ export fn airdb_txn_update(txn: ?*Txn, vals: [*]const u64, len: usize) i64 {
 
 // Stage a delete in the open transaction (no commit). Mirrors airdb_delete
 // against the threaded catalog ref. Returns AIRDB_OK or an error code; on error
-// the txn stays open and the catalog ref is not advanced.
-export fn airdb_txn_delete(txn: ?*Txn, pk: u64) i64 {
-    const t = txn orelse return AIRDB_E_GENERIC;
+// the transaction stays open and the catalog ref is not advanced.
+export fn airdb_txn_delete(transaction: ?*Transaction, pk: u64) i64 {
+    const t = transaction orelse return AIRDB_E_GENERIC;
     if (t.poisoned) return AIRDB_E_GENERIC;
     var cur: [MAX_PROPS]u64 = undefined;
     const ver = rows.getByPk(&t.w, t.cat, pk, cur[0..t.dbh.prop_count]) catch return AIRDB_E_GENERIC;
@@ -443,8 +443,8 @@ export fn airdb_txn_delete(txn: ?*Txn, pk: u64) i64 {
 // the lock on BOTH its success and its error/revert paths, so this must NOT
 // unlock again; it only frees the handle. Safe with null (returns
 // AIRDB_E_GENERIC).
-export fn airdb_commit(txn: ?*Txn) i64 {
-    const t = txn orelse return AIRDB_E_GENERIC;
+export fn airdb_commit(transaction: ?*Transaction) i64 {
+    const t = transaction orelse return AIRDB_E_GENERIC;
     if (t.poisoned) {
         // A structural op failure may have freed nodes the batch's tree still
         // references; committing would hand live nodes to the durable free
@@ -584,7 +584,7 @@ test "ffi: open of a corrupt database returns null and never truncates the file"
     try testing.expectEqualSlices(u8, &[_]u8{ 0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF }, &magic);
 }
 
-test "ffi txn: begin then abort releases the write lock" {
+test "ffi transaction: begin then abort releases the write lock" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try ffiTmpPathZ(testing.allocator, &tmp, "txn_beginabort.airdb");
@@ -592,15 +592,15 @@ test "ffi txn: begin then abort releases the write lock" {
     const h = airdb_open(path.ptr, 2) orelse return error.OpenFailed;
     defer airdb_close(h);
 
-    const txn = airdb_begin(h) orelse return error.BeginFailed;
-    airdb_abort(txn); // must release the lock without crashing
+    const transaction = airdb_begin(h) orelse return error.BeginFailed;
+    airdb_abort(transaction); // must release the lock without crashing
 
     // A subsequent begin proves the lock was released.
-    const txn2 = airdb_begin(h) orelse return error.BeginFailed;
-    airdb_abort(txn2);
+    const transaction2 = airdb_begin(h) orelse return error.BeginFailed;
+    airdb_abort(transaction2);
 }
 
-test "ffi txn: staged inserts are not durable after abort" {
+test "ffi transaction: staged inserts are not durable after abort" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try ffiTmpPathZ(testing.allocator, &tmp, "txn_abort.airdb");
@@ -608,16 +608,16 @@ test "ffi txn: staged inserts are not durable after abort" {
     const h = airdb_open(path.ptr, 2) orelse return error.OpenFailed;
     defer airdb_close(h);
 
-    const txn = airdb_begin(h) orelse return error.BeginFailed;
-    try testing.expect(airdb_txn_insert(txn, &[_]u64{ 1, 10 }, 2) >= 0);
-    try testing.expect(airdb_txn_insert(txn, &[_]u64{ 2, 20 }, 2) >= 0);
-    airdb_abort(txn);
+    const transaction = airdb_begin(h) orelse return error.BeginFailed;
+    try testing.expect(airdb_txn_insert(transaction, &[_]u64{ 1, 10 }, 2) >= 0);
+    try testing.expect(airdb_txn_insert(transaction, &[_]u64{ 2, 20 }, 2) >= 0);
+    airdb_abort(transaction);
 
     // Nothing was committed, so a fresh read sees zero rows.
     try testing.expectEqual(@as(i64, 0), airdb_count(h));
 }
 
-test "ffi txn: commit makes the whole batch durable in one commit" {
+test "ffi transaction: commit makes the whole batch durable in one commit" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try ffiTmpPathZ(testing.allocator, &tmp, "txn_commit.airdb");
@@ -626,10 +626,10 @@ test "ffi txn: commit makes the whole batch durable in one commit" {
         const h = airdb_open(path.ptr, 2) orelse return error.OpenFailed;
         defer airdb_close(h);
 
-        const txn = airdb_begin(h) orelse return error.BeginFailed;
-        try testing.expect(airdb_txn_insert(txn, &[_]u64{ 1, 10 }, 2) >= 0);
-        try testing.expect(airdb_txn_insert(txn, &[_]u64{ 2, 20 }, 2) >= 0);
-        try testing.expectEqual(AIRDB_OK, airdb_commit(txn));
+        const transaction = airdb_begin(h) orelse return error.BeginFailed;
+        try testing.expect(airdb_txn_insert(transaction, &[_]u64{ 1, 10 }, 2) >= 0);
+        try testing.expect(airdb_txn_insert(transaction, &[_]u64{ 2, 20 }, 2) >= 0);
+        try testing.expectEqual(AIRDB_OK, airdb_commit(transaction));
 
         try testing.expectEqual(@as(i64, 2), airdb_count(h));
         var out: [2]u64 = undefined;
@@ -649,7 +649,7 @@ test "ffi txn: commit makes the whole batch durable in one commit" {
     try testing.expectEqual(@as(u64, 20), out[1]);
 }
 
-test "ffi txn: update and delete apply within one batch" {
+test "ffi transaction: update and delete apply within one batch" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try ffiTmpPathZ(testing.allocator, &tmp, "txn_upddel.airdb");
@@ -659,17 +659,17 @@ test "ffi txn: update and delete apply within one batch" {
 
     // Seed two rows in one batch.
     {
-        const txn = airdb_begin(h) orelse return error.BeginFailed;
-        try testing.expect(airdb_txn_insert(txn, &[_]u64{ 1, 10 }, 2) >= 0);
-        try testing.expect(airdb_txn_insert(txn, &[_]u64{ 2, 20 }, 2) >= 0);
-        try testing.expectEqual(AIRDB_OK, airdb_commit(txn));
+        const transaction = airdb_begin(h) orelse return error.BeginFailed;
+        try testing.expect(airdb_txn_insert(transaction, &[_]u64{ 1, 10 }, 2) >= 0);
+        try testing.expect(airdb_txn_insert(transaction, &[_]u64{ 2, 20 }, 2) >= 0);
+        try testing.expectEqual(AIRDB_OK, airdb_commit(transaction));
     }
     // Update row 1 and delete row 2 in a single batch.
     {
-        const txn = airdb_begin(h) orelse return error.BeginFailed;
-        try testing.expectEqual(AIRDB_OK, airdb_txn_update(txn, &[_]u64{ 1, 99 }, 2));
-        try testing.expectEqual(AIRDB_OK, airdb_txn_delete(txn, 2));
-        try testing.expectEqual(AIRDB_OK, airdb_commit(txn));
+        const transaction = airdb_begin(h) orelse return error.BeginFailed;
+        try testing.expectEqual(AIRDB_OK, airdb_txn_update(transaction, &[_]u64{ 1, 99 }, 2));
+        try testing.expectEqual(AIRDB_OK, airdb_txn_delete(transaction, 2));
+        try testing.expectEqual(AIRDB_OK, airdb_commit(transaction));
     }
     try testing.expectEqual(@as(i64, 1), airdb_count(h));
     var out: [2]u64 = undefined;
@@ -678,7 +678,7 @@ test "ffi txn: update and delete apply within one batch" {
     try testing.expectEqual(AIRDB_E_NOT_FOUND, airdb_get(h, 2, &out, 2));
 }
 
-test "ffi txn: abort after a failed op releases the lock" {
+test "ffi transaction: abort after a failed op releases the lock" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try ffiTmpPathZ(testing.allocator, &tmp, "txn_failop.airdb");
@@ -686,20 +686,20 @@ test "ffi txn: abort after a failed op releases the lock" {
     const h = airdb_open(path.ptr, 2) orelse return error.OpenFailed;
     defer airdb_close(h);
 
-    const txn = airdb_begin(h) orelse return error.BeginFailed;
-    try testing.expect(airdb_txn_insert(txn, &[_]u64{ 1, 10 }, 2) >= 0);
-    // Duplicate pk fails but leaves the txn open.
-    try testing.expectEqual(AIRDB_E_DUPLICATE, airdb_txn_insert(txn, &[_]u64{ 1, 11 }, 2));
-    airdb_abort(txn);
+    const transaction = airdb_begin(h) orelse return error.BeginFailed;
+    try testing.expect(airdb_txn_insert(transaction, &[_]u64{ 1, 10 }, 2) >= 0);
+    // Duplicate pk fails but leaves the transaction open.
+    try testing.expectEqual(AIRDB_E_DUPLICATE, airdb_txn_insert(transaction, &[_]u64{ 1, 11 }, 2));
+    airdb_abort(transaction);
 
     // The lock was released, so a new begin succeeds.
-    const txn2 = airdb_begin(h) orelse return error.BeginFailed;
-    airdb_abort(txn2);
+    const transaction2 = airdb_begin(h) orelse return error.BeginFailed;
+    airdb_abort(transaction2);
     // And nothing was made durable.
     try testing.expectEqual(@as(i64, 0), airdb_count(h));
 }
 
-test "ffi txn: null handle is rejected, not crashed" {
+test "ffi transaction: null handle is rejected, not crashed" {
     try testing.expectEqual(AIRDB_E_GENERIC, airdb_txn_insert(null, &[_]u64{ 1, 2 }, 2));
     try testing.expectEqual(AIRDB_E_GENERIC, airdb_txn_update(null, &[_]u64{ 1, 2 }, 2));
     try testing.expectEqual(AIRDB_E_GENERIC, airdb_txn_delete(null, 1));
@@ -880,9 +880,9 @@ test "airdb_bulk_append wrong prop_count returns AIRDB_E_BAD_ARGS" {
     try testing.expect(airdb_insert(h, &[_]u64{ 1, 10 }, 2) >= 0);
 }
 
-test "ffi txn: a poisoned txn refuses commit and releases the lock" {
+test "ffi transaction: a poisoned transaction refuses commit and releases the lock" {
     // Regression: a structural op failure mid-batch can free tree nodes the
-    // unadvanced catalog ref still references; committing such a txn handed
+    // unadvanced catalog ref still references; committing such a transaction handed
     // live nodes to the durable free list. Commit must abort instead.
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();

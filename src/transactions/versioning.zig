@@ -95,7 +95,7 @@ fn selectPublishedSlot(db: *Db, lv: u64) ?Slot {
 /// observed. Only a version <= the published latest_version may be adopted.
 ///
 /// Safety: must only be called when no write transaction is in progress.
-/// It is called at the start of beginRead and beginWrite (before any txn
+/// It is called at the start of beginRead and beginWrite (before any transaction
 /// state is built), which is safe.
 pub fn refreshToLatest(db: *Db) !void {
     const lv = db.coord.latestVersion(); // acquire-load of the published version

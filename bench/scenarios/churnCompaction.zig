@@ -108,7 +108,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
 
     var it: u64 = 0;
     while (it < iters) : (it += 1) {
-        // Churn: insert k fresh rows and delete the k oldest live pks in one txn.
+        // Churn: insert k fresh rows and delete the k oldest live pks in one transaction.
         {
             var w = try db.beginWrite();
             cat = db.active_root;
@@ -138,7 +138,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
             oldest_pk += k;
         }
 
-        // Compaction: repack the type until fully packed, one step per write txn.
+        // Compaction: repack the type until fully packed, one step per write transaction.
         while (true) {
             var w = try db.beginWrite();
             cat = db.active_root;

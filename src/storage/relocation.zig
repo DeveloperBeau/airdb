@@ -10,27 +10,27 @@ const max_prop_count: usize = 256;
 // Move object `okey`'s live row to physical slot `new_row` (which must be a dead
 // slot), updating the key->row index so the key and all links stay valid. Does
 // not shrink columns. Returns the new catalog ref.
-pub fn relocateRow(txn: *WriteTransaction, cat: Reference, okey: u64, new_row: u64) !Reference {
-    var s = try catalog.CatalogSnapshot.load(txn, cat);
-    const old_row = (try Index.get(txn, s.keyrow_index_ref, okey)) orelse return cat;
+pub fn relocateRow(transaction: *WriteTransaction, cat: Reference, okey: u64, new_row: u64) !Reference {
+    var s = try catalog.CatalogSnapshot.load(transaction, cat);
+    const old_row = (try Index.get(transaction, s.keyrow_index_ref, okey)) orelse return cat;
     if (old_row == new_row) return cat;
     // Bijection / safety guards.
-    std.debug.assert((try Column.get(txn, s.live_col_ref, old_row)) == 1);
-    std.debug.assert((try Column.get(txn, s.live_col_ref, new_row)) == 0);
+    std.debug.assert((try Column.get(transaction, s.live_col_ref, old_row)) == 1);
+    std.debug.assert((try Column.get(transaction, s.live_col_ref, new_row)) == 0);
 
     // Copy each property cell + the version cell from old_row to new_row.
     var i: usize = 0;
     while (i < s.prop_count) : (i += 1) {
-        const cell = try Column.get(txn, s.props[i].col, old_row);
-        s.props[i].col = try Column.set(txn, s.props[i].col, new_row, cell);
+        const cell = try Column.get(transaction, s.props[i].col, old_row);
+        s.props[i].col = try Column.set(transaction, s.props[i].col, new_row, cell);
     }
-    const oldver = try Column.get(txn, s.version_col_ref, old_row);
-    s.version_col_ref = try Column.set(txn, s.version_col_ref, new_row, oldver);
-    s.live_col_ref = try Column.set(txn, s.live_col_ref, new_row, 1);
-    s.live_col_ref = try Column.set(txn, s.live_col_ref, old_row, 0);
-    s.keyrow_index_ref = try Index.insert(txn, s.keyrow_index_ref, okey, new_row);
+    const oldver = try Column.get(transaction, s.version_col_ref, old_row);
+    s.version_col_ref = try Column.set(transaction, s.version_col_ref, new_row, oldver);
+    s.live_col_ref = try Column.set(transaction, s.live_col_ref, new_row, 1);
+    s.live_col_ref = try Column.set(transaction, s.live_col_ref, old_row, 0);
+    s.keyrow_index_ref = try Index.insert(transaction, s.keyrow_index_ref, okey, new_row);
 
-    return s.replace(txn);
+    return s.replace(transaction);
 }
 
 // ---------------------------------------------------------------------------

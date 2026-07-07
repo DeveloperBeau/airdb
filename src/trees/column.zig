@@ -1,4 +1,4 @@
-// The `txn` parameter of every operation is `anytype`: a comptime duck-typed
+// The `transaction` parameter of every operation is `anytype`: a comptime duck-typed
 // transaction capability, monomorphized at compile time (no vtable on this
 // B+tree hot path). Read-only operations need only
 //   deref(ref, len) ![]const u8
@@ -34,8 +34,8 @@ const InnerView = node.InnerView;
 // ---------------------------------------------------------------------------
 
 /// Allocate an empty leaf column node and return its Reference.
-pub fn create(txn: anytype) !Reference {
-    const a = try txn.alloc(leaf_node_size);
+pub fn create(transaction: anytype) !Reference {
+    const a = try transaction.alloc(leaf_node_size);
     _ = encodeLeaf(a.bytes, &.{});
     return a.ref;
 }
@@ -47,18 +47,18 @@ pub fn create(txn: anytype) !Reference {
 pub const max_depth: usize = 16;
 
 /// Deref a node by first reading its kind byte, then dereffing the full node.
-fn derefNode(txn: anytype, ref: Reference) ![]const u8 {
-    const kind_buf = try txn.deref(ref, 1);
+fn derefNode(transaction: anytype, ref: Reference) ![]const u8 {
+    const kind_buf = try transaction.deref(ref, 1);
     return switch (kind_buf[0]) {
-        kind_leaf => txn.deref(ref, leaf_node_size),
-        kind_inner => txn.deref(ref, inner_node_size),
+        kind_leaf => transaction.deref(ref, leaf_node_size),
+        kind_inner => transaction.deref(ref, inner_node_size),
         else => error.Corrupt,
     };
 }
 
 /// Return the number of values stored in the column rooted at root.
-pub fn len(txn: anytype, root: Reference) !u64 {
-    const bytes = try derefNode(txn, root);
+pub fn len(transaction: anytype, root: Reference) !u64 {
+    const bytes = try derefNode(transaction, root);
     if (bytes[0] == kind_leaf) {
         const count = std.mem.readInt(u16, bytes[1..3], .little);
         return count;
@@ -74,13 +74,13 @@ pub fn len(txn: anytype, root: Reference) !u64 {
 }
 
 /// Return the value at index. Returns error.IndexOutOfBounds if out of range.
-pub fn get(txn: anytype, root: Reference, index: u64) !u64 {
-    return getAt(txn, root, index, 0);
+pub fn get(transaction: anytype, root: Reference, index: u64) !u64 {
+    return getAt(transaction, root, index, 0);
 }
 
-fn getAt(txn: anytype, root: Reference, index: u64, depth: usize) !u64 {
+fn getAt(transaction: anytype, root: Reference, index: u64, depth: usize) !u64 {
     if (depth >= max_depth) return error.Corrupt;
-    const bytes = try derefNode(txn, root);
+    const bytes = try derefNode(transaction, root);
     if (bytes[0] == kind_leaf) {
         const count = std.mem.readInt(u16, bytes[1..3], .little);
         if (index >= count) return error.IndexOutOfBounds;
@@ -93,7 +93,7 @@ fn getAt(txn: anytype, root: Reference, index: u64, depth: usize) !u64 {
         var i: u16 = 0;
         while (i < view.child_count) : (i += 1) {
             const cc = view.childCount(i);
-            if (idx < cc) return getAt(txn, view.childRef(i), idx, depth + 1);
+            if (idx < cc) return getAt(transaction, view.childRef(i), idx, depth + 1);
             idx -= cc;
         }
         return error.IndexOutOfBounds;
@@ -102,20 +102,20 @@ fn getAt(txn: anytype, root: Reference, index: u64, depth: usize) !u64 {
 
 const AppendResult = struct { ref: Reference, count: u64, split: ?Reference, split_count: u64 };
 
-fn appendInto(txn: anytype, node_ref: Reference, value: u64, depth: usize) !AppendResult {
+fn appendInto(transaction: anytype, node_ref: Reference, value: u64, depth: usize) !AppendResult {
     if (depth >= max_depth) return error.Corrupt;
-    const bytes = try derefNode(txn, node_ref);
+    const bytes = try derefNode(transaction, node_ref);
     if (bytes[0] == kind_leaf) {
         const count = std.mem.readInt(u16, bytes[1..3], .little);
         if (count < LEAF_CAP) {
-            const a = try txn.writableCopy(node_ref, leaf_node_size);
+            const a = try transaction.writableCopy(node_ref, leaf_node_size);
             std.mem.writeInt(u16, a.bytes[1..3], count + 1, .little);
             const off: usize = leaf_header + @as(usize, count) * 8;
             std.mem.writeInt(u64, a.bytes[off..][0..8], value, .little);
             return .{ .ref = a.ref, .count = @as(u64, count) + 1, .split = null, .split_count = 0 };
         } else {
             // Full leaf: allocate a new leaf for the new value; leave the old leaf untouched.
-            const a = try txn.alloc(leaf_node_size);
+            const a = try transaction.alloc(leaf_node_size);
             _ = encodeLeaf(a.bytes, &.{value});
             return .{ .ref = node_ref, .count = LEAF_CAP, .split = a.ref, .split_count = 1 };
         }
@@ -131,9 +131,9 @@ fn appendInto(txn: anytype, node_ref: Reference, value: u64, depth: usize) !Appe
             while (i < child_count) : (i += 1) old_total += view.childCount(i);
         }
         const old_last_count = view.childCount(last_idx);
-        const r = try appendInto(txn, last_ref, value, depth + 1);
+        const r = try appendInto(transaction, last_ref, value, depth + 1);
         // COW the inner node and update the last child entry.
-        const a = try txn.writableCopy(node_ref, inner_node_size);
+        const a = try transaction.writableCopy(node_ref, inner_node_size);
         const last_off: usize = inner_header + last_idx * 16;
         std.mem.writeInt(u64, a.bytes[last_off..][0..8], r.ref, .little);
         std.mem.writeInt(u64, a.bytes[last_off + 8 ..][0..8], r.count, .little);
@@ -149,7 +149,7 @@ fn appendInto(txn: anytype, node_ref: Reference, value: u64, depth: usize) !Appe
             return .{ .ref = a.ref, .count = old_total - old_last_count + r.count + r.split_count, .split = null, .split_count = 0 };
         } else {
             // Inner full: create a new right inner holding just the split child.
-            const new_inner = try txn.alloc(inner_node_size);
+            const new_inner = try transaction.alloc(inner_node_size);
             const split_ref = r.split.?;
             _ = encodeInner(new_inner.bytes, &.{split_ref}, &.{r.split_count});
             return .{ .ref = a.ref, .count = old_total - old_last_count + r.count, .split = new_inner.ref, .split_count = r.split_count };
@@ -159,11 +159,11 @@ fn appendInto(txn: anytype, node_ref: Reference, value: u64, depth: usize) !Appe
 
 /// Append value to the column. Returns the new root Reference (copy-on-write).
 /// Grows the tree through leaf splits and height increases as needed.
-pub fn append(txn: anytype, root: Reference, value: u64) !Reference {
-    const r = try appendInto(txn, root, value, 0);
+pub fn append(transaction: anytype, root: Reference, value: u64) !Reference {
+    const r = try appendInto(transaction, root, value, 0);
     if (r.split == null) return r.ref;
     // Split propagated to the root: grow height by one.
-    const a = try txn.alloc(inner_node_size);
+    const a = try transaction.alloc(inner_node_size);
     const split_ref = r.split.?;
     _ = encodeInner(a.bytes, &.{ r.ref, split_ref }, &.{ r.count, r.split_count });
     return a.ref;
@@ -188,7 +188,7 @@ pub const Child = struct { ref: u64, count: u64 };
 /// Pack `values` into leaves filled to LEAF_CAP in row order. Returns the leaf
 /// level: one Child per leaf, count == the number of values in that leaf.
 pub fn packLeaves(
-    txn: anytype,
+    transaction: anytype,
     values: []const u64,
     allocator: std.mem.Allocator,
 ) !std.ArrayList(Child) {
@@ -198,7 +198,7 @@ pub fn packLeaves(
     var i: usize = 0;
     while (i < values.len) {
         const end = @min(i + cap, values.len);
-        const a = try txn.alloc(leaf_node_size);
+        const a = try transaction.alloc(leaf_node_size);
         _ = encodeLeaf(a.bytes, values[i..end]);
         try out.append(allocator, .{ .ref = a.ref, .count = @intCast(end - i) });
         i = end;
@@ -211,7 +211,7 @@ pub fn packLeaves(
 /// of its children's counts, so each emitted node's count == the total of its
 /// run.
 pub fn stackInner(
-    txn: anytype,
+    transaction: anytype,
     children: []const Child,
     allocator: std.mem.Allocator,
 ) !std.ArrayList(Child) {
@@ -231,7 +231,7 @@ pub fn stackInner(
             total += children[k].count;
         }
         const cnt = end - j;
-        const a = try txn.alloc(inner_node_size);
+        const a = try transaction.alloc(inner_node_size);
         _ = encodeInner(a.bytes, refs[0..cnt], counts[0..cnt]);
         try out.append(allocator, .{ .ref = a.ref, .count = total });
         j = end;
@@ -242,12 +242,12 @@ pub fn stackInner(
 /// Stack inner levels over `level` until a single node remains, growing the
 /// tree height as needed. Replaces `level` in place; the survivor is the root.
 pub fn collapseToRoot(
-    txn: anytype,
+    transaction: anytype,
     level: *std.ArrayList(Child),
     allocator: std.mem.Allocator,
 ) !void {
     while (level.items.len > 1) {
-        const next = try stackInner(txn, level.items, allocator);
+        const next = try stackInner(transaction, level.items, allocator);
         level.deinit(allocator);
         level.* = next;
     }
@@ -258,7 +258,7 @@ pub fn collapseToRoot(
 /// rightmost leaf's ref. No arena allocation occurs here, so the deref'd node
 /// bytes stay valid for the duration of each iteration.
 fn descendRightEdge(
-    txn: anytype,
+    transaction: anytype,
     root: Reference,
     path_refs: *std.ArrayList(Reference),
     path_ridx: *std.ArrayList(usize),
@@ -268,7 +268,7 @@ fn descendRightEdge(
     var hops: usize = 0;
     while (true) : (hops += 1) {
         if (hops >= max_depth) return error.Corrupt; // ref cycle guard
-        const nb = try derefNode(txn, cur);
+        const nb = try derefNode(transaction, cur);
         if (nb[0] == kind_leaf) return cur;
         const iv = try parseInner(nb);
         const ri: usize = @as(usize, iv.child_count) - 1;
@@ -283,12 +283,12 @@ fn descendRightEdge(
 /// buffer (heap allocation never remaps the arena, so the leaf bytes stay
 /// valid while they are copied out). The caller owns the returned slice.
 fn combineLeafAndRun(
-    txn: anytype,
+    transaction: anytype,
     leaf_ref: Reference,
     values: []const u64,
     allocator: std.mem.Allocator,
 ) ![]u64 {
-    const lv = try parseLeaf(try derefNode(txn, leaf_ref));
+    const lv = try parseLeaf(try derefNode(transaction, leaf_ref));
     const total: usize = @as(usize, lv.count) + values.len;
     const cvals = try allocator.alloc(u64, total);
     var t: usize = 0;
@@ -307,7 +307,7 @@ fn combineLeafAndRun(
 /// runs of FANOUT splits automatically on overflow; the extra nodes propagate
 /// up as additional children of the next level. Replaces `level` in place.
 fn rebuildRightSpine(
-    txn: anytype,
+    transaction: anytype,
     path_refs: []const Reference,
     path_ridx: []const usize,
     level: *std.ArrayList(Child),
@@ -316,7 +316,7 @@ fn rebuildRightSpine(
     var i: usize = path_refs.len;
     while (i > 0) {
         i -= 1;
-        const iv = try parseInner(try derefNode(txn, path_refs[i]));
+        const iv = try parseInner(try derefNode(transaction, path_refs[i]));
         const ri = path_ridx[i];
         var full = std.ArrayList(Child).empty;
         defer full.deinit(allocator);
@@ -325,7 +325,7 @@ fn rebuildRightSpine(
             try full.append(allocator, .{ .ref = iv.childRef(j), .count = iv.childCount(j) });
         }
         for (level.items) |c| try full.append(allocator, c);
-        const next = try stackInner(txn, full.items, allocator);
+        const next = try stackInner(transaction, full.items, allocator);
         level.deinit(allocator);
         level.* = next;
     }
@@ -338,7 +338,7 @@ fn rebuildRightSpine(
 /// mutated). The result is logically identical to appending every value via
 /// append. An empty run returns `root` unchanged.
 pub fn appendRun(
-    txn: anytype,
+    transaction: anytype,
     root: Reference,
     values: []const u64,
     allocator: std.mem.Allocator,
@@ -350,23 +350,23 @@ pub fn appendRun(
     defer path_refs.deinit(allocator);
     var path_ridx = std.ArrayList(usize).empty;
     defer path_ridx.deinit(allocator);
-    const leaf_ref = try descendRightEdge(txn, root, &path_refs, &path_ridx, allocator);
+    const leaf_ref = try descendRightEdge(transaction, root, &path_refs, &path_ridx, allocator);
 
     // 2. Combine the rightmost leaf's values with the run, then pack the
     //    combined run into leaves filled to LEAF_CAP: the first new leaf reuses
     //    the old leaf's content topped up from the front of the run, the rest
     //    are full leaves.
-    const cvals = try combineLeafAndRun(txn, leaf_ref, values, allocator);
+    const cvals = try combineLeafAndRun(transaction, leaf_ref, values, allocator);
     defer allocator.free(cvals);
-    var level = try packLeaves(txn, cvals, allocator);
+    var level = try packLeaves(transaction, cvals, allocator);
     errdefer level.deinit(allocator);
 
     // 3. Rebuild the rightmost inner spine bottom-up, then stack further inner
     //    levels until a single root remains (the rebuilt root level may have
     //    overflowed FANOUT into several nodes), growing the tree height by one
     //    or more as needed.
-    try rebuildRightSpine(txn, path_refs.items, path_ridx.items, &level, allocator);
-    try collapseToRoot(txn, &level, allocator);
+    try rebuildRightSpine(transaction, path_refs.items, path_ridx.items, &level, allocator);
+    try collapseToRoot(transaction, &level, allocator);
 
     const result = level.items[0].ref;
 
@@ -374,8 +374,8 @@ pub fn appendRun(
     //    exactly as the index appendRun does: they are unreferenced by the new
     //    tree. Frees run before the manual deinit so the errdefer never
     //    double-frees.
-    try txn.free(leaf_ref, leaf_node_size);
-    for (path_refs.items) |old_ref| try txn.free(old_ref, inner_node_size);
+    try transaction.free(leaf_ref, leaf_node_size);
+    for (path_refs.items) |old_ref| try transaction.free(old_ref, inner_node_size);
 
     level.deinit(allocator);
     return result;
@@ -384,13 +384,13 @@ pub fn appendRun(
 /// Recursive copy-on-write set: copies only the nodes on the path from root to
 /// the target leaf. Sibling subtrees are shared by reference, so the old root
 /// remains a valid, unchanged snapshot after the call returns.
-fn setInto(txn: anytype, node_ref: Reference, index: u64, value: u64, depth: usize) !Reference {
+fn setInto(transaction: anytype, node_ref: Reference, index: u64, value: u64, depth: usize) !Reference {
     if (depth >= max_depth) return error.Corrupt;
-    const bytes = try derefNode(txn, node_ref);
+    const bytes = try derefNode(transaction, node_ref);
     if (bytes[0] == kind_leaf) {
         const count = std.mem.readInt(u16, bytes[1..3], .little);
         if (index >= count) return error.IndexOutOfBounds;
-        const a = try txn.writableCopy(node_ref, leaf_node_size);
+        const a = try transaction.writableCopy(node_ref, leaf_node_size);
         const idx: usize = @intCast(index);
         const off: usize = leaf_header + idx * 8;
         std.mem.writeInt(u64, a.bytes[off..][0..8], value, .little);
@@ -415,9 +415,9 @@ fn setInto(txn: anytype, node_ref: Reference, index: u64, value: u64, depth: usi
         if (!found) return error.IndexOutOfBounds;
         // Capture the child ref before the recursive call (bytes may alias mmap).
         const child_ref = view.childRef(target_i);
-        const new_child = try setInto(txn, child_ref, local_index, value, depth + 1);
+        const new_child = try setInto(transaction, child_ref, local_index, value, depth + 1);
         // COW this inner node and patch only the updated child's ref (count unchanged).
-        const a = try txn.writableCopy(node_ref, inner_node_size);
+        const a = try transaction.writableCopy(node_ref, inner_node_size);
         const off: usize = inner_header + @as(usize, target_i) * 16;
         std.mem.writeInt(u64, a.bytes[off..][0..8], new_child, .little);
         return a.ref;
@@ -426,28 +426,28 @@ fn setInto(txn: anytype, node_ref: Reference, index: u64, value: u64, depth: usi
 
 /// Overwrite the value at index. Returns the new root Reference (copy-on-write).
 /// Returns error.IndexOutOfBounds if out of range. Works on trees of any depth.
-pub fn set(txn: anytype, root: Reference, index: u64, value: u64) !Reference {
-    return setInto(txn, root, index, value, 0);
+pub fn set(transaction: anytype, root: Reference, index: u64, value: u64) !Reference {
+    return setInto(transaction, root, index, value, 0);
 }
 
 /// Recursively free every node in the subtree rooted at node_ref. Leaves and inner
 /// nodes are freed at their respective on-disk sizes so the space becomes reclaimable.
-pub fn freeTree(txn: anytype, node_ref: Reference) !void {
-    return freeTreeAt(txn, node_ref, 0);
+pub fn freeTree(transaction: anytype, node_ref: Reference) !void {
+    return freeTreeAt(transaction, node_ref, 0);
 }
 
-fn freeTreeAt(txn: anytype, node_ref: Reference, depth: usize) !void {
+fn freeTreeAt(transaction: anytype, node_ref: Reference, depth: usize) !void {
     if (depth >= max_depth) return error.Corrupt;
-    const bytes = try derefNode(txn, node_ref);
+    const bytes = try derefNode(transaction, node_ref);
     if (bytes[0] == kind_leaf) {
-        try txn.free(node_ref, leaf_node_size);
+        try transaction.free(node_ref, leaf_node_size);
     } else {
         const view = try parseInner(bytes);
         var i: u16 = 0;
         // Capture child refs before freeing: parsing reads from the mmap, which we do
         // not mutate here, so the view stays valid for the duration of the loop.
-        while (i < view.child_count) : (i += 1) try freeTreeAt(txn, view.childRef(i), depth + 1);
-        try txn.free(node_ref, inner_node_size);
+        while (i < view.child_count) : (i += 1) try freeTreeAt(transaction, view.childRef(i), depth + 1);
+        try transaction.free(node_ref, inner_node_size);
     }
 }
 
@@ -458,20 +458,20 @@ fn freeTreeAt(txn: anytype, node_ref: Reference, depth: usize) !void {
 /// Implemented by rebuilding: a fresh empty column is appended with entries 0..new_len
 /// copied from the old column, then the old tree is freed. O(new_len); trimming only the
 /// trailing nodes in place (instead of a full rebuild) is a deferred optimization.
-pub fn truncate(txn: anytype, root: Reference, new_len: u64) !Reference {
-    std.debug.assert(new_len <= try len(txn, root));
-    var new_root = try create(txn);
+pub fn truncate(transaction: anytype, root: Reference, new_len: u64) !Reference {
+    std.debug.assert(new_len <= try len(transaction, root));
+    var new_root = try create(transaction);
     var i: u64 = 0;
     while (i < new_len) : (i += 1) {
-        const value = try get(txn, root, i);
-        new_root = try append(txn, new_root, value);
+        const value = try get(transaction, root, i);
+        new_root = try append(transaction, new_root, value);
     }
-    try freeTree(txn, root);
+    try freeTree(transaction, root);
     return new_root;
 }
 
 /// Test-only helper: allocate an inner node over the given children and return its Reference.
-pub fn makeInnerForTest(txn: anytype, children: []const struct { ref: u64, count: u64 }) !Reference {
+pub fn makeInnerForTest(transaction: anytype, children: []const struct { ref: u64, count: u64 }) !Reference {
     std.debug.assert(children.len <= FANOUT);
     var refs: [FANOUT]u64 = undefined;
     var counts: [FANOUT]u64 = undefined;
@@ -479,7 +479,7 @@ pub fn makeInnerForTest(txn: anytype, children: []const struct { ref: u64, count
         refs[i] = c.ref;
         counts[i] = c.count;
     }
-    const a = try txn.alloc(inner_node_size);
+    const a = try transaction.alloc(inner_node_size);
     _ = encodeInner(a.bytes, refs[0..children.len], counts[0..children.len]);
     return a.ref;
 }

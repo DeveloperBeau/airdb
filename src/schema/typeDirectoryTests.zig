@@ -685,7 +685,7 @@ test "a directory delete of a self-referencing link_set row frees its set root e
     try testing.expect(res == .ok);
     var seen = std.AutoHashMap(u64, void).init(testing.allocator);
     defer seen.deinit();
-    for (w.txn_reuse.extents.items) |e| {
+    for (w.transactionReuse.extents.items) |e| {
         const gop = try seen.getOrPut(e.offset);
         try testing.expect(!gop.found_existing); // duplicate free
     }
@@ -729,7 +729,7 @@ test "a directory delete frees the row's collection storage" {
         if (e.offset == raw[1]) freed_set = true;
         if (e.offset == raw[2]) freed_list = true;
     }
-    for (w.txn_reuse.extents.items) |e| {
+    for (w.transactionReuse.extents.items) |e| {
         if (e.offset == raw[1]) freed_set = true;
         if (e.offset == raw[2]) freed_list = true;
     }
@@ -772,7 +772,7 @@ test "a cascade delete frees the child's collection storage" {
     for (w.in_flight_frees.items) |e| {
         if (e.offset == raw[1]) freed_child_set = true;
     }
-    for (w.txn_reuse.extents.items) |e| {
+    for (w.transactionReuse.extents.items) |e| {
         if (e.offset == raw[1]) freed_child_set = true;
     }
     try testing.expect(freed_child_set);

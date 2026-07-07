@@ -90,25 +90,25 @@ AirdbTxn *airdb_begin(AirdbDatabase *db);
 
 /* Abort: release the write lock without making anything durable, free the
  * handle. Safe with NULL. */
-void airdb_abort(AirdbTxn *txn);
+void airdb_abort(AirdbTxn *transaction);
 
 /* Commit: make every staged operation durable in a single barrier, release
  * the write lock, free the handle. Returns AIRDB_OK or AIRDB_E_GENERIC. */
-int64_t airdb_commit(AirdbTxn *txn);
+int64_t airdb_commit(AirdbTxn *transaction);
 
 /* Stage an insert in the open transaction (no commit). Returns the new object
  * key, or a negative error code. On error the transaction stays open and the
  * staged batch is unchanged. */
-int64_t airdb_txn_insert(AirdbTxn *txn, const uint64_t *vals, size_t len);
+int64_t airdb_txn_insert(AirdbTxn *transaction, const uint64_t *vals, size_t len);
 
 /* Stage an update (vals[0] is the primary key). Returns AIRDB_OK or an error
  * code; on error the transaction stays open and the batch is unchanged. */
-int64_t airdb_txn_update(AirdbTxn *txn, const uint64_t *vals, size_t len);
+int64_t airdb_txn_update(AirdbTxn *transaction, const uint64_t *vals, size_t len);
 
 /* Stage a delete of the row with primary key `pk`. Returns AIRDB_OK or an
  * error code; on error the transaction stays open and the batch is
  * unchanged. */
-int64_t airdb_txn_delete(AirdbTxn *txn, uint64_t pk);
+int64_t airdb_txn_delete(AirdbTxn *transaction, uint64_t pk);
 
 #ifdef __cplusplus
 }

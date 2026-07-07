@@ -28,10 +28,10 @@ pub const WriteTransaction = struct {
     /// Nodes allocated AND freed within this uncommitted transaction. They are private
     /// (no committed version or reader references them), so they are reused immediately
     /// within the same transaction instead of accumulating as copy-on-write garbage.
-    txn_reuse: FreeList,
+    transactionReuse: FreeList,
     /// arena.top at transaction start. A freed ref >= this was bump-allocated during this
-    /// transaction and is txn-private; a ref below it belongs to a committed version.
-    txn_start_top: u64,
+    /// transaction and is transaction-private; a ref below it belongs to a committed version.
+    transactionStartTop: u64,
     /// Pin/liveness part of the reclaim horizon, computed lazily on the first
     /// pool allocation and reused for the rest of the transaction. Computing
     /// it per allocation costs syscalls (pid liveness + incarnation checks per
@@ -78,7 +78,7 @@ pub const WriteTransaction = struct {
         //    uncommitted transaction; no committed version or reader can reference it, so
         //    reusing it is always safe and keeps single-transaction bulk writes space-bounded).
         //    Exact-size match: no carving, so fixed-size node churn never fragments the pool.
-        if (self.db.arena.allocFromPool(&self.txn_reuse, size, std.math.maxInt(u64))) |a| return a;
+        if (self.db.arena.allocFromPool(&self.transactionReuse, size, std.math.maxInt(u64))) |a| return a;
         // 2. Reuse a committed-free node, gated by the per-transaction reclaim horizon.
         if (self.db.arena.allocFromPool(&self.work_freelist, size, self.reclaimHorizon())) |a| return a;
         // 3. Bump-allocate, growing the file if the arena is full.
@@ -90,10 +90,10 @@ pub const WriteTransaction = struct {
     }
 
     pub fn free(self: *WriteTransaction, ref: Reference, len: usize) !void {
-        if (ref >= self.txn_start_top) {
+        if (ref >= self.transactionStartTop) {
             // Allocated within this uncommitted transaction: private, immediately reusable.
-            // (freed_version is irrelevant for the txn-private pool; allocFromPool ignores it.)
-            try self.txn_reuse.add(.{ .offset = ref, .len = @intCast(len), .freed_version = 0 });
+            // (freed_version is irrelevant for the transaction-private pool; allocFromPool ignores it.)
+            try self.transactionReuse.add(.{ .offset = ref, .len = @intCast(len), .freed_version = 0 });
         } else {
             // Belongs to a committed version a reader may still pin: defer reclamation to the
             // committed free list, tagged with this transaction's version (the freeing version).
@@ -120,18 +120,18 @@ pub const WriteTransaction = struct {
 
     // Shared conclusion for abort, commit failure, and (minus the rollback)
     // the moment before a successful commit publishes. Rolls the bump pointer
-    // back: no committed version references any ref >= txn_start_top (they
+    // back: no committed version references any ref >= transactionStartTop (they
     // were allocated by this uncommitted transaction only), so the rollback is
     // safe and prevents aborted/failed bytes from being folded into the next
     // commit's logical_size as permanently unreclaimable garbage. Extents this
-    // txn reused from the committed pool stay recorded in db.free_list
-    // (untouched during the txn), so they remain free as before.
+    // transaction reused from the committed pool stay recorded in db.free_list
+    // (untouched during the transaction), so they remain free as before.
     fn conclude(self: *WriteTransaction) void {
         self.done = true;
-        self.db.arena.top = @intCast(self.txn_start_top);
+        self.db.arena.top = @intCast(self.transactionStartTop);
         self.in_flight_frees.deinit(self.db.store.allocator);
         self.work_freelist.deinit();
-        self.txn_reuse.deinit();
+        self.transactionReuse.deinit();
         self.db.coord.unlock();
     }
 
@@ -200,7 +200,7 @@ pub const WriteTransaction = struct {
         self.done = true; // a later deinit must not roll back the committed state
         self.in_flight_frees.deinit(self.db.store.allocator);
         self.work_freelist.deinit();
-        self.txn_reuse.deinit();
+        self.transactionReuse.deinit();
         self.db.coord.unlock();
         return self.new_version;
     }
@@ -221,7 +221,7 @@ pub const WriteTransaction = struct {
         // behavior change; counter lives on the Db.
         const rebuild_io = std.Io.Threaded.global_single_threaded.io();
         const rebuild_start = Io.Clock.now(.awake, rebuild_io).nanoseconds;
-        // 1. Copy extents that work_freelist still holds (i.e. not reused this txn).
+        // 1. Copy extents that work_freelist still holds (i.e. not reused this transaction).
         for (self.work_freelist.extents.items) |e| {
             try new_fl.add(e);
         }
@@ -254,7 +254,7 @@ pub const WriteTransaction = struct {
         // 3b. Reclaim any leftover transaction-private nodes that were freed but not reused
         //     within this transaction. They are committed-but-unreferenced space; tag them
         //     with this version so the committed free list can reclaim them (no leak).
-        for (self.txn_reuse.extents.items) |e| {
+        for (self.transactionReuse.extents.items) |e| {
             try new_fl.add(.{ .offset = e.offset, .len = e.len, .freed_version = self.new_version });
         }
         db.fl_rebuild_ns += @intCast(Io.Clock.now(.awake, rebuild_io).nanoseconds - rebuild_start);

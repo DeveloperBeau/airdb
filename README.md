@@ -81,11 +81,11 @@ AirdbDatabase *db = airdb_open("/abs/path/app.airdb", 2);
 uint64_t row[2] = {1, 42};
 airdb_insert(db, row, 2);
 
-AirdbTxn *txn = airdb_begin(db);        /* batch: one durable commit */
+AirdbTxn *transaction = airdb_begin(db);        /* batch: one durable commit */
 uint64_t a[2] = {2, 10}, b[2] = {3, 20};
-airdb_txn_insert(txn, a, 2);
-airdb_txn_insert(txn, b, 2);
-airdb_commit(txn);
+airdb_txn_insert(transaction, a, 2);
+airdb_txn_insert(transaction, b, 2);
+airdb_commit(transaction);
 airdb_close(db);
 ```
 

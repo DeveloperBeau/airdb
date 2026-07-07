@@ -77,7 +77,7 @@ test "freeTree over a three-level tree frees every blob exactly once" {
 
     var seen = std.AutoHashMap(u64, void).init(testing.allocator);
     defer seen.deinit();
-    for (w.txn_reuse.extents.items) |e| {
+    for (w.transactionReuse.extents.items) |e| {
         const gop = try seen.getOrPut(e.offset);
         try testing.expect(!gop.found_existing); // duplicate free
     }

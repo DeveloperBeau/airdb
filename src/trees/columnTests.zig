@@ -184,7 +184,7 @@ test "Column.truncate to zero empties the column" {
     while (i < 1000) : (i += 1) root = try append(&w, root, i);
     root = try truncate(&w, root, 0);
     try testing.expectEqual(@as(u64, 0), try len(&w, root));
-    // Reclamation note: truncate frees every dropped node via txn.free, which routes
+    // Reclamation note: truncate frees every dropped node via transaction.free, which routes
     // them onto the transaction-private pool / committed free list (see WriteTransaction.free).
     // column.zig exposes no in-transaction free-list hook, so reclamation is covered by
     // that mechanism rather than asserted here.

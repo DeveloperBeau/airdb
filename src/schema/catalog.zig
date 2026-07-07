@@ -18,12 +18,12 @@ pub const Value = union(enum) {
     //   .bytes    -- a small blob (<= inline cap): a zero-copy slice into the
     //                mapped storage. Valid until the next MUTATING call on the
     //                same transaction: an update/delete that frees the blob
-    //                routes a txn-private node to the immediate-reuse pool, so
+    //                routes a transaction-private node to the immediate-reuse pool, so
     //                the next allocation may scribble it. Copy the bytes out
     //                before mutating if they must survive.
     //   .blob_ref -- a blob larger than the inline cap, stored chunked and thus
     //                without a single contiguous slice. The caller materializes
-    //                it with `blob.getAlloc(txn, ref, allocator)` and frees the
+    //                it with `blob.getAlloc(transaction, ref, allocator)` and frees the
     //                returned buffer.
     bytes: []const u8,
     blob_ref: Reference,
@@ -90,7 +90,7 @@ fn indexedFlagsOffset(pc: PropCount) usize {
 
 // Allocate and encode a fresh catalog node; return its ref.
 pub fn writeCatalog(
-    txn: *WriteTransaction,
+    transaction: *WriteTransaction,
     prop_count: PropCount,
     next_row: u64,
     keyrow_index_ref: Reference,
@@ -107,7 +107,7 @@ pub fn writeCatalog(
     value_index_refs: []const Reference,
     indexed_flags: []const bool,
 ) !Reference {
-    const a = try txn.alloc(catalogSize(prop_count));
+    const a = try transaction.alloc(catalogSize(prop_count));
     std.mem.writeInt(u16, a.bytes[off_prop_count..][0..2], prop_count, .little);
     std.mem.writeInt(u64, a.bytes[off_next_row..][0..8], next_row, .little);
     std.mem.writeInt(u64, a.bytes[off_keyrow_index_ref..][0..8], keyrow_index_ref, .little);
@@ -141,7 +141,7 @@ pub fn writeCatalog(
 
 // createDefs allocates columns, a pk index, version/live columns, and a catalog
 // node from explicit per-property definitions. defs[0].kind must be .int (the pk).
-pub fn createDefs(txn: *WriteTransaction, defs: []const PropDef) !Reference {
+pub fn createDefs(transaction: *WriteTransaction, defs: []const PropDef) !Reference {
     std.debug.assert(defs.len >= 1 and defs[0].kind == .int);
     const prop_count: PropCount = @intCast(defs.len);
     std.debug.assert(prop_count <= max_prop_count);
@@ -155,21 +155,21 @@ pub fn createDefs(txn: *WriteTransaction, defs: []const PropDef) !Reference {
     var indexed_flags: [max_prop_count]bool = undefined;
     var i: usize = 0;
     while (i < prop_count) : (i += 1) {
-        prop_col_refs[i] = try Column.create(txn);
+        prop_col_refs[i] = try Column.create(transaction);
         kinds[i] = defs[i].kind;
         elems[i] = defs[i].elem;
-        backlinks[i] = if (defs[i].kind == .link or defs[i].kind == .link_set) try Index.create(txn) else 0;
+        backlinks[i] = if (defs[i].kind == .link or defs[i].kind == .link_set) try Index.create(transaction) else 0;
         targets[i] = defs[i].link_target;
         rules[i] = defs[i].del_rule;
         indexed_flags[i] = defs[i].indexed;
-        value_index_refs[i] = if (defs[i].indexed) try Index.create(txn) else 0;
+        value_index_refs[i] = if (defs[i].indexed) try Index.create(transaction) else 0;
     }
-    const version_col_ref = try Column.create(txn);
-    const live_col_ref = try Column.create(txn);
-    const pk_index_ref = try Index.create(txn);
-    const keyrow = try Index.create(txn);
+    const version_col_ref = try Column.create(transaction);
+    const live_col_ref = try Column.create(transaction);
+    const pk_index_ref = try Index.create(transaction);
+    const keyrow = try Index.create(transaction);
     return writeCatalog(
-        txn,
+        transaction,
         prop_count,
         0,
         keyrow,
@@ -189,24 +189,24 @@ pub fn createDefs(txn: *WriteTransaction, defs: []const PropDef) !Reference {
 }
 
 // createTyped keeps its scalar-only signature; every property gets elem = int.
-pub fn createTyped(txn: *WriteTransaction, kinds: []const PropKind) !Reference {
+pub fn createTyped(transaction: *WriteTransaction, kinds: []const PropKind) !Reference {
     std.debug.assert(kinds.len >= 1 and kinds[0] == .int);
     const pc: PropCount = @intCast(kinds.len);
     std.debug.assert(pc <= max_prop_count);
     var defs: [max_prop_count]PropDef = undefined;
     var i: usize = 0;
     while (i < pc) : (i += 1) defs[i] = .{ .kind = kinds[i], .elem = .int };
-    return createDefs(txn, defs[0..pc]);
+    return createDefs(transaction, defs[0..pc]);
 }
 
 // Create prop_count property columns, a version column, a live column, and an
 // empty pk index. All property kinds default to .int.
-pub fn create(txn: *WriteTransaction, prop_count: PropCount) !Reference {
+pub fn create(transaction: *WriteTransaction, prop_count: PropCount) !Reference {
     std.debug.assert(prop_count <= max_prop_count);
     var all_int: [max_prop_count]PropKind = undefined;
     var i: usize = 0;
     while (i < prop_count) : (i += 1) all_int[i] = .int;
-    return createTyped(txn, all_int[0..prop_count]);
+    return createTyped(transaction, all_int[0..prop_count]);
 }
 
 pub const CatalogView = struct {
@@ -268,11 +268,11 @@ pub const CatalogView = struct {
 // come straight from the mapped file: a corrupted value must surface as
 // error.Corrupt, never as a panic (ReleaseSafe) or undefined behavior
 // (ReleaseFast) from an unchecked @enumFromInt.
-pub fn loadCatalog(txn: anytype, cat: Reference) !CatalogView {
-    const pc_bytes = try txn.deref(cat, 2);
+pub fn loadCatalog(transaction: anytype, cat: Reference) !CatalogView {
+    const pc_bytes = try transaction.deref(cat, 2);
     const prop_count = std.mem.readInt(u16, pc_bytes[0..2], .little);
     if (prop_count > max_prop_count) return error.Corrupt;
-    const bytes = try txn.deref(cat, catalogSize(prop_count));
+    const bytes = try transaction.deref(cat, catalogSize(prop_count));
     {
         const ko = kindsOffset(prop_count);
         const eo = elemsOffset(prop_count);
@@ -330,8 +330,8 @@ pub const CatalogSnapshot = struct {
     source: Reference,
     source_len: usize,
 
-    pub fn load(txn: anytype, cat: Reference) !CatalogSnapshot {
-        const v = try loadCatalog(txn, cat);
+    pub fn load(transaction: anytype, cat: Reference) !CatalogSnapshot {
+        const v = try loadCatalog(transaction, cat);
         var s: CatalogSnapshot = undefined;
         s.source = cat;
         s.source_len = catalogSize(v.prop_count);
@@ -359,7 +359,7 @@ pub const CatalogSnapshot = struct {
     }
 
     /// Allocate and encode a fresh catalog node from this snapshot.
-    pub fn write(self: *const CatalogSnapshot, txn: *WriteTransaction) !Reference {
+    pub fn write(self: *const CatalogSnapshot, transaction: *WriteTransaction) !Reference {
         var cols: [max_prop_count]Reference = undefined;
         var kinds: [max_prop_count]PropKind = undefined;
         var elems: [max_prop_count]ElemKind = undefined;
@@ -382,7 +382,7 @@ pub const CatalogSnapshot = struct {
             idxf[j] = p.indexed;
         }
         return writeCatalog(
-            txn,
+            transaction,
             pc,
             self.next_row,
             self.keyrow_index_ref,
@@ -404,80 +404,80 @@ pub const CatalogSnapshot = struct {
     /// Write the snapshot as a fresh node and free the node it was loaded
     /// from. This is the normal way to rewrite a catalog within one database:
     /// the old node is garbage the moment the caller adopts the new ref, and a
-    /// txn-private old node is reused by the very next same-size catalog write,
+    /// transaction-private old node is reused by the very next same-size catalog write,
     /// so catalog churn stops growing the file. Do NOT use when the source
     /// lives in a different database (copyTypeRows) or must stay readable.
-    pub fn replace(self: *const CatalogSnapshot, txn: *WriteTransaction) !Reference {
-        const new_ref = try self.write(txn);
-        try txn.free(self.source, self.source_len);
+    pub fn replace(self: *const CatalogSnapshot, transaction: *WriteTransaction) !Reference {
+        const new_ref = try self.write(transaction);
+        try transaction.free(self.source, self.source_len);
         return new_ref;
     }
 };
 
-pub fn propCount(txn: anytype, cat: Reference) !PropCount {
-    const view = try loadCatalog(txn, cat);
+pub fn propCount(transaction: anytype, cat: Reference) !PropCount {
+    const view = try loadCatalog(transaction, cat);
     return view.prop_count;
 }
 
 // liveCount returns the number of live rows tracked by the pk index.
-pub fn liveCount(txn: anytype, cat: Reference) !u64 {
-    const view = try loadCatalog(txn, cat);
-    return Index.count(txn, view.pk_index_ref);
+pub fn liveCount(transaction: anytype, cat: Reference) !u64 {
+    const view = try loadCatalog(transaction, cat);
+    return Index.count(transaction, view.pk_index_ref);
 }
 
 // Resolve an object key to its physical row via the key-to-row index.
 // Returns null if the okey has no mapping.
-pub fn okeyToRow(txn: anytype, cat: Reference, okey: u64) !?u64 {
-    const v = try loadCatalog(txn, cat);
-    return Index.get(txn, v.keyrow_index_ref, okey);
+pub fn okeyToRow(transaction: anytype, cat: Reference, okey: u64) !?u64 {
+    const v = try loadCatalog(transaction, cat);
+    return Index.get(transaction, v.keyrow_index_ref, okey);
 }
 
 // Resolve a primary key to its stable object key via the pk index.
 // Returns null if the pk has no mapping.
-pub fn pkToOkey(txn: anytype, cat: Reference, pk: u64) !?u64 {
-    const v = try loadCatalog(txn, cat);
-    return Index.get(txn, v.pk_index_ref, pk);
+pub fn pkToOkey(transaction: anytype, cat: Reference, pk: u64) !?u64 {
+    const v = try loadCatalog(transaction, cat);
+    return Index.get(transaction, v.pk_index_ref, pk);
 }
 
 // Resolve (cat, pk, prop) to the property column ref and the row;
 // null if pk absent or row tombstoned. The pk index maps pk -> okey, and the
 // keyrow index maps okey -> physical row.
-pub fn resolveProp(txn: anytype, cat: Reference, pk: u64, prop: usize) !?struct { row: u64, prop_col: Reference } {
-    const v = try loadCatalog(txn, cat);
-    const okey = (try Index.get(txn, v.pk_index_ref, pk)) orelse return null;
-    const row = (try Index.get(txn, v.keyrow_index_ref, okey)) orelse return null;
-    if ((try Column.get(txn, v.live_col_ref, row)) == 0) return null;
+pub fn resolveProp(transaction: anytype, cat: Reference, pk: u64, prop: usize) !?struct { row: u64, prop_col: Reference } {
+    const v = try loadCatalog(transaction, cat);
+    const okey = (try Index.get(transaction, v.pk_index_ref, pk)) orelse return null;
+    const row = (try Index.get(transaction, v.keyrow_index_ref, okey)) orelse return null;
+    if ((try Column.get(transaction, v.live_col_ref, row)) == 0) return null;
     return .{ .row = row, .prop_col = v.propColRef(prop) };
 }
 
 // Write new_root into property `prop` at `row`, bump that row's version stamp,
 // return the new catalog ref.
-pub fn replaceCollRoot(txn: *WriteTransaction, cat: Reference, row: u64, prop: usize, new_root: Reference) !Reference {
-    var s = try CatalogSnapshot.load(txn, cat);
-    s.props[prop].col = try Column.set(txn, s.props[prop].col, row, new_root);
-    s.version_col_ref = try Column.set(txn, s.version_col_ref, row, txn.new_version);
-    return s.replace(txn);
+pub fn replaceCollRoot(transaction: *WriteTransaction, cat: Reference, row: u64, prop: usize, new_root: Reference) !Reference {
+    var s = try CatalogSnapshot.load(transaction, cat);
+    s.props[prop].col = try Column.set(transaction, s.props[prop].col, row, new_root);
+    s.version_col_ref = try Column.set(transaction, s.version_col_ref, row, transaction.new_version);
+    return s.replace(transaction);
 }
 
 // Write a new backlink ref into property `p`, preserving everything else.
-pub fn setBacklinkRef(txn: *WriteTransaction, cat: Reference, p: usize, new_bl: Reference) !Reference {
-    var s = try CatalogSnapshot.load(txn, cat);
+pub fn setBacklinkRef(transaction: *WriteTransaction, cat: Reference, p: usize, new_bl: Reference) !Reference {
+    var s = try CatalogSnapshot.load(transaction, cat);
     s.props[p].backlink = new_bl;
-    return s.replace(txn);
+    return s.replace(transaction);
 }
 
 // Write a new value-index ref into property `p`, preserving everything else.
-pub fn setValueIndexRef(txn: *WriteTransaction, cat: Reference, p: usize, new_vi: Reference) !Reference {
-    var s = try CatalogSnapshot.load(txn, cat);
+pub fn setValueIndexRef(transaction: *WriteTransaction, cat: Reference, p: usize, new_vi: Reference) !Reference {
+    var s = try CatalogSnapshot.load(transaction, cat);
     s.props[p].value_index = new_vi;
-    return s.replace(txn);
+    return s.replace(transaction);
 }
 
 // Write a new column ref into property `p`, preserving everything else.
-pub fn setPropColRef(txn: *WriteTransaction, cat: Reference, p: usize, new_col: Reference) !Reference {
-    var s = try CatalogSnapshot.load(txn, cat);
+pub fn setPropColRef(transaction: *WriteTransaction, cat: Reference, p: usize, new_col: Reference) !Reference {
+    var s = try CatalogSnapshot.load(transaction, cat);
     s.props[p].col = new_col;
-    return s.replace(txn);
+    return s.replace(transaction);
 }
 
 // ---------------------------------------------------------------------------

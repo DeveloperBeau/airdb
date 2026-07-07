@@ -2,7 +2,7 @@
 // instantiated with inline numeric keys. The u64 stored in each key slot IS
 // the key, ordered numerically, so key duplication is identity and key
 // freeing is a no-op. See bTreeCore.zig for the transaction capability the
-// `txn` parameters must satisfy (WriteTransaction in production; ReadTransaction for the
+// `transaction` parameters must satisfy (WriteTransaction in production; ReadTransaction for the
 // read-only subset).
 
 const std = @import("std");
@@ -61,8 +61,8 @@ pub const get = Tree.get;
 
 /// Insert or update key->val in the tree rooted at root.
 /// Returns the (possibly new) root Reference. Grows the tree height on root split.
-pub fn insert(txn: anytype, root: Reference, key: u64, val: u64) !Reference {
-    return Tree.insert(txn, root, key, key, val);
+pub fn insert(transaction: anytype, root: Reference, key: u64, val: u64) !Reference {
+    return Tree.insert(transaction, root, key, key, val);
 }
 
 /// Remove key from the tree rooted at root.
@@ -95,11 +95,11 @@ pub const forEachEntry = Tree.forEachEntry;
 /// path would report a non-empty tree as empty, and bulkAppend would then
 /// admit a batch whose keys do not clear the true maximum, corrupting the pk
 /// index with duplicates and broken ordering.
-pub fn maxKey(txn: anytype, root: Reference) !?u64 {
+pub fn maxKey(transaction: anytype, root: Reference) !?u64 {
     var cur: Reference = root;
     var depth: usize = 0;
     while (depth < max_depth) : (depth += 1) {
-        const bytes = try derefNode(txn, cur);
+        const bytes = try derefNode(transaction, cur);
         if (bytes[0] == kind_leaf) {
             const v = try parseLeaf(bytes);
             if (v.count == 0) return null; // only the empty root reaches here
@@ -145,18 +145,18 @@ pub const appendRun = bulkBuild.appendRun;
 // starts each leaf at lowerBound(lo), stopping as soon as a key exceeds hi so
 // no leaf outside the range is visited. Read-only: no COW.
 pub fn forEachEntryInRange(
-    txn: anytype,
+    transaction: anytype,
     root: Reference,
     lo: u64,
     hi: u64,
     ctx: anytype,
     comptime onEntry: fn (@TypeOf(ctx), u64, u64) anyerror!void,
 ) !void {
-    return forEachEntryInRangeAt(txn, root, lo, hi, ctx, onEntry, 0);
+    return forEachEntryInRangeAt(transaction, root, lo, hi, ctx, onEntry, 0);
 }
 
 fn forEachEntryInRangeAt(
-    txn: anytype,
+    transaction: anytype,
     root: Reference,
     lo: u64,
     hi: u64,
@@ -166,7 +166,7 @@ fn forEachEntryInRangeAt(
 ) !void {
     if (root == 0 or lo > hi) return;
     if (depth >= max_depth) return error.Corrupt;
-    const bytes = try derefNode(txn, root);
+    const bytes = try derefNode(transaction, root);
     if (bytes[0] == kind_leaf) {
         const leaf = try parseLeaf(bytes);
         var i: usize = leaf.lowerBound(lo);
@@ -178,16 +178,16 @@ fn forEachEntryInRangeAt(
         return;
     }
     const inner = try parseInner(bytes);
-    var i: usize = try Tree.childIndexForKey(txn, inner, lo);
+    var i: usize = try Tree.childIndexForKey(transaction, inner, lo);
     while (i < inner.child_count) : (i += 1) {
         if (inner.lowKey(i) > hi) return;
         const child_ref: Reference = inner.childRef(i);
-        try forEachEntryInRangeAt(txn, child_ref, lo, hi, ctx, onEntry, depth + 1);
+        try forEachEntryInRangeAt(transaction, child_ref, lo, hi, ctx, onEntry, depth + 1);
     }
 }
 
 // Test-only helper: build an inner node from a slice of (ref, low, count) triples.
-pub fn makeInnerForTest(txn: anytype, children: []const struct { ref: u64, low: u64, count: u64 }) !Reference {
+pub fn makeInnerForTest(transaction: anytype, children: []const struct { ref: u64, low: u64, count: u64 }) !Reference {
     var refs: [FANOUT]u64 = undefined;
     var lows: [FANOUT]u64 = undefined;
     var counts: [FANOUT]u64 = undefined;
@@ -196,7 +196,7 @@ pub fn makeInnerForTest(txn: anytype, children: []const struct { ref: u64, low: 
         lows[i] = c.low;
         counts[i] = c.count;
     }
-    const a = try txn.alloc(inner_node_size);
+    const a = try transaction.alloc(inner_node_size);
     _ = encodeInner(a.bytes, refs[0..children.len], lows[0..children.len], counts[0..children.len]);
     return a.ref;
 }

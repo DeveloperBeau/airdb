@@ -27,8 +27,8 @@ const max_prop_count = catalog.max_prop_count;
 // Append a new property to the type. The new column is filled with
 // `default_value` for every existing row (live or tombstoned). For a link or
 // link_set property a fresh backlink index is created. Returns the new catalog.
-pub fn addProperty(txn: *WriteTransaction, cat: Reference, def: PropDef, default_value: u64) !Reference {
-    var s = try catalog.CatalogSnapshot.load(txn, cat);
+pub fn addProperty(transaction: *WriteTransaction, cat: Reference, def: PropDef, default_value: u64) !Reference {
+    var s = try catalog.CatalogSnapshot.load(transaction, cat);
     const pc = s.prop_count;
     std.debug.assert(pc + 1 <= max_prop_count);
 
@@ -40,21 +40,21 @@ pub fn addProperty(txn: *WriteTransaction, cat: Reference, def: PropDef, default
     // meaningless as values and impossible to backfill coherently.
     if (def.indexed and is_collection) return error.Unsupported;
 
-    const new_col = try buildBackfilledColumn(txn, &s, def, default_value, is_collection);
-    const vi: Reference = if (def.indexed) try backfillValueIndex(txn, s.keyrow_index_ref, new_col) else 0;
+    const new_col = try buildBackfilledColumn(transaction, &s, def, default_value, is_collection);
+    const vi: Reference = if (def.indexed) try backfillValueIndex(transaction, s.keyrow_index_ref, new_col) else 0;
 
     s.props[pc] = .{
         .col = new_col,
         .kind = def.kind,
         .elem = def.elem,
-        .backlink = if (def.kind == .link or def.kind == .link_set) try Index.create(txn) else 0,
+        .backlink = if (def.kind == .link or def.kind == .link_set) try Index.create(transaction) else 0,
         .target = def.link_target,
         .rule = def.del_rule,
         .value_index = vi,
         .indexed = def.indexed,
     };
     s.prop_count = pc + 1;
-    return s.replace(txn);
+    return s.replace(transaction);
 }
 
 // Build the new property's column, filled with the default for every existing
@@ -69,33 +69,33 @@ pub fn addProperty(txn: *WriteTransaction, cat: Reference, def: PropDef, default
 // the default bytes (the caller keeps ownership of the passed-in ref). Dead
 // rows get 0 for both; nothing ever dereferences a tombstoned row's columns.
 fn buildBackfilledColumn(
-    txn: *WriteTransaction,
+    transaction: *WriteTransaction,
     s: *const catalog.CatalogSnapshot,
     def: PropDef,
     default_value: u64,
     is_collection: bool,
 ) !Reference {
-    var new_col = try Column.create(txn);
+    var new_col = try Column.create(transaction);
     var i: u64 = 0;
     while (i < s.next_row) : (i += 1) {
-        const live = (try Column.get(txn, s.live_col_ref, i)) != 0;
+        const live = (try Column.get(transaction, s.live_col_ref, i)) != 0;
         const fill: u64 = if (def.kind == .blob)
-            (if (live and default_value != 0) try blobDup(txn, default_value) else if (live) default_value else 0)
+            (if (live and default_value != 0) try blobDup(transaction, default_value) else if (live) default_value else 0)
         else if (!is_collection)
             default_value
         else if (!live)
             0
         else switch (def.kind) {
-            .list => try Column.create(txn),
+            .list => try Column.create(transaction),
             .set => switch (def.elem) {
-                .int => try Index.create(txn),
-                .blob => try bindex.create(txn),
+                .int => try Index.create(transaction),
+                .blob => try bindex.create(transaction),
             },
-            .link_set => try Index.create(txn),
-            .dict => try bindex.create(txn),
+            .link_set => try Index.create(transaction),
+            .dict => try bindex.create(transaction),
             else => unreachable,
         };
-        new_col = try Column.append(txn, new_col, fill);
+        new_col = try Column.append(transaction, new_col, fill);
     }
     return new_col;
 }
@@ -106,32 +106,32 @@ fn buildBackfilledColumn(
 // audit). Each row is indexed under its OWN raw column value (mirroring the
 // insert path) -- blob backfills give every row a distinct ref, so a single
 // shared key would diverge from what reads and audits expect.
-fn backfillValueIndex(txn: *WriteTransaction, keyrow_ref: Reference, new_col: Reference) !Reference {
-    var vi = try Index.create(txn);
+fn backfillValueIndex(transaction: *WriteTransaction, keyrow_ref: Reference, new_col: Reference) !Reference {
+    var vi = try Index.create(transaction);
     const Sink = struct {
-        txn: *WriteTransaction,
+        transaction: *WriteTransaction,
         vi: *Reference,
         col: Reference,
         fn onEntry(self: @This(), okey: u64, row: u64) anyerror!void {
-            const raw = try Column.get(self.txn, self.col, row);
-            self.vi.* = try rows.viAdd(self.txn, self.vi.*, raw, okey);
+            const raw = try Column.get(self.transaction, self.col, row);
+            self.vi.* = try rows.viAdd(self.transaction, self.vi.*, raw, okey);
         }
     };
-    try Index.forEachEntry(txn, keyrow_ref, Sink{ .txn = txn, .vi = &vi, .col = new_col }, Sink.onEntry);
+    try Index.forEachEntry(transaction, keyrow_ref, Sink{ .transaction = transaction, .vi = &vi, .col = new_col }, Sink.onEntry);
     return vi;
 }
 
 // Copy a blob's bytes into a fresh node, returning the new ref. Used by the
 // blob-default backfill so no two rows share one node.
-fn blobDup(txn: *WriteTransaction, ref: u64) !u64 {
-    if (blob.get(txn, ref)) |bytes| {
-        return blob.put(txn, bytes);
+fn blobDup(transaction: *WriteTransaction, ref: u64) !u64 {
+    if (blob.get(transaction, ref)) |bytes| {
+        return blob.put(transaction, bytes);
     } else |err| switch (err) {
         error.BlobChunked => {
-            const alloc = txn.db.store.allocator;
-            const bytes = try blob.getAlloc(txn, ref, alloc);
+            const alloc = transaction.db.store.allocator;
+            const bytes = try blob.getAlloc(transaction, ref, alloc);
             defer alloc.free(bytes);
-            return blob.put(txn, bytes);
+            return blob.put(transaction, bytes);
         },
         else => |e| return e,
     }
@@ -139,14 +139,14 @@ fn blobDup(txn: *WriteTransaction, ref: u64) !u64 {
 
 // Remove property `prop` (must be >= 1; the primary key at 0 cannot be removed).
 // The dropped column is left for compaction to reclaim. Returns the new catalog.
-pub fn removeProperty(txn: *WriteTransaction, cat: Reference, prop: usize) !Reference {
+pub fn removeProperty(transaction: *WriteTransaction, cat: Reference, prop: usize) !Reference {
     std.debug.assert(prop >= 1);
-    var s = try catalog.CatalogSnapshot.load(txn, cat);
+    var s = try catalog.CatalogSnapshot.load(transaction, cat);
     std.debug.assert(prop < s.prop_count);
     var j: usize = prop;
     while (j + 1 < s.prop_count) : (j += 1) s.props[j] = s.props[j + 1];
     s.prop_count -= 1;
-    return s.replace(txn);
+    return s.replace(transaction);
 }
 
 test {

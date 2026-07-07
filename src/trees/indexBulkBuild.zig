@@ -7,7 +7,7 @@
 // on-disk format the sequential readers expect, so a bulk-built tree is
 // indistinguishable from one grown via the normal insert path.
 //
-// The `txn` parameter follows index.zig's convention: a comptime duck-typed
+// The `transaction` parameter follows index.zig's convention: a comptime duck-typed
 // transaction capability requiring deref(ref, len), alloc(size),
 // writableCopy(ref, len), and free(ref, len).
 
@@ -37,7 +37,7 @@ pub const Child = struct { ref: u64, low: u64, count: u64 };
 /// Pack strictly-ascending (keys, values) into leaves filled to LEAF_CAP in key
 /// order. Returns the leaf level: one Child per leaf, low == its first key.
 pub fn packLeaves(
-    txn: anytype,
+    transaction: anytype,
     keys: []const u64,
     values: []const u64,
     allocator: std.mem.Allocator,
@@ -49,7 +49,7 @@ pub fn packLeaves(
     var i: usize = 0;
     while (i < keys.len) {
         const end = @min(i + cap, keys.len);
-        const a = try txn.alloc(leaf_node_size);
+        const a = try transaction.alloc(leaf_node_size);
         _ = encodeLeaf(a.bytes, keys[i..end], values[i..end]);
         try out.append(allocator, .{ .ref = a.ref, .low = keys[i], .count = @intCast(end - i) });
         i = end;
@@ -61,7 +61,7 @@ pub fn packLeaves(
 /// node stores (child_ref, low_key, subtree_count); a parent's low key is the
 /// low key of its first child and its count is the sum of its run.
 pub fn stackInner(
-    txn: anytype,
+    transaction: anytype,
     children: []const Child,
     allocator: std.mem.Allocator,
 ) !std.ArrayList(Child) {
@@ -83,7 +83,7 @@ pub fn stackInner(
             total += children[k].count;
         }
         const cnt = end - j;
-        const a = try txn.alloc(inner_node_size);
+        const a = try transaction.alloc(inner_node_size);
         _ = encodeInner(a.bytes, refs[0..cnt], lows[0..cnt], counts[0..cnt]);
         try out.append(allocator, .{ .ref = a.ref, .low = children[j].low, .count = total });
         j = end;
@@ -94,12 +94,12 @@ pub fn stackInner(
 /// Stack inner levels over `level` until a single node remains, growing the
 /// tree height as needed. Replaces `level` in place; the survivor is the root.
 pub fn collapseToRoot(
-    txn: anytype,
+    transaction: anytype,
     level: *std.ArrayList(Child),
     allocator: std.mem.Allocator,
 ) !void {
     while (level.items.len > 1) {
-        const next = try stackInner(txn, level.items, allocator);
+        const next = try stackInner(transaction, level.items, allocator);
         level.deinit(allocator);
         level.* = next;
     }
@@ -110,7 +110,7 @@ pub fn collapseToRoot(
 /// allocation occurs here, so the deref'd node bytes stay valid for the
 /// duration of each iteration.
 fn descendRightEdge(
-    txn: anytype,
+    transaction: anytype,
     root: Reference,
     path_refs: *std.ArrayList(Reference),
     path_ridx: *std.ArrayList(usize),
@@ -120,7 +120,7 @@ fn descendRightEdge(
     var hops: usize = 0;
     while (true) : (hops += 1) {
         if (hops >= max_depth) return error.Corrupt; // ref cycle guard
-        const nb = try derefNode(txn, cur);
+        const nb = try derefNode(transaction, cur);
         if (nb[0] == kind_leaf) return cur;
         const iv = try parseInner(nb);
         const ri: usize = iv.child_count - 1;
@@ -140,13 +140,13 @@ const CombinedRun = struct { keys: []u64, values: []u64 };
 /// valid while they are copied out). Asserts under runtime safety that the
 /// run's first key clears the leaf's current max.
 fn combineLeafAndRun(
-    txn: anytype,
+    transaction: anytype,
     leaf_ref: Reference,
     keys: []const u64,
     values: []const u64,
     allocator: std.mem.Allocator,
 ) !CombinedRun {
-    const lv = try parseLeaf(try derefNode(txn, leaf_ref));
+    const lv = try parseLeaf(try derefNode(transaction, leaf_ref));
     if (std.debug.runtime_safety and lv.count > 0) {
         std.debug.assert(keys[0] > lv.key(lv.count - 1));
     }
@@ -174,7 +174,7 @@ fn combineLeafAndRun(
 /// automatically when the child list overflows; the extra nodes propagate up
 /// as additional children of the next level. Replaces `level` in place.
 fn rebuildRightSpine(
-    txn: anytype,
+    transaction: anytype,
     path_refs: []const Reference,
     path_ridx: []const usize,
     level: *std.ArrayList(Child),
@@ -183,7 +183,7 @@ fn rebuildRightSpine(
     var i: usize = path_refs.len;
     while (i > 0) {
         i -= 1;
-        const iv = try parseInner(try derefNode(txn, path_refs[i]));
+        const iv = try parseInner(try derefNode(transaction, path_refs[i]));
         const ri = path_ridx[i];
         var full = std.ArrayList(Child).empty;
         defer full.deinit(allocator);
@@ -192,7 +192,7 @@ fn rebuildRightSpine(
             try full.append(allocator, .{ .ref = iv.childRef(j), .low = iv.lowKey(j), .count = iv.subtreeCount(j) });
         }
         for (level.items) |c| try full.append(allocator, c);
-        const next = try stackInner(txn, full.items, allocator);
+        const next = try stackInner(transaction, full.items, allocator);
         level.deinit(allocator);
         level.* = next;
     }
@@ -209,7 +209,7 @@ fn rebuildRightSpine(
 /// are strictly ascending, and keys[0] is greater than the tree's current max
 /// key. An empty run returns `root` unchanged.
 pub fn appendRun(
-    txn: anytype,
+    transaction: anytype,
     root: Reference,
     keys: []const u64,
     values: []const u64,
@@ -227,35 +227,35 @@ pub fn appendRun(
     defer path_refs.deinit(allocator);
     var path_ridx = std.ArrayList(usize).empty;
     defer path_ridx.deinit(allocator);
-    const leaf_ref = try descendRightEdge(txn, root, &path_refs, &path_ridx, allocator);
+    const leaf_ref = try descendRightEdge(transaction, root, &path_refs, &path_ridx, allocator);
 
     // 2. Combine the rightmost leaf's pairs with the run, then pack the
     //    combined run into leaves filled to LEAF_CAP: the first new leaf reuses
     //    the old leaf's content topped up from the front of the run, the rest
     //    are full leaves.
-    const combined = try combineLeafAndRun(txn, leaf_ref, keys, values, allocator);
+    const combined = try combineLeafAndRun(transaction, leaf_ref, keys, values, allocator);
     defer allocator.free(combined.keys);
     defer allocator.free(combined.values);
-    var level = try packLeaves(txn, combined.keys, combined.values, allocator);
+    var level = try packLeaves(transaction, combined.keys, combined.values, allocator);
     errdefer level.deinit(allocator);
 
     // 3. Rebuild the rightmost inner spine bottom-up, then stack further inner
     //    levels until a single root remains (the rebuilt root level may have
     //    overflowed FANOUT into several nodes), growing the tree height by one
     //    or more as needed.
-    try rebuildRightSpine(txn, path_refs.items, path_ridx.items, &level, allocator);
-    try collapseToRoot(txn, &level, allocator);
+    try rebuildRightSpine(transaction, path_refs.items, path_ridx.items, &level, allocator);
+    try collapseToRoot(transaction, &level, allocator);
 
     const result = level.items[0].ref;
 
     // 4. Free the replaced right-edge nodes: the old rightmost leaf and every
     //    inner node on the old rightmost path were rebuilt above and are no
     //    longer referenced by the new tree. Committed nodes route to deferred
-    //    (MVCC-safe) reclaim; txn-private ones become immediately reusable.
+    //    (MVCC-safe) reclaim; transaction-private ones become immediately reusable.
     //    These frees are fallible, so they run BEFORE the manual level.deinit:
     //    the errdefer must never fire on an already-deinitialized list.
-    try txn.free(leaf_ref, leaf_node_size);
-    for (path_refs.items) |old_ref| try txn.free(old_ref, inner_node_size);
+    try transaction.free(leaf_ref, leaf_node_size);
+    for (path_refs.items) |old_ref| try transaction.free(old_ref, inner_node_size);
 
     level.deinit(allocator);
     return result;

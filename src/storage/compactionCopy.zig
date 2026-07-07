@@ -23,7 +23,7 @@ pub const Pair = struct { okey: u64, row: u64 };
 /// `keyrow_ref` into a list the caller owns. O(live rows).
 pub fn collectKeyRowPairs(
     allocator: std.mem.Allocator,
-    txn: anytype,
+    transaction: anytype,
     keyrow_ref: Reference,
 ) !std.ArrayList(Pair) {
     var pairs = std.ArrayList(Pair).empty;
@@ -35,7 +35,7 @@ pub fn collectKeyRowPairs(
             try self.list.append(self.a, .{ .okey = key, .row = val });
         }
     };
-    try Index.forEachEntry(txn, keyrow_ref, Collector{ .list = &pairs, .a = allocator }, Collector.onEntry);
+    try Index.forEachEntry(transaction, keyrow_ref, Collector{ .list = &pairs, .a = allocator }, Collector.onEntry);
     return pairs;
 }
 

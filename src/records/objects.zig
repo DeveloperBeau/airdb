@@ -31,8 +31,8 @@ pub const DeleteResult = rows.DeleteResult;
 
 // insertTyped encodes a []Value row into raw u64 storage, allocating a blob
 // node for each .blob property, then delegates to rows.insert.
-pub fn insertTyped(txn: *WriteTransaction, cat: Reference, values: []const Value) !struct { cat: Reference, row: u64 } {
-    const v = try loadCatalog(txn, cat);
+pub fn insertTyped(transaction: *WriteTransaction, cat: Reference, values: []const Value) !struct { cat: Reference, row: u64 } {
+    const v = try loadCatalog(transaction, cat);
     const pc = v.prop_count;
     std.debug.assert(values.len == pc);
     std.debug.assert(pc <= max_prop_count);
@@ -52,21 +52,21 @@ pub fn insertTyped(txn: *WriteTransaction, cat: Reference, values: []const Value
     while (i < pc) : (i += 1) {
         raw[i] = switch (kinds[i]) {
             .int => values[i].int,
-            .blob => try blob.put(txn, values[i].bytes),
+            .blob => try blob.put(transaction, values[i].bytes),
             .list => switch (elems[i]) {
-                .int => try collections.buildListInt(txn, values[i].list_int),
-                .blob => try collections.buildListBlob(txn, values[i].list_blob),
+                .int => try collections.buildListInt(transaction, values[i].list_int),
+                .blob => try collections.buildListBlob(transaction, values[i].list_blob),
             },
             .set => switch (elems[i]) {
-                .int => try collections.buildSetInt(txn, values[i].set_int),
-                .blob => try collections.buildSetBlob(txn, values[i].set_blob),
+                .int => try collections.buildSetInt(transaction, values[i].set_int),
+                .blob => try collections.buildSetBlob(transaction, values[i].set_blob),
             },
-            .dict => try collections.buildDict(txn, values[i].dict_int),
+            .dict => try collections.buildDict(transaction, values[i].dict_int),
             .link => if (values[i].link) |k| k + 1 else 0,
-            .link_set => try collections.buildSetInt(txn, values[i].link_set),
+            .link_set => try collections.buildSetInt(transaction, values[i].link_set),
         };
     }
-    const r = try rows.insert(txn, cat, raw[0..pc]);
+    const r = try rows.insert(transaction, cat, raw[0..pc]);
     // Maintain backlinks for any links the new row carries.
     var cat_ref = r.cat;
     {
@@ -75,12 +75,12 @@ pub fn insertTyped(txn: *WriteTransaction, cat: Reference, values: []const Value
             switch (kinds[p]) {
                 .link => {
                     if (values[p].link) |target| {
-                        cat_ref = try links.addBacklink(txn, cat_ref, p, target, r.row);
+                        cat_ref = try links.addBacklink(transaction, cat_ref, p, target, r.row);
                     }
                 },
                 .link_set => {
                     for (values[p].link_set) |target| {
-                        cat_ref = try links.addBacklink(txn, cat_ref, p, target, r.row);
+                        cat_ref = try links.addBacklink(transaction, cat_ref, p, target, r.row);
                     }
                 },
                 else => {},
@@ -95,8 +95,8 @@ pub fn insertTyped(txn: *WriteTransaction, cat: Reference, values: []const Value
 // storage; a blob larger than the inline cap (stored chunked) decodes to a
 // .blob_ref the caller materializes with blob.getAlloc.
 // Returns the row version, or null when the key is not found.
-pub fn getTyped(txn: anytype, cat: Reference, pk: u64, out: []Value) !?u64 {
-    const v = try loadCatalog(txn, cat);
+pub fn getTyped(transaction: anytype, cat: Reference, pk: u64, out: []Value) !?u64 {
+    const v = try loadCatalog(transaction, cat);
     const pc = v.prop_count;
     std.debug.assert(out.len == pc);
     std.debug.assert(pc <= max_prop_count);
@@ -107,12 +107,12 @@ pub fn getTyped(txn: anytype, cat: Reference, pk: u64, out: []Value) !?u64 {
         while (j < pc) : (j += 1) kinds[j] = v.kind(j);
     }
     var raw: [max_prop_count]u64 = undefined;
-    const ver = (try rows.getByPk(txn, cat, pk, raw[0..pc])) orelse return null;
+    const ver = (try rows.getByPk(transaction, cat, pk, raw[0..pc])) orelse return null;
     var i: usize = 0;
     while (i < pc) : (i += 1) {
         out[i] = switch (kinds[i]) {
             .int => .{ .int = raw[i] },
-            .blob => if (blob.get(txn, raw[i])) |slice| .{ .bytes = slice } else |err| switch (err) {
+            .blob => if (blob.get(transaction, raw[i])) |slice| .{ .bytes = slice } else |err| switch (err) {
                 error.BlobChunked => .{ .blob_ref = raw[i] },
                 else => |e| return e,
             },
@@ -124,8 +124,8 @@ pub fn getTyped(txn: anytype, cat: Reference, pk: u64, out: []Value) !?u64 {
 }
 
 // getTypedByOkey decodes a row addressed by stable object key into Values.
-pub fn getTypedByOkey(txn: anytype, cat: Reference, okey: u64, out: []Value) !?u64 {
-    const v = try loadCatalog(txn, cat);
+pub fn getTypedByOkey(transaction: anytype, cat: Reference, okey: u64, out: []Value) !?u64 {
+    const v = try loadCatalog(transaction, cat);
     const pc = v.prop_count;
     std.debug.assert(out.len == pc);
     std.debug.assert(pc <= max_prop_count);
@@ -135,12 +135,12 @@ pub fn getTypedByOkey(txn: anytype, cat: Reference, okey: u64, out: []Value) !?u
         while (j < pc) : (j += 1) kinds[j] = v.kind(j);
     }
     var raw: [max_prop_count]u64 = undefined;
-    const ver = (try rows.getByObjectKey(txn, cat, okey, raw[0..pc])) orelse return null;
+    const ver = (try rows.getByObjectKey(transaction, cat, okey, raw[0..pc])) orelse return null;
     var i: usize = 0;
     while (i < pc) : (i += 1) {
         out[i] = switch (kinds[i]) {
             .int => .{ .int = raw[i] },
-            .blob => if (blob.get(txn, raw[i])) |slice| .{ .bytes = slice } else |err| switch (err) {
+            .blob => if (blob.get(transaction, raw[i])) |slice| .{ .bytes = slice } else |err| switch (err) {
                 error.BlobChunked => .{ .blob_ref = raw[i] },
                 else => |e| return e,
             },
@@ -153,14 +153,14 @@ pub fn getTypedByOkey(txn: anytype, cat: Reference, okey: u64, out: []Value) !?u
 
 // Delete an object and keep the graph consistent: nullify inbound links and
 // clean the deleted object's outbound backlink entries.
-pub fn deleteAndNullify(txn: *WriteTransaction, cat: Reference, pk: u64, expected_version: u64) !DeleteResult {
-    const v = try loadCatalog(txn, cat);
-    const okey = (try Index.get(txn, v.pk_index_ref, pk)) orelse return .not_found;
-    const row = (try catalog.okeyToRow(txn, cat, okey)) orelse return .not_found;
-    const cur_ver = try Column.get(txn, v.version_col_ref, row);
+pub fn deleteAndNullify(transaction: *WriteTransaction, cat: Reference, pk: u64, expected_version: u64) !DeleteResult {
+    const v = try loadCatalog(transaction, cat);
+    const okey = (try Index.get(transaction, v.pk_index_ref, pk)) orelse return .not_found;
+    const row = (try catalog.okeyToRow(transaction, cat, okey)) orelse return .not_found;
+    const cur_ver = try Column.get(transaction, v.version_col_ref, row);
     if (cur_ver != expected_version) return .{ .conflict = .{ .current_version = cur_ver } };
-    const fixed = try links.fixBacklinksForDelete(txn, cat, okey);
-    return try rows.delete(txn, fixed, pk, expected_version);
+    const fixed = try links.fixBacklinksForDelete(transaction, cat, okey);
+    return try rows.delete(transaction, fixed, pk, expected_version);
 }
 
 // updateTyped is MVCC-safe: it does NOT free any blob unless the version check
@@ -170,13 +170,13 @@ pub fn deleteAndNullify(txn: *WriteTransaction, cat: Reference, pk: u64, expecte
 // is one irreducible MVCC step -- splitting it would scatter the frees from
 // the version check that alone makes them safe.
 pub fn updateTyped(
-    txn: *WriteTransaction,
+    transaction: *WriteTransaction,
     cat: Reference,
     pk: u64,
     values: []const Value,
     expected_version: u64,
 ) !UpdateResult {
-    const v = try loadCatalog(txn, cat);
+    const v = try loadCatalog(transaction, cat);
     const pc = v.prop_count;
     std.debug.assert(values.len == pc);
     std.debug.assert(pc <= max_prop_count);
@@ -188,7 +188,7 @@ pub fn updateTyped(
     }
     // Step 1: read the current row into cur_raw.
     var cur_raw: [max_prop_count]u64 = undefined;
-    const current_version = (try rows.getByPk(txn, cat, pk, cur_raw[0..pc])) orelse return .not_found;
+    const current_version = (try rows.getByPk(transaction, cat, pk, cur_raw[0..pc])) orelse return .not_found;
     // Step 2: version check BEFORE freeing or allocating any blob.
     if (current_version != expected_version)
         return .{ .conflict = .{ .current_version = current_version } };
@@ -202,15 +202,15 @@ pub fn updateTyped(
         new_raw[i] = switch (kinds[i]) {
             .int => values[i].int,
             .blob => blk: {
-                try blob.free(txn, cur_raw[i]);
-                break :blk try blob.put(txn, values[i].bytes);
+                try blob.free(transaction, cur_raw[i]);
+                break :blk try blob.put(transaction, values[i].bytes);
             },
             .list, .set, .dict, .link_set => cur_raw[i],
             .link => if (values[i].link) |k| k + 1 else 0,
         };
     }
     // Step 4: delegate to the core update; it will re-check the version (match).
-    const result = try rows.update(txn, cat, pk, new_raw[0..pc], expected_version);
+    const result = try rows.update(transaction, cat, pk, new_raw[0..pc], expected_version);
     // Step 5: maintain backlinks for any changed to-one link, mirroring
     // setLink. Skipping this left the old target's backlink set naming this
     // source forever and the new target's set missing it -- corrupting
@@ -225,9 +225,9 @@ pub fn updateTyped(
                 // The row was just updated successfully, so its pk must
                 // resolve; anything else is index divergence, and bailing
                 // mid-loop would leave the backlinks half-moved.
-                const okey = (try catalog.pkToOkey(txn, cat_out, pk)) orelse return error.Corrupt;
-                if (cur_raw[p] != 0) cat_out = try links.removeBacklink(txn, cat_out, p, cur_raw[p] - 1, okey);
-                if (new_raw[p] != 0) cat_out = try links.addBacklink(txn, cat_out, p, new_raw[p] - 1, okey);
+                const okey = (try catalog.pkToOkey(transaction, cat_out, pk)) orelse return error.Corrupt;
+                if (cur_raw[p] != 0) cat_out = try links.removeBacklink(transaction, cat_out, p, cur_raw[p] - 1, okey);
+                if (new_raw[p] != 0) cat_out = try links.addBacklink(transaction, cat_out, p, new_raw[p] - 1, okey);
                 changed = true;
             }
             if (changed) return .{ .ok = .{ .cat = cat_out, .version = ok.version } };
@@ -240,12 +240,12 @@ pub fn updateTyped(
 // deleteTyped is MVCC-safe: blobs are freed only on the apply path, never on
 // conflict or not_found.
 pub fn deleteTyped(
-    txn: *WriteTransaction,
+    transaction: *WriteTransaction,
     cat: Reference,
     pk: u64,
     expected_version: u64,
 ) !DeleteResult {
-    const v = try loadCatalog(txn, cat);
+    const v = try loadCatalog(transaction, cat);
     const pc = v.prop_count;
     std.debug.assert(pc <= max_prop_count);
     // Capture kinds/elems before any mutation.
@@ -260,12 +260,12 @@ pub fn deleteTyped(
     }
     // Step 1: read the current row.
     var cur_raw: [max_prop_count]u64 = undefined;
-    const current_version = (try rows.getByPk(txn, cat, pk, cur_raw[0..pc])) orelse return .not_found;
+    const current_version = (try rows.getByPk(transaction, cat, pk, cur_raw[0..pc])) orelse return .not_found;
     // Step 2: version check BEFORE freeing any blob.
     if (current_version != expected_version)
         return .{ .conflict = .{ .current_version = current_version } };
     // Step 3: delegate to the graph-safe delete (nullifies inbound links).
-    const result = try deleteAndNullify(txn, cat, pk, expected_version);
+    const result = try deleteAndNullify(transaction, cat, pk, expected_version);
     // Step 4: on the apply path, free the row's blob and collection storage.
     // This runs AFTER deleteAndNullify because the outbound backlink cleanup
     // reads the link_set roots; the tombstoned row's columns still hold the
@@ -273,7 +273,7 @@ pub fn deleteTyped(
     // its blobs and list/set/dict trees (and their element/key blobs)
     // permanently. MVCC-safe: a conflict or not_found result frees nothing.
     switch (result) {
-        .ok => try rows.freeRowStorage(txn, kinds[0..pc], elems[0..pc], cur_raw[0..pc]),
+        .ok => try rows.freeRowStorage(transaction, kinds[0..pc], elems[0..pc], cur_raw[0..pc]),
         else => {},
     }
     return result;

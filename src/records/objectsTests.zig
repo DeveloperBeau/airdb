@@ -542,16 +542,16 @@ test "getByObjectKey resolves through the key-to-row index" {
 // Collect, in ascending order, the object keys held in the value index's inner
 // set for (cat, prop, value). Empty/absent yields an empty list.
 fn collectIndexOkeys(
-    txn: anytype,
+    transaction: anytype,
     cat: Reference,
     prop: usize,
     value: u64,
     out: *std.ArrayList(u64),
     allocator: std.mem.Allocator,
 ) !void {
-    const v = try loadCatalog(txn, cat);
+    const v = try loadCatalog(transaction, cat);
     const vi = v.valueIndexRef(prop);
-    const inner = (try Index.get(txn, vi, value)) orelse return;
+    const inner = (try Index.get(transaction, vi, value)) orelse return;
     const Sink = struct {
         list: *std.ArrayList(u64),
         alloc: std.mem.Allocator,
@@ -559,11 +559,11 @@ fn collectIndexOkeys(
             try self.list.append(self.alloc, key);
         }
     };
-    try Index.forEachKey(txn, inner, Sink{ .list = out, .alloc = allocator }, Sink.onKey);
+    try Index.forEachKey(transaction, inner, Sink{ .list = out, .alloc = allocator }, Sink.onKey);
 }
 
 fn expectIndexOkeys(
-    txn: anytype,
+    transaction: anytype,
     cat: Reference,
     prop: usize,
     value: u64,
@@ -571,7 +571,7 @@ fn expectIndexOkeys(
 ) !void {
     var got = std.ArrayList(u64).empty;
     defer got.deinit(testing.allocator);
-    try collectIndexOkeys(txn, cat, prop, value, &got, testing.allocator);
+    try collectIndexOkeys(transaction, cat, prop, value, &got, testing.allocator);
     try testing.expectEqualSlices(u64, expected, got.items);
 }
 
@@ -894,7 +894,7 @@ test "deleteTyped frees a self-referencing link_set root exactly once" {
     try testing.expect(res == .ok);
     var seen = std.AutoHashMap(u64, void).init(testing.allocator);
     defer seen.deinit();
-    for (w.txn_reuse.extents.items) |e| {
+    for (w.transactionReuse.extents.items) |e| {
         const gop = try seen.getOrPut(e.offset);
         try testing.expect(!gop.found_existing); // duplicate free
     }

@@ -47,12 +47,12 @@ fn indexNodeSize(chunk_count: usize) usize {
 const ChunkedHeader = struct { total_len: usize, chunk_count: u32, node_size: usize };
 
 /// Read and VALIDATE a chunked-blob index header. These fields come straight
-/// from the mapped file: an unvalidated chunk_count feeds lengths to txn.free
+/// from the mapped file: an unvalidated chunk_count feeds lengths to transaction.free
 /// (poisoning the free list with garbage extents -- corruption that spreads
 /// after commit), underflows `total_len - start`, and on 32-bit hosts can
 /// overflow indexNodeSize into a too-short deref. Sizes are computed in u64.
-fn chunkedHeader(txn: anytype, ref: Reference) !ChunkedHeader {
-    const hdr = try txn.deref(ref, idx_refs_off);
+fn chunkedHeader(transaction: anytype, ref: Reference) !ChunkedHeader {
+    const hdr = try transaction.deref(ref, idx_refs_off);
     if (hdr[0] != tag_chunked) return error.Corrupt;
     const total_len = std.mem.readInt(u64, hdr[idx_total_off..][0..8], .little);
     const chunk_count = std.mem.readInt(u32, hdr[idx_count_off..][0..4], .little);
@@ -67,12 +67,12 @@ fn chunkedHeader(txn: anytype, ref: Reference) !ChunkedHeader {
 /// Returns the null ref (0) when `bytes` is empty -- no node is allocated.
 /// Small blobs become a single inline node; blobs over `inline_max` are split
 /// into chunk nodes referenced by an index node.
-pub fn put(txn: *WriteTransaction, bytes: []const u8) !Reference {
+pub fn put(transaction: *WriteTransaction, bytes: []const u8) !Reference {
     if (bytes.len == 0) return 0;
 
     if (bytes.len <= inline_max) {
         const total = inline_bytes_off + bytes.len;
-        const a = try txn.alloc(total);
+        const a = try transaction.alloc(total);
         a.bytes[0] = tag_inline;
         std.mem.writeInt(u32, a.bytes[inline_len_off..][0..4], @intCast(bytes.len), .little);
         @memcpy(a.bytes[inline_bytes_off .. inline_bytes_off + bytes.len], bytes);
@@ -84,7 +84,7 @@ pub fn put(txn: *WriteTransaction, bytes: []const u8) !Reference {
     // Allocate the index node first and write its header. Its mutable slice stays
     // valid across the chunk allocations below: sections never move on growth, and
     // chunk allocations land in distinct regions, so they never touch this node.
-    const idx = try txn.alloc(indexNodeSize(chunk_count));
+    const idx = try transaction.alloc(indexNodeSize(chunk_count));
     idx.bytes[0] = tag_chunked;
     std.mem.writeInt(u64, idx.bytes[idx_total_off..][0..8], @intCast(bytes.len), .little);
     std.mem.writeInt(u32, idx.bytes[idx_count_off..][0..4], @intCast(chunk_count), .little);
@@ -93,7 +93,7 @@ pub fn put(txn: *WriteTransaction, bytes: []const u8) !Reference {
     while (i < chunk_count) : (i += 1) {
         const start = i * chunk_size;
         const end = @min(start + chunk_size, bytes.len);
-        const c = try txn.alloc(end - start);
+        const c = try transaction.alloc(end - start);
         // Copy this chunk's source bytes in immediately, before the next alloc.
         @memcpy(c.bytes, bytes[start..end]);
         std.mem.writeInt(u64, idx.bytes[idx_refs_off + 8 * i ..][0..8], c.ref, .little);
@@ -104,48 +104,48 @@ pub fn put(txn: *WriteTransaction, bytes: []const u8) !Reference {
 
 /// Number of bytes stored at `ref`. Null ref -> 0.
 /// Accepts any transaction type exposing `deref(ref, len) ![]const u8`.
-pub fn size(txn: anytype, ref: Reference) !usize {
+pub fn size(transaction: anytype, ref: Reference) !usize {
     if (ref == 0) return 0;
-    const tag = (try txn.deref(ref, 1))[0];
+    const tag = (try transaction.deref(ref, 1))[0];
     if (tag == tag_inline) {
-        const node = try txn.deref(ref, inline_bytes_off);
+        const node = try transaction.deref(ref, inline_bytes_off);
         return std.mem.readInt(u32, node[inline_len_off..][0..4], .little);
     }
-    return (try chunkedHeader(txn, ref)).total_len;
+    return (try chunkedHeader(transaction, ref)).total_len;
 }
 
 /// Zero-copy slice into an inline blob node. Null ref -> empty slice.
 /// Returns `error.BlobChunked` for a chunked blob (it has no single contiguous
 /// slice); callers use `readInto`/`getAlloc` for those.
 /// Accepts any transaction type exposing `deref(ref, len) ![]const u8`.
-pub fn get(txn: anytype, ref: Reference) ![]const u8 {
+pub fn get(transaction: anytype, ref: Reference) ![]const u8 {
     if (ref == 0) return &.{};
-    const tag = (try txn.deref(ref, 1))[0];
+    const tag = (try transaction.deref(ref, 1))[0];
     if (tag == tag_chunked) return error.BlobChunked;
     if (tag != tag_inline) return error.Corrupt;
-    const hdr = try txn.deref(ref, inline_bytes_off);
+    const hdr = try transaction.deref(ref, inline_bytes_off);
     const len = std.mem.readInt(u32, hdr[inline_len_off..][0..4], .little);
-    const node = try txn.deref(ref, inline_bytes_off + @as(usize, len));
+    const node = try transaction.deref(ref, inline_bytes_off + @as(usize, len));
     return node[inline_bytes_off .. inline_bytes_off + len];
 }
 
 /// Copy the blob at `ref` into `out`, which must be exactly `size(ref)` bytes.
 /// No allocation; the caller owns `out`. Works for both inline and chunked blobs.
 /// Accepts any transaction type exposing `deref(ref, len) ![]const u8`.
-pub fn readInto(txn: anytype, ref: Reference, out: []u8) !void {
-    std.debug.assert(out.len == try size(txn, ref));
+pub fn readInto(transaction: anytype, ref: Reference, out: []u8) !void {
+    std.debug.assert(out.len == try size(transaction, ref));
     if (ref == 0) return;
 
-    const tag = (try txn.deref(ref, 1))[0];
+    const tag = (try transaction.deref(ref, 1))[0];
     if (tag == tag_inline) {
-        const hdr = try txn.deref(ref, inline_bytes_off);
+        const hdr = try transaction.deref(ref, inline_bytes_off);
         const len = std.mem.readInt(u32, hdr[inline_len_off..][0..4], .little);
-        const node = try txn.deref(ref, inline_bytes_off + @as(usize, len));
+        const node = try transaction.deref(ref, inline_bytes_off + @as(usize, len));
         @memcpy(out, node[inline_bytes_off .. inline_bytes_off + len]);
         return;
     }
 
-    const h = try chunkedHeader(txn, ref);
+    const h = try chunkedHeader(transaction, ref);
     if (h.total_len != out.len) return error.Corrupt;
     var i: usize = 0;
     while (i < h.chunk_count) : (i += 1) {
@@ -153,19 +153,19 @@ pub fn readInto(txn: anytype, ref: Reference, out: []u8) !void {
         const clen = @min(chunk_size, h.total_len - start);
         // Re-deref the index node each iteration so the read is independent of any
         // prior chunk deref slices.
-        const node = try txn.deref(ref, h.node_size);
+        const node = try transaction.deref(ref, h.node_size);
         const chunk_ref = std.mem.readInt(u64, node[idx_refs_off + 8 * i ..][0..8], .little);
-        const chunk = try txn.deref(chunk_ref, clen);
+        const chunk = try transaction.deref(chunk_ref, clen);
         @memcpy(out[start .. start + clen], chunk);
     }
 }
 
 /// Allocate a buffer, copy the blob at `ref` into it, and return it. Caller frees.
-pub fn getAlloc(txn: anytype, ref: Reference, allocator: std.mem.Allocator) ![]u8 {
-    const n = try size(txn, ref);
+pub fn getAlloc(transaction: anytype, ref: Reference, allocator: std.mem.Allocator) ![]u8 {
+    const n = try size(transaction, ref);
     const buf = try allocator.alloc(u8, n);
     errdefer allocator.free(buf);
-    try readInto(txn, ref, buf);
+    try readInto(transaction, ref, buf);
     return buf;
 }
 
@@ -184,31 +184,31 @@ pub fn copyInto(src: anytype, dst: *WriteTransaction, src_ref: Reference) !Refer
 /// Release the blob at `ref` back to the storage engine.
 /// Freeing the null ref (0) is a no-op. For a chunked blob, frees every chunk
 /// node and then the index node.
-pub fn free(txn: *WriteTransaction, ref: Reference) !void {
+pub fn free(transaction: *WriteTransaction, ref: Reference) !void {
     if (ref == 0) return;
-    const tag = (try txn.deref(ref, 1))[0];
+    const tag = (try transaction.deref(ref, 1))[0];
     if (tag == tag_inline) {
-        const hdr = try txn.deref(ref, inline_bytes_off);
+        const hdr = try transaction.deref(ref, inline_bytes_off);
         const len = std.mem.readInt(u32, hdr[inline_len_off..][0..4], .little);
-        try txn.free(ref, inline_bytes_off + @as(usize, len));
+        try transaction.free(ref, inline_bytes_off + @as(usize, len));
         return;
     }
 
-    const h = try chunkedHeader(txn, ref);
+    const h = try chunkedHeader(transaction, ref);
     var i: usize = 0;
     while (i < h.chunk_count) : (i += 1) {
         const start = i * chunk_size;
         const clen = @min(chunk_size, h.total_len - start);
         // Read the chunk ref from the still-intact index node, then free the chunk.
         // free() only updates the free list; it does not touch the index node's bytes.
-        const node = try txn.deref(ref, h.node_size);
+        const node = try transaction.deref(ref, h.node_size);
         const chunk_ref = std.mem.readInt(u64, node[idx_refs_off + 8 * i ..][0..8], .little);
         // Bounds-validate the chunk ref before handing its extent to the free
         // list: a corrupt ref would poison the pool with live/garbage space.
-        _ = try txn.deref(chunk_ref, clen);
-        try txn.free(chunk_ref, clen);
+        _ = try transaction.deref(chunk_ref, clen);
+        try transaction.free(chunk_ref, clen);
     }
-    try txn.free(ref, h.node_size);
+    try transaction.free(ref, h.node_size);
 }
 
 // ---------------------------------------------------------------------------
@@ -338,9 +338,9 @@ test "a corrupt chunked header is an error, not a panic or a poisoned free list"
     try testing.expectError(error.Corrupt, size(&w, ref));
     var out_buf: [16]u8 = undefined;
     try testing.expectError(error.Corrupt, readInto(&w, ref, out_buf[0..]));
-    const frees_before = w.in_flight_frees.items.len + w.txn_reuse.extents.items.len;
+    const frees_before = w.in_flight_frees.items.len + w.transactionReuse.extents.items.len;
     try testing.expectError(error.Corrupt, free(&w, ref));
-    try testing.expectEqual(frees_before, w.in_flight_frees.items.len + w.txn_reuse.extents.items.len);
+    try testing.expectEqual(frees_before, w.in_flight_frees.items.len + w.transactionReuse.extents.items.len);
 
     // (b) an out-of-range tag byte is Corrupt everywhere.
     db.store.map[off] = 7;

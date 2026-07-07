@@ -339,8 +339,8 @@ pub const Db = struct {
         if (retain != coord_mod.sentinel_max) {
             const lv = self.coord.latestVersion();
             if (version < lv -| retain) {
-                var txn = ReadTransaction{ .db = self, .root_ref = root, .version = version };
-                txn.end(); // unpin
+                var transaction = ReadTransaction{ .db = self, .root_ref = root, .version = version };
+                transaction.end(); // unpin
                 return error.VersionUnavailable;
             }
         }
@@ -415,7 +415,7 @@ pub const Db = struct {
         // Refresh under the lock so the writer sees the truly-latest committed version.
         try versioning.refreshToLatest(self);
         // Clone the committed free list into work_freelist so the transaction
-        // can reuse extents from it. db.free_list is untouched during the txn;
+        // can reuse extents from it. db.free_list is untouched during the transaction;
         // work_freelist is the mutable clone that reuse() shrinks.
         var work_freelist = FreeList.init(self.store.allocator);
         errdefer work_freelist.deinit();
@@ -433,8 +433,8 @@ pub const Db = struct {
             .new_version = self.active_version + 1,
             .in_flight_frees = .empty,
             .work_freelist = work_freelist,
-            .txn_reuse = FreeList.init(self.store.allocator),
-            .txn_start_top = self.arena.top,
+            .transactionReuse = FreeList.init(self.store.allocator),
+            .transactionStartTop = self.arena.top,
         };
     }
 

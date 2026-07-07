@@ -194,7 +194,7 @@ test "compaction reclaims under churn (scale)" {
         cat = r.cat;
     }
 
-    // delete every even pk; all rows carry version == w.new_version this txn
+    // delete every even pk; all rows carry version == w.new_version this transaction
     i = 0;
     while (i < n) : (i += 2) {
         cat = switch (try rows.delete(&w, cat, i, w.new_version)) {

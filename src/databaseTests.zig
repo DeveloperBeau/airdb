@@ -1043,7 +1043,7 @@ test "a failed commit-point flush poisons the instance until reopen" {
 
 test "a failed commit inside maybeCompactStep neither crashes nor wedges the write lock" {
     // Regression for the commit error contract: maybeCompactStep holds
-    // `errdefer w.deinit()` across commit. Commit used to deinit the txn's
+    // `errdefer w.deinit()` across commit. Commit used to deinit the transaction's
     // lists itself on error, so the errdefer double-freed them (heap
     // corruption); and non-durability commit errors leaked the cross-process
     // write lock. Commit now concludes uniformly and deinit is a no-op after.

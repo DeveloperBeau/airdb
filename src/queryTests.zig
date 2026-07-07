@@ -228,20 +228,20 @@ test "query returns stable object keys after relocation" {
 
 const relocation = @import("storage/relocation.zig");
 
-fn whereSorted(txn: anytype, cat: Reference, preds: []const Predicate, out: *std.ArrayList(u64)) !void {
-    try where(txn, cat, preds, out, testing.allocator);
+fn whereSorted(transaction: anytype, cat: Reference, preds: []const Predicate, out: *std.ArrayList(u64)) !void {
+    try where(transaction, cat, preds, out, testing.allocator);
     std.mem.sort(u64, out.items, {}, std.sort.asc(u64));
 }
 
 // Assert the index path (on cat_idx) yields the exact same sorted okey set as
 // the full scan (on cat_scan) for the given predicates.
-fn expectSameWhere(txn: anytype, cat_idx: Reference, cat_scan: Reference, preds: []const Predicate) !void {
+fn expectSameWhere(transaction: anytype, cat_idx: Reference, cat_scan: Reference, preds: []const Predicate) !void {
     var a = std.ArrayList(u64).empty;
     defer a.deinit(testing.allocator);
     var b = std.ArrayList(u64).empty;
     defer b.deinit(testing.allocator);
-    try whereSorted(txn, cat_idx, preds, &a);
-    try whereSorted(txn, cat_scan, preds, &b);
+    try whereSorted(transaction, cat_idx, preds, &a);
+    try whereSorted(transaction, cat_scan, preds, &b);
     try testing.expectEqualSlices(u64, b.items, a.items);
 }
 

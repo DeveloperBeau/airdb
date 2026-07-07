@@ -56,21 +56,21 @@ int main(void) {
     /* Explicit transaction: two staged inserts commit as one durable batch. */
     AirdbDatabase *db3 = airdb_open(path, 3);
     CHECK(db3 != NULL);
-    AirdbTxn *txn = airdb_begin(db3);
-    CHECK(txn != NULL);
+    AirdbTxn *transaction = airdb_begin(db3);
+    CHECK(transaction != NULL);
     uint64_t t1[3] = {300, 1, 1};
     uint64_t t2[3] = {400, 2, 2};
-    CHECK(airdb_txn_insert(txn, t1, 3) >= 0);
-    CHECK(airdb_txn_insert(txn, t2, 3) >= 0);
-    CHECK(airdb_commit(txn) == AIRDB_OK);
+    CHECK(airdb_txn_insert(transaction, t1, 3) >= 0);
+    CHECK(airdb_txn_insert(transaction, t2, 3) >= 0);
+    CHECK(airdb_commit(transaction) == AIRDB_OK);
     CHECK(airdb_count(db3) == 3);
 
     /* Abort makes nothing durable. */
-    AirdbTxn *txn2 = airdb_begin(db3);
-    CHECK(txn2 != NULL);
+    AirdbTxn *transaction2 = airdb_begin(db3);
+    CHECK(transaction2 != NULL);
     uint64_t t3[3] = {500, 3, 3};
-    CHECK(airdb_txn_insert(txn2, t3, 3) >= 0);
-    airdb_abort(txn2);
+    CHECK(airdb_txn_insert(transaction2, t3, 3) >= 0);
+    airdb_abort(transaction2);
     CHECK(airdb_count(db3) == 3);
 
     /* Bulk append: ascending keys above the current max, one commit. */

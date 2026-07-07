@@ -53,8 +53,8 @@ const Scan = struct {
     next_row: u64,
 };
 
-fn openScan(txn: anytype, cat: Reference) !Scan {
-    const v = try catalog.loadCatalog(txn, cat);
+fn openScan(transaction: anytype, cat: Reference) !Scan {
+    const v = try catalog.loadCatalog(transaction, cat);
     var s: Scan = undefined;
     s.prop_count = v.prop_count;
     s.live_ref = v.live_col_ref;
@@ -73,18 +73,18 @@ fn openScan(txn: anytype, cat: Reference) !Scan {
 // object key from the key->row index, so the current snapshot's index never
 // holds a stale key that could alias a relocated row; the live check is the
 // only filter needed.
-fn rowMatches(txn: anytype, s: *const Scan, row: u64, preds: []const Predicate) !bool {
+fn rowMatches(transaction: anytype, s: *const Scan, row: u64, preds: []const Predicate) !bool {
     for (preds) |p| {
-        const raw = try Column.get(txn, s.prop_refs[p.prop], row);
+        const raw = try Column.get(transaction, s.prop_refs[p.prop], row);
         if (!cmp(p.op, raw, p.value)) return false;
     }
     return true;
 }
 
 // Full row evaluation: live check plus every predicate (logical AND).
-fn evalRow(txn: anytype, s: *const Scan, row: u64, preds: []const Predicate) !bool {
-    if ((try Column.get(txn, s.live_ref, row)) == 0) return false;
-    return rowMatches(txn, s, row, preds);
+fn evalRow(transaction: anytype, s: *const Scan, row: u64, preds: []const Predicate) !bool {
+    if ((try Column.get(transaction, s.live_ref, row)) == 0) return false;
+    return rowMatches(transaction, s, row, preds);
 }
 
 // Reject out-of-range property indices up front: the evaluators index
@@ -176,7 +176,7 @@ const InnerRootCollector = struct {
 // index, resolving each okey to its current physical row via the keyrow index
 // (skipping any okey with no mapping). Pairs are returned sorted by okey.
 fn collectCandidatePairs(
-    txn: anytype,
+    transaction: anytype,
     s: *const Scan,
     driver: Predicate,
     pairs: *std.ArrayList(Pair),
@@ -187,24 +187,24 @@ fn collectCandidatePairs(
     defer okeys.deinit(allocator);
 
     if (driver.op == .eq) {
-        if (try index.get(txn, vi, driver.value)) |inner_root| {
+        if (try index.get(transaction, vi, driver.value)) |inner_root| {
             if (inner_root != 0) {
-                try index.forEachKey(txn, inner_root, OkeyCollector{ .list = &okeys, .allocator = allocator }, OkeyCollector.onKey);
+                try index.forEachKey(transaction, inner_root, OkeyCollector{ .list = &okeys, .allocator = allocator }, OkeyCollector.onKey);
             }
         }
     } else {
         const bounds = rangeBounds(driver.op, driver.value) orelse return; // empty range
         var inner_roots = std.ArrayList(u64).empty;
         defer inner_roots.deinit(allocator);
-        try index.forEachEntryInRange(txn, vi, bounds.lo, bounds.hi, InnerRootCollector{ .list = &inner_roots, .allocator = allocator }, InnerRootCollector.onEntry);
+        try index.forEachEntryInRange(transaction, vi, bounds.lo, bounds.hi, InnerRootCollector{ .list = &inner_roots, .allocator = allocator }, InnerRootCollector.onEntry);
         for (inner_roots.items) |inner_root| {
             if (inner_root == 0) continue;
-            try index.forEachKey(txn, inner_root, OkeyCollector{ .list = &okeys, .allocator = allocator }, OkeyCollector.onKey);
+            try index.forEachKey(transaction, inner_root, OkeyCollector{ .list = &okeys, .allocator = allocator }, OkeyCollector.onKey);
         }
     }
 
     for (okeys.items) |okey| {
-        const row = (try index.get(txn, s.keyrow_index_ref, okey)) orelse continue;
+        const row = (try index.get(transaction, s.keyrow_index_ref, okey)) orelse continue;
         try pairs.append(allocator, .{ .okey = okey, .row = row });
     }
     std.mem.sort(Pair, pairs.items, {}, struct {
@@ -220,7 +220,7 @@ fn collectCandidatePairs(
 // full-scan path streams the key->row index directly and evaluates each row
 // inside the traversal, so no O(live) buffer is ever materialized.
 fn runQuery(
-    txn: anytype,
+    transaction: anytype,
     s: *const Scan,
     preds: []const Predicate,
     allocator: std.mem.Allocator,
@@ -230,41 +230,41 @@ fn runQuery(
     if (pickDriving(s, preds)) |di| {
         var pairs = std.ArrayList(Pair).empty;
         defer pairs.deinit(allocator);
-        try collectCandidatePairs(txn, s, preds[di], &pairs, allocator);
+        try collectCandidatePairs(transaction, s, preds[di], &pairs, allocator);
         for (pairs.items) |pr| {
-            if (try evalRow(txn, s, pr.row, preds)) try onMatch(ctx, pr.okey, pr.row);
+            if (try evalRow(transaction, s, pr.row, preds)) try onMatch(ctx, pr.okey, pr.row);
         }
         return;
     }
     const Stream = struct {
-        txn: @TypeOf(txn),
+        transaction: @TypeOf(transaction),
         s: *const Scan,
         preds: []const Predicate,
         inner: @TypeOf(ctx),
         fn onEntry(self: @This(), okey: u64, row: u64) anyerror!void {
-            if (try evalRow(self.txn, self.s, row, self.preds)) try onMatch(self.inner, okey, row);
+            if (try evalRow(self.transaction, self.s, row, self.preds)) try onMatch(self.inner, okey, row);
         }
     };
-    try index.forEachEntry(txn, s.keyrow_index_ref, Stream{ .txn = txn, .s = s, .preds = preds, .inner = ctx }, Stream.onEntry);
+    try index.forEachEntry(transaction, s.keyrow_index_ref, Stream{ .transaction = transaction, .s = s, .preds = preds, .inner = ctx }, Stream.onEntry);
 }
 
 // Test-only: expose the driving-predicate choice so equivalence tests can assert
 // which path the planner takes.
-fn drivingPredicateIndex(txn: anytype, cat: Reference, preds: []const Predicate) !?usize {
-    const s = try openScan(txn, cat);
+fn drivingPredicateIndex(transaction: anytype, cat: Reference, preds: []const Predicate) !?usize {
+    const s = try openScan(transaction, cat);
     return pickDriving(&s, preds);
 }
 
 // Collect the okeys of every live row that satisfies ALL predicates (logical
 // AND). An empty predicate list matches every live row.
 pub fn where(
-    txn: anytype,
+    transaction: anytype,
     cat: Reference,
     preds: []const Predicate,
     out: *std.ArrayList(u64),
     allocator: std.mem.Allocator,
 ) !void {
-    const s = try openScan(txn, cat);
+    const s = try openScan(transaction, cat);
     try validateProps(&s, preds);
     const Sink = struct {
         out: *std.ArrayList(u64),
@@ -273,13 +273,13 @@ pub fn where(
             try self.out.append(self.allocator, okey);
         }
     };
-    try runQuery(txn, &s, preds, allocator, Sink{ .out = out, .allocator = allocator }, Sink.onMatch);
+    try runQuery(transaction, &s, preds, allocator, Sink{ .out = out, .allocator = allocator }, Sink.onMatch);
 }
 
 // Number of live rows satisfying all predicates. The full-scan path streams,
 // so this allocates nothing proportional to the table.
-pub fn countWhere(txn: anytype, cat: Reference, preds: []const Predicate, allocator: std.mem.Allocator) !u64 {
-    const s = try openScan(txn, cat);
+pub fn countWhere(transaction: anytype, cat: Reference, preds: []const Predicate, allocator: std.mem.Allocator) !u64 {
+    const s = try openScan(transaction, cat);
     try validateProps(&s, preds);
     var n: u64 = 0;
     const Sink = struct {
@@ -288,7 +288,7 @@ pub fn countWhere(txn: anytype, cat: Reference, preds: []const Predicate, alloca
             self.n.* += 1;
         }
     };
-    try runQuery(txn, &s, preds, allocator, Sink{ .n = &n }, Sink.onMatch);
+    try runQuery(transaction, &s, preds, allocator, Sink{ .n = &n }, Sink.onMatch);
     return n;
 }
 
@@ -296,25 +296,25 @@ pub const Aggregate = struct { count: u64, sum: u64, min: ?u64, max: ?u64 };
 
 // Aggregate an int property over the live rows satisfying all predicates.
 // `sum` wraps on overflow (wrapping add); min/max are null when no row matches.
-pub fn aggregateInt(txn: anytype, cat: Reference, prop: usize, preds: []const Predicate, allocator: std.mem.Allocator) !Aggregate {
-    const s = try openScan(txn, cat);
+pub fn aggregateInt(transaction: anytype, cat: Reference, prop: usize, preds: []const Predicate, allocator: std.mem.Allocator) !Aggregate {
+    const s = try openScan(transaction, cat);
     try validateProps(&s, preds);
     if (prop >= s.prop_count) return error.BadProp;
     var agg = Aggregate{ .count = 0, .sum = 0, .min = null, .max = null };
     const Sink = struct {
-        txn: @TypeOf(txn),
+        transaction: @TypeOf(transaction),
         s: *const Scan,
         prop: usize,
         agg: *Aggregate,
         fn onMatch(self: @This(), _: u64, row: u64) anyerror!void {
-            const val = try Column.get(self.txn, self.s.prop_refs[self.prop], row);
+            const val = try Column.get(self.transaction, self.s.prop_refs[self.prop], row);
             self.agg.count += 1;
             self.agg.sum +%= val;
             if (self.agg.min == null or val < self.agg.min.?) self.agg.min = val;
             if (self.agg.max == null or val > self.agg.max.?) self.agg.max = val;
         }
     };
-    try runQuery(txn, &s, preds, allocator, Sink{ .txn = txn, .s = &s, .prop = prop, .agg = &agg }, Sink.onMatch);
+    try runQuery(transaction, &s, preds, allocator, Sink{ .transaction = transaction, .s = &s, .prop = prop, .agg = &agg }, Sink.onMatch);
     return agg;
 }
 
@@ -322,7 +322,7 @@ pub fn aggregateInt(txn: anytype, cat: Reference, prop: usize, preds: []const Pr
 // [lo, hi]. Implemented as a scan with two predicates; an index-seek fast path
 // is a later optimization.
 pub fn rangeInclusive(
-    txn: anytype,
+    transaction: anytype,
     cat: Reference,
     prop: usize,
     lo: u64,
@@ -334,19 +334,19 @@ pub fn rangeInclusive(
         .{ .prop = prop, .op = .ge, .value = lo },
         .{ .prop = prop, .op = .le, .value = hi },
     };
-    try where(txn, cat, &preds, out, allocator);
+    try where(transaction, cat, &preds, out, allocator);
 }
 
 // Sort a slice of okeys in place by an int property, ascending. Reads each
 // row's value once into a temporary pair array, then sorts.
 pub fn sortByPropAsc(
-    txn: anytype,
+    transaction: anytype,
     cat: Reference,
     okeys: []u64,
     prop: usize,
     allocator: std.mem.Allocator,
 ) !void {
-    const v = try catalog.loadCatalog(txn, cat);
+    const v = try catalog.loadCatalog(transaction, cat);
     if (prop >= v.prop_count) return error.BadProp;
     const col = v.propColRef(prop);
     const SortPair = struct { val: u64, key: u64 };
@@ -355,8 +355,8 @@ pub fn sortByPropAsc(
     for (okeys, 0..) |k, i| {
         // A caller-supplied okey that no longer resolves (stale or deleted) is
         // an input error, not a crash.
-        const row = (try catalog.okeyToRow(txn, cat, k)) orelse return error.NotFound;
-        pairs[i] = .{ .val = try Column.get(txn, col, row), .key = k };
+        const row = (try catalog.okeyToRow(transaction, cat, k)) orelse return error.NotFound;
+        pairs[i] = .{ .val = try Column.get(transaction, col, row), .key = k };
     }
     std.mem.sort(SortPair, pairs, {}, struct {
         fn lt(_: void, a: SortPair, b: SortPair) bool {

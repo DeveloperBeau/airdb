@@ -175,8 +175,8 @@ test "writableCopy allocates a new node, copies bytes, and records the old as fr
     // The old node was allocated within this same uncommitted transaction, so freeing it
     // routes to the transaction-private reuse pool (immediately reusable), not in_flight_frees.
     try testing.expectEqual(@as(usize, 0), w.in_flight_frees.items.len);
-    try testing.expectEqual(@as(usize, 1), w.txn_reuse.extents.items.len);
-    try testing.expectEqual(a.ref, w.txn_reuse.extents.items[0].offset);
+    try testing.expectEqual(@as(usize, 1), w.transactionReuse.extents.items.len);
+    try testing.expectEqual(a.ref, w.transactionReuse.extents.items[0].offset);
     w.deinit(); // releases the transaction-private pools without committing
 }
 
@@ -211,11 +211,11 @@ test "a committed node freed within a transaction is not reused mid-transaction"
     }
     const committed_ref = db.active_root;
     var w = try db.beginWrite();
-    try w.free(committed_ref, 64); // committed node -> deferred reclaim, NOT txn-private
+    try w.free(committed_ref, 64); // committed node -> deferred reclaim, NOT transaction-private
     const b = try w.alloc(64);
     // A committed node a reader might still pin must not be reused within this transaction.
     try testing.expect(b.ref != committed_ref);
-    try testing.expectEqual(@as(usize, 0), w.txn_reuse.extents.items.len);
+    try testing.expectEqual(@as(usize, 0), w.transactionReuse.extents.items.len);
     try testing.expectEqual(@as(usize, 1), w.in_flight_frees.items.len);
     w.deinit();
 }
