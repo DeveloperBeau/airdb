@@ -252,10 +252,6 @@ pub fn dictCollect(
     try bindex.forEachEntry(txn, dict_root, Sink{ .list = out, .alloc = allocator }, Sink.onEntry);
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 test {
     _ = @import("collectionsTests.zig");
 }

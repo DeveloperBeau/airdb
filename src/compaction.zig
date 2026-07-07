@@ -688,10 +688,6 @@ pub fn compactInPlace(allocator: std.mem.Allocator, path: []const u8) !void {
     file_store.syncParentDir(path);
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 // NOTE: link/backlink survival across a relocation is covered directly by
 // relocation.zig's tests ("a same-type link to a relocated object still
 // resolves"); compactStep only sequences relocateRow calls, so wiring links

@@ -272,10 +272,6 @@ pub fn makeInnerForTest(txn: anytype, children: []const struct { ref: u64, count
     return a.ref;
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 test {
     _ = @import("columnTests.zig");
 }

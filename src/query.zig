@@ -366,9 +366,7 @@ pub fn sortByPropAsc(
     for (pairs, 0..) |pr, i| okeys[i] = pr.key;
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
+// Tests of file-private invariants; the main suite lives in queryTests.zig.
 
 const testing = std.testing;
 const Db = @import("db.zig").Db;

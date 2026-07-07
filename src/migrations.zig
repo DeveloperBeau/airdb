@@ -137,10 +137,6 @@ pub fn removeProperty(txn: *WriteTxn, cat: Ref, prop: usize) !Ref {
     return s.replace(txn);
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 test {
     _ = @import("migrationsTests.zig");
 }

@@ -319,10 +319,6 @@ pub fn fixBacklinksForDelete(txn: *WriteTxn, cat: Ref, okey: u64) !Ref {
     return try cleanOutboundInCatalog(txn, c1, okey);
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 test {
     _ = @import("linksTests.zig");
 }

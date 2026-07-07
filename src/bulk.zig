@@ -821,21 +821,6 @@ fn fallbackInsert(txn: *WriteTxn, cat: Ref, rows: []const []const u64) !Ref {
 // Tests
 // ---------------------------------------------------------------------------
 
-// ---------------------------------------------------------------------------
-// indexAppendRun: right-edge run append, asserted equivalent to sequential
-// Index.insert of the same keys.
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// columnAppendRun: right-edge run append, asserted equivalent to sequential
-// Column.append of the same values.
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// bulkAppend / bulkAppendOrInsert: right-edge batch append with a row-by-row
-// fallback, asserted equivalent to sequential rows.insert.
-// ---------------------------------------------------------------------------
-
 test {
     _ = @import("bulkTests.zig");
 }

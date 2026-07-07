@@ -738,9 +738,7 @@ pub const Db = struct {
 pub const ReadTxn = @import("read_txn.zig").ReadTxn;
 pub const WriteTxn = @import("write_txn.zig").WriteTxn;
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
+// Tests of file-private invariants; the main suite lives in dbTests.zig.
 
 fn tmpFilePath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const u8) ![]const u8 {
     var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
