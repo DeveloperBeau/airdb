@@ -1,6 +1,6 @@
 const std = @import("std");
-const WriteTxn = @import("db.zig").WriteTxn;
-const Ref = @import("ref.zig").Ref;
+const WriteTxn = @import("database.zig").WriteTxn;
+const Ref = @import("reference.zig").Ref;
 const Column = @import("column.zig");
 const Index = @import("index.zig");
 const catalog = @import("catalog.zig");
@@ -37,7 +37,7 @@ pub fn relocateRow(txn: *WriteTxn, cat: Ref, okey: u64, new_row: u64) !Ref {
 // Tests
 // ---------------------------------------------------------------------------
 
-const Db = @import("db.zig").Db;
+const Db = @import("database.zig").Db;
 const testing = std.testing;
 const objects = @import("objects.zig");
 const rows = @import("rows.zig");

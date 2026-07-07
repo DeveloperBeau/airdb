@@ -20,7 +20,7 @@ pub const name = "insert_recovery";
 // Rows committed per write transaction.
 const batch_size: usize = 10_000;
 
-// Monotonic wall-clock instance, matching the convention in file_store.zig.
+// Monotonic wall-clock instance, matching the convention in fileStore.zig.
 inline fn sysIo() Io {
     return std.Io.Threaded.global_single_threaded.io();
 }

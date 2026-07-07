@@ -11,7 +11,7 @@ const removeProperty = migrations.removeProperty;
 
 const testing = std.testing;
 
-const Db = @import("db.zig").Db;
+const Db = @import("database.zig").Db;
 
 const create = catalog.create;
 
@@ -131,7 +131,7 @@ test "addProperty(link_set) leaves pre-migration rows deletable" {
     // broke every collection accessor on migrated rows and made them
     // undeletable through the graph-safe delete (its outbound cleanup walks
     // link_set roots and hit error.BadRef).
-    const typedir = @import("typedir.zig");
+    const typedir = @import("typeDirectory.zig");
     const typeRouting = @import("typeRouting.zig");
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();

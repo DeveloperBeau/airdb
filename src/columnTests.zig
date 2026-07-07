@@ -1,7 +1,7 @@
 const std = @import("std");
 const Column = @import("column.zig");
-const node = @import("column_node.zig");
-const Ref = @import("ref.zig").Ref;
+const node = @import("columnNode.zig");
+const Ref = @import("reference.zig").Ref;
 const create = Column.create;
 const len = Column.len;
 const get = Column.get;
@@ -18,8 +18,8 @@ const encodeInner = node.encodeInner;
 
 const testing = std.testing;
 
-const Db = @import("db.zig").Db;
-const WriteTxn = @import("db.zig").WriteTxn;
+const Db = @import("database.zig").Db;
+const WriteTxn = @import("database.zig").WriteTxn;
 
 fn colTmpPath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const u8) ![]const u8 {
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;

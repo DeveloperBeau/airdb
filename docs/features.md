@@ -5,7 +5,7 @@ Code pointers use `module.function` names under `src/`.
 ## Durability and recovery
 
 - Two-slot atomic commit with CRC-checked slots and header
-  (`write_txn.commit`, `slots.Slot`). A commit either fully happens or leaves
+  (`writeTransaction.commit`, `slots.Slot`). A commit either fully happens or leaves
   the previous version live — verified by flush-failure injection tests.
 - Full durability barrier per commit: `F_FULLFSYNC` on Apple platforms (drive
   write cache included), `fsync` elsewhere (`syncer.RealSyncer`).

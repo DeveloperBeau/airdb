@@ -2,11 +2,11 @@
 
 const std = @import("std");
 const testing = std.testing;
-const Db = @import("db.zig").Db;
-const WriteTxn = @import("db.zig").WriteTxn;
-const Ref = @import("ref.zig").Ref;
+const Db = @import("database.zig").Db;
+const WriteTxn = @import("database.zig").WriteTxn;
+const Ref = @import("reference.zig").Ref;
 const index = @import("index.zig");
-const node = @import("index_node.zig");
+const node = @import("indexNode.zig");
 
 const create = index.create;
 const insert = index.insert;

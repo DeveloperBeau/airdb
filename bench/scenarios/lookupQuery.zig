@@ -41,7 +41,7 @@ const eq_category: u64 = 42;
 // latency (averaged), small enough to keep the run well under a minute.
 const idx_eq_reps: usize = 1000;
 
-// Monotonic wall-clock instance, matching the convention in file_store.zig.
+// Monotonic wall-clock instance, matching the convention in fileStore.zig.
 inline fn sysIo() Io {
     return std.Io.Threaded.global_single_threaded.io();
 }

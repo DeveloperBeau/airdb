@@ -7,11 +7,11 @@
 // lives above this in objects.zig.
 
 const std = @import("std");
-const WriteTxn = @import("write_txn.zig").WriteTxn;
-const Ref = @import("ref.zig").Ref;
+const WriteTxn = @import("writeTransaction.zig").WriteTxn;
+const Ref = @import("reference.zig").Ref;
 const Column = @import("column.zig");
 const Index = @import("index.zig");
-const bindex = @import("bindex.zig");
+const bindex = @import("byteKeyIndex.zig");
 const blob = @import("blob.zig");
 const catalog = @import("catalog.zig");
 

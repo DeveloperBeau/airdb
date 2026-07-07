@@ -11,12 +11,12 @@ maintenance (compaction) is driven explicitly by the caller.
 | Layer | Files | Responsibility |
 |---|---|---|
 | Platform | `platform.zig`, `syncer.zig` | mmap sections, file locks, pid/incarnation checks, durability barrier (`F_FULLFSYNC` on Darwin, `fsync` elsewhere), injectable `Syncer` for crash tests |
-| Store | `file_store.zig`, `slots.zig`, `arena.zig`, `freelist.zig` | CRC-checked header, two CRC-checked commit slots, bump-allocating arena over the mapping, persisted free list with size-class buckets |
-| Transactions | `db.zig`, `write_txn.zig`, `read_txn.zig`, `coord.zig` | MVCC snapshots and pins, the commit protocol, version→root ring for point-in-time reads, cross-process coordination |
-| Trees | `index.zig`/`index_node.zig`, `column.zig`/`column_node.zig`, `bindex.zig`, `blob.zig` | copy-on-write B+trees (u64-keyed index with subtree counts, row-indexed column, byte-keyed bindex), chunked blob heap |
-| Objects | `catalog.zig`, `objects.zig`, `typedir.zig`, `links.zig`, `collections.zig` | typed columnar storage, stable object keys, optimistic versioning, value indexes, link graph with delete rules |
+| Store | `fileStore.zig`, `slots.zig`, `arena.zig`, `freeList.zig` | CRC-checked header, two CRC-checked commit slots, bump-allocating arena over the mapping, persisted free list with size-class buckets |
+| Transactions | `database.zig`, `writeTransaction.zig`, `readTransaction.zig`, `coordination.zig` | MVCC snapshots and pins, the commit protocol, version→root ring for point-in-time reads, cross-process coordination |
+| Trees | `index.zig`/`indexNode.zig`, `column.zig`/`columnNode.zig`, `byteKeyIndex.zig`, `blob.zig` | copy-on-write B+trees (u64-keyed index with subtree counts, row-indexed column, byte-keyed bindex), chunked blob heap |
+| Objects | `catalog.zig`, `objects.zig`, `typeDirectory.zig`, `links.zig`, `collections.zig` | typed columnar storage, stable object keys, optimistic versioning, value indexes, link graph with delete rules |
 | Operations | `compaction.zig`, `relocation.zig`, `bulk.zig`, `migrations.zig`, `query.zig` | incremental and full compaction, bulk import/append, schema evolution, predicate queries |
-| Edge | `ffi.zig`, `include/airdb.h` | C ABI: auto-commit CRUD, bulk, explicit transactions |
+| Edge | `cApi.zig`, `include/airdb.h` | C ABI: auto-commit CRUD, bulk, explicit transactions |
 
 ## Memory mapping: sections that never move
 

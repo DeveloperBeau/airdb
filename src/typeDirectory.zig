@@ -1,12 +1,12 @@
-// typedir.zig -- type directory node mapping type ids to catalog refs.
+// typeDirectory.zig -- type directory node mapping type ids to catalog refs.
 //
 // Node layout: [type_count u16 LE @0][type_count * (catalog_ref u64 LE) @2]
 //              [type_count * (is_embedded u8) @ 2 + tc*8]
 // dirSize(tc) = 2 + tc * 8 + tc
 
 const std = @import("std");
-const WriteTxn = @import("db.zig").WriteTxn;
-const Ref = @import("ref.zig").Ref;
+const WriteTxn = @import("database.zig").WriteTxn;
+const Ref = @import("reference.zig").Ref;
 const rows = @import("rows.zig");
 const catalog = @import("catalog.zig");
 
@@ -245,5 +245,5 @@ pub fn clearEmbedded(txn: *WriteTxn, dir: Ref, owner_type: u16, owner_pk: u64, p
 }
 
 test {
-    _ = @import("typedirTests.zig");
+    _ = @import("typeDirectoryTests.zig");
 }

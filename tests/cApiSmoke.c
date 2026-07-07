@@ -15,9 +15,9 @@
 
 int main(void) {
     /* The storage layer requires an absolute path. */
-    const char *path = "/tmp/airdb_ffi_smoke_test.airdb";
+    const char *path = "/tmp/airdb_capi_smoke_test.airdb";
     remove(path);
-    remove("/tmp/airdb_ffi_smoke_test.airdb.coord");
+    remove("/tmp/airdb_capi_smoke_test.airdb.coord");
 
     AirdbDatabase *db = airdb_open(path, 3);
     CHECK(db != NULL);
@@ -80,9 +80,9 @@ int main(void) {
     airdb_close(db3);
 
     /* Bulk import requires an empty type: use a fresh file. */
-    const char *bulk_path = "/tmp/airdb_ffi_smoke_bulk.airdb";
+    const char *bulk_path = "/tmp/airdb_capi_smoke_bulk.airdb";
     remove(bulk_path);
-    remove("/tmp/airdb_ffi_smoke_bulk.airdb.coord");
+    remove("/tmp/airdb_capi_smoke_bulk.airdb.coord");
     AirdbDatabase *bdb = airdb_open(bulk_path, 2);
     CHECK(bdb != NULL);
     uint64_t rows[3 * 2] = {1, 10, 2, 20, 3, 30};
@@ -91,10 +91,10 @@ int main(void) {
     CHECK(airdb_bulk_insert(bdb, rows, 3, 2) == AIRDB_E_NOT_EMPTY);
     airdb_close(bdb);
     remove(bulk_path);
-    remove("/tmp/airdb_ffi_smoke_bulk.airdb.coord");
+    remove("/tmp/airdb_capi_smoke_bulk.airdb.coord");
 
     remove(path);
-    remove("/tmp/airdb_ffi_smoke_test.airdb.coord");
-    printf("ffi_smoke: ok\n");
+    remove("/tmp/airdb_capi_smoke_test.airdb.coord");
+    printf("cApiSmoke: ok\n");
     return 0;
 }

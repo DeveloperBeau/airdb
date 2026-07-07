@@ -2,19 +2,19 @@
 // type directory.
 //
 // Every function here follows the same pattern: resolve type_id to its catalog
-// ref via the directory (typedir.zig owns the directory node format), forward
+// ref via the directory (typeDirectory.zig owns the directory node format), forward
 // to the object/link layer, and COW the directory when the catalog changed.
 // The cross-type delete machinery (deleteNullifyX and its worker) also lives
 // here because it routes across every type in the directory.
 
 const std = @import("std");
-const WriteTxn = @import("db.zig").WriteTxn;
-const Ref = @import("ref.zig").Ref;
+const WriteTxn = @import("database.zig").WriteTxn;
+const Ref = @import("reference.zig").Ref;
 const Objects = @import("objects.zig");
 const rows = @import("rows.zig");
 const catalog = @import("catalog.zig");
 const links = @import("links.zig");
-const typedir = @import("typedir.zig");
+const typedir = @import("typeDirectory.zig");
 
 const Value = catalog.Value;
 const typeCount = typedir.typeCount;

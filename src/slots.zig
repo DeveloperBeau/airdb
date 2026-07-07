@@ -1,5 +1,5 @@
 const std = @import("std");
-const Ref = @import("ref.zig").Ref;
+const Ref = @import("reference.zig").Ref;
 
 pub const Slot = struct {
     version: u64,

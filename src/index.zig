@@ -6,8 +6,8 @@
 // read-only subset).
 
 const std = @import("std");
-const Ref = @import("ref.zig").Ref;
-const node = @import("index_node.zig");
+const Ref = @import("reference.zig").Ref;
+const node = @import("indexNode.zig");
 const bTreeCore = @import("bTreeCore.zig");
 
 // Local aliases for the on-disk node format, used by the numeric-only extras

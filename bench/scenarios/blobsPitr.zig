@@ -42,7 +42,7 @@ const pitr_batch: usize = 100;
 const pitr_rows: usize = 1_000;
 const pitr_lookups: usize = 10_000;
 
-// Monotonic wall-clock instance, matching the convention in file_store.zig.
+// Monotonic wall-clock instance, matching the convention in fileStore.zig.
 inline fn sysIo() Io {
     return std.Io.Threaded.global_single_threaded.io();
 }

@@ -1,9 +1,9 @@
 const std = @import("std");
-const WriteTxn = @import("db.zig").WriteTxn;
-const Ref = @import("ref.zig").Ref;
+const WriteTxn = @import("database.zig").WriteTxn;
+const Ref = @import("reference.zig").Ref;
 const Column = @import("column.zig");
 const Index = @import("index.zig");
-const inode = @import("index_node.zig");
+const inode = @import("indexNode.zig");
 const catalog = @import("catalog.zig");
 const rawRows = @import("rows.zig");
 

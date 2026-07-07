@@ -4,7 +4,7 @@ const Io = std.Io;
 const compaction = @import("compaction.zig");
 const catalog = @import("catalog.zig");
 const links = @import("links.zig");
-const typedir = @import("typedir.zig");
+const typedir = @import("typeDirectory.zig");
 const typeRouting = @import("typeRouting.zig");
 const objects = @import("objects.zig");
 const rows = @import("rows.zig");
@@ -20,7 +20,7 @@ const compactInPlace = compaction.compactInPlace;
 
 const testing = std.testing;
 
-const Db = @import("db.zig").Db;
+const Db = @import("database.zig").Db;
 
 const collections = @import("collections.zig");
 

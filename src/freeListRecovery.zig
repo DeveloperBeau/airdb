@@ -2,15 +2,15 @@
 // memory when a database is opened or refreshed to a newer committed version.
 //
 // The free list is persisted by commit as a chain of bounded chunks on the
-// arena (see freelist.zig for the chunk format). Decoding walks the chain,
+// arena (see freeList.zig for the chunk format). Decoding walks the chain,
 // validates it against forged or bit-rotted refs, and re-validates every
 // extent before any of it is trusted for reuse.
 
 const std = @import("std");
 const platform = @import("platform.zig");
-const Db = @import("db.zig").Db;
-const Ref = @import("ref.zig").Ref;
-const FreeList = @import("freelist.zig").FreeList;
+const Db = @import("database.zig").Db;
+const Ref = @import("reference.zig").Ref;
+const FreeList = @import("freeList.zig").FreeList;
 
 /// Decode the persisted free-list chain headed at free_list_ref into `out`,
 /// returning the HEAD chunk's byte length. `out` must already be initialized;

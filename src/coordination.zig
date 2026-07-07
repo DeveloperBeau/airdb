@@ -1,4 +1,4 @@
-// coord.zig -- coordination file for multi-process attach/detach and latest-version signal.
+// coordination.zig -- coordination file for multi-process attach/detach and latest-version signal.
 //
 // Layout (4096-byte mmap'd file):
 //   [0..8]   magic        u64 LE  (coord_magic)
@@ -13,7 +13,7 @@
 //              the claimer: a recycled pid alone cannot keep a dead reader's
 //              slot alive, the incarnation must match too.
 //
-// Zig 0.16 notes (same adaptations as file_store.zig):
+// Zig 0.16 notes (same adaptations as fileStore.zig):
 //   - File I/O via std.Io.File and std.Io.Dir.*Absolute(io, path, .{})
 //   - mmap PROT flags: .{ .READ = true, .WRITE = true }
 //   - mmap flags:      .{ .TYPE = .SHARED }
@@ -293,7 +293,7 @@ pub const Coord = struct {
     }
 };
 
-// Tests of file-private invariants; the main suite lives in coordTests.zig.
+// Tests of file-private invariants; the main suite lives in coordinationTests.zig.
 
 const testing = std.testing;
 
@@ -374,5 +374,5 @@ test "reclaim leaves a slot alone when its claim word changed since the sample" 
 }
 
 test {
-    _ = @import("coordTests.zig");
+    _ = @import("coordinationTests.zig");
 }

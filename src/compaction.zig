@@ -1,13 +1,13 @@
 const std = @import("std");
-const WriteTxn = @import("db.zig").WriteTxn;
-const Ref = @import("ref.zig").Ref;
+const WriteTxn = @import("database.zig").WriteTxn;
+const Ref = @import("reference.zig").Ref;
 const Column = @import("column.zig");
 const Index = @import("index.zig");
 const catalog = @import("catalog.zig");
-const typedir = @import("typedir.zig");
+const typedir = @import("typeDirectory.zig");
 const objects = @import("objects.zig");
 const relocateRow = @import("relocation.zig").relocateRow;
-const file_store = @import("file_store.zig");
+const file_store = @import("fileStore.zig");
 const compactionCopy = @import("compactionCopy.zig");
 
 const max_prop_count = catalog.max_prop_count;
@@ -121,8 +121,8 @@ fn truncatePacked(txn: *WriteTxn, cat: Ref, new_len: u64) !Ref {
 // steps so no slot is ever revisited (relocateRow is not idempotent).
 //
 // The struct itself lives on the Db (the cursor persists across the write
-// transactions of one packing run), so its definition is in db.zig.
-pub const CompactCursor = @import("db.zig").CompactCursor;
+// transactions of one packing run), so its definition is in database.zig.
+pub const CompactCursor = @import("database.zig").CompactCursor;
 
 // Map a physical row to its stable object key. There is no reverse key->row
 // index, so we go through the primary key: property 0 holds the pk, and the pk
@@ -375,14 +375,14 @@ fn verifyEquivalent(allocator: std.mem.Allocator, src: anytype, src_dir: Ref, ds
 // file is published (committed) it is verified equivalent to the source; on any
 // mismatch the destination is discarded uncommitted and the error propagates.
 pub fn compactToNewFile(allocator: std.mem.Allocator, src_path: []const u8, dst_path: []const u8) !void {
-    var src_db = try @import("db.zig").Db.open(allocator, src_path);
+    var src_db = try @import("database.zig").Db.open(allocator, src_path);
     defer src_db.deinit();
     var src_r = try src_db.beginRead();
     defer src_r.end();
     const src_dir = src_r.root();
     const tc = try typedir.typeCount(&src_r, src_dir);
 
-    var dst_db = try @import("db.zig").Db.create(allocator, dst_path);
+    var dst_db = try @import("database.zig").Db.create(allocator, dst_path);
     var dst_db_alive = true;
     defer if (dst_db_alive) dst_db.deinit();
     var dst_w = try dst_db.beginWrite();

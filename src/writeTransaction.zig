@@ -1,4 +1,4 @@
-// write_txn.zig -- WriteTxn and the two-slot atomic durable commit.
+// writeTransaction.zig -- WriteTxn and the two-slot atomic durable commit.
 //
 // Slot A byte range in the header page: [64, 64+Slot.size).
 // Slot B byte range in the header page: [128, 128+Slot.size).
@@ -7,14 +7,14 @@ const std = @import("std");
 const testing = std.testing;
 const Io = std.Io;
 const Allocation = @import("arena.zig").Allocation;
-const Ref = @import("ref.zig").Ref;
+const Ref = @import("reference.zig").Ref;
 const Slot = @import("slots.zig").Slot;
-const FreeExtent = @import("freelist.zig").FreeExtent;
-const FreeList = @import("freelist.zig").FreeList;
-const Db = @import("db.zig").Db;
-const ring_head_off = @import("db.zig").ring_head_off;
-const ring_off = @import("db.zig").ring_off;
-const ring_capacity = @import("db.zig").ring_capacity;
+const FreeExtent = @import("freeList.zig").FreeExtent;
+const FreeList = @import("freeList.zig").FreeList;
+const Db = @import("database.zig").Db;
+const ring_head_off = @import("database.zig").ring_head_off;
+const ring_off = @import("database.zig").ring_off;
+const ring_capacity = @import("database.zig").ring_capacity;
 
 const slot_a_off: usize = 64;
 const slot_b_off: usize = 128;
@@ -368,5 +368,5 @@ pub const WriteTxn = struct {
 };
 
 test {
-    _ = @import("writeTxnTests.zig");
+    _ = @import("writeTransactionTests.zig");
 }

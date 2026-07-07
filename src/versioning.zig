@@ -1,23 +1,23 @@
 // versioning.zig -- commit-slot selection, version adoption, reader pins, and
 // the shared retention window for a Db.
 //
-// These free functions implement the version/pin machinery behind db.zig's
+// These free functions implement the version/pin machinery behind database.zig's
 // public surface: which commit slot is authoritative after a crash, when an
 // instance may adopt a newer published version, how reader pins are advertised
-// to other processes, and how far back point-in-time reads may reach. db.zig
+// to other processes, and how far back point-in-time reads may reach. database.zig
 // keeps thin public delegates for the caller-facing pieces.
 
 const std = @import("std");
 const testing = std.testing;
 const platform = @import("platform.zig");
-const dbModule = @import("db.zig");
+const dbModule = @import("database.zig");
 const Db = dbModule.Db;
-const Ref = @import("ref.zig").Ref;
+const Ref = @import("reference.zig").Ref;
 const Slot = @import("slots.zig").Slot;
-const FreeList = @import("freelist.zig").FreeList;
-const coord_mod = @import("coord.zig");
+const FreeList = @import("freeList.zig").FreeList;
+const coord_mod = @import("coordination.zig");
 const freeListRecovery = @import("freeListRecovery.zig");
-const default_page_size = @import("file_store.zig").default_page_size;
+const default_page_size = @import("fileStore.zig").default_page_size;
 
 const slot_a_off = dbModule.slot_a_off;
 const slot_b_off = dbModule.slot_b_off;

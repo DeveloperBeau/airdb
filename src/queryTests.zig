@@ -4,8 +4,8 @@ const query = @import("query.zig");
 const catalog = @import("catalog.zig");
 const rows = @import("rows.zig");
 const index = @import("index.zig");
-const Ref = @import("ref.zig").Ref;
-const Db = @import("db.zig").Db;
+const Ref = @import("reference.zig").Ref;
+const Db = @import("database.zig").Db;
 const Predicate = query.Predicate;
 const where = query.where;
 const countWhere = query.countWhere;
@@ -21,7 +21,7 @@ fn qTmpPath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const u8
 
 // Build a 3-prop type: prop0 = pk, prop1 = value (indexed iff `idx`), prop2 =
 // secondary. Inserts n rows with pk=i, prop1=i%100, prop2=i.
-fn seedPlannerCat(w: *@import("db.zig").WriteTxn, idx: bool, n: u64) !Ref {
+fn seedPlannerCat(w: *@import("database.zig").WriteTxn, idx: bool, n: u64) !Ref {
     const defs = [_]catalog.PropDef{
         .{ .kind = .int },
         .{ .kind = .int, .indexed = idx },

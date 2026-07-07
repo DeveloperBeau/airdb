@@ -1,6 +1,6 @@
 // bTreeCore.zig -- the comptime-generic B+tree shared by index.zig (inline
-// numeric keys) and bindex.zig (blob-ref byte keys). Both trees use the
-// on-disk node layout of index_node.zig; the only difference between them is
+// numeric keys) and byteKeyIndex.zig (blob-ref byte keys). Both trees use the
+// on-disk node layout of indexNode.zig; the only difference between them is
 // how the u64 stored in a key slot relates to the key a caller searches with.
 // That difference is captured by the comptime `Keying` capability, so every
 // operation here is monomorphized per instantiation: no function pointers and
@@ -17,10 +17,10 @@
 // implementation; ReadTxn satisfies the read-only subset.
 
 const std = @import("std");
-const Ref = @import("ref.zig").Ref;
-const indexNode = @import("index_node.zig");
+const Ref = @import("reference.zig").Ref;
+const indexNode = @import("indexNode.zig");
 
-// Local aliases for the on-disk node format, which lives in index_node.zig.
+// Local aliases for the on-disk node format, which lives in indexNode.zig.
 const leafCapacity = indexNode.LEAF_CAP;
 const fanout = indexNode.FANOUT;
 const kindLeaf = indexNode.kind_leaf;
@@ -49,7 +49,7 @@ const Split = struct { ref: Ref, low: u64, count: u64 };
 const InsertResult = struct { ref: Ref, count: u64, split: ?Split };
 const RemoveResult = struct { ref: Ref, count: u64 };
 
-/// Shared B+tree operations over the index_node.zig layout, specialized by a
+/// Shared B+tree operations over the indexNode.zig layout, specialized by a
 /// comptime `Keying` capability that decides how the u64 stored in each key
 /// slot is ordered against a caller-supplied probe key and how key material
 /// is duplicated and freed. `Keying` must declare:

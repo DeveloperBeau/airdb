@@ -1,8 +1,8 @@
 const std = @import("std");
 const testing = std.testing;
 const Io = std.Io;
-const Db = @import("db.zig").Db;
-const Ref = @import("ref.zig").Ref;
+const Db = @import("database.zig").Db;
+const Ref = @import("reference.zig").Ref;
 
 const catalog = @import("catalog.zig");
 

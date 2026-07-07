@@ -1,7 +1,7 @@
-// read_txn.zig -- ReadTxn, a pinned read snapshot over a Db.
+// readTransaction.zig -- ReadTxn, a pinned read snapshot over a Db.
 
-const Ref = @import("ref.zig").Ref;
-const Db = @import("db.zig").Db;
+const Ref = @import("reference.zig").Ref;
+const Db = @import("database.zig").Db;
 
 pub const ReadTxn = struct {
     db: *Db,

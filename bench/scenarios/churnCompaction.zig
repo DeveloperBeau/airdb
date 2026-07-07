@@ -46,7 +46,7 @@ const compact_budget: usize = 4096;
 // Dead-ratio bound the steady state is expected to hold below.
 const dead_ratio_bound: f64 = 0.5;
 
-// Monotonic wall-clock instance, matching the convention in file_store.zig.
+// Monotonic wall-clock instance, matching the convention in fileStore.zig.
 inline fn sysIo() Io {
     return std.Io.Threaded.global_single_threaded.io();
 }

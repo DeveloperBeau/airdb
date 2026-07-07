@@ -12,8 +12,8 @@
 // writableCopy(ref, len), and free(ref, len).
 
 const std = @import("std");
-const Ref = @import("ref.zig").Ref;
-const node = @import("index_node.zig");
+const Ref = @import("reference.zig").Ref;
+const node = @import("indexNode.zig");
 const index = @import("index.zig");
 
 // Local aliases for the on-disk node format and the shared tree walkers.

@@ -1,6 +1,6 @@
 const std = @import("std");
 const testing = std.testing;
-const coord = @import("coord.zig");
+const coord = @import("coordination.zig");
 const platform = @import("platform.zig");
 const Coord = coord.Coord;
 const coordIo = coord.coordIo;

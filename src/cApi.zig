@@ -11,9 +11,9 @@
 // failure.
 
 const std = @import("std");
-const Db = @import("db.zig").Db;
-const WriteTxn = @import("db.zig").WriteTxn;
-const Ref = @import("ref.zig").Ref;
+const Db = @import("database.zig").Db;
+const WriteTxn = @import("database.zig").WriteTxn;
+const Ref = @import("reference.zig").Ref;
 const rows = @import("rows.zig");
 const catalog = @import("catalog.zig");
 const bulk = @import("bulk.zig");

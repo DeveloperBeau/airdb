@@ -7,14 +7,14 @@
 // destination's backlink indexes from its copied forward links.
 
 const std = @import("std");
-const WriteTxn = @import("db.zig").WriteTxn;
-const Ref = @import("ref.zig").Ref;
+const WriteTxn = @import("database.zig").WriteTxn;
+const Ref = @import("reference.zig").Ref;
 const Column = @import("column.zig");
 const Index = @import("index.zig");
 const catalog = @import("catalog.zig");
 const blob = @import("blob.zig");
 const links = @import("links.zig");
-const bindex = @import("bindex.zig");
+const bindex = @import("byteKeyIndex.zig");
 
 /// One key->row index entry: a stable object key and its physical row.
 pub const Pair = struct { okey: u64, row: u64 };

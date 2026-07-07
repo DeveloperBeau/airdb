@@ -1,6 +1,6 @@
-// bindex.zig -- byte-keyed ordered B+tree: the shared core of bTreeCore.zig
+// byteKeyIndex.zig -- byte-keyed ordered B+tree: the shared core of bTreeCore.zig
 // instantiated with blob-ref keys. Same on-disk node layout as index.zig
-// (see index_node.zig). The ONLY difference from index.zig: the u64 stored in
+// (see indexNode.zig). The ONLY difference from index.zig: the u64 stored in
 // a leaf key slot is a blob ref to the key bytes (not the key itself), and
 // the "low_key" of an inner pair is a blob ref to the smallest key in that
 // subtree. All ordering compares the dereferenced bytes with std.mem.order;
@@ -9,7 +9,7 @@
 // ReadTxn for the read-only subset).
 
 const std = @import("std");
-const Ref = @import("ref.zig").Ref;
+const Ref = @import("reference.zig").Ref;
 const blob = @import("blob.zig");
 const bTreeCore = @import("bTreeCore.zig");
 
@@ -106,5 +106,5 @@ pub fn forEachEntry(
 }
 
 test {
-    _ = @import("bindexTests.zig");
+    _ = @import("byteKeyIndexTests.zig");
 }

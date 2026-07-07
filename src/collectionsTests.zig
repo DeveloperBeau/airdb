@@ -26,7 +26,7 @@ const dictCollect = collections.dictCollect;
 
 const testing = std.testing;
 
-const Db = @import("db.zig").Db;
+const Db = @import("database.zig").Db;
 
 const insertTyped = @import("objects.zig").insertTyped;
 

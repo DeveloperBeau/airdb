@@ -1,6 +1,6 @@
 const std = @import("std");
-const WriteTxn = @import("db.zig").WriteTxn;
-const Ref = @import("ref.zig").Ref;
+const WriteTxn = @import("database.zig").WriteTxn;
+const Ref = @import("reference.zig").Ref;
 const Column = @import("column.zig");
 const Index = @import("index.zig");
 
@@ -485,7 +485,7 @@ pub fn setPropColRef(txn: *WriteTxn, cat: Ref, p: usize, new_col: Ref) !Ref {
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
-const Db = @import("db.zig").Db;
+const Db = @import("database.zig").Db;
 
 fn objTmpPath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const u8) ![]const u8 {
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;

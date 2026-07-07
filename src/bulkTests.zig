@@ -1,12 +1,12 @@
 const std = @import("std");
 const verification = @import("verification.zig");
 const bulk = @import("bulk.zig");
-const WriteTxn = @import("db.zig").WriteTxn;
-const Ref = @import("ref.zig").Ref;
+const WriteTxn = @import("database.zig").WriteTxn;
+const Ref = @import("reference.zig").Ref;
 const Column = @import("column.zig");
 const Index = @import("index.zig");
-const cnode = @import("column_node.zig");
-const inode = @import("index_node.zig");
+const cnode = @import("columnNode.zig");
+const inode = @import("indexNode.zig");
 const catalog = @import("catalog.zig");
 const objects = @import("objects.zig");
 const rawRows = @import("rows.zig");
@@ -20,11 +20,11 @@ const bulkAppendOrInsert = bulk.bulkAppendOrInsert;
 
 const testing = std.testing;
 
-const Db = @import("db.zig").Db;
+const Db = @import("database.zig").Db;
 
 const query = @import("query.zig");
 
-const typedir = @import("typedir.zig");
+const typedir = @import("typeDirectory.zig");
 
 fn bulkTmpPath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const u8) ![]const u8 {
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;

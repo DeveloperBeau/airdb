@@ -17,8 +17,8 @@
 // is allocated for it.
 
 const std = @import("std");
-const Ref = @import("ref.zig").Ref;
-const WriteTxn = @import("db.zig").WriteTxn;
+const Ref = @import("reference.zig").Ref;
+const WriteTxn = @import("database.zig").WriteTxn;
 const section_size = @import("platform.zig").section_size;
 
 /// Largest blob stored as a single inline node. The +5 node header (tag + len)
@@ -216,7 +216,7 @@ pub fn free(txn: *WriteTxn, ref: Ref) !void {
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
-const Db = @import("db.zig").Db;
+const Db = @import("database.zig").Db;
 const Io = std.Io;
 
 fn blobTmpPath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const u8) ![]const u8 {

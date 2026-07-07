@@ -1,4 +1,4 @@
-// db.zig -- Db, ReadTxn, WriteTxn, and the two-slot atomic durable commit.
+// database.zig -- Db, ReadTxn, WriteTxn, and the two-slot atomic durable commit.
 //
 // Slot A byte range in the header page: [64, 64+Slot.size).
 // Slot B byte range in the header page: [128, 128+Slot.size).
@@ -8,17 +8,17 @@ const std = @import("std");
 const testing = std.testing;
 const Io = std.Io;
 const platform = @import("platform.zig");
-const FileStore = @import("file_store.zig").FileStore;
+const FileStore = @import("fileStore.zig").FileStore;
 const RealSyncer = @import("syncer.zig").RealSyncer;
 const Syncer = @import("syncer.zig").Syncer;
-const default_page_size = @import("file_store.zig").default_page_size;
+const default_page_size = @import("fileStore.zig").default_page_size;
 const Arena = @import("arena.zig").Arena;
 const Allocation = @import("arena.zig").Allocation;
-const Ref = @import("ref.zig").Ref;
+const Ref = @import("reference.zig").Ref;
 const Slot = @import("slots.zig").Slot;
-const FreeList = @import("freelist.zig").FreeList;
-const Coord = @import("coord.zig").Coord;
-const coord_mod = @import("coord.zig");
+const FreeList = @import("freeList.zig").FreeList;
+const Coord = @import("coordination.zig").Coord;
+const coord_mod = @import("coordination.zig");
 const versioning = @import("versioning.zig");
 const freeListRecovery = @import("freeListRecovery.zig");
 
@@ -525,12 +525,12 @@ pub const Db = struct {
 
 // ---------------------------------------------------------------------------
 // Transaction types (defined in their own modules; re-exported here so existing
-// call sites that do @import("db.zig").ReadTxn / .WriteTxn keep working).
+// call sites that do @import("database.zig").ReadTxn / .WriteTxn keep working).
 // ---------------------------------------------------------------------------
 
-pub const ReadTxn = @import("read_txn.zig").ReadTxn;
-pub const WriteTxn = @import("write_txn.zig").WriteTxn;
+pub const ReadTxn = @import("readTransaction.zig").ReadTxn;
+pub const WriteTxn = @import("writeTransaction.zig").WriteTxn;
 
 test {
-    _ = @import("dbTests.zig");
+    _ = @import("databaseTests.zig");
 }

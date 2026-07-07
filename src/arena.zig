@@ -1,6 +1,6 @@
 const std = @import("std");
-const Ref = @import("ref.zig").Ref;
-const FreeList = @import("freelist.zig").FreeList;
+const Ref = @import("reference.zig").Ref;
+const FreeList = @import("freeList.zig").FreeList;
 const platform = @import("platform.zig");
 
 const section_shift = platform.section_shift;

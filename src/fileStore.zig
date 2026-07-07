@@ -1,4 +1,4 @@
-// file_store.zig -- header, mmap, and injectable Syncer for airdb.
+// fileStore.zig -- header, mmap, and injectable Syncer for airdb.
 //
 // Zig 0.16 adaptations from the task spec:
 //   - std.fs.File           -> std.Io.File  (std.fs.File removed in 0.16)
@@ -62,7 +62,7 @@ pub const FileStore = struct {
     syncer: Syncer,
     /// True when the header CRC32 matches the stored checksum at [28..32].
     /// Set by readHeader (open path) or to true after writeHeader (create/persistHeader path).
-    /// Recovery in db.zig openWith reads this to decide whether to trust active_slot.
+    /// Recovery in database.zig openWith reads this to decide whether to trust active_slot.
     header_checksum_ok: bool,
     /// Measurement-only counters accumulated since open. Total nanoseconds spent in
     /// blocking file.setLength (file growth) and the number of such calls. Read via
@@ -223,7 +223,7 @@ pub const FileStore = struct {
 
         // Validate header CRC32: hash [0..28], compare to stored u32 at [28..32].
         // A mismatch sets header_checksum_ok = false but does NOT hard-fail;
-        // db.zig openWith decides how to recover.
+        // database.zig openWith decides how to recover.
         const stored_crc = std.mem.readInt(u32, self.map[off.checksum..][0..4], .little);
         const computed_crc = std.hash.Crc32.hash(self.map[0..28]);
         self.header_checksum_ok = (stored_crc == computed_crc);

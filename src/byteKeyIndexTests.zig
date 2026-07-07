@@ -1,11 +1,11 @@
-// bindexTests.zig -- test suite for the byte-keyed B+tree in bindex.zig.
+// byteKeyIndexTests.zig -- test suite for the byte-keyed B+tree in byteKeyIndex.zig.
 
 const std = @import("std");
 const testing = std.testing;
-const Db = @import("db.zig").Db;
+const Db = @import("database.zig").Db;
 const blob = @import("blob.zig");
-const bindex = @import("bindex.zig");
-const node = @import("index_node.zig");
+const bindex = @import("byteKeyIndex.zig");
+const node = @import("indexNode.zig");
 
 const create = bindex.create;
 const insert = bindex.insert;

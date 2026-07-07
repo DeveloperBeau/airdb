@@ -9,10 +9,10 @@
 // implementation; ReadTxn satisfies the read-only subset.
 
 const std = @import("std");
-const Ref = @import("ref.zig").Ref;
-const node = @import("column_node.zig");
+const Ref = @import("reference.zig").Ref;
+const node = @import("columnNode.zig");
 
-// Local aliases for the on-disk node format, which lives in column_node.zig.
+// Local aliases for the on-disk node format, which lives in columnNode.zig.
 const LEAF_CAP = node.LEAF_CAP;
 const FANOUT = node.FANOUT;
 const kind_leaf = node.kind_leaf;
