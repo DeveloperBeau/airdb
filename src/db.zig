@@ -16,10 +16,11 @@ const Arena = @import("arena.zig").Arena;
 const Allocation = @import("arena.zig").Allocation;
 const Ref = @import("ref.zig").Ref;
 const Slot = @import("slots.zig").Slot;
-const FreeExtent = @import("freelist.zig").FreeExtent;
 const FreeList = @import("freelist.zig").FreeList;
 const Coord = @import("coord.zig").Coord;
 const coord_mod = @import("coord.zig");
+const versioning = @import("versioning.zig");
+const freeListRecovery = @import("freeListRecovery.zig");
 
 /// Byte offset of commit slot A in the header page.
 pub const slot_a_off: usize = 64;
@@ -204,7 +205,8 @@ pub const Db = struct {
         // by-value move of store into db.store.
         const store_sections = store.sectionsView();
 
-        // Build a partial Db so we can call selectActiveSlot and loadFreeList.
+        // Build a partial Db so versioning.selectActiveSlot and
+        // freeListRecovery.loadFreeList can run against it.
         // coord is left undefined; it is set at the very end.
         // On any error path, errdefer store.deinit() (above) frees the file+mmap,
         // and errdefer db.free_list.deinit() (below) frees any allocated extents.
@@ -224,11 +226,11 @@ pub const Db = struct {
         };
         errdefer db.free_list.deinit();
 
-        const active = try db.selectActiveSlot();
+        const active = try versioning.selectActiveSlot(&db);
         db.active_version = active.version;
         db.active_root = active.root_ref;
         db.arena.top = @intCast(active.logical_size);
-        if (active.free_list_ref != 0) try db.loadFreeList(active.free_list_ref);
+        if (active.free_list_ref != 0) try freeListRecovery.loadFreeList(&db, active.free_list_ref);
 
         // Coord setup -- done last so the errdefer has no further try-s after it.
         const coord_path = try std.fmt.allocPrint(allocator, "{s}.coord", .{path});
@@ -259,172 +261,9 @@ pub const Db = struct {
         self.store.deinit();
     }
 
-    /// Select the active Slot from the shared mapping.
-    /// Reads self.store.header_checksum_ok and self.store.header.active_slot.
-    /// The caller must have called self.store.readHeader() before this when refreshing.
-    fn selectActiveSlot(self: *Db) !Slot {
-        if (self.store.header_checksum_ok) {
-            // The durable header.active_slot is the source of truth for which version is
-            // committed. The max-version heuristic would wrongly resurrect an aborted
-            // commit whose new slot was durably written in the data barrier but never
-            // published (i.e., header flush failed after the data barrier succeeded).
-            const primary_idx = self.store.header.active_slot;
-            if (primary_idx > 1) return error.Corrupt;
-            const primary_off: usize = if (primary_idx == 0) slot_a_off else slot_b_off;
-            const other_off: usize = if (primary_idx == 0) slot_b_off else slot_a_off;
-
-            // Try the primary slot first (normal path and correct crash-recovery path).
-            // Fall back to the other slot only if the primary checksum is bad, which
-            // indicates a crash mid-slot-write into the primary region itself. The
-            // fallback silently resumes from the previous version, so it is recorded
-            // on the Db and surfaced via metrics().
-            return Slot.decode(self.store.map[primary_off..][0..Slot.size]) catch {
-                const s = Slot.decode(self.store.map[other_off..][0..Slot.size]) catch return error.Corrupt;
-                self.recovered_fallback = true;
-                return s;
-            };
-        } else {
-            // Header checksum failed: the authoritative active_slot pointer is unreadable,
-            // so fall back to the highest valid-version slot. This last-resort heuristic is
-            // used ONLY when the header itself is corrupt, and is likewise surfaced.
-            const maybe_a: ?Slot = Slot.decode(self.store.map[slot_a_off..][0..Slot.size]) catch null;
-            const maybe_b: ?Slot = Slot.decode(self.store.map[slot_b_off..][0..Slot.size]) catch null;
-            const chosen: Slot = blk: {
-                if (maybe_a != null and maybe_b != null) {
-                    break :blk if (maybe_a.?.version >= maybe_b.?.version) maybe_a.? else maybe_b.?;
-                } else if (maybe_a != null) {
-                    break :blk maybe_a.?;
-                } else if (maybe_b != null) {
-                    break :blk maybe_b.?;
-                } else {
-                    return error.Corrupt;
-                }
-            };
-            self.recovered_fallback = true;
-            return chosen;
-        }
-    }
-
-    /// Decode the persisted free-list chain headed at free_list_ref into
-    /// `out`, returning the HEAD chunk's byte length. `out` must already be
-    /// initialized; its previous contents are discarded.
-    fn decodeFreeListNode(self: *Db, free_list_ref: Ref, out: *FreeList) !usize {
-        out.reset();
-        const limit: u64 = @intCast(self.store.sectionsView().len * platform.section_size);
-        var head_len: usize = 0;
-        var cref = free_list_ref;
-        var hops: usize = 0;
-        while (cref != 0) : (hops += 1) {
-            if (hops >= FreeList.max_chunks) return error.Corrupt; // ref cycle
-            // Read the chunk header to learn the chunk size and successor.
-            const hdr = try self.arena.deref(cref, FreeList.chunk_header_bytes);
-            const count = std.mem.readInt(u32, hdr[0..4], .little);
-            const node_len = FreeList.chunkByteLen(count);
-            const node_bytes = try self.arena.deref(cref, node_len);
-            const next = try out.decodeChunkAppend(node_bytes);
-            // Chunks are written back-to-front, so a legitimate chain's refs
-            // strictly DECREASE along the walk. Enforcing that kills forged or
-            // bit-rotted cycles outright: a next_ref pointing at itself or any
-            // up-chain chunk re-decoded its extents every hop, demanding
-            // terabytes of heap before the hop guard could ever fire.
-            if (next != 0 and (next % 8 != 0 or next >= cref)) return error.Corrupt;
-            if (hops == 0) head_len = node_len;
-            cref = next;
-        }
-        // Validate every decoded extent before trusting it for reuse: the
-        // free-list chunks carry no checksum of their own, and the reuse path
-        // translates offsets without bounds checks -- a bit-rotted extent
-        // would silently hand out live or out-of-bounds bytes as free space.
-        for (out.extents.items) |ex| {
-            if (ex.len == 0 or ex.offset % 8 != 0) return error.Corrupt;
-            if (ex.offset > limit or ex.len > limit - ex.offset) return error.Corrupt;
-        }
-        return head_len;
-    }
-
-    /// Decode the persisted free-list node at free_list_ref into self.free_list.
-    /// Sets self.free_list_node_ref and self.free_list_node_len.
-    /// self.free_list must already be initialized (possibly empty).
-    fn loadFreeList(self: *Db, free_list_ref: Ref) !void {
-        const node_len = try self.decodeFreeListNode(free_list_ref, &self.free_list);
-        self.free_list_node_ref = free_list_ref;
-        self.free_list_node_len = node_len;
-    }
-
-    /// Select the highest-version slot that qualifies as published (version <= lv).
-    /// Decodes both slot A and slot B; among those that decode successfully and
-    /// have version <= lv, returns the one with the highest version. Returns null
-    /// if no qualifying slot exists. Slots with version > lv are in-flight or
-    /// aborted and must never be returned.
-    fn selectPublishedSlot(self: *Db, lv: u64) ?Slot {
-        const maybe_a: ?Slot = Slot.decode(self.store.map[slot_a_off..][0..Slot.size]) catch null;
-        const maybe_b: ?Slot = Slot.decode(self.store.map[slot_b_off..][0..Slot.size]) catch null;
-        var best: ?Slot = null;
-        for ([_]?Slot{ maybe_a, maybe_b }) |ms| {
-            const s = ms orelse continue;
-            if (s.version > lv) continue;
-            if (best == null or s.version > best.?.version) best = s;
-        }
-        return best;
-    }
-
-    /// Refresh this instance's in-memory view from the shared memory mapping.
-    /// Gates advancement on coord.latestVersion() so that a slot written by an
-    /// aborted commit (durable data barrier but failed header flush) is never
-    /// observed. Only a version <= the published latest_version may be adopted.
-    ///
-    /// Safety: must only be called when no write transaction is in progress.
-    /// It is called at the start of beginRead and beginWrite (before any txn
-    /// state is built), which is safe.
-    fn refreshToLatest(self: *Db) !void {
-        const lv = self.coord.latestVersion(); // acquire-load of the published version
-        if (lv <= self.active_version) return; // nothing newer has been published
-        try self.store.readHeader(); // refresh header_checksum_ok / mapping view (for integrity use elsewhere)
-        // If another process extended the file, map the new sections before dereferencing
-        // slot descriptors or free-list nodes that may live in the grown region.
-        const flen = try self.store.fileLen();
-        const mapped = self.store.sectionsView().len * platform.section_size;
-        if (flen > mapped) {
-            try self.store.grow(@intCast(flen));
-            self.arena.sections = self.store.sectionsView();
-        }
-        const published = self.selectPublishedSlot(lv) orelse return; // no qualifying published slot visible yet
-        if (published.version <= self.active_version) return;
-        // Decode the published free list into a temporary FIRST. A decode
-        // failure must leave this instance's committed state (version, root,
-        // top, free list) fully intact: advancing the version with an empty
-        // free list would make the next commit durably persist that empty list
-        // and permanently drop every reclaimable-extent record.
-        var new_fl = FreeList.init(self.store.allocator);
-        errdefer new_fl.deinit();
-        var node_len: usize = 0;
-        if (published.free_list_ref != 0) {
-            node_len = try self.decodeFreeListNode(published.free_list_ref, &new_fl);
-        }
-        // All decoding succeeded: install everything together.
-        self.active_version = published.version;
-        self.active_root = published.root_ref;
-        self.arena.top = @intCast(published.logical_size);
-        self.free_list.deinit();
-        self.free_list = new_fl;
-        self.free_list_node_ref = published.free_list_ref;
-        self.free_list_node_len = node_len;
-    }
-
-    /// Returns the minimum pinned version among all active readers, or sentinel_max if none.
-    fn localMinPinned(self: *Db) u64 {
-        var min: ?u64 = null;
-        var it = self.pins.iterator();
-        while (it.next()) |entry| {
-            if (entry.value_ptr.* == 0) continue;
-            if (min == null or entry.key_ptr.* < min.?) min = entry.key_ptr.*;
-        }
-        return min orelse coord_mod.sentinel_max;
-    }
-
     /// Publish the local minimum pinned version to our participant slot (if we have one).
     pub fn publishPins(self: *Db) void {
-        if (self.participant_slot) |idx| self.coord.publishMinPinned(idx, self.localMinPinned());
+        versioning.publishPins(self);
     }
 
     pub fn beginRead(self: *Db) !ReadTxn {
@@ -440,7 +279,7 @@ pub const Db = struct {
         // versions only move forward and each retry pins the newest one seen.
         var prev_v: ?u64 = null;
         while (true) {
-            try self.refreshToLatest();
+            try versioning.refreshToLatest(self);
             const v = self.active_version;
             const root = self.active_root;
             // A retry that made no progress means the published version keeps
@@ -471,7 +310,7 @@ pub const Db = struct {
     /// aged out of the retention window (its nodes may have been reclaimed).
     /// Pins the version so its nodes are held for the life of the read.
     pub fn beginReadAt(self: *Db, version: u64) !ReadTxn {
-        try self.refreshToLatest();
+        try versioning.refreshToLatest(self);
         if (version > self.active_version) return error.VersionUnavailable;
         // Must be inside the retention window: older versions' nodes may already
         // be reclaimed. maxInt means "retain everything".
@@ -508,14 +347,10 @@ pub const Db = struct {
         return ReadTxn{ .db = self, .root_ref = root, .version = version };
     }
 
+    /// The minimum version pinned by a live reader in this process, or the
+    /// active version if no reader is open.
     pub fn horizon(self: *Db) u64 {
-        var min: ?u64 = null;
-        var it = self.pins.iterator();
-        while (it.next()) |entry| {
-            if (entry.value_ptr.* == 0) continue;
-            if (min == null or entry.key_ptr.* < min.?) min = entry.key_ptr.*;
-        }
-        return min orelse self.active_version;
+        return versioning.horizon(self);
     }
 
     /// Oldest version still pinned by a live reader in this process, or the
@@ -539,75 +374,34 @@ pub const Db = struct {
         return self.store.fileLen();
     }
 
-    fn retainPtr(self: *Db) *u64 {
-        return @ptrCast(@alignCast(&self.store.map[retain_off]));
-    }
-
     /// The shared retention window: recently-freed space is withheld from reuse
     /// for the most recent `retainVersions()` versions, across ALL processes.
     pub fn retainVersions(self: *Db) u64 {
-        return @atomicLoad(u64, self.retainPtr(), .acquire);
+        return versioning.retainVersions(self);
     }
 
     /// Withhold recently-freed space from reuse for the most recent `n` versions.
-    /// Shared and durable: the value lives in the header page, so every attached
-    /// process honors it immediately, and it is carried to disk by the next
-    /// commit's flush. Lowering the window while point-in-time readers are
-    /// active in other processes is unsafe; raise-only while readers may exist.
+    /// Shared and durable; see versioning.setRetainVersions for the safety rules.
     pub fn setRetainVersions(self: *Db, n: u64) void {
-        @atomicStore(u64, self.retainPtr(), n, .release);
+        versioning.setRetainVersions(self, n);
     }
 
-    /// Root ref for a committed version, or null if not retained / not yet committed.
-    /// The `version > active_version` guard rejects a ring entry written during a
-    /// commit that crashed/aborted before publishing (the slot flip never happened),
-    /// so a recorded-but-unpublished pair is never trusted.
-    ///
-    /// The ring is scanned newest-to-oldest. A commit that failed its durability
-    /// barrier leaves its (version, root) entry behind, and the retry commit --
-    /// which reuses the same version number -- writes a second entry for that
-    /// version. The retry's entry is always written later, so the newest match is
-    /// the committed root and the aborted duplicate is never returned.
+    /// Root ref for a committed version, or null if not retained / not yet
+    /// committed. See versioning.versionRoot for the ring-scan rules.
     pub fn versionRoot(self: *Db, version: u64) ?u64 {
-        if (version > self.active_version) return null;
-        const map = self.store.map;
-        const head = std.mem.readInt(u64, map[ring_head_off..][0..8], .little);
-        const n = @min(head, ring_capacity);
-        var j: u64 = 0;
-        while (j < n) : (j += 1) {
-            const slot_idx: usize = @intCast((head - 1 - j) % ring_capacity);
-            const e = ring_off + slot_idx * 16;
-            const v = std.mem.readInt(u64, map[e..][0..8], .little);
-            if (v == version) return std.mem.readInt(u64, map[e + 8 ..][0..8], .little);
-        }
-        return null;
+        return versioning.versionRoot(self, version);
     }
 
-    /// Oldest version still recorded in the ring, or active_version if the ring is
-    /// empty. As the ring wraps, the recovery window's lower bound advances. Entries
-    /// above active_version (an unpublished/aborted commit) are ignored.
+    /// Oldest version still recorded in the ring, or active_version if the
+    /// ring is empty.
     pub fn oldestRetainedVersion(self: *Db) u64 {
-        const map = self.store.map;
-        const head = std.mem.readInt(u64, map[ring_head_off..][0..8], .little);
-        const n = @min(head, ring_capacity);
-        var i: u64 = 0;
-        var min: ?u64 = null;
-        while (i < n) : (i += 1) {
-            const e = ring_off + @as(usize, @intCast(i)) * 16;
-            const v = std.mem.readInt(u64, map[e..][0..8], .little);
-            if (v > self.active_version) continue;
-            if (min == null or v < min.?) min = v;
-        }
-        return min orelse self.active_version;
+        return versioning.oldestRetainedVersion(self);
     }
 
-    /// Oldest version `beginReadAt` can open: the later of the oldest ring entry
-    /// and the retention-window floor. Versions in [this, active_version] open.
+    /// Oldest version `beginReadAt` can open: the later of the oldest ring
+    /// entry and the retention-window floor.
     pub fn oldestReadableVersion(self: *Db) u64 {
-        const ring_floor = self.oldestRetainedVersion();
-        const retain = self.retainVersions();
-        if (retain == coord_mod.sentinel_max) return ring_floor;
-        return @max(ring_floor, self.active_version -| retain);
+        return versioning.oldestReadableVersion(self);
     }
 
     /// Shared body for beginWrite and beginWriteTry. Caller must hold the coord
@@ -619,7 +413,7 @@ pub const Db = struct {
         // published. Reopen to resolve.
         if (self.poisoned) return error.CommitIndeterminate;
         // Refresh under the lock so the writer sees the truly-latest committed version.
-        try self.refreshToLatest();
+        try versioning.refreshToLatest(self);
         // Clone the committed free list into work_freelist so the transaction
         // can reuse extents from it. db.free_list is untouched during the txn;
         // work_freelist is the mutable clone that reuse() shrinks.
@@ -727,7 +521,6 @@ pub const Db = struct {
             .poisoned = self.poisoned,
         };
     }
-
 };
 
 // ---------------------------------------------------------------------------
@@ -737,105 +530,6 @@ pub const Db = struct {
 
 pub const ReadTxn = @import("read_txn.zig").ReadTxn;
 pub const WriteTxn = @import("write_txn.zig").WriteTxn;
-
-// Tests of file-private invariants; the main suite lives in dbTests.zig.
-
-fn tmpFilePath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const u8) ![]const u8 {
-    var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
-    const path_len = try tmp.dir.realPath(testing.io, &path_buf);
-    const dir_path = path_buf[0..path_len];
-    return std.fs.path.join(allocator, &.{ dir_path, name });
-}
-
-test "recovery follows header active_slot pointer, not max version" {
-    // Regression test: after a crash where the data barrier (step 3 of commit) made
-    // the new slot durable but the header flush (step 5) never completed, Db.open must
-    // recover the version that header.active_slot points to, not the highest-version
-    // slot on disk.
-    //
-    // Setup: header.active_slot=0 (slot A, version 1). We manually write a valid
-    // higher-version slot (version 50) into slot B's byte range WITHOUT updating
-    // header.active_slot. This is exactly the dangerous on-disk state that a
-    // max-version heuristic would mishandle.
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try tmpFilePath(testing.allocator, &tmp, "recovery.airdb");
-    defer testing.allocator.free(path);
-
-    {
-        var db = try Db.create(testing.allocator, path);
-        defer db.deinit();
-        // Inject a plausible-but-aborted slot into slot B without touching the header.
-        const aborted = Slot{ .version = 50, .root_ref = 0, .free_list_ref = 0, .logical_size = default_page_size };
-        aborted.encode(db.store.map[slot_b_off..][0..Slot.size]);
-        try db.store.syncer.flush(db.store.file);
-        // header.active_slot remains 0 (slot A, version 1).
-    }
-
-    // On reopen the correct recovery path must pick slot A (header.active_slot=0,
-    // version 1), not slot B (version 50).
-    {
-        var db = try Db.open(testing.allocator, path);
-        defer db.deinit();
-        try testing.expectEqual(@as(u64, 1), db.active_version);
-    }
-}
-
-test "falling back past a corrupt primary slot is surfaced in metrics" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try tmpFilePath(testing.allocator, &tmp, "fallback.airdb");
-    defer testing.allocator.free(path);
-    {
-        var db = try Db.create(testing.allocator, path);
-        defer db.deinit();
-        var w = try db.beginWrite();
-        const a = try w.alloc(8);
-        @memcpy(a.bytes, "VERSION2");
-        w.setRoot(a.ref);
-        _ = try w.commit();
-        try testing.expect(!db.metrics().recovered_fallback); // clean session
-        // Corrupt the PRIMARY (active) slot's checksum region on disk.
-        const primary_off: usize = if (db.store.header.active_slot == 0) slot_a_off else slot_b_off;
-        db.store.map[primary_off + 4] ^= 0xFF;
-        try db.store.syncer.flush(db.store.file);
-    }
-    {
-        var db = try Db.open(testing.allocator, path);
-        defer db.deinit();
-        // Recovery used the other slot (the previous version) and says so.
-        try testing.expect(db.metrics().recovered_fallback);
-        try testing.expectEqual(@as(u64, 1), db.active_version);
-    }
-}
-
-test "refresh does not advance to a durable-but-unpublished (aborted) slot" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try tmpFilePath(testing.allocator, &tmp, "unpub.airdb");
-    defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    {
-        var w = try db.beginWrite();
-        const a = try w.alloc(8);
-        @memcpy(a.bytes, "PUBLISH_");
-        w.setRoot(a.ref);
-        _ = try w.commit(); // publishes; coord.latest_version advances to this version
-    }
-    const published_version = db.active_version;
-    // Forge a VALID slot with a much higher version into the inactive slot bytes,
-    // WITHOUT advancing coord.latest_version (simulates an aborted-but-durable commit).
-    const forged = Slot{ .version = published_version + 50, .root_ref = 0, .free_list_ref = 0, .logical_size = default_page_size };
-    var buf: [Slot.size]u8 = undefined;
-    forged.encode(&buf);
-    // Write it into whichever slot is currently inactive. The active slot is header.active_slot.
-    const inactive_off: usize = if (db.store.header.active_slot == 0) slot_b_off else slot_a_off;
-    @memcpy(db.store.map[inactive_off .. inactive_off + Slot.size], &buf);
-    // Refresh must NOT advance to the forged version (coord.latest_version unchanged).
-    try db.refreshToLatest();
-    try testing.expectEqual(published_version, db.active_version);
-}
 
 test {
     _ = @import("dbTests.zig");
