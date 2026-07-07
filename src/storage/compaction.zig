@@ -46,7 +46,7 @@ pub fn compactType(transaction: *WriteTransaction, catalogRef: Reference) !Refer
         var j: usize = 0;
         while (j < propertyCount) : (j += 1) oldPropertyColumns[j] = s.properties[j].col;
     }
-    const old_ver = s.version_col_ref;
+    const oldVersion = s.version_col_ref;
     const old_live = s.live_col_ref;
     const old_keyrow = s.keyrow_index_ref;
 
@@ -72,8 +72,8 @@ pub fn compactType(transaction: *WriteTransaction, catalogRef: Reference) !Refer
             const cell = try Column.get(transaction, oldPropertyColumns[j], pr.row);
             s.properties[j].col = try Column.append(transaction, s.properties[j].col, cell);
         }
-        const ver = try Column.get(transaction, old_ver, pr.row);
-        s.version_col_ref = try Column.append(transaction, s.version_col_ref, ver);
+        const version = try Column.get(transaction, oldVersion, pr.row);
+        s.version_col_ref = try Column.append(transaction, s.version_col_ref, version);
         s.live_col_ref = try Column.append(transaction, s.live_col_ref, 1);
         s.keyrow_index_ref = try Index.insert(transaction, s.keyrow_index_ref, pr.objectKey, new_row);
         new_row += 1;
@@ -88,7 +88,7 @@ pub fn compactType(transaction: *WriteTransaction, catalogRef: Reference) !Refer
         var j: usize = 0;
         while (j < propertyCount) : (j += 1) try Column.freeTree(transaction, oldPropertyColumns[j]);
     }
-    try Column.freeTree(transaction, old_ver);
+    try Column.freeTree(transaction, oldVersion);
     try Column.freeTree(transaction, old_live);
     try Index.freeTree(transaction, old_keyrow);
 
@@ -402,12 +402,12 @@ pub fn compactToNewFile(allocator: std.mem.Allocator, src_path: []const u8, dst_
         while (t < tc) : (t += 1) {
             const sc = try typedir.catalogRef(&src_r, src_dir, t);
             const v = try catalog.loadCatalog(&src_r, sc);
-            const defs = try allocator.alloc(catalog.PropertyDefinition, v.propertyCount);
+            const definitions = try allocator.alloc(catalog.PropertyDefinition, v.propertyCount);
             var j: usize = 0;
             while (j < v.propertyCount) : (j += 1) {
-                defs[j] = .{ .kind = v.kind(j), .elem = v.elemKind(j), .link_target = v.linkTarget(j), .del_rule = v.delRule(j), .indexed = v.indexed(j) };
+                definitions[j] = .{ .kind = v.kind(j), .element = v.elementKind(j), .link_target = v.linkTarget(j), .del_rule = v.delRule(j), .indexed = v.indexed(j) };
             }
-            try schema.append(allocator, defs);
+            try schema.append(allocator, definitions);
             try embedded.append(allocator, try typedir.isEmbedded(&src_r, src_dir, t));
         }
     }

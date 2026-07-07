@@ -130,13 +130,13 @@ export fn airdb_prop_count(handle: ?*DatabaseHandle) i64 {
     return @intCast(self.propertyCount);
 }
 
-// Insert a row of `len` u64 values (must equal propertyCount; vals[0] is the
+// Insert a row of `length` u64 values (must equal propertyCount; vals[0] is the
 // primary key). Returns the new object key on success.
-export fn airdb_insert(handle: ?*DatabaseHandle, vals: [*]const u64, len: usize) i64 {
+export fn airdb_insert(handle: ?*DatabaseHandle, vals: [*]const u64, length: usize) i64 {
     const self = handle orelse return AIRDB_E_GENERIC;
-    if (len != self.propertyCount) return AIRDB_E_BAD_ARGS;
+    if (length != self.propertyCount) return AIRDB_E_BAD_ARGS;
     var w = self.database.beginWrite() catch return commitErrCode(self);
-    const r = rows.insert(&w, w.new_root, vals[0..len]) catch |e| {
+    const r = rows.insert(&w, w.new_root, vals[0..length]) catch |e| {
         w.deinit();
         return if (e == error.DuplicateKey) AIRDB_E_DUPLICATE else AIRDB_E_GENERIC;
     };
@@ -145,15 +145,15 @@ export fn airdb_insert(handle: ?*DatabaseHandle, vals: [*]const u64, len: usize)
     return @intCast(r.row);
 }
 
-// Read the row with primary key `primaryKey` into `out` (len must equal propertyCount).
+// Read the row with primary key `primaryKey` into `out` (length must equal propertyCount).
 // Returns the row version (>= 1) on success, AIRDB_E_NOT_FOUND if absent.
-export fn airdb_get(handle: ?*DatabaseHandle, primaryKey: u64, out: [*]u64, len: usize) i64 {
+export fn airdb_get(handle: ?*DatabaseHandle, primaryKey: u64, out: [*]u64, length: usize) i64 {
     const self = handle orelse return AIRDB_E_GENERIC;
-    if (len != self.propertyCount) return AIRDB_E_BAD_ARGS;
+    if (length != self.propertyCount) return AIRDB_E_BAD_ARGS;
     var r = self.database.beginRead() catch return AIRDB_E_GENERIC;
     defer r.end();
-    const ver = rows.getByPrimaryKey(&r, r.root(), primaryKey, out[0..len]) catch return AIRDB_E_GENERIC;
-    return if (ver) |v| @intCast(v) else AIRDB_E_NOT_FOUND;
+    const version = rows.getByPrimaryKey(&r, r.root(), primaryKey, out[0..length]) catch return AIRDB_E_GENERIC;
+    return if (version) |v| @intCast(v) else AIRDB_E_NOT_FOUND;
 }
 
 // Number of live rows. Returns the count or a negative error code.
@@ -165,24 +165,24 @@ export fn airdb_count(handle: ?*DatabaseHandle) i64 {
     return @intCast(c);
 }
 
-// Update the row with primary key `primaryKey` to `vals` (len must equal propertyCount,
+// Update the row with primary key `primaryKey` to `vals` (length must equal propertyCount,
 // vals[0] must equal primaryKey). Auto-reads the current version, so it always applies
 // (no optimistic check at this layer). Returns AIRDB_OK or an error code.
-export fn airdb_update(handle: ?*DatabaseHandle, vals: [*]const u64, len: usize) i64 {
+export fn airdb_update(handle: ?*DatabaseHandle, vals: [*]const u64, length: usize) i64 {
     const self = handle orelse return AIRDB_E_GENERIC;
-    if (len != self.propertyCount) return AIRDB_E_BAD_ARGS;
+    if (length != self.propertyCount) return AIRDB_E_BAD_ARGS;
     const primaryKey = vals[0];
     var w = self.database.beginWrite() catch return commitErrCode(self);
     var cur: [MAX_PROPS]u64 = undefined;
-    const ver = rows.getByPrimaryKey(&w, w.new_root, primaryKey, cur[0..len]) catch {
+    const version = rows.getByPrimaryKey(&w, w.new_root, primaryKey, cur[0..length]) catch {
         w.deinit();
         return AIRDB_E_GENERIC;
     };
-    if (ver == null) {
+    if (version == null) {
         w.deinit();
         return AIRDB_E_NOT_FOUND;
     }
-    const res = rows.update(&w, w.new_root, primaryKey, vals[0..len], ver.?) catch {
+    const res = rows.update(&w, w.new_root, primaryKey, vals[0..length], version.?) catch {
         w.deinit();
         return AIRDB_E_GENERIC;
     };
@@ -208,15 +208,15 @@ export fn airdb_delete(handle: ?*DatabaseHandle, primaryKey: u64) i64 {
     const self = handle orelse return AIRDB_E_GENERIC;
     var w = self.database.beginWrite() catch return commitErrCode(self);
     var cur: [MAX_PROPS]u64 = undefined;
-    const ver = rows.getByPrimaryKey(&w, w.new_root, primaryKey, cur[0..self.propertyCount]) catch {
+    const version = rows.getByPrimaryKey(&w, w.new_root, primaryKey, cur[0..self.propertyCount]) catch {
         w.deinit();
         return AIRDB_E_GENERIC;
     };
-    if (ver == null) {
+    if (version == null) {
         w.deinit();
         return AIRDB_E_NOT_FOUND;
     }
-    const res = rows.delete(&w, w.new_root, primaryKey, ver.?) catch {
+    const res = rows.delete(&w, w.new_root, primaryKey, version.?) catch {
         w.deinit();
         return AIRDB_E_GENERIC;
     };
@@ -372,15 +372,15 @@ export fn airdb_abort(transaction: ?*Transaction) void {
     alloc.destroy(t);
 }
 
-// Stage an insert in the open transaction (no commit). vals has `len` u64
+// Stage an insert in the open transaction (no commit). vals has `length` u64
 // values (must equal propertyCount; vals[0] is the primary key). Returns the new
 // object key on success. On error the transaction stays open and the catalog ref is not
 // advanced, so the batch remains consistent.
-export fn airdb_txn_insert(transaction: ?*Transaction, vals: [*]const u64, len: usize) i64 {
+export fn airdb_txn_insert(transaction: ?*Transaction, vals: [*]const u64, length: usize) i64 {
     const t = transaction orelse return AIRDB_E_GENERIC;
     if (t.poisoned) return AIRDB_E_GENERIC;
-    if (len != t.databaseHandle.propertyCount) return AIRDB_E_BAD_ARGS;
-    const r = rows.insert(&t.w, t.catalogRef, vals[0..len]) catch |e| {
+    if (length != t.databaseHandle.propertyCount) return AIRDB_E_BAD_ARGS;
+    const r = rows.insert(&t.w, t.catalogRef, vals[0..length]) catch |e| {
         if (e == error.DuplicateKey) return AIRDB_E_DUPLICATE; // pre-mutation check: transaction stays usable
         t.poisoned = true; // mid-mutation failure: the batch may reference freed nodes
         return AIRDB_E_GENERIC;
@@ -392,15 +392,15 @@ export fn airdb_txn_insert(transaction: ?*Transaction, vals: [*]const u64, len: 
 // Stage an update in the open transaction (no commit). Mirrors airdb_update
 // against the threaded catalog ref. Returns AIRDB_OK or an error code; on error
 // the transaction stays open and the catalog ref is not advanced.
-export fn airdb_txn_update(transaction: ?*Transaction, vals: [*]const u64, len: usize) i64 {
+export fn airdb_txn_update(transaction: ?*Transaction, vals: [*]const u64, length: usize) i64 {
     const t = transaction orelse return AIRDB_E_GENERIC;
     if (t.poisoned) return AIRDB_E_GENERIC;
-    if (len != t.databaseHandle.propertyCount) return AIRDB_E_BAD_ARGS;
+    if (length != t.databaseHandle.propertyCount) return AIRDB_E_BAD_ARGS;
     const primaryKey = vals[0];
     var cur: [MAX_PROPS]u64 = undefined;
-    const ver = rows.getByPrimaryKey(&t.w, t.catalogRef, primaryKey, cur[0..len]) catch return AIRDB_E_GENERIC;
-    if (ver == null) return AIRDB_E_NOT_FOUND;
-    const res = rows.update(&t.w, t.catalogRef, primaryKey, vals[0..len], ver.?) catch {
+    const version = rows.getByPrimaryKey(&t.w, t.catalogRef, primaryKey, cur[0..length]) catch return AIRDB_E_GENERIC;
+    if (version == null) return AIRDB_E_NOT_FOUND;
+    const res = rows.update(&t.w, t.catalogRef, primaryKey, vals[0..length], version.?) catch {
         t.poisoned = true; // mid-mutation failure
         return AIRDB_E_GENERIC;
     };
@@ -421,9 +421,9 @@ export fn airdb_txn_delete(transaction: ?*Transaction, primaryKey: u64) i64 {
     const t = transaction orelse return AIRDB_E_GENERIC;
     if (t.poisoned) return AIRDB_E_GENERIC;
     var cur: [MAX_PROPS]u64 = undefined;
-    const ver = rows.getByPrimaryKey(&t.w, t.catalogRef, primaryKey, cur[0..t.databaseHandle.propertyCount]) catch return AIRDB_E_GENERIC;
-    if (ver == null) return AIRDB_E_NOT_FOUND;
-    const res = rows.delete(&t.w, t.catalogRef, primaryKey, ver.?) catch {
+    const version = rows.getByPrimaryKey(&t.w, t.catalogRef, primaryKey, cur[0..t.databaseHandle.propertyCount]) catch return AIRDB_E_GENERIC;
+    if (version == null) return AIRDB_E_NOT_FOUND;
+    const res = rows.delete(&t.w, t.catalogRef, primaryKey, version.?) catch {
         t.poisoned = true; // mid-mutation failure
         return AIRDB_E_GENERIC;
     };
@@ -472,9 +472,9 @@ export fn airdb_commit(transaction: ?*Transaction) i64 {
 const testing = std.testing;
 
 fn ffiTmpPathZ(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const u8) ![:0]u8 {
-    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const dlen = try tmp.dir.realPath(testing.io, &path_buf);
-    const joined = try std.fs.path.join(allocator, &.{ path_buf[0..dlen], name });
+    var pathBuffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dlen = try tmp.dir.realPath(testing.io, &pathBuffer);
+    const joined = try std.fs.path.join(allocator, &.{ pathBuffer[0..dlen], name });
     defer allocator.free(joined);
     return allocator.dupeZ(u8, joined);
 }
@@ -499,8 +499,8 @@ test "ffi: open, insert, get, count, update, delete, reopen" {
 
     // get
     var out: [3]u64 = undefined;
-    const ver = airdb_get(h, 200, &out, 3);
-    try testing.expect(ver >= 1);
+    const version = airdb_get(h, 200, &out, 3);
+    try testing.expect(version >= 1);
     try testing.expectEqual(@as(u64, 200), out[0]);
     try testing.expectEqual(@as(u64, 8), out[1]);
     try testing.expectEqual(AIRDB_E_NOT_FOUND, airdb_get(h, 999, &out, 3));

@@ -26,7 +26,7 @@ pub const Predicate = struct {
     value: u64,
 };
 
-fn cmp(op: Op, lhs: u64, rhs: u64) bool {
+fn matches(op: Op, lhs: u64, rhs: u64) bool {
     return switch (op) {
         .eq => lhs == rhs,
         .ne => lhs != rhs,
@@ -76,7 +76,7 @@ fn openScan(transaction: anytype, catalogRef: Reference) !Scan {
 fn rowMatches(transaction: anytype, s: *const Scan, row: u64, preds: []const Predicate) !bool {
     for (preds) |p| {
         const raw = try Column.get(transaction, s.propertyRefs[p.property], row);
-        if (!cmp(p.op, raw, p.value)) return false;
+        if (!matches(p.op, raw, p.value)) return false;
     }
     return true;
 }
@@ -372,9 +372,9 @@ const testing = std.testing;
 const Database = @import("database.zig").Database;
 
 fn qTmpPath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const u8) ![]const u8 {
-    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const dlen = try tmp.dir.realPath(testing.io, &path_buf);
-    return std.fs.path.join(allocator, &.{ path_buf[0..dlen], name });
+    var pathBuffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dlen = try tmp.dir.realPath(testing.io, &pathBuffer);
+    return std.fs.path.join(allocator, &.{ pathBuffer[0..dlen], name });
 }
 
 // ---------------------------------------------------------------------------
@@ -388,15 +388,15 @@ fn qTmpPath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const u8
 // between the index path and the full scan is a defect.
 // ---------------------------------------------------------------------------
 
-// Build a 3-property type: property0 = primaryKey, property1 = value (indexed iff `idx`), property2 =
+// Build a 3-property type: property0 = primaryKey, property1 = value (indexed iff `indexed`), property2 =
 // secondary. Inserts n rows with primaryKey=i, property1=i%100, property2=i.
-fn seedPlannerCatalog(w: *@import("database.zig").WriteTransaction, idx: bool, n: u64) !Reference {
-    const defs = [_]catalog.PropertyDefinition{
+fn seedPlannerCatalog(w: *@import("database.zig").WriteTransaction, indexed: bool, n: u64) !Reference {
+    const definitions = [_]catalog.PropertyDefinition{
         .{ .kind = .int },
-        .{ .kind = .int, .indexed = idx },
+        .{ .kind = .int, .indexed = indexed },
         .{ .kind = .int },
     };
-    var catalogRef = try catalog.createDefs(w, &defs);
+    var catalogRef = try catalog.createFromDefinitions(w, &definitions);
     var i: u64 = 0;
     while (i < n) : (i += 1) catalogRef = (try rows.insert(w, catalogRef, &.{ i, i % 100, i })).catalogRef;
     return catalogRef;

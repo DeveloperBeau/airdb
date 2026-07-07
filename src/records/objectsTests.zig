@@ -32,9 +32,9 @@ const loadPropertyCount = catalog.loadPropertyCount;
 const liveCount = catalog.liveCount;
 
 fn objTmpPath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const u8) ![]const u8 {
-    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const dlen = try tmp.dir.realPath(testing.io, &path_buf);
-    return std.fs.path.join(allocator, &.{ path_buf[0..dlen], name });
+    var pathBuffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dlen = try tmp.dir.realPath(testing.io, &pathBuffer);
+    return std.fs.path.join(allocator, &.{ pathBuffer[0..dlen], name });
 }
 
 test "insert appends a row" {
@@ -81,8 +81,8 @@ test "getByPrimaryKey reads property values and the row version" {
     catalogRef = (try insert(&w, catalogRef, &.{ 200, 8, 0 })).catalogRef;
 
     var out: [3]u64 = undefined;
-    const ver = try getByPrimaryKey(&w, catalogRef, 200, &out);
-    try testing.expect(ver != null);
+    const version = try getByPrimaryKey(&w, catalogRef, 200, &out);
+    try testing.expect(version != null);
     try testing.expectEqual(@as(u64, 200), out[0]);
     try testing.expectEqual(@as(u64, 8), out[1]);
     try testing.expectEqual(@as(u64, 0), out[2]);
@@ -146,8 +146,8 @@ test "update copies only the columns whose value changed" {
     const col2 = before.propertyColumnRef(2);
 
     var out: [3]u64 = undefined;
-    const ver = (try getByPrimaryKey(&w, catalogRef, 1, &out)).?;
-    const res = try update(&w, catalogRef, 1, &.{ 1, 99, 20 }, ver);
+    const version = (try getByPrimaryKey(&w, catalogRef, 1, &out)).?;
+    const res = try update(&w, catalogRef, 1, &.{ 1, 99, 20 }, version);
     try testing.expect(res == .ok);
     catalogRef = res.ok.catalogRef;
 
@@ -310,14 +310,14 @@ test "100k objects with updates and deletes match a reference map after reopen" 
         defer keys.deinit(testing.allocator);
         var kit = ref.keyIterator();
         while (kit.next()) |k| try keys.append(testing.allocator, k.*);
-        for (keys.items, 0..) |primaryKey, idx| {
-            const ver = (try getByPrimaryKey(&w, catalogRef, primaryKey, &out)).?;
-            if (idx % 5 == 0) {
-                const res = try update(&w, catalogRef, primaryKey, &.{ primaryKey, out[1] +% 1 }, ver);
+        for (keys.items, 0..) |primaryKey, index| {
+            const version = (try getByPrimaryKey(&w, catalogRef, primaryKey, &out)).?;
+            if (index % 5 == 0) {
+                const res = try update(&w, catalogRef, primaryKey, &.{ primaryKey, out[1] +% 1 }, version);
                 catalogRef = res.ok.catalogRef;
                 try ref.put(primaryKey, out[1] +% 1);
-            } else if (idx % 7 == 0) {
-                const res = try delete(&w, catalogRef, primaryKey, ver);
+            } else if (index % 7 == 0) {
+                const res = try delete(&w, catalogRef, primaryKey, version);
                 catalogRef = res.ok;
                 _ = ref.remove(primaryKey);
             }
@@ -333,8 +333,8 @@ test "100k objects with updates and deletes match a reference map after reopen" 
         var out: [2]u64 = undefined;
         var it = ref.iterator();
         while (it.next()) |e| {
-            const ver = try getByPrimaryKey(&r, r.root(), e.key_ptr.*, &out);
-            try testing.expect(ver != null);
+            const version = try getByPrimaryKey(&r, r.root(), e.key_ptr.*, &out);
+            try testing.expect(version != null);
             try testing.expectEqual(e.value_ptr.*, out[1]);
         }
         r.end();
@@ -353,8 +353,8 @@ test "typed insert and get round-trip a string property" {
     catalogRef = (try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .bytes = "Ada" }, .{ .int = 30 } })).catalogRef;
     catalogRef = (try insertTyped(&w, catalogRef, &.{ .{ .int = 2 }, .{ .bytes = "Linus" }, .{ .int = 54 } })).catalogRef;
     var out: [3]Value = undefined;
-    const ver = try getTyped(&w, catalogRef, 2, &out);
-    try testing.expect(ver != null);
+    const version = try getTyped(&w, catalogRef, 2, &out);
+    try testing.expect(version != null);
     try testing.expectEqual(@as(u64, 2), out[0].int);
     try testing.expectEqualStrings("Linus", out[1].bytes);
     try testing.expectEqual(@as(u64, 54), out[2].int);
@@ -372,9 +372,9 @@ test "typed update on a stale version does not free the old blob" {
     var catalogRef = try createTyped(&w, &.{ .int, .blob });
     catalogRef = (try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .bytes = "short" } })).catalogRef;
     var out: [2]Value = undefined;
-    const ver = (try getTyped(&w, catalogRef, 1, &out)).?;
+    const version = (try getTyped(&w, catalogRef, 1, &out)).?;
     // stale-version update must NOT free the old blob (conflict path)
-    const conflict = try updateTyped(&w, catalogRef, 1, &.{ .{ .int = 1 }, .{ .bytes = "X" } }, ver + 1);
+    const conflict = try updateTyped(&w, catalogRef, 1, &.{ .{ .int = 1 }, .{ .bytes = "X" } }, version + 1);
     try testing.expect(conflict == .conflict);
     _ = (try getTyped(&w, catalogRef, 1, &out)).?;
     try testing.expectEqualStrings("short", out[1].bytes);
@@ -392,8 +392,8 @@ test "typed update replaces a string" {
     var catalogRef = try createTyped(&w, &.{ .int, .blob });
     catalogRef = (try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .bytes = "short" } })).catalogRef;
     var out: [2]Value = undefined;
-    const ver = (try getTyped(&w, catalogRef, 1, &out)).?;
-    const ures = try updateTyped(&w, catalogRef, 1, &.{ .{ .int = 1 }, .{ .bytes = "a much longer value" } }, ver);
+    const version = (try getTyped(&w, catalogRef, 1, &out)).?;
+    const ures = try updateTyped(&w, catalogRef, 1, &.{ .{ .int = 1 }, .{ .bytes = "a much longer value" } }, version);
     catalogRef = ures.ok.catalogRef;
     _ = try getTyped(&w, catalogRef, 1, &out);
     try testing.expectEqualStrings("a much longer value", out[1].bytes);
@@ -429,9 +429,9 @@ test "strings persist across reopen" {
         var w = try database.beginWrite();
         var catalogRef = try createTyped(&w, &.{ .int, .blob });
         var i: u64 = 0;
-        var buf: [32]u8 = undefined;
+        var buffer: [32]u8 = undefined;
         while (i < 500) : (i += 1) {
-            const s = try std.fmt.bufPrint(&buf, "name-{d}", .{i});
+            const s = try std.fmt.bufPrint(&buffer, "name-{d}", .{i});
             catalogRef = (try insertTyped(&w, catalogRef, &.{ .{ .int = i }, .{ .bytes = s } })).catalogRef;
         }
         w.setRoot(catalogRef);
@@ -583,7 +583,7 @@ test "value index tracks inserts" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    var catalogRef = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .int, .indexed = true } });
+    var catalogRef = try catalog.createFromDefinitions(&w, &.{ .{ .kind = .int }, .{ .kind = .int, .indexed = true } });
     const o0 = try insert(&w, catalogRef, &.{ 1, 10 });
     catalogRef = o0.catalogRef;
     const o1 = try insert(&w, catalogRef, &.{ 2, 20 });
@@ -606,7 +606,7 @@ test "value index tracks updates" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    var catalogRef = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .int, .indexed = true } });
+    var catalogRef = try catalog.createFromDefinitions(&w, &.{ .{ .kind = .int }, .{ .kind = .int, .indexed = true } });
     const o0 = try insert(&w, catalogRef, &.{ 1, 10 });
     catalogRef = o0.catalogRef;
     const o1 = try insert(&w, catalogRef, &.{ 2, 20 });
@@ -615,8 +615,8 @@ test "value index tracks updates" {
     catalogRef = o2.catalogRef;
     // Move o1's indexed property from 20 to 10.
     var out: [2]u64 = undefined;
-    const ver = (try getByPrimaryKey(&w, catalogRef, 2, &out)).?;
-    const res = try update(&w, catalogRef, 2, &.{ 2, 10 }, ver);
+    const version = (try getByPrimaryKey(&w, catalogRef, 2, &out)).?;
+    const res = try update(&w, catalogRef, 2, &.{ 2, 10 }, version);
     try testing.expect(res == .ok);
     catalogRef = res.ok.catalogRef;
     try expectIndexObjectKeys(&w, catalogRef, 1, 10, &.{ o0.row, o1.row, o2.row });
@@ -633,7 +633,7 @@ test "value index tracks deletes" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    var catalogRef = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .int, .indexed = true } });
+    var catalogRef = try catalog.createFromDefinitions(&w, &.{ .{ .kind = .int }, .{ .kind = .int, .indexed = true } });
     const o0 = try insert(&w, catalogRef, &.{ 1, 10 });
     catalogRef = o0.catalogRef;
     const o1 = try insert(&w, catalogRef, &.{ 2, 20 });
@@ -643,8 +643,8 @@ test "value index tracks deletes" {
     try expectIndexObjectKeys(&w, catalogRef, 1, 10, &.{ o0.row, o2.row });
     // Delete o0 (value 10); only o2 should remain under 10.
     var out: [2]u64 = undefined;
-    const ver = (try getByPrimaryKey(&w, catalogRef, 1, &out)).?;
-    catalogRef = (try delete(&w, catalogRef, 1, ver)).ok;
+    const version = (try getByPrimaryKey(&w, catalogRef, 1, &out)).?;
+    catalogRef = (try delete(&w, catalogRef, 1, version)).ok;
     try expectIndexObjectKeys(&w, catalogRef, 1, 10, &.{o2.row});
     try expectIndexObjectKeys(&w, catalogRef, 1, 20, &.{o1.row});
     w.deinit();
@@ -662,12 +662,12 @@ test "updateTyped carries collection properties through unchanged" {
     defer database.deinit();
     var w = try database.beginWrite();
     defer w.deinit();
-    var catalogRef = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .int }, .{ .kind = .list, .elem = .int } });
+    var catalogRef = try catalog.createFromDefinitions(&w, &.{ .{ .kind = .int }, .{ .kind = .int }, .{ .kind = .list, .element = .int } });
     catalogRef = (try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .int = 10 }, .{ .list_int = &.{ 7, 8, 9 } } })).catalogRef;
 
     var out: [3]Value = undefined;
-    const ver = (try getTyped(&w, catalogRef, 1, &out)).?;
-    const res = try updateTyped(&w, catalogRef, 1, &.{ .{ .int = 1 }, .{ .int = 20 }, out[2] }, ver);
+    const version = (try getTyped(&w, catalogRef, 1, &out)).?;
+    const res = try updateTyped(&w, catalogRef, 1, &.{ .{ .int = 1 }, .{ .int = 20 }, out[2] }, version);
     try testing.expect(res == .ok);
     catalogRef = res.ok.catalogRef;
 
@@ -690,10 +690,10 @@ test "deleteTyped frees the row's collection storage" {
     // Commit a row carrying every collection kind so its trees are committed.
     {
         var w = try database.beginWrite();
-        var catalogRef = try catalog.createDefs(&w, &.{
+        var catalogRef = try catalog.createFromDefinitions(&w, &.{
             .{ .kind = .int },
-            .{ .kind = .list, .elem = .blob },
-            .{ .kind = .set, .elem = .int },
+            .{ .kind = .list, .element = .blob },
+            .{ .kind = .set, .element = .int },
             .{ .kind = .dict },
         });
         catalogRef = (try insertTyped(&w, catalogRef, &.{
@@ -709,9 +709,9 @@ test "deleteTyped frees the row's collection storage" {
     var w = try database.beginWrite();
     defer w.deinit();
     var out: [4]Value = undefined;
-    const ver = (try getTyped(&w, w.new_root, 1, &out)).?;
+    const version = (try getTyped(&w, w.new_root, 1, &out)).?;
     const before = w.in_flight_frees.items.len;
-    const res = try deleteTyped(&w, w.new_root, 1, ver);
+    const res = try deleteTyped(&w, w.new_root, 1, version);
     try testing.expect(res == .ok);
     // list tree + 2 element blobs + set tree + dict tree + 2 key blobs, plus
     // the COW frees of the delete itself: well above the tombstone-only count.
@@ -730,7 +730,7 @@ test "updateTyped moves backlinks when a link value changes" {
     defer database.deinit();
     var w = try database.beginWrite();
     defer w.deinit();
-    var catalogRef = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
+    var catalogRef = try catalog.createFromDefinitions(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
     const a = try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .link = null } });
     catalogRef = a.catalogRef;
     const b = try insertTyped(&w, catalogRef, &.{ .{ .int = 2 }, .{ .link = null } });
@@ -739,8 +739,8 @@ test "updateTyped moves backlinks when a link value changes" {
     catalogRef = c.catalogRef;
 
     var out: [2]Value = undefined;
-    const ver = (try getTyped(&w, catalogRef, 3, &out)).?;
-    const res = try updateTyped(&w, catalogRef, 3, &.{ .{ .int = 3 }, .{ .link = b.row } }, ver);
+    const version = (try getTyped(&w, catalogRef, 3, &out)).?;
+    const res = try updateTyped(&w, catalogRef, 3, &.{ .{ .int = 3 }, .{ .link = b.row } }, version);
     try testing.expect(res == .ok);
     catalogRef = res.ok.catalogRef;
 
@@ -768,15 +768,15 @@ test "a multi-leaf value-index set is pruned and freed when emptied" {
     defer database.deinit();
     var w = try database.beginWrite();
     defer w.deinit();
-    var catalogRef = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .int, .indexed = true } });
+    var catalogRef = try catalog.createFromDefinitions(&w, &.{ .{ .kind = .int }, .{ .kind = .int, .indexed = true } });
     const n: u64 = 80;
     var primaryKey: u64 = 1;
     while (primaryKey <= n) : (primaryKey += 1) catalogRef = (try insert(&w, catalogRef, &.{ primaryKey, 7 })).catalogRef;
     var out: [2]u64 = undefined;
     primaryKey = 1;
     while (primaryKey <= n) : (primaryKey += 1) {
-        const ver = (try getByPrimaryKey(&w, catalogRef, primaryKey, &out)).?;
-        catalogRef = (try delete(&w, catalogRef, primaryKey, ver)).ok;
+        const version = (try getByPrimaryKey(&w, catalogRef, primaryKey, &out)).?;
+        catalogRef = (try delete(&w, catalogRef, primaryKey, version)).ok;
     }
     const v = try loadCatalog(&w, catalogRef);
     try testing.expectEqual(@as(?u64, null), try Index.get(&w, v.valueIndexRef(1), 7));
@@ -792,7 +792,7 @@ test "an emptied value-index set is pruned from the outer index" {
     defer database.deinit();
     var w = try database.beginWrite();
     defer w.deinit();
-    var catalogRef = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .int, .indexed = true } });
+    var catalogRef = try catalog.createFromDefinitions(&w, &.{ .{ .kind = .int }, .{ .kind = .int, .indexed = true } });
     catalogRef = (try insert(&w, catalogRef, &.{ 1, 10 })).catalogRef;
     catalogRef = (try insert(&w, catalogRef, &.{ 2, 10 })).catalogRef;
     // Delete both rows carrying value 10: the 10 entry must disappear entirely,
@@ -800,8 +800,8 @@ test "an emptied value-index set is pruned from the outer index" {
     var out: [2]u64 = undefined;
     var primaryKey: u64 = 1;
     while (primaryKey <= 2) : (primaryKey += 1) {
-        const ver = (try getByPrimaryKey(&w, catalogRef, primaryKey, &out)).?;
-        catalogRef = (try delete(&w, catalogRef, primaryKey, ver)).ok;
+        const version = (try getByPrimaryKey(&w, catalogRef, primaryKey, &out)).?;
+        catalogRef = (try delete(&w, catalogRef, primaryKey, version)).ok;
     }
     const v = try loadCatalog(&w, catalogRef);
     try testing.expectEqual(@as(?u64, null), try Index.get(&w, v.valueIndexRef(1), 10));
@@ -816,12 +816,12 @@ test "non-indexed property has no index" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    var catalogRef = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .int } });
+    var catalogRef = try catalog.createFromDefinitions(&w, &.{ .{ .kind = .int }, .{ .kind = .int } });
     const r0 = try insert(&w, catalogRef, &.{ 1, 100 });
     catalogRef = r0.catalogRef;
     var out: [2]u64 = undefined;
-    const ver = (try getByPrimaryKey(&w, catalogRef, 1, &out)).?;
-    catalogRef = (try update(&w, catalogRef, 1, &.{ 1, 200 }, ver)).ok.catalogRef;
+    const version = (try getByPrimaryKey(&w, catalogRef, 1, &out)).?;
+    catalogRef = (try update(&w, catalogRef, 1, &.{ 1, 200 }, version)).ok.catalogRef;
     const ver2 = (try getByPrimaryKey(&w, catalogRef, 1, &out)).?;
     catalogRef = (try delete(&w, catalogRef, 1, ver2)).ok;
     const v = try loadCatalog(&w, catalogRef);
@@ -876,7 +876,7 @@ test "deleteTyped frees a self-referencing link_set root exactly once" {
 
     {
         var w = try database.beginWrite();
-        var catalogRef = try catalog.createDefs(&w, &.{
+        var catalogRef = try catalog.createFromDefinitions(&w, &.{
             .{ .kind = .int },
             .{ .kind = .link_set },
         });
@@ -889,8 +889,8 @@ test "deleteTyped frees a self-referencing link_set root exactly once" {
     var w = try database.beginWrite();
     defer w.deinit();
     var out: [2]Value = undefined;
-    const ver = (try getTyped(&w, w.new_root, 1, &out)).?;
-    const res = try deleteTyped(&w, w.new_root, 1, ver);
+    const version = (try getTyped(&w, w.new_root, 1, &out)).?;
+    const res = try deleteTyped(&w, w.new_root, 1, version);
     try testing.expect(res == .ok);
     var seen = std.AutoHashMap(u64, void).init(testing.allocator);
     defer seen.deinit();

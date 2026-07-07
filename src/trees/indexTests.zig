@@ -26,9 +26,9 @@ const encodeLeaf = node.encodeLeaf;
 const encodeInner = node.encodeInner;
 
 fn idxTmpPath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const u8) ![]const u8 {
-    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const dlen = try tmp.dir.realPath(testing.io, &path_buf);
-    return std.fs.path.join(allocator, &.{ path_buf[0..dlen], name });
+    var pathBuffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dlen = try tmp.dir.realPath(testing.io, &pathBuffer);
+    return std.fs.path.join(allocator, &.{ pathBuffer[0..dlen], name });
 }
 
 test "a ref cycle or unknown kind byte fails with error.Corrupt" {
@@ -461,7 +461,7 @@ test "forEachEntryInRange spans multiple leaves" {
     var vals = std.ArrayList(u64).empty;
     defer vals.deinit(testing.allocator);
 
-    // [50,800] crosses many leaves (LEAF_CAP == 64).
+    // [50,800] crosses many leaves (leafCap == 64).
     try forEachEntryInRange(&w, root, 50, 800, RangeCollector{ .keys = &keys, .vals = &vals }, RangeCollector.onEntry);
 
     try testing.expectEqual(@as(usize, 751), keys.items.len); // 800-50+1
@@ -619,7 +619,7 @@ test "appendRun overflow rightmost inner node" {
     defer database.deinit();
     var w = try database.beginWrite();
     // A multi-level base plus a run large enough that the new leaves alone
-    // exceed FANOUT, forcing a split at the leaf-parent (non-root) inner level.
+    // exceed fanout, forcing a split at the leaf-parent (non-root) inner level.
     try checkAppendEquiv(&w, 3000, 5000);
     w.deinit();
 }
@@ -630,7 +630,7 @@ test "appendRun grows tree height by one" {
     var database = try appendTmpDatabase(&tmp, "append3.airdb");
     defer database.deinit();
     var w = try database.beginWrite();
-    // Single-leaf base, run crossing FANOUT*LEAF_CAP (== 4096) so the result
+    // Single-leaf base, run crossing fanout*leafCap (== 4096) so the result
     // must be three levels tall.
     try checkAppendEquiv(&w, 50, 4200);
     w.deinit();
@@ -642,7 +642,7 @@ test "appendRun single-leaf base tree" {
     var database = try appendTmpDatabase(&tmp, "append4.airdb");
     defer database.deinit();
     var w = try database.beginWrite();
-    try checkAppendEquiv(&w, 40, 50); // base < LEAF_CAP
+    try checkAppendEquiv(&w, 40, 50); // base < leafCap
     w.deinit();
 }
 

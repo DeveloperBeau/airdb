@@ -11,7 +11,7 @@
 //   - mmap alignment        -> []align(std.heap.page_size_min) u8
 //   - mmap flags            -> .{ .TYPE = .SHARED } (not .SHARED = true)
 //   - page-size constant    -> std.heap.page_size_min (compile-time lower bound)
-//   - Dir.realpathAlloc     -> Dir.realPath(io, buf) with stack buffer
+//   - Dir.realpathAlloc     -> Dir.realPath(io, buffer) with stack buffer
 //   - Io instance           -> std.Io.Threaded.global_single_threaded.io()
 //       (always initialized; works in both test and production contexts)
 
@@ -330,9 +330,9 @@ pub fn syncParentDir(path: []const u8) void {
 test "real syncer flush succeeds (exercises the platform durability path)" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
-    const path_len = try tmp.dir.realPath(testing.io, &path_buf);
-    const dir_path = path_buf[0..path_len];
+    var pathBuffer: [Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(testing.io, &pathBuffer);
+    const dir_path = pathBuffer[0..path_len];
     const file_path = try std.fs.path.join(testing.allocator, &.{ dir_path, "fsync.airdb" });
     defer testing.allocator.free(file_path);
     var fs = try FileStore.create(testing.allocator, file_path, FileSyncer.any());
@@ -343,9 +343,9 @@ test "real syncer flush succeeds (exercises the platform durability path)" {
 test "header checksum validates on a clean file and fails when the header is tampered" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
-    const path_len = try tmp.dir.realPath(testing.io, &path_buf);
-    const file_path = try std.fs.path.join(testing.allocator, &.{ path_buf[0..path_len], "hcrc.airdb" });
+    var pathBuffer: [Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(testing.io, &pathBuffer);
+    const file_path = try std.fs.path.join(testing.allocator, &.{ pathBuffer[0..path_len], "hcrc.airdb" });
     defer testing.allocator.free(file_path);
     {
         var fs = try FileStore.create(testing.allocator, file_path, FileSyncer.any());
@@ -367,10 +367,10 @@ test "create writes a header that reopen reads back" {
     defer tmp.cleanup();
 
     // Zig 0.16: Dir.realpathAlloc no longer exists.
-    // Use Dir.realPath(io, buf) with a stack buffer instead.
-    var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
-    const path_len = try tmp.dir.realPath(testing.io, &path_buf);
-    const dir_path = path_buf[0..path_len];
+    // Use Dir.realPath(io, buffer) with a stack buffer instead.
+    var pathBuffer: [Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(testing.io, &pathBuffer);
+    const dir_path = pathBuffer[0..path_len];
 
     const file_path = try std.fs.path.join(testing.allocator, &.{ dir_path, "wsk.airdb" });
     defer testing.allocator.free(file_path);
@@ -391,9 +391,9 @@ test "create writes a header that reopen reads back" {
 test "grow adds sections, section 0 base stable, existing bytes preserved" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
-    const dlen = try tmp.dir.realPath(testing.io, &path_buf);
-    const fpath = try std.fs.path.join(testing.allocator, &.{ path_buf[0..dlen], "grow.airdb" });
+    var pathBuffer: [Io.Dir.max_path_bytes]u8 = undefined;
+    const dlen = try tmp.dir.realPath(testing.io, &pathBuffer);
+    const fpath = try std.fs.path.join(testing.allocator, &.{ pathBuffer[0..dlen], "grow.airdb" });
     defer testing.allocator.free(fpath);
     var fs = try FileStore.create(testing.allocator, fpath, FileSyncer.any());
     defer fs.deinit();
@@ -411,9 +411,9 @@ test "grow adds sections, section 0 base stable, existing bytes preserved" {
 test "grow beyond the reservation fails cleanly" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
-    const dlen = try tmp.dir.realPath(testing.io, &path_buf);
-    const fpath = try std.fs.path.join(testing.allocator, &.{ path_buf[0..dlen], "toobig.airdb" });
+    var pathBuffer: [Io.Dir.max_path_bytes]u8 = undefined;
+    const dlen = try tmp.dir.realPath(testing.io, &pathBuffer);
+    const fpath = try std.fs.path.join(testing.allocator, &.{ pathBuffer[0..dlen], "toobig.airdb" });
     defer testing.allocator.free(fpath);
     var fs = try FileStore.create(testing.allocator, fpath, FileSyncer.any());
     defer fs.deinit();

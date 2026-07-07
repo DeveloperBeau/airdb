@@ -262,9 +262,9 @@ fn auditBacklinksBackward(r: *ReadTransaction, cv: catalog.CatalogView, p: usize
 // ---------------------------------------------------------------------------
 
 fn tmpFilePath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const u8) ![]const u8 {
-    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const path_len = try tmp.dir.realPath(testing.io, &path_buf);
-    return std.fs.path.join(allocator, &.{ path_buf[0..path_len], name });
+    var pathBuffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(testing.io, &pathBuffer);
+    return std.fs.path.join(allocator, &.{ pathBuffer[0..path_len], name });
 }
 
 test "verifyIntegrity detects both slots corrupt" {

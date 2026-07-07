@@ -103,12 +103,12 @@ pub const Latencies = struct {
 
     /// Returns the p-th percentile sample (p in 0..=100), sorting in place.
     /// Returns 0 when there are no samples.
-    pub fn pct(self: *Latencies, p: u64) u64 {
+    pub fn percentile(self: *Latencies, p: u64) u64 {
         const items = self.samples.items;
         if (items.len == 0) return 0;
         std.mem.sort(u64, items, {}, std.sort.asc(u64));
-        const idx = (items.len - 1) * p / 100;
-        return items[idx];
+        const rank = (items.len - 1) * p / 100;
+        return items[rank];
     }
 };
 
@@ -189,8 +189,8 @@ pub fn appendJson(path: []const u8, scale: Scale, results: []const Result, alloc
     defer file.close(io);
     const start = try file.length(io);
 
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(alloc);
+    var buffer: std.ArrayList(u8) = .empty;
+    defer buffer.deinit(alloc);
     for (results) |r| {
         const rec = Record{
             .scenario = r.name,
@@ -207,10 +207,10 @@ pub fn appendJson(path: []const u8, scale: Scale, results: []const Result, alloc
         };
         const line = try std.fmt.allocPrint(alloc, "{f}\n", .{std.json.fmt(rec, .{})});
         defer alloc.free(line);
-        try buf.appendSlice(alloc, line);
+        try buffer.appendSlice(alloc, line);
     }
 
-    if (buf.items.len > 0) try file.writePositionalAll(io, buf.items, start);
+    if (buffer.items.len > 0) try file.writePositionalAll(io, buffer.items, start);
 }
 
 // ---------------------------------------------------------------------------
@@ -338,8 +338,8 @@ pub fn runAll(alloc: Allocator, opts: Opts) !void {
         try results.append(alloc, try s.run(&ctx));
     }
 
-    var buf: [4096]u8 = undefined;
-    var fw: Io.File.Writer = .init(.stdout(), io, &buf);
+    var buffer: [4096]u8 = undefined;
+    var fw: Io.File.Writer = .init(.stdout(), io, &buffer);
     const w = &fw.interface;
     try printTable(results.items, w);
     try w.flush();
@@ -370,16 +370,16 @@ test "Latencies percentiles pick the right sample" {
     var v: u64 = 1;
     while (v <= 100) : (v += 1) try lat.add(alloc, v);
 
-    try std.testing.expectEqual(@as(u64, 50), lat.pct(50));
-    try std.testing.expectEqual(@as(u64, 100), lat.pct(100));
-    try std.testing.expectEqual(@as(u64, 1), lat.pct(0));
+    try std.testing.expectEqual(@as(u64, 50), lat.percentile(50));
+    try std.testing.expectEqual(@as(u64, 100), lat.percentile(100));
+    try std.testing.expectEqual(@as(u64, 1), lat.percentile(0));
 }
 
 test "Latencies percentiles on an empty set are zero" {
     const alloc = std.testing.allocator;
     var lat = Latencies.init();
     defer lat.deinit(alloc);
-    try std.testing.expectEqual(@as(u64, 0), lat.pct(50));
+    try std.testing.expectEqual(@as(u64, 0), lat.percentile(50));
 }
 
 test "Result throughput math" {

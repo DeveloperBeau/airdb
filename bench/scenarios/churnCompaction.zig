@@ -124,8 +124,8 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
             while (j < k) : (j += 1) {
                 const primaryKey = oldestPrimaryKey + j;
                 var out: [2]u64 = undefined;
-                const ver = (try rows.getByPrimaryKey(&w, catalogRef, primaryKey, &out)) orelse unreachable;
-                catalogRef = switch (try rows.delete(&w, catalogRef, primaryKey, ver)) {
+                const version = (try rows.getByPrimaryKey(&w, catalogRef, primaryKey, &out)) orelse unreachable;
+                catalogRef = switch (try rows.delete(&w, catalogRef, primaryKey, version)) {
                     .ok => |c| c,
                     else => unreachable,
                 };
@@ -186,9 +186,9 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         .name = name,
         .ops = total_moved,
         .wall_ns = phase_ns,
-        .p50_ns = step_lat.pct(50),
-        .p99_ns = step_lat.pct(99),
-        .max_ns = step_lat.pct(100),
+        .p50_ns = step_lat.percentile(50),
+        .p99_ns = step_lat.percentile(99),
+        .max_ns = step_lat.percentile(100),
         .file_bytes = try database.fileSize(),
         .logical_bytes = database.logicalSize(),
         .peak_rss_bytes = airdb.peakResidentBytes(),

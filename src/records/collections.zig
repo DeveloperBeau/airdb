@@ -8,7 +8,7 @@ const blob = @import("blob.zig");
 const catalog = @import("../schema/catalog.zig");
 
 const PropertyKind = catalog.PropertyKind;
-const ElemKind = catalog.ElemKind;
+const ElementKind = catalog.ElementKind;
 const PropertyDefinition = catalog.PropertyDefinition;
 const Value = catalog.Value;
 const PropertyCount = catalog.PropertyCount;
@@ -39,7 +39,7 @@ pub fn buildSetInt(transaction: *WriteTransaction, items: []const u64) !Referenc
 pub fn listLen(transaction: anytype, catalogRef: Reference, primaryKey: u64, property: usize) !?u64 {
     const r = (try catalog.resolveProperty(transaction, catalogRef, primaryKey, property)) orelse return null;
     const list_root = try Column.get(transaction, r.propertyColumn, r.row);
-    return try Column.len(transaction, list_root);
+    return try Column.length(transaction, list_root);
 }
 
 pub fn listGetInt(transaction: anytype, catalogRef: Reference, primaryKey: u64, property: usize, index: u64) !u64 {

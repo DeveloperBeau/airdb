@@ -48,8 +48,8 @@ pub const WriteTransaction = struct {
     /// bookkeeping lists or double-unlocking the cross-process write lock.
     done: bool = false,
 
-    pub fn deref(self: *WriteTransaction, ref: Reference, len: usize) ![]const u8 {
-        return self.database.arena.deref(ref, len);
+    pub fn deref(self: *WriteTransaction, ref: Reference, length: usize) ![]const u8 {
+        return self.database.arena.deref(ref, length);
     }
 
     fn reclaimHorizon(self: *WriteTransaction) u64 {
@@ -89,27 +89,27 @@ pub const WriteTransaction = struct {
         self.new_root = ref;
     }
 
-    pub fn free(self: *WriteTransaction, ref: Reference, len: usize) !void {
+    pub fn free(self: *WriteTransaction, ref: Reference, length: usize) !void {
         if (ref >= self.transactionStartTop) {
             // Allocated within this uncommitted transaction: private, immediately reusable.
             // (freed_version is irrelevant for the transaction-private pool; allocFromPool ignores it.)
-            try self.transactionReuse.add(.{ .offset = ref, .len = @intCast(len), .freed_version = 0 });
+            try self.transactionReuse.add(.{ .offset = ref, .len = @intCast(length), .freed_version = 0 });
         } else {
             // Belongs to a committed version a reader may still pin: defer reclamation to the
             // committed free list, tagged with this transaction's version (the freeing version).
             try self.in_flight_frees.append(self.database.store.allocator, .{
                 .offset = ref,
-                .len = @intCast(len),
+                .len = @intCast(length),
                 .freed_version = self.new_version,
             });
         }
     }
 
-    pub fn writableCopy(self: *WriteTransaction, ref: Reference, len: usize) !Allocation {
-        const old = try self.database.arena.deref(ref, len);
-        const fresh = try self.alloc(len);
+    pub fn writableCopy(self: *WriteTransaction, ref: Reference, length: usize) !Allocation {
+        const old = try self.database.arena.deref(ref, length);
+        const fresh = try self.alloc(length);
         @memcpy(fresh.bytes, old);
-        try self.free(ref, len);
+        try self.free(ref, length);
         return fresh;
     }
 
@@ -177,7 +177,7 @@ pub const WriteTransaction = struct {
         var new_fl = try self.buildNewFreeList();
         errdefer new_fl.deinit();
         const chain = try self.encodeFreeListChain(&new_fl);
-        const inactive_idx = self.writeSlotAndRing(prev_active_slot, chain.head_ref);
+        const inactiveSlotIndex = self.writeSlotAndRing(prev_active_slot, chain.head_ref);
 
         // Step 3: flush new data + inactive slot to durable storage.
         // Failure here: old active slot is still valid; no in-memory state
@@ -185,7 +185,7 @@ pub const WriteTransaction = struct {
         database.store.syncer.flush(database.store.file) catch return error.Durability;
 
         // Steps 4-5: flip the header commit pointer and flush (commit point).
-        try self.flipCommitPointer(inactive_idx, prev_active_slot, prev_logical_size);
+        try self.flipCommitPointer(inactiveSlotIndex, prev_active_slot, prev_logical_size);
 
         // Step 6: publish the new version in memory only after both flushes succeed.
         database.active_version = self.new_version;
@@ -237,9 +237,9 @@ pub const WriteTransaction = struct {
             var hops: usize = 0;
             while (cref != 0) : (hops += 1) {
                 if (hops >= FreeList.max_chunks) return error.Corrupt;
-                const hdr = try self.deref(cref, FreeList.chunk_header_bytes);
-                const cnt = std.mem.readInt(u32, hdr[0..4], .little);
-                const next = std.mem.readInt(u64, hdr[4..12], .little);
+                const header = try self.deref(cref, FreeList.chunk_header_bytes);
+                const cnt = std.mem.readInt(u32, header[0..4], .little);
+                const next = std.mem.readInt(u64, header[4..12], .little);
                 // Legitimate chains strictly decrease (written back-to-front);
                 // anything else is corruption and must not feed the free list.
                 if (next != 0 and next >= cref) return error.Corrupt;
@@ -310,8 +310,8 @@ pub const WriteTransaction = struct {
         const database = self.database;
 
         // Determine the inactive slot and its byte offset.
-        const inactive_idx: u8 = if (prev_active_slot == 0) 1 else 0;
-        const inactive_off: usize = if (inactive_idx == 0) slot_a_off else slot_b_off;
+        const inactiveSlotIndex: u8 = if (prev_active_slot == 0) 1 else 0;
+        const inactive_off: usize = if (inactiveSlotIndex == 0) slot_a_off else slot_b_off;
 
         // Write the new slot descriptor into the inactive region.
         // logical_size is captured AFTER the node alloc so it covers the node bytes.
@@ -330,13 +330,13 @@ pub const WriteTransaction = struct {
         // so versionRoot's `version > active_version` guard ignores it. The ring is bounded
         // and self-overwriting, so we never revert it.
         const head = std.mem.readInt(u64, database.store.map[ring_head_off..][0..8], .little);
-        const idx: usize = @intCast(head % ring_capacity);
-        const e = ring_off + idx * 16;
+        const ringIndex: usize = @intCast(head % ring_capacity);
+        const e = ring_off + ringIndex * 16;
         std.mem.writeInt(u64, database.store.map[e..][0..8], self.new_version, .little);
         std.mem.writeInt(u64, database.store.map[e + 8 ..][0..8], self.new_root, .little);
         std.mem.writeInt(u64, database.store.map[ring_head_off..][0..8], head + 1, .little);
 
-        return inactive_idx;
+        return inactiveSlotIndex;
     }
 
     /// Commit phase (protocol steps 4-5): flip header.active_slot to the
@@ -344,9 +344,9 @@ pub const WriteTransaction = struct {
     /// revert every in-memory header change so the old version stays live,
     /// poison the instance (the commit's on-disk fate is indeterminate), and
     /// return error.Durability.
-    fn flipCommitPointer(self: *WriteTransaction, inactive_idx: u8, prev_active_slot: u8, prev_logical_size: u64) !void {
+    fn flipCommitPointer(self: *WriteTransaction, inactiveSlotIndex: u8, prev_active_slot: u8, prev_logical_size: u64) !void {
         const database = self.database;
-        database.store.header.active_slot = inactive_idx;
+        database.store.header.active_slot = inactiveSlotIndex;
         database.store.header.logical_size = @intCast(database.arena.top);
         database.store.persistHeader();
         database.store.syncer.flush(database.store.file) catch {

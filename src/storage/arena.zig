@@ -20,13 +20,13 @@ pub const Arena = struct {
     }
 
     /// Translate an absolute offset to the mutable backing slice for its section.
-    /// The caller guarantees `[off, off + len)` does not cross a section boundary and
+    /// The caller guarantees `[off, off + length)` does not cross a section boundary and
     /// that the section exists (true for any alloc result and any freed extent, since
     /// no allocation crosses a boundary).
-    fn translate(self: *Arena, off: usize, len: usize) []u8 {
+    fn translate(self: *Arena, off: usize, length: usize) []u8 {
         const s = off >> section_shift;
         const w = off & section_mask;
-        return self.sections[s].map[w .. w + len];
+        return self.sections[s].map[w .. w + length];
     }
 
     pub fn alloc(self: *Arena, size: usize) error{ OutOfSpace, AllocTooLarge }!Allocation {
@@ -58,16 +58,16 @@ pub const Arena = struct {
     }
 
     // The single bounds-checked chokepoint. All reads go through here.
-    pub fn deref(self: *Arena, ref: Reference, len: usize) error{BadRef}![]const u8 {
+    pub fn deref(self: *Arena, ref: Reference, length: usize) error{BadRef}![]const u8 {
         const off: usize = @intCast(ref);
         if (off == 0) return error.BadRef; // null ref
         if (off % 8 != 0) return error.BadRef; // misaligned
-        if (len > section_size) return error.BadRef; // cannot span a section
+        if (length > section_size) return error.BadRef; // cannot span a section
         const s = off >> section_shift;
         const w = off & section_mask;
         if (s >= self.sections.len) return error.BadRef; // section not mapped
-        if (w + len > section_size) return error.BadRef; // would cross a section boundary
-        return self.sections[s].map[w .. w + len];
+        if (w + length > section_size) return error.BadRef; // would cross a section boundary
+        return self.sections[s].map[w .. w + length];
     }
 };
 

@@ -130,11 +130,11 @@ pub const Section = struct {
     }
 };
 
-/// Map `[file_offset, file_offset + len)` of `file` as a shared, read/write section.
-/// The caller guarantees the file is at least `file_offset + len` bytes long and that
+/// Map `[file_offset, file_offset + length)` of `file` as a shared, read/write section.
+/// The caller guarantees the file is at least `file_offset + length` bytes long and that
 /// `file_offset` is a multiple of the OS allocation granularity (it is: every caller
 /// passes a multiple of `section_size`, which is 16 MiB).
-pub fn mapSection(file: std.Io.File, file_offset: u64, len: usize) !Section {
+pub fn mapSection(file: std.Io.File, file_offset: u64, length: usize) !Section {
     if (is_windows) {
         // One file-mapping object per section. Passing max-size 0 makes the object track
         // the current file size; the view starts at the section's file offset. The file
@@ -143,13 +143,13 @@ pub fn mapSection(file: std.Io.File, file_offset: u64, len: usize) !Section {
         errdefer _ = win.CloseHandle(h);
         const off_high: win.DWORD = @intCast(file_offset >> 32);
         const off_low: win.DWORD = @intCast(file_offset & 0xFFFFFFFF);
-        const ptr = win.MapViewOfFile(h, win.FILE_MAP_READ | win.FILE_MAP_WRITE, off_high, off_low, len) orelse return error.MapFailed;
+        const ptr = win.MapViewOfFile(h, win.FILE_MAP_READ | win.FILE_MAP_WRITE, off_high, off_low, length) orelse return error.MapFailed;
         const base: [*]align(page) u8 = @ptrCast(@alignCast(ptr));
-        return .{ .map = base[0..len], .handle = h };
+        return .{ .map = base[0..length], .handle = h };
     } else {
         const m = try std.posix.mmap(
             null,
-            len,
+            length,
             .{ .READ = true, .WRITE = true },
             .{ .TYPE = .SHARED },
             file.handle,
@@ -232,24 +232,24 @@ pub fn processStartToken(pid: u32) ?u64 {
         // kinfo_proc's first field is the extern_proc union whose overlay is
         // p_starttime (a timeval), so the start time sits at offset 0 of the
         // sysctl result.
-        var buf: [1024]u8 align(8) = undefined;
-        var len: usize = buf.len;
+        var buffer: [1024]u8 align(8) = undefined;
+        var length: usize = buffer.len;
         var mib = [4]c_int{ 1, 14, 1, @intCast(pid) }; // CTL_KERN, KERN_PROC, KERN_PROC_PID, pid
-        const rc = std.c.sysctl(&mib, 4, &buf, &len, null, 0);
-        if (std.c.errno(rc) != .SUCCESS or len < 16) return null;
-        const sec = std.mem.readInt(i64, buf[0..8], .little);
-        const usec = std.mem.readInt(i32, buf[8..12], .little);
+        const rc = std.c.sysctl(&mib, 4, &buffer, &length, null, 0);
+        if (std.c.errno(rc) != .SUCCESS or length < 16) return null;
+        const sec = std.mem.readInt(i64, buffer[0..8], .little);
+        const usec = std.mem.readInt(i32, buffer[8..12], .little);
         return @as(u64, @bitCast(sec)) *% 1_000_000 +% @as(u32, @bitCast(usec));
     } else {
         // Linux: field 22 of /proc/<pid>/stat is starttime in clock ticks.
-        var path_buf: [64]u8 = undefined;
-        const path = std.fmt.bufPrint(&path_buf, "/proc/{d}/stat", .{pid}) catch return null;
+        var pathBuffer: [64]u8 = undefined;
+        const path = std.fmt.bufPrint(&pathBuffer, "/proc/{d}/stat", .{pid}) catch return null;
         const io = std.Io.Threaded.global_single_threaded.io();
         var f = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return null;
         defer f.close(io);
-        var stat_buf: [512]u8 = undefined;
-        const n = f.readPositionalAll(io, &stat_buf, 0) catch return null;
-        const content = stat_buf[0..n];
+        var statBuffer: [512]u8 = undefined;
+        const n = f.readPositionalAll(io, &statBuffer, 0) catch return null;
+        const content = statBuffer[0..n];
         // comm can contain spaces/parens: skip past the LAST ')'.
         const close = std.mem.lastIndexOfScalar(u8, content, ')') orelse return null;
         var it = std.mem.tokenizeScalar(u8, content[close + 1 ..], ' ');

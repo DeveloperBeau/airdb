@@ -40,23 +40,23 @@ pub fn collectKeyRowPairs(
 }
 
 // Deep-copy a single property value from the source database into the destination database.
-// kind/elem describe the property. Returns the destination-local raw u64.
-fn copyValue(src: anytype, dst: *WriteTransaction, kind: catalog.PropertyKind, elem: catalog.ElemKind, src_raw: u64) !u64 {
+// kind/element describe the property. Returns the destination-local raw u64.
+fn copyValue(src: anytype, dst: *WriteTransaction, kind: catalog.PropertyKind, element: catalog.ElementKind, src_raw: u64) !u64 {
     return switch (kind) {
         .int, .link => src_raw, // verbatim (a link stores an object key, preserved)
         .blob => try blob.copyInto(src, dst, src_raw),
         .list => blk: {
             var newc = try Column.create(dst);
-            const n = try Column.len(src, src_raw);
+            const n = try Column.length(src, src_raw);
             var i: u64 = 0;
             while (i < n) : (i += 1) {
                 const el = try Column.get(src, src_raw, i);
-                const dv = if (elem == .blob) try blob.copyInto(src, dst, el) else el;
+                const dv = if (element == .blob) try blob.copyInto(src, dst, el) else el;
                 newc = try Column.append(dst, newc, dv);
             }
             break :blk newc;
         },
-        .set => switch (elem) {
+        .set => switch (element) {
             .blob => try copyBindex(src, dst, src_raw), // byte-keyed set -> bindex deep-copy
             else => try copyKeySet(src, dst, src_raw), // int-keyed set: a u64-keyed Index
         },
@@ -70,13 +70,13 @@ fn copyValue(src: anytype, dst: *WriteTransaction, kind: catalog.PropertyKind, e
 fn copyKeySet(src: anytype, dst: *WriteTransaction, src_root: u64) !u64 {
     var newi = try Index.create(dst);
     const Sink = struct {
-        idx: *Reference,
+        indexRef: *Reference,
         dstp: *WriteTransaction,
         fn onKey(self: @This(), key: u64) !void {
-            self.idx.* = try Index.insert(self.dstp, self.idx.*, key, 1);
+            self.indexRef.* = try Index.insert(self.dstp, self.indexRef.*, key, 1);
         }
     };
-    try Index.forEachKey(src, src_root, Sink{ .idx = &newi, .dstp = dst }, Sink.onKey);
+    try Index.forEachKey(src, src_root, Sink{ .indexRef = &newi, .dstp = dst }, Sink.onKey);
     return newi;
 }
 
@@ -133,7 +133,7 @@ fn createDestinationStructures(dst: *WriteTransaction, s: *catalog.CatalogSnapsh
 /// O(live rows x properties), plus the deep copies' own costs.
 pub fn copyTypeRows(src: anytype, sourceCatalog: Reference, dst: *WriteTransaction) !Reference {
     // Load the source snapshot, then re-point every ref field at structures
-    // created in the DESTINATION database before writing. Kinds, elem kinds, targets,
+    // created in the DESTINATION database before writing. Kinds, element kinds, targets,
     // rules, and indexed flags carry over as plain values.
     var s = try catalog.CatalogSnapshot.load(src, sourceCatalog);
     const propertyCount = s.propertyCount;
@@ -143,7 +143,7 @@ pub fn copyTypeRows(src: anytype, sourceCatalog: Reference, dst: *WriteTransacti
         var j: usize = 0;
         while (j < propertyCount) : (j += 1) sourcePropertyColumns[j] = s.properties[j].col;
     }
-    const s_ver = s.version_col_ref;
+    const sourceVersionColumn = s.version_col_ref;
     const s_live = s.live_col_ref;
     const s_keyrow = s.keyrow_index_ref;
 
@@ -159,7 +159,7 @@ pub fn copyTypeRows(src: anytype, sourceCatalog: Reference, dst: *WriteTransacti
         var j: usize = 0;
         while (j < propertyCount) : (j += 1) {
             const sraw = try Column.get(src, sourcePropertyColumns[j], pr.row);
-            const draw = try copyValue(src, dst, s.properties[j].kind, s.properties[j].elem, sraw);
+            const draw = try copyValue(src, dst, s.properties[j].kind, s.properties[j].element, sraw);
             s.properties[j].col = try Column.append(dst, s.properties[j].col, draw);
             // Repopulate the destination value index in the same pass. Leaving
             // it empty while the catalog still says indexed=true silently
@@ -169,8 +169,8 @@ pub fn copyTypeRows(src: anytype, sourceCatalog: Reference, dst: *WriteTransacti
                 s.properties[j].value_index = try viAddInto(dst, s.properties[j].value_index, draw, pr.objectKey);
             }
         }
-        const ver = try Column.get(src, s_ver, pr.row);
-        s.version_col_ref = try Column.append(dst, s.version_col_ref, ver);
+        const version = try Column.get(src, sourceVersionColumn, pr.row);
+        s.version_col_ref = try Column.append(dst, s.version_col_ref, version);
         s.live_col_ref = try Column.append(dst, s.live_col_ref, 1);
         s.keyrow_index_ref = try Index.insert(dst, s.keyrow_index_ref, pr.objectKey, d_row);
         const primaryKey = try Column.get(src, sourcePropertyColumns[0], pr.row);

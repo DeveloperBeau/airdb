@@ -57,7 +57,7 @@ defer database.deinit();
 
 // Define a type: primaryKey (int) + name (blob) + an indexed int.
 var w = try database.beginWrite();
-var dir = try airdb.typedir.createWithDefs(&w, &.{
+var dir = try airdb.typedir.createWithDefinitions(&w, &.{
     &.{ .{ .kind = .int }, .{ .kind = .blob }, .{ .kind = .int, .indexed = true } },
 });
 dir = (try airdb.typeRouting.insert(&w, dir, 0, &.{

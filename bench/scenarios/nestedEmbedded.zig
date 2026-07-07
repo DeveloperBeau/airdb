@@ -167,8 +167,8 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
             total_ns += @intCast(nowNs(io) - phase_start);
         }
 
-        create_p50_us[d - 1] = @as(f64, @floatFromInt(create_lat.pct(50))) / 1000.0;
-        read_p50_us[d - 1] = @as(f64, @floatFromInt(read_lat.pct(50))) / 1000.0;
+        create_p50_us[d - 1] = @as(f64, @floatFromInt(create_lat.percentile(50))) / 1000.0;
+        read_p50_us[d - 1] = @as(f64, @floatFromInt(read_lat.percentile(50))) / 1000.0;
         total_built += rows;
     }
 
@@ -190,9 +190,9 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         .name = name,
         .ops = total_built,
         .wall_ns = total_ns,
-        .p50_ns = combined.pct(50),
-        .p99_ns = combined.pct(99),
-        .max_ns = combined.pct(100),
+        .p50_ns = combined.percentile(50),
+        .p99_ns = combined.percentile(99),
+        .max_ns = combined.percentile(100),
         .file_bytes = file_bytes,
         .logical_bytes = logical_bytes,
         .peak_rss_bytes = airdb.peakResidentBytes(),

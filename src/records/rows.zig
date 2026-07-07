@@ -16,7 +16,7 @@ const blob = @import("blob.zig");
 const catalog = @import("../schema/catalog.zig");
 
 const PropertyKind = catalog.PropertyKind;
-const ElemKind = catalog.ElemKind;
+const ElementKind = catalog.ElementKind;
 const maxPropertyCount = catalog.maxPropertyCount;
 
 const loadCatalog = catalog.loadCatalog;
@@ -259,22 +259,22 @@ pub fn getByObjectKey(transaction: anytype, catalogRef: Reference, objectKey: u6
 /// and list/set/dict trees permanently. A raw of 0 (no storage, e.g. a row
 /// written with caller-supplied raws or a dead-row migration backfill) frees
 /// nothing rather than erroring mid-delete.
-pub fn freeRowStorage(transaction: *WriteTransaction, kinds: []const PropertyKind, elems: []const ElemKind, raw: []const u64) !void {
+pub fn freeRowStorage(transaction: *WriteTransaction, kinds: []const PropertyKind, elements: []const ElementKind, raw: []const u64) !void {
     var i: usize = 0;
     while (i < kinds.len) : (i += 1) {
         if (raw[i] == 0) continue;
         switch (kinds[i]) {
             .blob => try blob.free(transaction, raw[i]),
             .list => {
-                if (elems[i] == .blob) {
+                if (elements[i] == .blob) {
                     // Elements are blob refs: free each before the tree.
-                    const n = try Column.len(transaction, raw[i]);
+                    const n = try Column.length(transaction, raw[i]);
                     var e: u64 = 0;
                     while (e < n) : (e += 1) try blob.free(transaction, try Column.get(transaction, raw[i], e));
                 }
                 try Column.freeTree(transaction, raw[i]);
             },
-            .set => switch (elems[i]) {
+            .set => switch (elements[i]) {
                 .int => try Index.freeTree(transaction, raw[i]),
                 .blob => try bindex.freeTree(transaction, raw[i]),
             },

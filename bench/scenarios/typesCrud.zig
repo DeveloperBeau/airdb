@@ -11,8 +11,8 @@
 //   3  blob  a 32-byte inline string
 //   4  link  self-link (link_target = 0) to another row's object key, or null
 //   5  dict  a few string -> int entries
-//   6  set   a few ints (elem = int)
-//   7  set   a few byte members (elem = blob): the set-of-blob kind
+//   6  set   a few ints (element = int)
+//   7  set   a few byte members (element = blob): the set-of-blob kind
 //
 // Kinds exercised: int, bool (as int), blob, link, dict, set, set_blob.
 // Omitted by design: list and link_set. The task's kind list does not include
@@ -93,15 +93,15 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     // One type carrying a property of each exercised kind.
     {
         var w = try database.beginWrite();
-        const catalogRef = try catalog.createDefs(&w, &.{
+        const catalogRef = try catalog.createFromDefinitions(&w, &.{
             .{ .kind = .int }, // 0 primaryKey
             .{ .kind = .int }, // 1 int
             .{ .kind = .int }, // 2 bool (0/1)
             .{ .kind = .blob }, // 3 string
             .{ .kind = .link, .link_target = 0 }, // 4 self-link
             .{ .kind = .dict }, // 5 dict
-            .{ .kind = .set, .elem = .int }, // 6 set of int
-            .{ .kind = .set, .elem = .blob }, // 7 set of blob
+            .{ .kind = .set, .element = .int }, // 6 set of int
+            .{ .kind = .set, .element = .blob }, // 7 set of blob
         });
         w.setRoot(catalogRef);
         _ = try w.commit();
@@ -135,8 +135,8 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
                 var rng: u64 = primaryKey +% 0x9E3779B97F4A7C15;
                 const iv = xorshift(&rng);
 
-                var blob_buf: [32]u8 = undefined;
-                for (&blob_buf, 0..) |*b, k| b.* = @truncate(iv +% k);
+                var blobBuffer: [32]u8 = undefined;
+                for (&blobBuffer, 0..) |*b, k| b.* = @truncate(iv +% k);
 
                 const dict_entries = [_]catalog.DictEntry{
                     .{ .key = "alpha", .val = iv & 0xffff },
@@ -150,7 +150,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
                     .{ .int = primaryKey },
                     .{ .int = iv },
                     .{ .int = primaryKey & 1 }, // bool
-                    .{ .bytes = &blob_buf },
+                    .{ .bytes = &blobBuffer },
                     .{ .link = if (primaryKey == 0) null else primaryKey - 1 }, // self-link to prior objectKey
                     .{ .dict_int = &dict_entries },
                     .{ .set_int = &set_ints },
@@ -243,9 +243,9 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
             var j: usize = 0;
             while (j < this_batch) : (j += 1) {
                 const primaryKey: u64 = ((done + j) * delete_stride) % rows;
-                const ver = (try rawRows.getByPrimaryKey(&w, catalogRef, primaryKey, &raw)) orelse continue;
+                const version = (try rawRows.getByPrimaryKey(&w, catalogRef, primaryKey, &raw)) orelse continue;
                 const t0 = nowNs(io);
-                const dres = try objects.deleteTyped(&w, catalogRef, primaryKey, ver);
+                const dres = try objects.deleteTyped(&w, catalogRef, primaryKey, version);
                 const dt: u64 = @intCast(nowNs(io) - t0);
                 switch (dres) {
                     .ok => |c| {
@@ -273,10 +273,10 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         alloc,
         "create_p50_us={d:.1} read_p50_us={d:.1} update_p50_us={d:.1} delete_p50_us={d:.1} rows={d} kinds=int,bool,blob,link,dict,set,set_blob",
         .{
-            @as(f64, @floatFromInt(create_lat.pct(50))) / 1000.0,
-            @as(f64, @floatFromInt(read_lat.pct(50))) / 1000.0,
-            @as(f64, @floatFromInt(update_lat.pct(50))) / 1000.0,
-            @as(f64, @floatFromInt(delete_lat.pct(50))) / 1000.0,
+            @as(f64, @floatFromInt(create_lat.percentile(50))) / 1000.0,
+            @as(f64, @floatFromInt(read_lat.percentile(50))) / 1000.0,
+            @as(f64, @floatFromInt(update_lat.percentile(50))) / 1000.0,
+            @as(f64, @floatFromInt(delete_lat.percentile(50))) / 1000.0,
             rows,
         },
     );
@@ -285,9 +285,9 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         .name = name,
         .ops = ops,
         .wall_ns = total_ns,
-        .p50_ns = combined.pct(50),
-        .p99_ns = combined.pct(99),
-        .max_ns = combined.pct(100),
+        .p50_ns = combined.percentile(50),
+        .p99_ns = combined.percentile(99),
+        .max_ns = combined.percentile(100),
         .file_bytes = file_bytes,
         .logical_bytes = logical_bytes,
         .peak_rss_bytes = airdb.peakResidentBytes(),

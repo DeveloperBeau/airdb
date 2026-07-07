@@ -11,12 +11,12 @@ const rows = @import("../records/rows.zig");
 const PropertyKind = catalog.PropertyKind;
 const Value = typedir.Value;
 const createTypes = typedir.createTypes;
-const createWithDefs = typedir.createWithDefs;
+const createWithDefinitions = typedir.createWithDefinitions;
 const create = typedir.create;
 const typeCount = typedir.typeCount;
 const catalogRef = typedir.catalogRef;
 const setCatalogRef = typedir.setCatalogRef;
-const addTypeDefs = typedir.addTypeDefs;
+const addTypeDefinitions = typedir.addTypeDefinitions;
 const addType = typedir.addType;
 const isEmbedded = typedir.isEmbedded;
 const validate = typedir.validate;
@@ -37,9 +37,9 @@ const insertEmbedded = typedir.insertEmbedded;
 const clearEmbedded = typedir.clearEmbedded;
 
 fn tdTmpPath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const u8) ![]const u8 {
-    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const dlen = try tmp.dir.realPath(testing.io, &path_buf);
-    return std.fs.path.join(allocator, &.{ path_buf[0..dlen], name });
+    var pathBuffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dlen = try tmp.dir.realPath(testing.io, &pathBuffer);
+    return std.fs.path.join(allocator, &.{ pathBuffer[0..dlen], name });
 }
 
 test "create builds a directory with one catalog per type" {
@@ -157,9 +157,9 @@ test "multiple types persist across reopen and validate" {
         var w = try database.beginWrite();
         var dir = try create(&w, &schema);
         var i: u64 = 0;
-        var buf: [16]u8 = undefined;
+        var buffer: [16]u8 = undefined;
         while (i < 300) : (i += 1) {
-            const s = try std.fmt.bufPrint(&buf, "p{d}", .{i});
+            const s = try std.fmt.bufPrint(&buffer, "p{d}", .{i});
             dir = (try insert(&w, dir, 0, &.{ .{ .int = i }, .{ .bytes = s } })).dir;
             dir = (try insert(&w, dir, 1, &.{ .{ .int = i }, .{ .int = i * 10 } })).dir;
         }
@@ -223,7 +223,7 @@ test "multi-type directory carries links and collections via createWithDefs" {
         &.{ .{ .kind = .int }, .{ .kind = .blob } },
         &.{ .{ .kind = .int }, .{ .kind = .link }, .{ .kind = .link_set } },
     };
-    var dir = try createWithDefs(&w, &schema);
+    var dir = try createWithDefinitions(&w, &schema);
     try testing.expectEqual(@as(u16, 2), try typeCount(&w, dir));
 
     // insert two type-1 rows; row a links to nothing, b's set links to a.
@@ -239,8 +239,8 @@ test "multi-type directory carries links and collections via createWithDefs" {
     // a has 2 inbound to-one? no: only b's to-one links a -> backlink on property 1 == 1
     try testing.expectEqual(@as(u64, 1), try backlinkCount(&w, dir, 1, 1, a.row));
 
-    // addTypeDefs: append a type with a list property
-    const added = try addTypeDefs(&w, dir, &.{ .{ .kind = .int }, .{ .kind = .list, .elem = .int } });
+    // addTypeDefinitions: append a type with a list property
+    const added = try addTypeDefinitions(&w, dir, &.{ .{ .kind = .int }, .{ .kind = .list, .element = .int } });
     dir = added.dir;
     try testing.expectEqual(@as(u16, 2), added.type_id);
     dir = (try insert(&w, dir, 2, &.{ .{ .int = 1 }, .{ .list_int = &.{ 7, 8, 9 } } })).dir;
@@ -261,7 +261,7 @@ test "a cross-type link resolves to the target type's object" {
         &.{ .{ .kind = .int }, .{ .kind = .blob } }, // 0: Author
         &.{ .{ .kind = .int }, .{ .kind = .link, .link_target = 0 } }, // 1: Book.author -> Author
     };
-    var dir = try createWithDefs(&w, &schema);
+    var dir = try createWithDefinitions(&w, &schema);
 
     const ains = try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .bytes = "Ada" } });
     dir = ains.dir;
@@ -291,7 +291,7 @@ test "deleting a target nullifies inbound links from another type" {
         &.{ .{ .kind = .int }, .{ .kind = .blob } }, // 0: Author
         &.{ .{ .kind = .int }, .{ .kind = .link, .link_target = 0 } }, // 1: Book.author -> Author
     };
-    var dir = try createWithDefs(&w, &schema);
+    var dir = try createWithDefinitions(&w, &schema);
 
     const ains = try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .bytes = "Ada" } });
     dir = ains.dir;
@@ -302,8 +302,8 @@ test "deleting a target nullifies inbound links from another type" {
     try testing.expectEqual(@as(u64, 2), try backlinkCount(&w, dir, 1, 1, authorObjectKey));
 
     var abuf: [2]Value = undefined;
-    const author_ver = (try get(&w, dir, 0, 1, &abuf)).?;
-    const dres = try deleteNullifyX(&w, dir, 0, 1, author_ver);
+    const authorVersion = (try get(&w, dir, 0, 1, &abuf)).?;
+    const dres = try deleteNullifyX(&w, dir, 0, 1, authorVersion);
     dir = dres.ok;
 
     try testing.expectEqual(@as(?u64, null), try getLink(&w, dir, 1, 1, 1));
@@ -327,7 +327,7 @@ test "cross-type links persist across reopen" {
         var database = try Database.create(testing.allocator, path);
         defer database.deinit();
         var w = try database.beginWrite();
-        var dir = try createWithDefs(&w, &schema);
+        var dir = try createWithDefinitions(&w, &schema);
         const ains = try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .bytes = "Ada" } });
         dir = ains.dir;
         authorObjectKey = ains.row;
@@ -366,7 +366,7 @@ test "block prevents deleting a referenced object" {
         &.{ .{ .kind = .int }, .{ .kind = .blob } }, // Author
         &.{ .{ .kind = .int }, .{ .kind = .link, .link_target = 0, .del_rule = .block } }, // Book.author (block)
     };
-    var dir = try createWithDefs(&w, &schema);
+    var dir = try createWithDefinitions(&w, &schema);
     const author = try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .bytes = "Ada" } });
     dir = author.dir;
     const book = try insert(&w, dir, 1, &.{ .{ .int = 1 }, .{ .link = author.row } });
@@ -380,8 +380,8 @@ test "block prevents deleting a referenced object" {
 
     // Remove the book, then the author deletes fine.
     var bv: [2]Value = undefined;
-    const bver = (try get(&w, dir, 1, 1, &bv)).?;
-    const dbk = try deleteNullifyX(&w, dir, 1, 1, bver);
+    const versionB = (try get(&w, dir, 1, 1, &bv)).?;
+    const dbk = try deleteNullifyX(&w, dir, 1, 1, versionB);
     dir = dbk.ok;
     const aver2 = (try get(&w, dir, 0, 1, &av)).?;
     const da = try deleteNullifyX(&w, dir, 0, 1, aver2);
@@ -404,7 +404,7 @@ test "cascade deletes owned children" {
         &.{ .{ .kind = .int }, .{ .kind = .link_set, .link_target = 1, .del_rule = .cascade } }, // Parent.children
         &.{.{ .kind = .int }}, // Child
     };
-    var dir = try createWithDefs(&w, &schema);
+    var dir = try createWithDefinitions(&w, &schema);
     const c1 = try insert(&w, dir, 1, &.{.{ .int = 10 }});
     dir = c1.dir;
     const c2 = try insert(&w, dir, 1, &.{.{ .int = 20 }});
@@ -527,8 +527,8 @@ test "deleting the owner cascades to the embedded child" {
     dir = try insertEmbedded(&w, dir, 0, 1, 1, &.{ .{ .int = 100 }, .{ .bytes = "note" } });
 
     var ov: [2]Value = undefined;
-    const owner_ver = (try get(&w, dir, 0, 1, &ov)).?;
-    const dres = try deleteNullifyX(&w, dir, 0, 1, owner_ver);
+    const ownerVersion = (try get(&w, dir, 0, 1, &ov)).?;
+    const dres = try deleteNullifyX(&w, dir, 0, 1, ownerVersion);
     dir = dres.ok;
     try testing.expectEqual(@as(?u64, null), try get(&w, dir, 0, 1, &ov));
     try testing.expectEqual(@as(u64, 0), try liveCount(&w, dir, 1));
@@ -548,7 +548,7 @@ test "directory delete works after relocating the target" {
         &.{ .{ .kind = .int }, .{ .kind = .blob } }, // 0: Author
         &.{ .{ .kind = .int }, .{ .kind = .link, .link_target = 0 } }, // 1: Book.author -> Author
     };
-    var dir = try createWithDefs(&w, &schema);
+    var dir = try createWithDefinitions(&w, &schema);
 
     // A throwaway author opens a dead slot for the real author to move into.
     const throwaway = try insert(&w, dir, 0, &.{ .{ .int = 99 }, .{ .bytes = "tmp" } });
@@ -576,8 +576,8 @@ test "directory delete works after relocating the target" {
     // Deleting the author must nullify the book's link, proving the delete used
     // the object key rather than a stale physical row.
     var abuf: [2]Value = undefined;
-    const author_ver = (try get(&w, dir, 0, 1, &abuf)).?;
-    const dres = try deleteNullifyX(&w, dir, 0, 1, author_ver);
+    const authorVersion = (try get(&w, dir, 0, 1, &abuf)).?;
+    const dres = try deleteNullifyX(&w, dir, 0, 1, authorVersion);
     dir = dres.ok;
     try testing.expectEqual(@as(?u64, null), try getLink(&w, dir, 1, 1, 1));
     w.deinit();
@@ -600,7 +600,7 @@ test "a self-linked object is deletable across transactions" {
     // Commit a row that links to ITSELF via a block-rule property.
     {
         var w = try database.beginWrite();
-        var dir = try createWithDefs(&w, &.{
+        var dir = try createWithDefinitions(&w, &.{
             &.{ .{ .kind = .int }, .{ .kind = .link, .link_target = 0, .del_rule = .block } },
         });
         const a = try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .link = null } });
@@ -614,8 +614,8 @@ test "a self-linked object is deletable across transactions" {
     {
         var w = try database.beginWrite();
         var out: [2]Value = undefined;
-        const ver = (try get(&w, w.new_root, 0, 1, &out)).?;
-        const res = try deleteNullifyX(&w, w.new_root, 0, 1, ver);
+        const version = (try get(&w, w.new_root, 0, 1, &out)).?;
+        const res = try deleteNullifyX(&w, w.new_root, 0, 1, version);
         try testing.expect(res == .ok);
         w.setRoot(res.ok);
         _ = try w.commit();
@@ -639,7 +639,7 @@ test "cascade is cycle-safe" {
     const schema = [_][]const PD{
         &.{ .{ .kind = .int }, .{ .kind = .link, .link_target = 0, .del_rule = .cascade } }, // Node.next (self type)
     };
-    var dir = try createWithDefs(&w, &schema);
+    var dir = try createWithDefinitions(&w, &schema);
     const a = try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .link = null } });
     dir = a.dir;
     const b = try insert(&w, dir, 0, &.{ .{ .int = 2 }, .{ .link = a.row } }); // b -> a
@@ -668,7 +668,7 @@ test "a directory delete of a self-referencing link_set row frees its set root e
 
     {
         var w = try database.beginWrite();
-        var dir = try createWithDefs(&w, &.{
+        var dir = try createWithDefinitions(&w, &.{
             &.{ .{ .kind = .int }, .{ .kind = .link_set, .link_target = 0 } },
         });
         const ins = try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .link_set = &.{} } });
@@ -680,8 +680,8 @@ test "a directory delete of a self-referencing link_set row frees its set root e
     var w = try database.beginWrite();
     defer w.deinit();
     var out: [2]Value = undefined;
-    const ver = (try get(&w, w.new_root, 0, 1, &out)).?;
-    const res = try deleteNullifyX(&w, w.new_root, 0, 1, ver);
+    const version = (try get(&w, w.new_root, 0, 1, &out)).?;
+    const res = try deleteNullifyX(&w, w.new_root, 0, 1, version);
     try testing.expect(res == .ok);
     var seen = std.AutoHashMap(u64, void).init(testing.allocator);
     defer seen.deinit();
@@ -708,8 +708,8 @@ test "a directory delete frees the row's collection storage" {
 
     {
         var w = try database.beginWrite();
-        var dir = try createWithDefs(&w, &.{
-            &.{ .{ .kind = .int }, .{ .kind = .set, .elem = .int }, .{ .kind = .list, .elem = .int } },
+        var dir = try createWithDefinitions(&w, &.{
+            &.{ .{ .kind = .int }, .{ .kind = .set, .element = .int }, .{ .kind = .list, .element = .int } },
         });
         dir = (try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .set_int = &.{ 1, 2, 3 } }, .{ .list_int = &.{ 7, 8, 9 } } })).dir;
         w.setRoot(dir);
@@ -720,8 +720,8 @@ test "a directory delete frees the row's collection storage" {
     var raw: [3]u64 = undefined;
     _ = (try rows.getByPrimaryKey(&w, try catalogRef(&w, w.new_root, 0), 1, &raw)).?;
     var out: [3]Value = undefined;
-    const ver = (try get(&w, w.new_root, 0, 1, &out)).?;
-    const res = try deleteNullifyX(&w, w.new_root, 0, 1, ver);
+    const version = (try get(&w, w.new_root, 0, 1, &out)).?;
+    const res = try deleteNullifyX(&w, w.new_root, 0, 1, version);
     try testing.expect(res == .ok);
     var freed_set = false;
     var freed_list = false;
@@ -749,9 +749,9 @@ test "a cascade delete frees the child's collection storage" {
 
     {
         var w = try database.beginWrite();
-        var dir = try createWithDefs(&w, &.{
+        var dir = try createWithDefinitions(&w, &.{
             &.{ .{ .kind = .int }, .{ .kind = .link, .link_target = 1, .del_rule = .cascade } }, // 0: owner
-            &.{ .{ .kind = .int }, .{ .kind = .set, .elem = .int } }, // 1: child
+            &.{ .{ .kind = .int }, .{ .kind = .set, .element = .int } }, // 1: child
         });
         const child = try insert(&w, dir, 1, &.{ .{ .int = 100 }, .{ .set_int = &.{ 1, 2, 3 } } });
         dir = child.dir;
@@ -764,8 +764,8 @@ test "a cascade delete frees the child's collection storage" {
     var raw: [2]u64 = undefined;
     _ = (try rows.getByPrimaryKey(&w, try catalogRef(&w, w.new_root, 1), 100, &raw)).?;
     var out: [2]Value = undefined;
-    const ver = (try get(&w, w.new_root, 0, 1, &out)).?;
-    const res = try deleteNullifyX(&w, w.new_root, 0, 1, ver);
+    const version = (try get(&w, w.new_root, 0, 1, &out)).?;
+    const res = try deleteNullifyX(&w, w.new_root, 0, 1, version);
     try testing.expect(res == .ok);
     try testing.expectEqual(@as(u64, 0), try liveCount(&w, res.ok, 1)); // child cascaded
     var freed_child_set = false;

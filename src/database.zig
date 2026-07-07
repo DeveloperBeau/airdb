@@ -253,7 +253,7 @@ pub const Database = struct {
     }
 
     pub fn deinit(self: *Database) void {
-        if (self.participant_slot) |idx| self.coord.releaseSlot(idx);
+        if (self.participant_slot) |slotIndex| self.coord.releaseSlot(slotIndex);
         _ = self.coord.detach();
         self.coord.deinit();
         self.free_list.deinit();

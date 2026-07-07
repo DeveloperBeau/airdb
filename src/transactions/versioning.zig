@@ -35,10 +35,10 @@ pub fn selectActiveSlot(database: *Database) !Slot {
         // committed. The max-version heuristic would wrongly resurrect an aborted
         // commit whose new slot was durably written in the data barrier but never
         // published (i.e., header flush failed after the data barrier succeeded).
-        const primary_idx = database.store.header.active_slot;
-        if (primary_idx > 1) return error.Corrupt;
-        const primary_off: usize = if (primary_idx == 0) slot_a_off else slot_b_off;
-        const other_off: usize = if (primary_idx == 0) slot_b_off else slot_a_off;
+        const primarySlotIndex = database.store.header.active_slot;
+        if (primarySlotIndex > 1) return error.Corrupt;
+        const primary_off: usize = if (primarySlotIndex == 0) slot_a_off else slot_b_off;
+        const other_off: usize = if (primarySlotIndex == 0) slot_b_off else slot_a_off;
 
         // Try the primary slot first (normal path and correct crash-recovery path).
         // Fall back to the other slot only if the primary checksum is bad, which
@@ -146,7 +146,7 @@ fn localMinPinned(database: *Database) u64 {
 /// Publish the local minimum pinned version to the instance's participant slot
 /// (if it has one), making the pins visible to other processes' reclaim horizons.
 pub fn publishPins(database: *Database) void {
-    if (database.participant_slot) |idx| database.coord.publishMinPinned(idx, localMinPinned(database));
+    if (database.participant_slot) |slotIndex| database.coord.publishMinPinned(slotIndex, localMinPinned(database));
 }
 
 /// The minimum version pinned by a live reader in this process, or the active
@@ -197,8 +197,8 @@ pub fn versionRoot(database: *Database, version: u64) ?u64 {
     const n = @min(head, ring_capacity);
     var j: u64 = 0;
     while (j < n) : (j += 1) {
-        const slot_idx: usize = @intCast((head - 1 - j) % ring_capacity);
-        const e = ring_off + slot_idx * 16;
+        const slotIndex: usize = @intCast((head - 1 - j) % ring_capacity);
+        const e = ring_off + slotIndex * 16;
         const v = std.mem.readInt(u64, map[e..][0..8], .little);
         if (v == version) return std.mem.readInt(u64, map[e + 8 ..][0..8], .little);
     }
@@ -235,9 +235,9 @@ pub fn oldestReadableVersion(database: *Database) u64 {
 // Tests of this file's own invariants.
 
 fn tmpFilePath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const u8) ![]const u8 {
-    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const path_len = try tmp.dir.realPath(testing.io, &path_buf);
-    return std.fs.path.join(allocator, &.{ path_buf[0..path_len], name });
+    var pathBuffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(testing.io, &pathBuffer);
+    return std.fs.path.join(allocator, &.{ pathBuffer[0..path_len], name });
 }
 
 test "refresh does not advance to a durable-but-unpublished (aborted) slot" {
@@ -258,11 +258,11 @@ test "refresh does not advance to a durable-but-unpublished (aborted) slot" {
     // Forge a VALID slot with a much higher version into the inactive slot bytes,
     // WITHOUT advancing coord.latest_version (simulates an aborted-but-durable commit).
     const forged = Slot{ .version = published_version + 50, .root_ref = 0, .free_list_ref = 0, .logical_size = default_page_size };
-    var buf: [Slot.size]u8 = undefined;
-    forged.encode(&buf);
+    var buffer: [Slot.size]u8 = undefined;
+    forged.encode(&buffer);
     // Write it into whichever slot is currently inactive. The active slot is header.active_slot.
     const inactive_off: usize = if (database.store.header.active_slot == 0) slot_b_off else slot_a_off;
-    @memcpy(database.store.map[inactive_off .. inactive_off + Slot.size], &buf);
+    @memcpy(database.store.map[inactive_off .. inactive_off + Slot.size], &buffer);
     // Refresh must NOT advance to the forged version (coord.latest_version unchanged).
     try refreshToLatest(&database);
     try testing.expectEqual(published_version, database.active_version);

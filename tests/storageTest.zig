@@ -4,9 +4,9 @@ const testing = std.testing;
 const Io = std.Io;
 
 fn tmpFilePath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const u8) ![]const u8 {
-    var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
-    const path_len = try tmp.dir.realPath(testing.io, &path_buf);
-    const dir_path = path_buf[0..path_len];
+    var pathBuffer: [Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(testing.io, &pathBuffer);
+    const dir_path = pathBuffer[0..path_len];
     return std.fs.path.join(allocator, &.{ dir_path, name });
 }
 

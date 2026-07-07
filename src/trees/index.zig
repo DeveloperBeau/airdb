@@ -12,7 +12,7 @@ const bTreeCore = @import("bTreeCore.zig");
 
 // Local aliases for the on-disk node format, used by the numeric-only extras
 // below (maxKey, range iteration, test helpers).
-const FANOUT = node.FANOUT;
+const fanout = node.fanout;
 const kind_leaf = node.kind_leaf;
 const leaf_node_size = node.leaf_node_size;
 const inner_node_size = node.inner_node_size;
@@ -126,10 +126,10 @@ const bulkBuild = @import("indexBulkBuild.zig");
 /// it; the per-level work item of packLeaves/stackInner/appendRun.
 pub const Child = bulkBuild.Child;
 
-/// Pack strictly-ascending (keys, values) into leaves filled to LEAF_CAP.
+/// Pack strictly-ascending (keys, values) into leaves filled to leafCap.
 pub const packLeaves = bulkBuild.packLeaves;
 
-/// Build one inner level over a slice of children, packed in runs of FANOUT.
+/// Build one inner level over a slice of children, packed in runs of fanout.
 pub const stackInner = bulkBuild.stackInner;
 
 /// Stack inner levels until a single root remains, replacing `level` in place.
@@ -188,9 +188,9 @@ fn forEachEntryInRangeAt(
 
 // Test-only helper: build an inner node from a slice of (ref, low, count) triples.
 pub fn makeInnerForTest(transaction: anytype, children: []const struct { ref: u64, low: u64, count: u64 }) !Reference {
-    var refs: [FANOUT]u64 = undefined;
-    var lows: [FANOUT]u64 = undefined;
-    var counts: [FANOUT]u64 = undefined;
+    var refs: [fanout]u64 = undefined;
+    var lows: [fanout]u64 = undefined;
+    var counts: [fanout]u64 = undefined;
     for (children, 0..) |c, i| {
         refs[i] = c.ref;
         lows[i] = c.low;
@@ -202,22 +202,22 @@ pub fn makeInnerForTest(transaction: anytype, children: []const struct { ref: u6
 }
 
 test "leaf encode/decode round-trips sorted pairs" {
-    var buf: [leaf_node_size]u8 = undefined;
+    var buffer: [leaf_node_size]u8 = undefined;
     const keys = [_]u64{ 1, 5, 9 };
     const vals = [_]u64{ 10, 50, 90 };
-    const n = encodeLeaf(&buf, &keys, &vals);
-    const v = try parseLeaf(buf[0..n]);
+    const n = encodeLeaf(&buffer, &keys, &vals);
+    const v = try parseLeaf(buffer[0..n]);
     try std.testing.expectEqual(@as(u16, 3), v.count);
     try std.testing.expectEqual(@as(u64, 5), v.key(1));
     try std.testing.expectEqual(@as(u64, 90), v.value(2));
 }
 
 test "lowerBound finds the first index whose key is >= the search key" {
-    var buf: [leaf_node_size]u8 = undefined;
+    var buffer: [leaf_node_size]u8 = undefined;
     const keys = [_]u64{ 2, 4, 6, 8 };
     const vals = [_]u64{ 0, 0, 0, 0 };
-    const n = encodeLeaf(&buf, &keys, &vals);
-    const v = try parseLeaf(buf[0..n]);
+    const n = encodeLeaf(&buffer, &keys, &vals);
+    const v = try parseLeaf(buffer[0..n]);
     try std.testing.expectEqual(@as(usize, 0), v.lowerBound(1));
     try std.testing.expectEqual(@as(usize, 1), v.lowerBound(4));
     try std.testing.expectEqual(@as(usize, 2), v.lowerBound(5));

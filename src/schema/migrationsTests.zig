@@ -24,9 +24,9 @@ const getByPrimaryKey = @import("../records/rows.zig").getByPrimaryKey;
 const getLink = @import("../records/links.zig").getLink;
 
 fn objTmpPath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const u8) ![]const u8 {
-    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const dlen = try tmp.dir.realPath(testing.io, &path_buf);
-    return std.fs.path.join(allocator, &.{ path_buf[0..dlen], name });
+    var pathBuffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dlen = try tmp.dir.realPath(testing.io, &pathBuffer);
+    return std.fs.path.join(allocator, &.{ pathBuffer[0..dlen], name });
 }
 
 test "addProperty backfills the default for existing rows" {
@@ -154,8 +154,8 @@ test "addProperty(link_set) leaves pre-migration rows deletable" {
     {
         var w = try database.beginWrite();
         var out: [2]catalog.Value = undefined;
-        const ver = (try typeRouting.get(&w, w.new_root, 0, 1, &out)).?;
-        const res = try typeRouting.deleteNullifyX(&w, w.new_root, 0, 1, ver);
+        const version = (try typeRouting.get(&w, w.new_root, 0, 1, &out)).?;
+        const res = try typeRouting.deleteNullifyX(&w, w.new_root, 0, 1, version);
         try testing.expect(res == .ok); // previously error.BadRef
         w.setRoot(res.ok);
         _ = try w.commit();

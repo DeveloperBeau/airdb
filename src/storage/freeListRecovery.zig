@@ -24,8 +24,8 @@ pub fn decodeFreeListNode(database: *Database, free_list_ref: Reference, out: *F
     while (cref != 0) : (hops += 1) {
         if (hops >= FreeList.max_chunks) return error.Corrupt; // ref cycle
         // Read the chunk header to learn the chunk size and successor.
-        const hdr = try database.arena.deref(cref, FreeList.chunk_header_bytes);
-        const count = std.mem.readInt(u32, hdr[0..4], .little);
+        const header = try database.arena.deref(cref, FreeList.chunk_header_bytes);
+        const count = std.mem.readInt(u32, header[0..4], .little);
         const node_len = FreeList.chunkByteLen(count);
         const node_bytes = try database.arena.deref(cref, node_len);
         const next = try out.decodeChunkAppend(node_bytes);

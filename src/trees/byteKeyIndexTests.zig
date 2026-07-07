@@ -19,9 +19,9 @@ const inner_node_size = node.inner_node_size;
 const encodeInner = node.encodeInner;
 
 fn bidxTmpPath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const u8) ![]const u8 {
-    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const dlen = try tmp.dir.realPath(testing.io, &path_buf);
-    return std.fs.path.join(allocator, &.{ path_buf[0..dlen], name });
+    var pathBuffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dlen = try tmp.dir.realPath(testing.io, &pathBuffer);
+    return std.fs.path.join(allocator, &.{ pathBuffer[0..dlen], name });
 }
 
 test "a bindex ref cycle fails with error.Corrupt" {
@@ -65,10 +65,10 @@ test "freeTree over a three-level tree frees every blob exactly once" {
     defer w.deinit();
 
     var root = try create(&w);
-    var buf: [10]u8 = undefined;
+    var buffer: [10]u8 = undefined;
     var i: u64 = 0;
-    while (i < 4300) : (i += 1) { // > LEAF_CAP * FANOUT: forces inner splits
-        const key = try std.fmt.bufPrint(&buf, "k{d:0>7}", .{i});
+    while (i < 4300) : (i += 1) { // > leafCap * fanout: forces inner splits
+        const key = try std.fmt.bufPrint(&buffer, "k{d:0>7}", .{i});
         root = try insert(&w, root, key, i);
     }
     try testing.expectEqual(@as(u64, 4300), try count(&w, root));
@@ -103,33 +103,33 @@ test "removing split-boundary keys never dangles routing separators" {
     defer w.deinit();
 
     var root = try create(&w);
-    var buf: [8]u8 = undefined;
+    var buffer: [8]u8 = undefined;
     var i: u64 = 0;
     while (i < 200) : (i += 1) { // multiple leaf splits
-        const key = try std.fmt.bufPrint(&buf, "k{d:0>5}", .{i});
+        const key = try std.fmt.bufPrint(&buffer, "k{d:0>5}", .{i});
         root = try insert(&w, root, key, i);
     }
     // Remove each key (any of them may be a split boundary) and immediately
     // insert a same-length replacement so the freed key blob is reused.
     i = 0;
     while (i < 200) : (i += 1) {
-        const key = try std.fmt.bufPrint(&buf, "k{d:0>5}", .{i});
+        const key = try std.fmt.bufPrint(&buffer, "k{d:0>5}", .{i});
         root = try remove(&w, root, key);
-        const repl = try std.fmt.bufPrint(&buf, "z{d:0>5}", .{i});
+        const repl = try std.fmt.bufPrint(&buffer, "z{d:0>5}", .{i});
         root = try insert(&w, root, repl, i);
         // Every surviving original key must still resolve exactly.
         var j: u64 = i + 1;
         while (j < 200) : (j += 17) {
-            const probe = try std.fmt.bufPrint(&buf, "k{d:0>5}", .{j});
+            const probe = try std.fmt.bufPrint(&buffer, "k{d:0>5}", .{j});
             try testing.expectEqual(@as(?u64, j), try get(&w, root, probe));
         }
     }
     // All replacements resolve; all originals are gone.
     i = 0;
     while (i < 200) : (i += 1) {
-        const repl = try std.fmt.bufPrint(&buf, "z{d:0>5}", .{i});
+        const repl = try std.fmt.bufPrint(&buffer, "z{d:0>5}", .{i});
         try testing.expectEqual(@as(?u64, i), try get(&w, root, repl));
-        const orig = try std.fmt.bufPrint(&buf, "k{d:0>5}", .{i});
+        const orig = try std.fmt.bufPrint(&buffer, "k{d:0>5}", .{i});
         try testing.expectEqual(@as(?u64, null), try get(&w, root, orig));
     }
     try testing.expectEqual(@as(u64, 200), try count(&w, root));
@@ -195,9 +195,9 @@ test "keys iterate in ascending byte order" {
     const expect_keys = [_][]const u8{ "app", "apple", "banana", "cherry" };
     const expect_vals = [_]u64{ 40, 20, 10, 30 };
     try testing.expectEqual(expect_keys.len, keys.items.len);
-    for (keys.items, vals.items, 0..) |k, val, idx| {
-        try testing.expectEqualStrings(expect_keys[idx], k);
-        try testing.expectEqual(expect_vals[idx], val);
+    for (keys.items, vals.items, 0..) |k, val, index| {
+        try testing.expectEqualStrings(expect_keys[index], k);
+        try testing.expectEqual(expect_vals[index], val);
     }
     // And explicitly assert the collected keys are sorted by std.mem.order.
     var i: usize = 1;
@@ -259,12 +259,12 @@ test "many keys across splits" {
     var root = try create(&w);
 
     const N: u64 = 1000;
-    var buf: [64]u8 = undefined;
+    var buffer: [64]u8 = undefined;
     // Scrambled insertion order; varied lengths/zero-padding make byte order non-trivial.
     var i: u64 = 0;
     while (i < N) : (i += 1) {
         const k = (i *% 2654435761) % N; // permutation of 0..N-1
-        const key = try std.fmt.bufPrint(&buf, "key-{d}", .{k});
+        const key = try std.fmt.bufPrint(&buffer, "key-{d}", .{k});
         root = try insert(&w, root, key, k +% 7);
     }
     try testing.expectEqual(N, try count(&w, root));
@@ -272,7 +272,7 @@ test "many keys across splits" {
     // Get every key back.
     i = 0;
     while (i < N) : (i += 1) {
-        const key = try std.fmt.bufPrint(&buf, "key-{d}", .{i});
+        const key = try std.fmt.bufPrint(&buffer, "key-{d}", .{i});
         try testing.expectEqual(@as(?u64, i +% 7), try get(&w, root, key));
     }
 

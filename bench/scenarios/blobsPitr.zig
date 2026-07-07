@@ -68,9 +68,9 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     defer harness.removeScratch(ctx.*, blob_path);
 
     // One deterministic 24 MiB source buffer, reused for every blob.
-    const buf = try alloc.alloc(u8, blob_bytes);
-    defer alloc.free(buf);
-    for (buf, 0..) |*b, i| b.* = @truncate(i *% 2654435761);
+    const buffer = try alloc.alloc(u8, blob_bytes);
+    defer alloc.free(buffer);
+    for (buffer, 0..) |*b, i| b.* = @truncate(i *% 2654435761);
 
     var database = try airdb.Database.create(alloc, blob_path);
     errdefer database.deinit();
@@ -83,7 +83,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     var i: usize = 0;
     while (i < blob_count) : (i += 1) {
         var w = try database.beginWrite();
-        refs[i] = try blob.put(&w, buf);
+        refs[i] = try blob.put(&w, buffer);
         _ = try w.commit();
         put_bytes += blob_bytes;
     }
@@ -101,7 +101,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         // Correctness guard on the last blob: a chunked round-trip that silently
         // dropped or reordered bytes must fail the bench loudly.
         if (i == blob_count - 1) {
-            if (out.len != blob_bytes or out[0] != buf[0] or out[out.len - 1] != buf[buf.len - 1]) {
+            if (out.len != blob_bytes or out[0] != buffer[0] or out[out.len - 1] != buffer[buffer.len - 1]) {
                 return error.BlobRoundTripMismatch;
             }
         }
@@ -200,9 +200,9 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         rh.end();
     }
 
-    const latest_p50 = lat_latest.pct(50);
-    const hist_p50 = lat_hist.pct(50);
-    const overhead_pct: f64 = if (latest_p50 == 0)
+    const latest_p50 = lat_latest.percentile(50);
+    const hist_p50 = lat_hist.percentile(50);
+    const overheadPercent: f64 = if (latest_p50 == 0)
         0
     else
         (@as(f64, @floatFromInt(hist_p50)) - @as(f64, @floatFromInt(latest_p50))) /
@@ -212,7 +212,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         alloc,
         "blobs={d}x{d}MiB(chunked) put_MiBps={d:.0} get_MiBps={d:.0} " ++
             "latest_p50_us={d:.2} hist_p50_us={d:.2} overhead_pct={d:.1} " ++
-            "(file/logical from blob database; latencies from latest reads)",
+            "(file/logical from blob db; latencies from latest reads)",
         .{
             blob_count,
             blob_bytes / (1024 * 1024),
@@ -220,7 +220,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
             mibPerSec(get_bytes, get_ns),
             @as(f64, @floatFromInt(latest_p50)) / 1000.0,
             @as(f64, @floatFromInt(hist_p50)) / 1000.0,
-            overhead_pct,
+            overheadPercent,
         },
     );
 
@@ -229,8 +229,8 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         .ops = blob_count,
         .wall_ns = put_ns + get_ns,
         .p50_ns = latest_p50,
-        .p99_ns = lat_latest.pct(99),
-        .max_ns = lat_latest.pct(100),
+        .p99_ns = lat_latest.percentile(99),
+        .max_ns = lat_latest.percentile(100),
         .file_bytes = file_bytes,
         .logical_bytes = logical_bytes,
         .peak_rss_bytes = airdb.peakResidentBytes(),

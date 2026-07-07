@@ -16,8 +16,8 @@ pub const ReadTransaction = struct {
         return self.root_ref;
     }
 
-    pub fn deref(self: *ReadTransaction, ref: Reference, len: usize) ![]const u8 {
-        return self.database.arena.deref(ref, len);
+    pub fn deref(self: *ReadTransaction, ref: Reference, length: usize) ![]const u8 {
+        return self.database.arena.deref(ref, length);
     }
 
     pub fn end(self: *ReadTransaction) void {

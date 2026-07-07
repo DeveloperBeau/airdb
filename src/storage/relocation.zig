@@ -44,9 +44,9 @@ const rows = @import("../records/rows.zig");
 const links = @import("../records/links.zig");
 
 fn objTmpPath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const u8) ![]const u8 {
-    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const dlen = try tmp.dir.realPath(testing.io, &path_buf);
-    return std.fs.path.join(allocator, &.{ path_buf[0..dlen], name });
+    var pathBuffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dlen = try tmp.dir.realPath(testing.io, &pathBuffer);
+    return std.fs.path.join(allocator, &.{ pathBuffer[0..dlen], name });
 }
 
 test "relocateRow moves a row and keeps key, primaryKey, and value" {
@@ -70,8 +70,8 @@ test "relocateRow moves a row and keeps key, primaryKey, and value" {
 
     // Free b's physical slot by deleting primaryKey 2.
     const b_row = (try catalog.objectKeyToRow(&w, catalogRef, objectKeyB)).?;
-    var ver_out: [2]u64 = undefined;
-    const v2 = (try rows.getByPrimaryKey(&w, catalogRef, 2, &ver_out)).?;
+    var valuesOut: [2]u64 = undefined;
+    const v2 = (try rows.getByPrimaryKey(&w, catalogRef, 2, &valuesOut)).?;
     const del = try rows.delete(&w, catalogRef, 2, v2);
     catalogRef = del.ok;
     try testing.expectEqual(@as(u64, 2), try catalog.liveCount(&w, catalogRef));
@@ -110,7 +110,7 @@ test "setLink after relocating the SOURCE keeps the backlink graph exact" {
     var w = try database.beginWrite();
     defer w.deinit();
 
-    var catalogRef = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
+    var catalogRef = try catalog.createFromDefinitions(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
 
     // Throwaway opens a dead slot; then two targets and the source.
     const dead = try rows.insert(&w, catalogRef, &.{ 99, 0 });
@@ -159,7 +159,7 @@ test "a same-type link to a relocated object still resolves" {
     var w = try database.beginWrite();
 
     // primaryKey + a single .link property (property index 1).
-    var catalogRef = try catalog.createDefs(&w, &.{
+    var catalogRef = try catalog.createFromDefinitions(&w, &.{
         .{ .kind = .int },
         .{ .kind = .link },
     });
@@ -183,8 +183,8 @@ test "a same-type link to a relocated object still resolves" {
 
     // Free the throwaway's slot.
     const d_row = (try catalog.objectKeyToRow(&w, catalogRef, objectKeyD)).?;
-    var ver_out: [2]u64 = undefined;
-    const v10 = (try rows.getByPrimaryKey(&w, catalogRef, 10, &ver_out)).?;
+    var valuesOut: [2]u64 = undefined;
+    const v10 = (try rows.getByPrimaryKey(&w, catalogRef, 10, &valuesOut)).?;
     const del = try rows.delete(&w, catalogRef, 10, v10);
     catalogRef = del.ok;
 

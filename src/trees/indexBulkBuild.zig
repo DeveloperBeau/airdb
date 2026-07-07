@@ -8,8 +8,8 @@
 // indistinguishable from one grown via the normal insert path.
 //
 // The `transaction` parameter follows index.zig's convention: a comptime duck-typed
-// transaction capability requiring deref(ref, len), alloc(size),
-// writableCopy(ref, len), and free(ref, len).
+// transaction capability requiring deref(ref, length), alloc(size),
+// writableCopy(ref, length), and free(ref, length).
 
 const std = @import("std");
 const Reference = @import("../storage/reference.zig").Reference;
@@ -17,8 +17,8 @@ const node = @import("indexNode.zig");
 const index = @import("index.zig");
 
 // Local aliases for the on-disk node format and the shared tree walkers.
-const LEAF_CAP = node.LEAF_CAP;
-const FANOUT = node.FANOUT;
+const leafCap = node.leafCap;
+const fanout = node.fanout;
 const kind_leaf = node.kind_leaf;
 const leaf_node_size = node.leaf_node_size;
 const inner_node_size = node.inner_node_size;
@@ -34,7 +34,7 @@ const derefNode = index.derefNode;
 /// work item of the bottom-up builders (packLeaves, stackInner, appendRun).
 pub const Child = struct { ref: u64, low: u64, count: u64 };
 
-/// Pack strictly-ascending (keys, values) into leaves filled to LEAF_CAP in key
+/// Pack strictly-ascending (keys, values) into leaves filled to leafCap in key
 /// order. Returns the leaf level: one Child per leaf, low == its first key.
 pub fn packLeaves(
     transaction: anytype,
@@ -45,7 +45,7 @@ pub fn packLeaves(
     std.debug.assert(keys.len == values.len);
     var out = std.ArrayList(Child).empty;
     errdefer out.deinit(allocator);
-    const cap: usize = LEAF_CAP;
+    const cap: usize = leafCap;
     var i: usize = 0;
     while (i < keys.len) {
         const end = @min(i + cap, keys.len);
@@ -57,7 +57,7 @@ pub fn packLeaves(
     return out;
 }
 
-/// Build one inner level over `children`, packed in runs of FANOUT. An inner
+/// Build one inner level over `children`, packed in runs of fanout. An inner
 /// node stores (child_ref, low_key, subtree_count); a parent's low key is the
 /// low key of its first child and its count is the sum of its run.
 pub fn stackInner(
@@ -67,10 +67,10 @@ pub fn stackInner(
 ) !std.ArrayList(Child) {
     var out = std.ArrayList(Child).empty;
     errdefer out.deinit(allocator);
-    const fan: usize = FANOUT;
-    var refs: [FANOUT]u64 = undefined;
-    var lows: [FANOUT]u64 = undefined;
-    var counts: [FANOUT]u64 = undefined;
+    const fan: usize = fanout;
+    var refs: [fanout]u64 = undefined;
+    var lows: [fanout]u64 = undefined;
+    var counts: [fanout]u64 = undefined;
     var j: usize = 0;
     while (j < children.len) {
         const end = @min(j + fan, children.len);
@@ -170,7 +170,7 @@ fn combineLeafAndRun(
 /// Rebuild the rightmost inner spine bottom-up. At each recorded path level,
 /// the shared LEFT children (all but the rightmost) are re-emitted unchanged
 /// and the rightmost child is replaced by the level rebuilt below, which may
-/// have grown into several nodes. Packing in runs of FANOUT splits
+/// have grown into several nodes. Packing in runs of fanout splits
 /// automatically when the child list overflows; the extra nodes propagate up
 /// as additional children of the next level. Replaces `level` in place.
 fn rebuildRightSpine(
@@ -230,7 +230,7 @@ pub fn appendRun(
     const leaf_ref = try descendRightEdge(transaction, root, &path_refs, &path_ridx, allocator);
 
     // 2. Combine the rightmost leaf's pairs with the run, then pack the
-    //    combined run into leaves filled to LEAF_CAP: the first new leaf reuses
+    //    combined run into leaves filled to leafCap: the first new leaf reuses
     //    the old leaf's content topped up from the front of the run, the rest
     //    are full leaves.
     const combined = try combineLeafAndRun(transaction, leaf_ref, keys, values, allocator);
@@ -241,7 +241,7 @@ pub fn appendRun(
 
     // 3. Rebuild the rightmost inner spine bottom-up, then stack further inner
     //    levels until a single root remains (the rebuilt root level may have
-    //    overflowed FANOUT into several nodes), growing the tree height by one
+    //    overflowed fanout into several nodes), growing the tree height by one
     //    or more as needed.
     try rebuildRightSpine(transaction, path_refs.items, path_ridx.items, &level, allocator);
     try collapseToRoot(transaction, &level, allocator);

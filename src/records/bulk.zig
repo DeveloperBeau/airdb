@@ -8,7 +8,7 @@ const catalog = @import("../schema/catalog.zig");
 const rawRows = @import("rows.zig");
 
 const PropertyKind = catalog.PropertyKind;
-const ElemKind = catalog.ElemKind;
+const ElementKind = catalog.ElementKind;
 const DeletionRule = catalog.DeletionRule;
 const maxPropertyCount = catalog.maxPropertyCount;
 
@@ -17,7 +17,7 @@ const maxPropertyCount = catalog.maxPropertyCount;
 //
 // These build a complete, balanced tree directly from sorted input rather than
 // inserting one element at a time. Leaves are packed to capacity in key order,
-// then inner levels are stacked on top in runs of FANOUT until a single root
+// then inner levels are stacked on top in runs of fanout until a single root
 // remains (packLeaves/stackInner/collapseToRoot live with each tree's own
 // operations in column.zig and index.zig).
 // ---------------------------------------------------------------------------
@@ -28,12 +28,12 @@ pub const ValueObjectKeys = struct { value: u64, objectKeys: []const u64 };
 /// the root Reference. Equivalent to Column.create followed by an append per value.
 pub fn bulkColumn(transaction: *WriteTransaction, values: []const u64) !Reference {
     if (values.len == 0) return Column.create(transaction);
-    const al = transaction.database.store.allocator;
+    const allocator = transaction.database.store.allocator;
 
     // Pack leaves, then stack inner levels until a single root remains.
-    var level = try Column.packLeaves(transaction, values, al);
-    defer level.deinit(al);
-    try Column.collapseToRoot(transaction, &level, al);
+    var level = try Column.packLeaves(transaction, values, allocator);
+    defer level.deinit(allocator);
+    try Column.collapseToRoot(transaction, &level, allocator);
     return level.items[0].ref;
 }
 
@@ -78,12 +78,12 @@ pub fn bulkIndex(transaction: *WriteTransaction, keys: []const u64, vals: []cons
         while (p < keys.len) : (p += 1) std.debug.assert(keys[p] > keys[p - 1]);
     }
     if (keys.len == 0) return Index.create(transaction);
-    const al = transaction.database.store.allocator;
+    const allocator = transaction.database.store.allocator;
 
     // Pack leaves, then stack inner levels until a single root remains.
-    var level = try Index.packLeaves(transaction, keys, vals, al);
-    defer level.deinit(al);
-    try Index.collapseToRoot(transaction, &level, al);
+    var level = try Index.packLeaves(transaction, keys, vals, allocator);
+    defer level.deinit(allocator);
+    try Index.collapseToRoot(transaction, &level, allocator);
     return level.items[0].ref;
 }
 
@@ -92,18 +92,18 @@ pub fn bulkIndex(transaction: *WriteTransaction, keys: []const u64, vals: []cons
 /// the shape rows.valueIndexAdd maintains (value -> Index{objectKey -> 1}).
 pub fn bulkValueIndex(transaction: *WriteTransaction, entries: []const ValueObjectKeys) !Reference {
     if (entries.len == 0) return Index.create(transaction);
-    const al = transaction.database.store.allocator;
+    const allocator = transaction.database.store.allocator;
 
-    const values = try al.alloc(u64, entries.len);
-    defer al.free(values);
-    const inner_roots = try al.alloc(u64, entries.len);
-    defer al.free(inner_roots);
+    const values = try allocator.alloc(u64, entries.len);
+    defer allocator.free(values);
+    const inner_roots = try allocator.alloc(u64, entries.len);
+    defer allocator.free(inner_roots);
 
     // A reusable buffer of 1s big enough for the largest objectKey set.
     var maxObjectKeys: usize = 0;
     for (entries) |e| maxObjectKeys = @max(maxObjectKeys, e.objectKeys.len);
-    const ones = try al.alloc(u64, maxObjectKeys);
-    defer al.free(ones);
+    const ones = try allocator.alloc(u64, maxObjectKeys);
+    defer allocator.free(ones);
     @memset(ones, 1);
 
     for (entries, 0..) |e, k| {
@@ -145,9 +145,9 @@ pub fn bulkImport(
     const old_next_key = s.next_key;
     try validateImportInput(&s, rows);
 
-    const al = transaction.database.store.allocator;
-    const perm = try primaryKeySortOrder(rows, opts.presorted, al);
-    defer al.free(perm);
+    const allocator = transaction.database.store.allocator;
+    const perm = try primaryKeySortOrder(rows, opts.presorted, allocator);
+    defer allocator.free(perm);
 
     // --- All validation passed; build the tree roots bottom-up. ---
     try freePreallocatedTrees(transaction, &s);
@@ -180,11 +180,11 @@ fn validateImportInput(s: *const catalog.CatalogSnapshot, rows: []const []const 
 fn primaryKeySortOrder(
     rows: []const []const u64,
     presorted: bool,
-    al: std.mem.Allocator,
+    allocator: std.mem.Allocator,
 ) ![]usize {
     const n = rows.len;
-    const perm = try al.alloc(usize, n);
-    errdefer al.free(perm);
+    const perm = try allocator.alloc(usize, n);
+    errdefer allocator.free(perm);
     for (perm, 0..) |*x, i| x.* = i;
     if (presorted) {
         if (std.debug.runtime_safety) {
@@ -230,12 +230,12 @@ fn buildImportTrees(
     old_next_key: u64,
 ) !void {
     const n = rows.len;
-    const al = transaction.database.store.allocator;
+    const allocator = transaction.database.store.allocator;
 
     // Property columns: gather each property's values in sorted-row order.
     {
-        const col_vals = try al.alloc(u64, n);
-        defer al.free(col_vals);
+        const col_vals = try allocator.alloc(u64, n);
+        defer allocator.free(col_vals);
         var p: usize = 0;
         while (p < s.propertyCount) : (p += 1) {
             for (perm, 0..) |src, r| col_vals[r] = rows[src][p];
@@ -246,8 +246,8 @@ fn buildImportTrees(
     // Version and live columns: one stamp per row. The version stamp matches
     // rows.insert (transaction.new_version), so a bulk row carries the same version a
     // single-insert twin committed in the same transaction would; live = 1.
-    const stamps = try al.alloc(u64, n);
-    defer al.free(stamps);
+    const stamps = try allocator.alloc(u64, n);
+    defer allocator.free(stamps);
     @memset(stamps, transaction.new_version);
     s.version_col_ref = try bulkColumn(transaction, stamps[0..n]);
     @memset(stamps, 1);
@@ -256,12 +256,12 @@ fn buildImportTrees(
     // primaryKey index (primaryKey -> objectKey) and key->row index (objectKey -> physical row). objectKeys are
     // assigned in sorted-primaryKey order from the type's current next_key, so
     // objectKeyR == old_next_key + r and physical row r == r.
-    const primaryKeys = try al.alloc(u64, n);
-    defer al.free(primaryKeys);
-    const objectKeys = try al.alloc(u64, n);
-    defer al.free(objectKeys);
-    const phys_rows = try al.alloc(u64, n);
-    defer al.free(phys_rows);
+    const primaryKeys = try allocator.alloc(u64, n);
+    defer allocator.free(primaryKeys);
+    const objectKeys = try allocator.alloc(u64, n);
+    defer allocator.free(objectKeys);
+    const phys_rows = try allocator.alloc(u64, n);
+    defer allocator.free(phys_rows);
     for (perm, 0..) |src, r| {
         primaryKeys[r] = rows[src][0];
         objectKeys[r] = old_next_key + @as(u64, @intCast(r));
@@ -280,11 +280,11 @@ fn buildValueIndexes(
     perm: []const usize,
     old_next_key: u64,
 ) !void {
-    const al = transaction.database.store.allocator;
+    const allocator = transaction.database.store.allocator;
     var p: usize = 0;
     while (p < s.propertyCount) : (p += 1) {
         if (s.properties[p].indexed) {
-            s.properties[p].value_index = try buildPropertyValueIndex(transaction, rows, perm, p, old_next_key, al);
+            s.properties[p].value_index = try buildPropertyValueIndex(transaction, rows, perm, p, old_next_key, allocator);
         }
     }
 }
@@ -300,12 +300,12 @@ fn buildPropertyValueIndex(
     perm: []const usize,
     p: usize,
     old_next_key: u64,
-    al: std.mem.Allocator,
+    allocator: std.mem.Allocator,
 ) !Reference {
     const n = perm.len;
     const Pair = struct { value: u64, objectKey: u64 };
-    const pairs = try al.alloc(Pair, n);
-    defer al.free(pairs);
+    const pairs = try allocator.alloc(Pair, n);
+    defer allocator.free(pairs);
     for (perm, 0..) |src, r| pairs[r] = .{ .value = rows[src][p], .objectKey = old_next_key + @as(u64, @intCast(r)) };
     std.mem.sort(Pair, pairs, {}, struct {
         fn lt(_: void, a: Pair, b: Pair) bool {
@@ -316,17 +316,17 @@ fn buildPropertyValueIndex(
 
     // A contiguous objectKey buffer in (value, objectKey) order; each entry's objectKeys slice
     // points into it.
-    const sortedObjectKeys = try al.alloc(u64, n);
-    defer al.free(sortedObjectKeys);
+    const sortedObjectKeys = try allocator.alloc(u64, n);
+    defer allocator.free(sortedObjectKeys);
     for (pairs, 0..) |pr, i| sortedObjectKeys[i] = pr.objectKey;
 
     var entries = std.ArrayList(ValueObjectKeys).empty;
-    defer entries.deinit(al);
+    defer entries.deinit(allocator);
     var i: usize = 0;
     while (i < n) {
         var j = i + 1;
         while (j < n and pairs[j].value == pairs[i].value) j += 1;
-        try entries.append(al, .{ .value = pairs[i].value, .objectKeys = sortedObjectKeys[i..j] });
+        try entries.append(allocator, .{ .value = pairs[i].value, .objectKeys = sortedObjectKeys[i..j] });
         i = j;
     }
     return bulkValueIndex(transaction, entries.items);
@@ -368,17 +368,17 @@ pub fn bulkAppend(transaction: *WriteTransaction, catalogRef: Reference, rows: [
     const old_next_row = s.next_row;
     const old_next_key = s.next_key;
     const n = rows.len;
-    const al = transaction.database.store.allocator;
+    const allocator = transaction.database.store.allocator;
 
     // Object keys and physical rows are assigned in batch order from the type's
     // current counters, exactly as sequential ascending-primaryKey inserts would: the
     // j-th row gets objectKey = next_key + j and physical row = next_row + j.
-    const primaryKeys = try al.alloc(u64, n);
-    defer al.free(primaryKeys);
-    const objectKeys = try al.alloc(u64, n);
-    defer al.free(objectKeys);
-    const phys_rows = try al.alloc(u64, n);
-    defer al.free(phys_rows);
+    const primaryKeys = try allocator.alloc(u64, n);
+    defer allocator.free(primaryKeys);
+    const objectKeys = try allocator.alloc(u64, n);
+    defer allocator.free(objectKeys);
+    const phys_rows = try allocator.alloc(u64, n);
+    defer allocator.free(phys_rows);
     for (rows, 0..) |row, j| {
         primaryKeys[j] = row[0];
         objectKeys[j] = old_next_key + @as(u64, @intCast(j));
@@ -390,8 +390,8 @@ pub fn bulkAppend(transaction: *WriteTransaction, catalogRef: Reference, rows: [
     // primaryKey index (primaryKey -> objectKey) and key->row index (objectKey -> physical row). Both runs
     // land on the right edge: batch primaryKeys are ascending and above the current max,
     // and objectKeys are consecutive from next_key (thus above every existing objectKey).
-    s.primaryKeyIndexRef = try Index.appendRun(transaction, s.primaryKeyIndexRef, primaryKeys[0..n], objectKeys[0..n], al);
-    s.keyrow_index_ref = try Index.appendRun(transaction, s.keyrow_index_ref, objectKeys[0..n], phys_rows[0..n], al);
+    s.primaryKeyIndexRef = try Index.appendRun(transaction, s.primaryKeyIndexRef, primaryKeys[0..n], objectKeys[0..n], allocator);
+    s.keyrow_index_ref = try Index.appendRun(transaction, s.keyrow_index_ref, objectKeys[0..n], phys_rows[0..n], allocator);
 
     s.next_row = old_next_row + @as(u64, @intCast(n));
     s.next_key = old_next_key + @as(u64, @intCast(n));
@@ -408,26 +408,26 @@ fn appendColumnRuns(
     rows: []const []const u64,
 ) !void {
     const n = rows.len;
-    const al = transaction.database.store.allocator;
+    const allocator = transaction.database.store.allocator;
 
     // Property columns: append each property's values in batch order.
     {
-        const col_vals = try al.alloc(u64, n);
-        defer al.free(col_vals);
+        const col_vals = try allocator.alloc(u64, n);
+        defer allocator.free(col_vals);
         var p: usize = 0;
         while (p < s.propertyCount) : (p += 1) {
             for (rows, 0..) |row, j| col_vals[j] = row[p];
-            s.properties[p].col = try Column.appendRun(transaction, s.properties[p].col, col_vals[0..n], al);
+            s.properties[p].col = try Column.appendRun(transaction, s.properties[p].col, col_vals[0..n], allocator);
         }
     }
 
     // Version and live columns: one stamp per row, matching rows.insert.
-    const stamps = try al.alloc(u64, n);
-    defer al.free(stamps);
+    const stamps = try allocator.alloc(u64, n);
+    defer allocator.free(stamps);
     @memset(stamps, transaction.new_version);
-    s.version_col_ref = try Column.appendRun(transaction, s.version_col_ref, stamps[0..n], al);
+    s.version_col_ref = try Column.appendRun(transaction, s.version_col_ref, stamps[0..n], allocator);
     @memset(stamps, 1);
-    s.live_col_ref = try Column.appendRun(transaction, s.live_col_ref, stamps[0..n], al);
+    s.live_col_ref = try Column.appendRun(transaction, s.live_col_ref, stamps[0..n], allocator);
 }
 
 // Qualify a batch for the right-edge fast path, returning error.NotAppendable

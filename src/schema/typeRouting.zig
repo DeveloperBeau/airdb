@@ -136,9 +136,9 @@ pub fn getLinked(transaction: anytype, dir: Reference, src_type: u16, primaryKey
 pub fn deleteNullifyX(transaction: *WriteTransaction, dir: Reference, type_id: u16, primaryKey: u64, expected_version: u64) !DeleteResult {
     const catalog0 = try typedir.catalogRef(transaction, dir, type_id);
     const propertyCount = (try catalog.loadCatalog(transaction, catalog0)).propertyCount;
-    var buf: [256]u64 = undefined;
-    const ver = (try rows.getByPrimaryKey(transaction, catalog0, primaryKey, buf[0..propertyCount])) orelse return .not_found;
-    if (ver != expected_version) return .{ .conflict = .{ .current_version = ver } };
+    var buffer: [256]u64 = undefined;
+    const version = (try rows.getByPrimaryKey(transaction, catalog0, primaryKey, buffer[0..propertyCount])) orelse return .not_found;
+    if (version != expected_version) return .{ .conflict = .{ .current_version = version } };
     const objectKey = (try catalog.primaryKeyToObjectKey(transaction, catalog0, primaryKey)) orelse return .not_found;
 
     if (try isBlocked(transaction, dir, type_id, objectKey)) return .blocked;
@@ -182,7 +182,7 @@ fn isBlocked(transaction: *WriteTransaction, dir: Reference, type_id: u16, objec
 const SchemaSnapshot = struct {
     propertyCount: usize,
     kinds: [256]catalog.PropertyKind,
-    elems: [256]catalog.ElemKind,
+    elements: [256]catalog.ElementKind,
     rules: [256]catalog.DeletionRule,
     targets: [256]u16,
 };
@@ -194,7 +194,7 @@ fn snapshotSchema(transaction: *WriteTransaction, catalogRef: Reference, propert
     var p: usize = 0;
     while (p < propertyCount) : (p += 1) {
         s.kinds[p] = sv.kind(p);
-        s.elems[p] = sv.elemKind(p);
+        s.elements[p] = sv.elementKind(p);
         s.rules[p] = sv.delRule(p);
         s.targets[p] = sv.linkTarget(p);
     }
@@ -210,11 +210,11 @@ fn deleteWorker(transaction: *WriteTransaction, dir: Reference, type_id: u16, ob
     if (visited.contains(key)) return dir;
     try visited.put(key, {});
 
-    var rbuf: [256]u64 = undefined;
+    var rowBuffer: [256]u64 = undefined;
     const catalogBefore = try typedir.catalogRef(transaction, dir, type_id);
     const propertyCount = (try catalog.loadCatalog(transaction, catalogBefore)).propertyCount;
-    if ((try rows.getByObjectKey(transaction, catalogBefore, objectKey, rbuf[0..propertyCount])) == null) return dir; // already gone
-    const primaryKey = rbuf[0];
+    if ((try rows.getByObjectKey(transaction, catalogBefore, objectKey, rowBuffer[0..propertyCount])) == null) return dir; // already gone
+    const primaryKey = rowBuffer[0];
     const schema = try snapshotSchema(transaction, catalogBefore, propertyCount);
 
     // Phase 1) Cascade: delete children reached by this object's cascade-rule
@@ -273,14 +273,14 @@ fn cleanOutbound(transaction: *WriteTransaction, dir: Reference, type_id: u16, o
 // cascade-deleted child -- leaked its blobs and collection trees.
 fn tombstoneAndReclaim(transaction: *WriteTransaction, dir: Reference, type_id: u16, primaryKey: u64, objectKey: u64, schema: *const SchemaSnapshot) !Reference {
     const propertyCount = schema.propertyCount;
-    var rbuf: [256]u64 = undefined;
+    var rowBuffer: [256]u64 = undefined;
     const typeCatalog = try typedir.catalogRef(transaction, dir, type_id);
-    const cur_ver = (try rows.getByObjectKey(transaction, typeCatalog, objectKey, rbuf[0..propertyCount])) orelse return dir;
-    const dres = try rows.delete(transaction, typeCatalog, primaryKey, cur_ver);
+    const currentVersion = (try rows.getByObjectKey(transaction, typeCatalog, objectKey, rowBuffer[0..propertyCount])) orelse return dir;
+    const dres = try rows.delete(transaction, typeCatalog, primaryKey, currentVersion);
     switch (dres) {
         .ok => |newCatalog| {
             const cur = try setCatalogRef(transaction, dir, type_id, newCatalog);
-            try rows.freeRowStorage(transaction, schema.kinds[0..propertyCount], schema.elems[0..propertyCount], rbuf[0..propertyCount]);
+            try rows.freeRowStorage(transaction, schema.kinds[0..propertyCount], schema.elements[0..propertyCount], rowBuffer[0..propertyCount]);
             return cur;
         },
         else => return dir,

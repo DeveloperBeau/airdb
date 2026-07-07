@@ -25,9 +25,9 @@ const Database = @import("../database.zig").Database;
 const collections = @import("../records/collections.zig");
 
 fn cmpTmpPath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const u8) ![]const u8 {
-    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const dlen = try tmp.dir.realPath(testing.io, &path_buf);
-    return std.fs.path.join(allocator, &.{ path_buf[0..dlen], name });
+    var pathBuffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dlen = try tmp.dir.realPath(testing.io, &pathBuffer);
+    return std.fs.path.join(allocator, &.{ pathBuffer[0..dlen], name });
 }
 
 test "compactType packs live rows and drops dead ones" {
@@ -49,8 +49,8 @@ test "compactType packs live rows and drops dead ones" {
 
     for ([_]u64{ 2, 5, 8 }) |deletedPrimaryKey| {
         var out: [2]u64 = undefined;
-        const ver = (try rows.getByPrimaryKey(&w, catalogRef, deletedPrimaryKey, &out)).?;
-        catalogRef = switch (try rows.delete(&w, catalogRef, deletedPrimaryKey, ver)) {
+        const version = (try rows.getByPrimaryKey(&w, catalogRef, deletedPrimaryKey, &out)).?;
+        catalogRef = switch (try rows.delete(&w, catalogRef, deletedPrimaryKey, version)) {
             .ok => |c| c,
             else => unreachable,
         };
@@ -91,8 +91,8 @@ test "compactType frees the replaced column set" {
         primaryKey = 0;
         while (primaryKey < 100) : (primaryKey += 5) {
             var out: [2]u64 = undefined;
-            const ver = (try rows.getByPrimaryKey(&w, catalogRef, primaryKey, &out)).?;
-            catalogRef = (try rows.delete(&w, catalogRef, primaryKey, ver)).ok;
+            const version = (try rows.getByPrimaryKey(&w, catalogRef, primaryKey, &out)).?;
+            catalogRef = (try rows.delete(&w, catalogRef, primaryKey, version)).ok;
         }
         w.setRoot(catalogRef);
         _ = try w.commit();
@@ -116,7 +116,7 @@ test "object keys and links survive compaction" {
     var w = try database.beginWrite();
     defer w.deinit();
 
-    var catalogRef = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
+    var catalogRef = try catalog.createFromDefinitions(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
 
     const a = try objects.insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .link = null } });
     catalogRef = a.catalogRef;
@@ -128,8 +128,8 @@ test "object keys and links survive compaction" {
 
     // delete B (primaryKey 2) -- creates a hole
     var out: [2]u64 = undefined;
-    const ver = (try rows.getByPrimaryKey(&w, catalogRef, 2, &out)).?;
-    catalogRef = switch (try rows.delete(&w, catalogRef, 2, ver)) {
+    const version = (try rows.getByPrimaryKey(&w, catalogRef, 2, &out)).?;
+    catalogRef = switch (try rows.delete(&w, catalogRef, 2, version)) {
         .ok => |x| x,
         else => unreachable,
     };
@@ -167,8 +167,8 @@ test "shouldCompact reflects dead ratio" {
     primaryKey = 0;
     while (primaryKey < 6) : (primaryKey += 1) {
         var out: [1]u64 = undefined;
-        const ver = (try rows.getByPrimaryKey(&w, catalogRef, primaryKey, &out)).?;
-        catalogRef = switch (try rows.delete(&w, catalogRef, primaryKey, ver)) {
+        const version = (try rows.getByPrimaryKey(&w, catalogRef, primaryKey, &out)).?;
+        catalogRef = switch (try rows.delete(&w, catalogRef, primaryKey, version)) {
             .ok => |c| c,
             else => unreachable,
         };
@@ -237,11 +237,11 @@ test "all value kinds deep-copy across databases preserving keys" {
     // Build the source database: 3 rows across every value kind, then delete one.
     {
         var w = try sourceDatabase.beginWrite();
-        var catalogRef = try catalog.createDefs(&w, &.{
+        var catalogRef = try catalog.createFromDefinitions(&w, &.{
             .{ .kind = .int },
             .{ .kind = .blob },
-            .{ .kind = .list, .elem = .int },
-            .{ .kind = .set, .elem = .int },
+            .{ .kind = .list, .element = .int },
+            .{ .kind = .set, .element = .int },
             .{ .kind = .link, .link_target = 0 },
         });
         const r1 = try objects.insertTyped(&w, catalogRef, &.{
@@ -345,7 +345,7 @@ test "compactToNewFile produces a verified, smaller, equivalent file" {
         var w = try database.beginWrite();
         const schema = [_][]const PD{
             &.{ .{ .kind = .int }, .{ .kind = .blob } }, // 0: Author{int primaryKey, blob name}
-            &.{ .{ .kind = .int }, .{ .kind = .link, .link_target = 0 }, .{ .kind = .set, .elem = .int } }, // 1: Book{int primaryKey, link author, set tags}
+            &.{ .{ .kind = .int }, .{ .kind = .link, .link_target = 0 }, .{ .kind = .set, .element = .int } }, // 1: Book{int primaryKey, link author, set tags}
         };
         var dir = try typedir.createTypes(&w, &schema, &.{ false, false });
 
@@ -367,8 +367,8 @@ test "compactToNewFile produces a verified, smaller, equivalent file" {
         i = 0;
         while (i < 300) : (i += 3) {
             var out: [3]catalog.Value = undefined;
-            const ver = (try typeRouting.get(&w, dir, 1, i, &out)).?;
-            const dres = try typeRouting.deleteNullifyX(&w, dir, 1, i, ver);
+            const version = (try typeRouting.get(&w, dir, 1, i, &out)).?;
+            const dres = try typeRouting.deleteNullifyX(&w, dir, 1, i, version);
             dir = dres.ok;
         }
         w.setRoot(dir);
@@ -433,14 +433,14 @@ test "compaction preserves dict and set-of-blob" {
 
     const PD = catalog.PropertyDefinition;
 
-    // Build the source: a type with {int primaryKey, dict, set(elem=blob)}, two rows with
+    // Build the source: a type with {int primaryKey, dict, set(element=blob)}, two rows with
     // dict entries + blob-set members, then delete one row to leave a gap.
     {
         var database = try Database.create(testing.allocator, src_path);
         defer database.deinit();
         var w = try database.beginWrite();
         const schema = [_][]const PD{
-            &.{ .{ .kind = .int }, .{ .kind = .dict }, .{ .kind = .set, .elem = .blob } },
+            &.{ .{ .kind = .int }, .{ .kind = .dict }, .{ .kind = .set, .element = .blob } },
         };
         var dir = try typedir.createTypes(&w, &schema, &.{false});
 
@@ -459,8 +459,8 @@ test "compaction preserves dict and set-of-blob" {
 
         // Delete primaryKey 2 -- leaves a gap in the source.
         var out: [3]catalog.Value = undefined;
-        const ver = (try typeRouting.get(&w, dir, 0, 2, &out)).?;
-        const dres = try typeRouting.deleteNullifyX(&w, dir, 0, 2, ver);
+        const version = (try typeRouting.get(&w, dir, 0, 2, &out)).?;
+        const dres = try typeRouting.deleteNullifyX(&w, dir, 0, 2, version);
         dir = dres.ok;
 
         w.setRoot(dir);
@@ -579,8 +579,8 @@ test "compactStep packs a delete-heavy type across several small steps" {
     const dels = [_]u64{ 0, 2, 3, 5, 7, 8, 11 };
     for (dels) |deletedPrimaryKey| {
         var out: [2]u64 = undefined;
-        const ver = (try rows.getByPrimaryKey(&w, catalogRef, deletedPrimaryKey, &out)).?;
-        catalogRef = switch (try rows.delete(&w, catalogRef, deletedPrimaryKey, ver)) {
+        const version = (try rows.getByPrimaryKey(&w, catalogRef, deletedPrimaryKey, &out)).?;
+        catalogRef = switch (try rows.delete(&w, catalogRef, deletedPrimaryKey, version)) {
             .ok => |c| c,
             else => unreachable,
         };
@@ -638,8 +638,8 @@ test "compactStep on an all-dead type truncates to zero" {
     primaryKey = 0;
     while (primaryKey < 6) : (primaryKey += 1) {
         var out: [2]u64 = undefined;
-        const ver = (try rows.getByPrimaryKey(&w, catalogRef, primaryKey, &out)).?;
-        catalogRef = switch (try rows.delete(&w, catalogRef, primaryKey, ver)) {
+        const version = (try rows.getByPrimaryKey(&w, catalogRef, primaryKey, &out)).?;
+        catalogRef = switch (try rows.delete(&w, catalogRef, primaryKey, version)) {
             .ok => |c| c,
             else => unreachable,
         };
@@ -808,8 +808,8 @@ test "compactStep truncation never drops a live row at the top" {
     primaryKey = 0;
     while (primaryKey < 5) : (primaryKey += 1) {
         var out: [2]u64 = undefined;
-        const ver = (try rows.getByPrimaryKey(&w, catalogRef, primaryKey, &out)).?;
-        catalogRef = (try rows.delete(&w, catalogRef, primaryKey, ver)).ok;
+        const version = (try rows.getByPrimaryKey(&w, catalogRef, primaryKey, &out)).?;
+        catalogRef = (try rows.delete(&w, catalogRef, primaryKey, version)).ok;
     }
     try testing.expectEqual(@as(u64, 5), try liveCount(&w, catalogRef));
 
@@ -958,8 +958,8 @@ test "compactInPlace shrinks and preserves data" {
         i = 0;
         while (i < 200) : (i += 2) {
             var out: [2]catalog.Value = undefined;
-            const ver = (try typeRouting.get(&w, dir, 1, i, &out)).?;
-            const dres = try typeRouting.deleteNullifyX(&w, dir, 1, i, ver);
+            const version = (try typeRouting.get(&w, dir, 1, i, &out)).?;
+            const dres = try typeRouting.deleteNullifyX(&w, dir, 1, i, version);
             dir = dres.ok;
         }
         w.setRoot(dir);

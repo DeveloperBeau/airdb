@@ -9,7 +9,7 @@ const blob = @import("../records/blob.zig");
 const rows = @import("../records/rows.zig");
 
 const PropertyKind = catalog.PropertyKind;
-const ElemKind = catalog.ElemKind;
+const ElementKind = catalog.ElementKind;
 const PropertyDefinition = catalog.PropertyDefinition;
 const Value = catalog.Value;
 const PropertyCount = catalog.PropertyCount;
@@ -46,7 +46,7 @@ pub fn addProperty(transaction: *WriteTransaction, catalogRef: Reference, def: P
     s.properties[propertyCount] = .{
         .col = new_col,
         .kind = def.kind,
-        .elem = def.elem,
+        .element = def.element,
         .backlink = if (def.kind == .link or def.kind == .link_set) try Index.create(transaction) else 0,
         .target = def.link_target,
         .rule = def.del_rule,
@@ -87,7 +87,7 @@ fn buildBackfilledColumn(
             0
         else switch (def.kind) {
             .list => try Column.create(transaction),
-            .set => switch (def.elem) {
+            .set => switch (def.element) {
                 .int => try Index.create(transaction),
                 .blob => try bindex.create(transaction),
             },

@@ -9,10 +9,10 @@
 // The `transaction` parameter of every operation is `anytype`: a comptime
 // duck-typed transaction capability, monomorphized at compile time.
 // Read-only operations need only
-//   deref(ref, len) ![]const u8
+//   deref(ref, length) ![]const u8
 // and mutating operations additionally require
-//   alloc(size) !Allocation, writableCopy(ref, len) !Allocation,
-//   free(ref, len) !void
+//   alloc(size) !Allocation, writableCopy(ref, length) !Allocation,
+//   free(ref, length) !void
 // where Allocation is arena.Allocation. WriteTransaction is the production
 // implementation; ReadTransaction satisfies the read-only subset.
 
@@ -21,11 +21,11 @@ const Reference = @import("../storage/reference.zig").Reference;
 const indexNode = @import("indexNode.zig");
 
 // Local aliases for the on-disk node format, which lives in indexNode.zig.
-const leafCapacity = indexNode.LEAF_CAP;
-const fanout = indexNode.FANOUT;
+const leafCapacity = indexNode.leafCap;
+const fanout = indexNode.fanout;
 const kindLeaf = indexNode.kind_leaf;
 const kindInner = indexNode.kind_inner;
-const headerSize = indexNode.hdr;
+const headerSize = indexNode.headerSize;
 const leafNodeSize = indexNode.leaf_node_size;
 const innerNodeSize = indexNode.inner_node_size;
 const innerStride = indexNode.inner_stride;

@@ -6,9 +6,9 @@ const Index = @import("../trees/index.zig");
 
 pub const PropertyCount = u16;
 pub const PropertyKind = enum(u8) { int = 0, blob = 1, list = 2, set = 3, link = 4, link_set = 5, dict = 6 };
-pub const ElemKind = enum(u8) { int = 0, blob = 1 };
+pub const ElementKind = enum(u8) { int = 0, blob = 1 };
 pub const DeletionRule = enum(u8) { nullify = 0, cascade = 1, block = 2 };
-pub const PropertyDefinition = struct { kind: PropertyKind, elem: ElemKind = .int, link_target: u16 = 0, del_rule: DeletionRule = .nullify, indexed: bool = false };
+pub const PropertyDefinition = struct { kind: PropertyKind, element: ElementKind = .int, link_target: u16 = 0, del_rule: DeletionRule = .nullify, indexed: bool = false };
 // A single byte-keyed dictionary entry: a byte-string key mapped to a u64 value
 // (an int, or an object key for a "dict of links" -- u64 covers both).
 pub const DictEntry = struct { key: []const u8, val: u64 };
@@ -39,7 +39,7 @@ pub const Value = union(enum) {
 
 // Catalog node layout:
 // [propertyCount u16][next_row u64][primaryKeyIndexRef u64][version_col_ref u64][live_col_ref u64]
-// [propertyCount * (propertyColumnRef u64)][propertyCount * (kind u8)][propertyCount * (elem u8)]
+// [propertyCount * (propertyColumnRef u64)][propertyCount * (kind u8)][propertyCount * (element u8)]
 // [propertyCount * (backlink_ref u64)][propertyCount * (link_target u16)][propertyCount * (del_rule u8)]
 // [propertyCount * (value_index_ref u64)][propertyCount * (indexed u8)]
 //
@@ -100,7 +100,7 @@ pub fn writeCatalog(
     live_col_ref: Reference,
     propertyColumnRefs: []const Reference,
     kinds: []const PropertyKind,
-    elems: []const ElemKind,
+    elements: []const ElementKind,
     backlinks: []const Reference,
     targets: []const u16,
     rules: []const DeletionRule,
@@ -121,7 +121,7 @@ pub fn writeCatalog(
     const ko = kindsOffset(propertyCount);
     for (kinds, 0..) |k, i| a.bytes[ko + i] = @intFromEnum(k);
     const eo = elemsOffset(propertyCount);
-    for (elems, 0..) |e, i| a.bytes[eo + i] = @intFromEnum(e);
+    for (elements, 0..) |e, i| a.bytes[eo + i] = @intFromEnum(e);
     const blo = backlinksOffset(propertyCount);
     for (backlinks, 0..) |bref, i| {
         std.mem.writeInt(u64, a.bytes[blo + i * 8 ..][0..8], bref, .little);
@@ -139,15 +139,15 @@ pub fn writeCatalog(
     return a.ref;
 }
 
-// createDefs allocates columns, a primaryKey index, version/live columns, and a catalog
-// node from explicit per-property definitions. defs[0].kind must be .int (the primaryKey).
-pub fn createDefs(transaction: *WriteTransaction, defs: []const PropertyDefinition) !Reference {
-    std.debug.assert(defs.len >= 1 and defs[0].kind == .int);
-    const propertyCount: PropertyCount = @intCast(defs.len);
+// createFromDefinitions allocates columns, a primaryKey index, version/live columns, and a catalog
+// node from explicit per-property definitions. definitions[0].kind must be .int (the primaryKey).
+pub fn createFromDefinitions(transaction: *WriteTransaction, definitions: []const PropertyDefinition) !Reference {
+    std.debug.assert(definitions.len >= 1 and definitions[0].kind == .int);
+    const propertyCount: PropertyCount = @intCast(definitions.len);
     std.debug.assert(propertyCount <= maxPropertyCount);
     var propertyColumnRefs: [maxPropertyCount]Reference = undefined;
     var kinds: [maxPropertyCount]PropertyKind = undefined;
-    var elems: [maxPropertyCount]ElemKind = undefined;
+    var elements: [maxPropertyCount]ElementKind = undefined;
     var backlinks: [maxPropertyCount]Reference = undefined;
     var targets: [maxPropertyCount]u16 = undefined;
     var rules: [maxPropertyCount]DeletionRule = undefined;
@@ -156,13 +156,13 @@ pub fn createDefs(transaction: *WriteTransaction, defs: []const PropertyDefiniti
     var i: usize = 0;
     while (i < propertyCount) : (i += 1) {
         propertyColumnRefs[i] = try Column.create(transaction);
-        kinds[i] = defs[i].kind;
-        elems[i] = defs[i].elem;
-        backlinks[i] = if (defs[i].kind == .link or defs[i].kind == .link_set) try Index.create(transaction) else 0;
-        targets[i] = defs[i].link_target;
-        rules[i] = defs[i].del_rule;
-        indexed_flags[i] = defs[i].indexed;
-        value_index_refs[i] = if (defs[i].indexed) try Index.create(transaction) else 0;
+        kinds[i] = definitions[i].kind;
+        elements[i] = definitions[i].element;
+        backlinks[i] = if (definitions[i].kind == .link or definitions[i].kind == .link_set) try Index.create(transaction) else 0;
+        targets[i] = definitions[i].link_target;
+        rules[i] = definitions[i].del_rule;
+        indexed_flags[i] = definitions[i].indexed;
+        value_index_refs[i] = if (definitions[i].indexed) try Index.create(transaction) else 0;
     }
     const version_col_ref = try Column.create(transaction);
     const live_col_ref = try Column.create(transaction);
@@ -179,7 +179,7 @@ pub fn createDefs(transaction: *WriteTransaction, defs: []const PropertyDefiniti
         live_col_ref,
         propertyColumnRefs[0..propertyCount],
         kinds[0..propertyCount],
-        elems[0..propertyCount],
+        elements[0..propertyCount],
         backlinks[0..propertyCount],
         targets[0..propertyCount],
         rules[0..propertyCount],
@@ -188,15 +188,15 @@ pub fn createDefs(transaction: *WriteTransaction, defs: []const PropertyDefiniti
     );
 }
 
-// createTyped keeps its scalar-only signature; every property gets elem = int.
+// createTyped keeps its scalar-only signature; every property gets element = int.
 pub fn createTyped(transaction: *WriteTransaction, kinds: []const PropertyKind) !Reference {
     std.debug.assert(kinds.len >= 1 and kinds[0] == .int);
     const propertyCount: PropertyCount = @intCast(kinds.len);
     std.debug.assert(propertyCount <= maxPropertyCount);
-    var defs: [maxPropertyCount]PropertyDefinition = undefined;
+    var definitions: [maxPropertyCount]PropertyDefinition = undefined;
     var i: usize = 0;
-    while (i < propertyCount) : (i += 1) defs[i] = .{ .kind = kinds[i], .elem = .int };
-    return createDefs(transaction, defs[0..propertyCount]);
+    while (i < propertyCount) : (i += 1) definitions[i] = .{ .kind = kinds[i], .element = .int };
+    return createFromDefinitions(transaction, definitions[0..propertyCount]);
 }
 
 // Create propertyCount property columns, a version column, a live column, and an
@@ -228,7 +228,7 @@ pub const CatalogView = struct {
         return @enumFromInt(self.bytes[kinds_offset + i]);
     }
 
-    pub fn elemKind(self: CatalogView, i: usize) ElemKind {
+    pub fn elementKind(self: CatalogView, i: usize) ElementKind {
         const eo = propertyColumnsOffset + @as(usize, self.propertyCount) * 8 + self.propertyCount;
         return @enumFromInt(self.bytes[eo + i]);
     }
@@ -263,7 +263,7 @@ pub const CatalogView = struct {
 // all fixed fields. Returns a CatalogView whose bytes slice is valid for the
 // lifetime of the transaction.
 //
-// All per-property enum bytes (kind, elem kind, deletion rule) are validated
+// All per-property enum bytes (kind, element kind, deletion rule) are validated
 // here, ONCE, so the CatalogView accessors can stay infallible. These bytes
 // come straight from the mapped file: a corrupted value must surface as
 // error.Corrupt, never as a panic (ReleaseSafe) or undefined behavior
@@ -280,7 +280,7 @@ pub fn loadCatalog(transaction: anytype, catalogRef: Reference) !CatalogView {
         var p: usize = 0;
         while (p < propertyCount) : (p += 1) {
             if (std.enums.fromInt(PropertyKind, bytes[ko + p]) == null) return error.Corrupt;
-            if (std.enums.fromInt(ElemKind, bytes[eo + p]) == null) return error.Corrupt;
+            if (std.enums.fromInt(ElementKind, bytes[eo + p]) == null) return error.Corrupt;
             if (std.enums.fromInt(DeletionRule, bytes[ro + p]) == null) return error.Corrupt;
         }
     }
@@ -300,7 +300,7 @@ pub fn loadCatalog(transaction: anytype, catalogRef: Reference) !CatalogView {
 pub const PropertySnapshot = struct {
     col: Reference,
     kind: PropertyKind,
-    elem: ElemKind,
+    element: ElementKind,
     backlink: Reference,
     target: u16,
     rule: DeletionRule,
@@ -347,7 +347,7 @@ pub const CatalogSnapshot = struct {
             s.properties[j] = .{
                 .col = v.propertyColumnRef(j),
                 .kind = v.kind(j),
-                .elem = v.elemKind(j),
+                .element = v.elementKind(j),
                 .backlink = v.backlinkRef(j),
                 .target = v.linkTarget(j),
                 .rule = v.delRule(j),
@@ -362,7 +362,7 @@ pub const CatalogSnapshot = struct {
     pub fn write(self: *const CatalogSnapshot, transaction: *WriteTransaction) !Reference {
         var cols: [maxPropertyCount]Reference = undefined;
         var kinds: [maxPropertyCount]PropertyKind = undefined;
-        var elems: [maxPropertyCount]ElemKind = undefined;
+        var elements: [maxPropertyCount]ElementKind = undefined;
         var backlinks: [maxPropertyCount]Reference = undefined;
         var targets: [maxPropertyCount]u16 = undefined;
         var rules: [maxPropertyCount]DeletionRule = undefined;
@@ -374,7 +374,7 @@ pub const CatalogSnapshot = struct {
             const p = self.properties[j];
             cols[j] = p.col;
             kinds[j] = p.kind;
-            elems[j] = p.elem;
+            elements[j] = p.element;
             backlinks[j] = p.backlink;
             targets[j] = p.target;
             rules[j] = p.rule;
@@ -392,7 +392,7 @@ pub const CatalogSnapshot = struct {
             self.live_col_ref,
             cols[0..propertyCount],
             kinds[0..propertyCount],
-            elems[0..propertyCount],
+            elements[0..propertyCount],
             backlinks[0..propertyCount],
             targets[0..propertyCount],
             rules[0..propertyCount],
@@ -488,9 +488,9 @@ const testing = std.testing;
 const Database = @import("../database.zig").Database;
 
 fn objTmpPath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const u8) ![]const u8 {
-    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const dlen = try tmp.dir.realPath(testing.io, &path_buf);
-    return std.fs.path.join(allocator, &.{ path_buf[0..dlen], name });
+    var pathBuffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dlen = try tmp.dir.realPath(testing.io, &pathBuffer);
+    return std.fs.path.join(allocator, &.{ pathBuffer[0..dlen], name });
 }
 
 test "create allocates an empty type and load reads it back" {
@@ -516,11 +516,11 @@ test "CatalogSnapshot round-trips every field through load and write" {
     defer database.deinit();
     var w = try database.beginWrite();
     defer w.deinit();
-    const catalogRef = try createDefs(&w, &.{
+    const catalogRef = try createFromDefinitions(&w, &.{
         .{ .kind = .int },
         .{ .kind = .int, .indexed = true },
         .{ .kind = .link, .link_target = 3, .del_rule = .cascade },
-        .{ .kind = .list, .elem = .blob },
+        .{ .kind = .list, .element = .blob },
     });
     const s = try CatalogSnapshot.load(&w, catalogRef);
     const copy_ref = try s.write(&w);
@@ -537,7 +537,7 @@ test "CatalogSnapshot round-trips every field through load and write" {
     while (j < v0.propertyCount) : (j += 1) {
         try testing.expectEqual(v0.propertyColumnRef(j), v1.propertyColumnRef(j));
         try testing.expectEqual(v0.kind(j), v1.kind(j));
-        try testing.expectEqual(v0.elemKind(j), v1.elemKind(j));
+        try testing.expectEqual(v0.elementKind(j), v1.elementKind(j));
         try testing.expectEqual(v0.backlinkRef(j), v1.backlinkRef(j));
         try testing.expectEqual(v0.linkTarget(j), v1.linkTarget(j));
         try testing.expectEqual(v0.delRule(j), v1.delRule(j));
@@ -600,25 +600,25 @@ test "createDefs records kind and element kind per property" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    const catalogRef = try createDefs(&w, &.{
+    const catalogRef = try createFromDefinitions(&w, &.{
         .{ .kind = .int },
-        .{ .kind = .list, .elem = .int },
-        .{ .kind = .set, .elem = .int },
-        .{ .kind = .list, .elem = .blob },
+        .{ .kind = .list, .element = .int },
+        .{ .kind = .set, .element = .int },
+        .{ .kind = .list, .element = .blob },
     });
     const v = try loadCatalog(&w, catalogRef);
     try testing.expectEqual(@as(PropertyCount, 4), v.propertyCount);
     try testing.expectEqual(PropertyKind.int, v.kind(0));
     try testing.expectEqual(PropertyKind.list, v.kind(1));
-    try testing.expectEqual(ElemKind.int, v.elemKind(1));
+    try testing.expectEqual(ElementKind.int, v.elementKind(1));
     try testing.expectEqual(PropertyKind.set, v.kind(2));
-    try testing.expectEqual(ElemKind.int, v.elemKind(2));
+    try testing.expectEqual(ElementKind.int, v.elementKind(2));
     try testing.expectEqual(PropertyKind.list, v.kind(3));
-    try testing.expectEqual(ElemKind.blob, v.elemKind(3));
+    try testing.expectEqual(ElementKind.blob, v.elementKind(3));
     const catalog2 = try createTyped(&w, &.{ .int, .blob });
     const v2 = try loadCatalog(&w, catalog2);
     try testing.expectEqual(PropertyKind.blob, v2.kind(1));
-    try testing.expectEqual(ElemKind.int, v2.elemKind(1));
+    try testing.expectEqual(ElementKind.int, v2.elementKind(1));
     w.deinit();
 }
 
@@ -630,7 +630,7 @@ test "createDefs builds a backlink index for each link property" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    const catalogRef = try createDefs(&w, &.{
+    const catalogRef = try createFromDefinitions(&w, &.{
         .{ .kind = .int },
         .{ .kind = .int },
         .{ .kind = .link },
@@ -651,7 +651,7 @@ test "createDefs records a link target type id" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    const catalogRef = try createDefs(&w, &.{
+    const catalogRef = try createFromDefinitions(&w, &.{
         .{ .kind = .int },
         .{ .kind = .link, .link_target = 3 },
         .{ .kind = .link_set, .link_target = 7 },
@@ -671,7 +671,7 @@ test "createDefs creates an empty key-to-row index and zero next_key" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    const catalogRef = try createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .int } });
+    const catalogRef = try createFromDefinitions(&w, &.{ .{ .kind = .int }, .{ .kind = .int } });
     const v = try loadCatalog(&w, catalogRef);
     try testing.expect(v.keyrow_index_ref != 0);
     try testing.expectEqual(@as(u64, 0), v.next_key);
@@ -686,7 +686,7 @@ test "catalog persists indexed flag and value index ref" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    const catalogRef = try createDefs(&w, &.{
+    const catalogRef = try createFromDefinitions(&w, &.{
         .{ .kind = .int },
         .{ .kind = .int, .indexed = true },
         .{ .kind = .int },
@@ -720,9 +720,9 @@ test "non-indexed catalog: value index refs zero and existing fields intact" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    const catalogRef = try createDefs(&w, &.{
+    const catalogRef = try createFromDefinitions(&w, &.{
         .{ .kind = .int },
-        .{ .kind = .list, .elem = .blob },
+        .{ .kind = .list, .element = .blob },
         .{ .kind = .link, .link_target = 4, .del_rule = .cascade },
     });
     const v = try loadCatalog(&w, catalogRef);
@@ -735,7 +735,7 @@ test "non-indexed catalog: value index refs zero and existing fields intact" {
     // that appending the new arrays did not disturb the earlier offset math.
     try testing.expectEqual(PropertyKind.int, v.kind(0));
     try testing.expectEqual(PropertyKind.list, v.kind(1));
-    try testing.expectEqual(ElemKind.blob, v.elemKind(1));
+    try testing.expectEqual(ElementKind.blob, v.elementKind(1));
     try testing.expectEqual(PropertyKind.link, v.kind(2));
     try testing.expect(v.propertyColumnRef(0) != 0);
     try testing.expect(v.propertyColumnRef(1) != 0);
@@ -757,7 +757,7 @@ test "createDefs records a per-property deletion rule" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    const catalogRef = try createDefs(&w, &.{
+    const catalogRef = try createFromDefinitions(&w, &.{
         .{ .kind = .int },
         .{ .kind = .link, .link_target = 2, .del_rule = .cascade },
         .{ .kind = .link, .link_target = 3, .del_rule = .block },

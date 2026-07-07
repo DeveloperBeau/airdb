@@ -14,20 +14,20 @@ const rangeInclusive = query.rangeInclusive;
 const sortByPropertyAscending = query.sortByPropertyAscending;
 
 fn qTmpPath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const u8) ![]const u8 {
-    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const path_len = try tmp.dir.realPath(testing.io, &path_buf);
-    return std.fs.path.join(allocator, &.{ path_buf[0..path_len], name });
+    var pathBuffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(testing.io, &pathBuffer);
+    return std.fs.path.join(allocator, &.{ pathBuffer[0..path_len], name });
 }
 
-// Build a 3-property type: property0 = primaryKey, property1 = value (indexed iff `idx`), property2 =
+// Build a 3-property type: property0 = primaryKey, property1 = value (indexed iff `indexed`), property2 =
 // secondary. Inserts n rows with primaryKey=i, property1=i%100, property2=i.
-fn seedPlannerCatalog(w: *@import("database.zig").WriteTransaction, idx: bool, n: u64) !Reference {
-    const defs = [_]catalog.PropertyDefinition{
+fn seedPlannerCatalog(w: *@import("database.zig").WriteTransaction, indexed: bool, n: u64) !Reference {
+    const definitions = [_]catalog.PropertyDefinition{
         .{ .kind = .int },
-        .{ .kind = .int, .indexed = idx },
+        .{ .kind = .int, .indexed = indexed },
         .{ .kind = .int },
     };
-    var catalogRef = try catalog.createDefs(w, &defs);
+    var catalogRef = try catalog.createFromDefinitions(w, &definitions);
     var i: u64 = 0;
     while (i < n) : (i += 1) catalogRef = (try rows.insert(w, catalogRef, &.{ i, i % 100, i })).catalogRef;
     return catalogRef;
@@ -105,8 +105,8 @@ test "streamed full scan agrees with where on count and aggregate" {
     var catalogRef = try seed(&w, &.{ .{ 1, 20 }, .{ 2, 30 }, .{ 3, 40 }, .{ 4, 30 }, .{ 5, 25 } });
     // Tombstone one matching row so the live filter is exercised mid-stream.
     var out: [2]u64 = undefined;
-    const ver = (try rows.getByPrimaryKey(&w, catalogRef, 4, &out)).?;
-    catalogRef = (try rows.delete(&w, catalogRef, 4, ver)).ok;
+    const version = (try rows.getByPrimaryKey(&w, catalogRef, 4, &out)).?;
+    catalogRef = (try rows.delete(&w, catalogRef, 4, version)).ok;
 
     const preds = [_]Predicate{.{ .property = 1, .op = .ge, .value = 25 }};
     var objectKeys = std.ArrayList(u64).empty;

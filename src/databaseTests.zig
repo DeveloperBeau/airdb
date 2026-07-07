@@ -16,9 +16,9 @@ const catalog = @import("schema/catalog.zig");
 const Index = @import("trees/index.zig");
 
 fn tmpFilePath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const u8) ![]const u8 {
-    var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
-    const path_len = try tmp.dir.realPath(testing.io, &path_buf);
-    const dir_path = path_buf[0..path_len];
+    var pathBuffer: [Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(testing.io, &pathBuffer);
+    const dir_path = pathBuffer[0..path_len];
     return std.fs.path.join(allocator, &.{ dir_path, name });
 }
 
@@ -236,14 +236,14 @@ test "verifyIntegrity passes after churn on an indexed type" {
         var primaryKey: u64 = 0;
         while (primaryKey < 200) : (primaryKey += 1) {
             var out: [2]catalog.Value = undefined;
-            const ver = (try typeRouting.get(&w, dir, tid, primaryKey, &out)).?;
+            const version = (try typeRouting.get(&w, dir, tid, primaryKey, &out)).?;
             if (primaryKey % 5 == 0) {
-                dir = switch (try typeRouting.delete(&w, dir, tid, primaryKey, ver)) {
+                dir = switch (try typeRouting.delete(&w, dir, tid, primaryKey, version)) {
                     .ok => |d| d,
                     else => unreachable,
                 };
             } else if (primaryKey % 2 == 0) {
-                const ur = try typeRouting.update(&w, dir, tid, primaryKey, &.{ .{ .int = primaryKey }, .{ .int = (primaryKey + 7) % 16 } }, ver);
+                const ur = try typeRouting.update(&w, dir, tid, primaryKey, &.{ .{ .int = primaryKey }, .{ .int = (primaryKey + 7) % 16 } }, version);
                 dir = ur.ok.dir;
             }
         }
@@ -976,8 +976,8 @@ fn churnNetZero(path: []const u8, live: u64, iters: u64, auto: bool) !struct { n
             k = 0;
             while (k < live) : (k += 1) {
                 var out: [2]catalog.Value = undefined;
-                const ver = (try typeRouting.get(&w, dir, tid, lo, &out)).?;
-                dir = switch (try typeRouting.delete(&w, dir, tid, lo, ver)) {
+                const version = (try typeRouting.get(&w, dir, tid, lo, &out)).?;
+                dir = switch (try typeRouting.delete(&w, dir, tid, lo, version)) {
                     .ok => |d| d,
                     else => unreachable,
                 };
@@ -1073,8 +1073,8 @@ test "a failed commit inside maybeCompactStep neither crashes nor wedges the wri
         var out: [2]catalog.Value = undefined;
         primaryKey = 0;
         while (primaryKey < 8) : (primaryKey += 1) {
-            const ver = (try typeRouting.get(&w, dir, tid, primaryKey, &out)).?;
-            dir = switch (try typeRouting.delete(&w, dir, tid, primaryKey, ver)) {
+            const version = (try typeRouting.get(&w, dir, tid, primaryKey, &out)).?;
+            dir = switch (try typeRouting.delete(&w, dir, tid, primaryKey, version)) {
                 .ok => |d| d,
                 else => unreachable,
             };
@@ -1127,8 +1127,8 @@ test "the compaction cursor never resumes across types" {
             var out: [2]catalog.Value = undefined;
             primaryKey = 0;
             while (primaryKey < 8) : (primaryKey += 1) {
-                const ver = (try typeRouting.get(&w, dir, t, primaryKey, &out)).?;
-                dir = switch (try typeRouting.delete(&w, dir, t, primaryKey, ver)) {
+                const version = (try typeRouting.get(&w, dir, t, primaryKey, &out)).?;
+                dir = switch (try typeRouting.delete(&w, dir, t, primaryKey, version)) {
                     .ok => |d| d,
                     else => unreachable,
                 };

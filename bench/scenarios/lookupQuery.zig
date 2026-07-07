@@ -39,7 +39,7 @@ const eq_category: u64 = 42;
 
 // Repetitions of the index-backed equality query used to derive its per-call
 // latency (averaged), small enough to keep the run well under a minute.
-const idx_eq_reps: usize = 1000;
+const indexedEqRepetitions: usize = 1000;
 
 // Monotonic wall-clock instance, matching the convention in fileStore.zig.
 inline fn sysIo() Io {
@@ -67,7 +67,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     // is served by its value index rather than a full scan.
     var catalogRef: Reference = blk: {
         var w = try database.beginWrite();
-        const c = try catalog.createDefs(&w, &.{
+        const c = try catalog.createFromDefinitions(&w, &.{
             .{ .kind = .int },
             .{ .kind = .int, .indexed = true },
         });
@@ -126,7 +126,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     var rows_eq: u64 = 0;
     const eq_start = nowNs(io);
     var e: usize = 0;
-    while (e < idx_eq_reps) : (e += 1) {
+    while (e < indexedEqRepetitions) : (e += 1) {
         rows_eq = try query.countWhere(
             &rd,
             catalogRef,
@@ -135,7 +135,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         );
     }
     const eq_total_ns: u64 = @intCast(nowNs(io) - eq_start);
-    const idx_eq_ns: u64 = eq_total_ns / idx_eq_reps;
+    const indexedEqNs: u64 = eq_total_ns / indexedEqRepetitions;
 
     // Full scan: no predicate matches every live row.
     const full_start = nowNs(io);
@@ -148,9 +148,9 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         alloc,
         "eq={d}us full={d}ms idx_eq_us={d} rows_eq={d}",
         .{
-            idx_eq_ns / std.time.ns_per_us,
+            indexedEqNs / std.time.ns_per_us,
             full_ns / std.time.ns_per_ms,
-            idx_eq_ns / std.time.ns_per_us,
+            indexedEqNs / std.time.ns_per_us,
             rows_eq,
         },
     );
@@ -159,9 +159,9 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         .name = name,
         .ops = lookup_count,
         .wall_ns = lookup_ns,
-        .p50_ns = lat.pct(50),
-        .p99_ns = lat.pct(99),
-        .max_ns = lat.pct(100),
+        .p50_ns = lat.percentile(50),
+        .p99_ns = lat.percentile(99),
+        .max_ns = lat.percentile(100),
         .file_bytes = try database.fileSize(),
         .logical_bytes = database.logicalSize(),
         .peak_rss_bytes = airdb.peakResidentBytes(),

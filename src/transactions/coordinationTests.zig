@@ -9,9 +9,9 @@ const sentinel_max = coord.sentinel_max;
 test "coord create initializes magic and zero attach count, reopen reads them" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const dlen = try tmp.dir.realPath(coordIo(), &path_buf);
-    const cpath = try std.fs.path.join(testing.allocator, &.{ path_buf[0..dlen], "x.coord" });
+    var pathBuffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dlen = try tmp.dir.realPath(coordIo(), &pathBuffer);
+    const cpath = try std.fs.path.join(testing.allocator, &.{ pathBuffer[0..dlen], "x.coord" });
     defer testing.allocator.free(cpath);
 
     var c1 = try Coord.openOrCreate(cpath);
@@ -30,9 +30,9 @@ test "a second openOrCreate preserves live coordination state" {
     // the first opener must all survive a second open of the same file.
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const dlen = try tmp.dir.realPath(coordIo(), &path_buf);
-    const cpath = try std.fs.path.join(testing.allocator, &.{ path_buf[0..dlen], "keep.coord" });
+    var pathBuffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dlen = try tmp.dir.realPath(coordIo(), &pathBuffer);
+    const cpath = try std.fs.path.join(testing.allocator, &.{ pathBuffer[0..dlen], "keep.coord" });
     defer testing.allocator.free(cpath);
 
     var c1 = try Coord.openOrCreate(cpath);
@@ -56,9 +56,9 @@ test "openOrCreate succeeds while another holder owns the coord flock" {
     // (stamped) coord file opens without touching the flock.
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const dlen = try tmp.dir.realPath(coordIo(), &path_buf);
-    const cpath = try std.fs.path.join(testing.allocator, &.{ path_buf[0..dlen], "locked.coord" });
+    var pathBuffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dlen = try tmp.dir.realPath(coordIo(), &pathBuffer);
+    const cpath = try std.fs.path.join(testing.allocator, &.{ pathBuffer[0..dlen], "locked.coord" });
     defer testing.allocator.free(cpath);
 
     var a = try Coord.openOrCreate(cpath);
@@ -73,9 +73,9 @@ test "openOrCreate succeeds while another holder owns the coord flock" {
 test "latest_version round-trips through the mapping" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const dlen = try tmp.dir.realPath(coordIo(), &path_buf);
-    const cpath = try std.fs.path.join(testing.allocator, &.{ path_buf[0..dlen], "y.coord" });
+    var pathBuffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dlen = try tmp.dir.realPath(coordIo(), &pathBuffer);
+    const cpath = try std.fs.path.join(testing.allocator, &.{ pathBuffer[0..dlen], "y.coord" });
     defer testing.allocator.free(cpath);
     var c = try Coord.openOrCreate(cpath);
     defer c.deinit();
@@ -86,9 +86,9 @@ test "latest_version round-trips through the mapping" {
 test "exclusive lock blocks a second holder via the same coord file" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const dlen = try tmp.dir.realPath(coordIo(), &path_buf);
-    const cpath = try std.fs.path.join(testing.allocator, &.{ path_buf[0..dlen], "z.coord" });
+    var pathBuffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dlen = try tmp.dir.realPath(coordIo(), &pathBuffer);
+    const cpath = try std.fs.path.join(testing.allocator, &.{ pathBuffer[0..dlen], "z.coord" });
     defer testing.allocator.free(cpath);
 
     var a = try Coord.openOrCreate(cpath);
@@ -106,25 +106,25 @@ test "exclusive lock blocks a second holder via the same coord file" {
 test "claim returns a slot index, publish and read back min_pinned, release frees it" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const dlen = try tmp.dir.realPath(coordIo(), &path_buf);
-    const cpath = try std.fs.path.join(testing.allocator, &.{ path_buf[0..dlen], "p.coord" });
+    var pathBuffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dlen = try tmp.dir.realPath(coordIo(), &pathBuffer);
+    const cpath = try std.fs.path.join(testing.allocator, &.{ pathBuffer[0..dlen], "p.coord" });
     defer testing.allocator.free(cpath);
     var c = try Coord.openOrCreate(cpath);
     defer c.deinit();
-    const idx = (try c.claimSlot()).?;
-    c.publishMinPinned(idx, 7);
-    try testing.expectEqual(@as(u64, 7), c.slotMinPinnedForTest(idx));
-    c.releaseSlot(idx);
-    try testing.expectEqual(@as(u32, 0), c.slotPidForTest(idx));
+    const slotIndex = (try c.claimSlot()).?;
+    c.publishMinPinned(slotIndex, 7);
+    try testing.expectEqual(@as(u64, 7), c.slotMinPinnedForTest(slotIndex));
+    c.releaseSlot(slotIndex);
+    try testing.expectEqual(@as(u32, 0), c.slotPidForTest(slotIndex));
 }
 
 test "two claims get distinct slots" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const dlen = try tmp.dir.realPath(coordIo(), &path_buf);
-    const cpath = try std.fs.path.join(testing.allocator, &.{ path_buf[0..dlen], "p2.coord" });
+    var pathBuffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dlen = try tmp.dir.realPath(coordIo(), &pathBuffer);
+    const cpath = try std.fs.path.join(testing.allocator, &.{ pathBuffer[0..dlen], "p2.coord" });
     defer testing.allocator.free(cpath);
     var c = try Coord.openOrCreate(cpath);
     defer c.deinit();
@@ -138,9 +138,9 @@ test "two claims get distinct slots" {
 test "globalHorizon is the min of live slots min_pinned, clamped to fallback" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const dlen = try tmp.dir.realPath(coordIo(), &path_buf);
-    const cpath = try std.fs.path.join(testing.allocator, &.{ path_buf[0..dlen], "gh.coord" });
+    var pathBuffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dlen = try tmp.dir.realPath(coordIo(), &pathBuffer);
+    const cpath = try std.fs.path.join(testing.allocator, &.{ pathBuffer[0..dlen], "gh.coord" });
     defer testing.allocator.free(cpath);
     var c = try Coord.openOrCreate(cpath);
     defer c.deinit();
@@ -155,9 +155,9 @@ test "globalHorizon is the min of live slots min_pinned, clamped to fallback" {
 test "globalHorizon ignores and reclaims a dead-pid slot" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const dlen = try tmp.dir.realPath(coordIo(), &path_buf);
-    const cpath = try std.fs.path.join(testing.allocator, &.{ path_buf[0..dlen], "dead.coord" });
+    var pathBuffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dlen = try tmp.dir.realPath(coordIo(), &pathBuffer);
+    const cpath = try std.fs.path.join(testing.allocator, &.{ pathBuffer[0..dlen], "dead.coord" });
     defer testing.allocator.free(cpath);
     var c = try Coord.openOrCreate(cpath);
     defer c.deinit();
@@ -175,9 +175,9 @@ test "globalHorizon reclaims a slot whose live pid has the wrong incarnation tok
     // the horizon must ignore and reclaim it.
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const dlen = try tmp.dir.realPath(coordIo(), &path_buf);
-    const cpath = try std.fs.path.join(testing.allocator, &.{ path_buf[0..dlen], "recycled.coord" });
+    var pathBuffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dlen = try tmp.dir.realPath(coordIo(), &pathBuffer);
+    const cpath = try std.fs.path.join(testing.allocator, &.{ pathBuffer[0..dlen], "recycled.coord" });
     defer testing.allocator.free(cpath);
     var c = try Coord.openOrCreate(cpath);
     defer c.deinit();
@@ -189,10 +189,10 @@ test "globalHorizon reclaims a slot whose live pid has the wrong incarnation tok
     try testing.expectEqual(@as(u32, 0), c.slotPidForTest(2)); // reclaimed
 
     // A correctly claimed slot (matching token) still pins the horizon.
-    const idx = (try c.claimSlot()).?;
-    c.publishMinPinned(idx, 7);
+    const slotIndex = (try c.claimSlot()).?;
+    c.publishMinPinned(slotIndex, 7);
     try testing.expectEqual(@as(u64, 7), c.globalHorizon(50));
-    c.releaseSlot(idx);
+    c.releaseSlot(slotIndex);
 }
 
 test "globalHorizon keeps a live-pid slot whose stored token is zero" {
@@ -201,9 +201,9 @@ test "globalHorizon keeps a live-pid slot whose stored token is zero" {
     // pin; the horizon must honor the pin (pid-only liveness) instead.
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const dlen = try tmp.dir.realPath(coordIo(), &path_buf);
-    const cpath = try std.fs.path.join(testing.allocator, &.{ path_buf[0..dlen], "zerotoken.coord" });
+    var pathBuffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dlen = try tmp.dir.realPath(coordIo(), &pathBuffer);
+    const cpath = try std.fs.path.join(testing.allocator, &.{ pathBuffer[0..dlen], "zerotoken.coord" });
     defer testing.allocator.free(cpath);
     var c = try Coord.openOrCreate(cpath);
     defer c.deinit();

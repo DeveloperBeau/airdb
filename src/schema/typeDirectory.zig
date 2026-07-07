@@ -13,7 +13,7 @@ const catalog = @import("catalog.zig");
 pub const Schema = []const []const catalog.PropertyKind;
 // Full schema: each type is a slice of PropertyDefinitions, so a multi-type directory can
 // hold link and collection properties (not just scalar kinds).
-pub const DefSchema = []const []const catalog.PropertyDefinition;
+pub const DefinitionSchema = []const []const catalog.PropertyDefinition;
 pub const Value = catalog.Value;
 const PropertyKind = catalog.PropertyKind;
 const PropertyDefinition = catalog.PropertyDefinition;
@@ -37,23 +37,23 @@ fn writeDir(transaction: *WriteTransaction, catalogRefs: []const Reference, embe
 
 // Create a directory from a full PropertyDefinition schema (supports links/collections),
 // with the given per-type embedded flags.
-pub fn createTypes(transaction: *WriteTransaction, schema: DefSchema, embedded: []const bool) !Reference {
+pub fn createTypes(transaction: *WriteTransaction, schema: DefinitionSchema, embedded: []const bool) !Reference {
     std.debug.assert(schema.len <= 256);
     std.debug.assert(embedded.len == schema.len);
     var catalogRefs: [256]Reference = undefined;
     var t: usize = 0;
-    while (t < schema.len) : (t += 1) catalogRefs[t] = try catalog.createDefs(transaction, schema[t]);
+    while (t < schema.len) : (t += 1) catalogRefs[t] = try catalog.createFromDefinitions(transaction, schema[t]);
     return writeDir(transaction, catalogRefs[0..schema.len], embedded);
 }
 
 // Create a directory from a full PropertyDefinition schema (supports links/collections).
-pub fn createWithDefs(transaction: *WriteTransaction, schema: DefSchema) !Reference {
+pub fn createWithDefinitions(transaction: *WriteTransaction, schema: DefinitionSchema) !Reference {
     var flags: [256]bool = undefined;
     @memset(flags[0..schema.len], false);
     return createTypes(transaction, schema, flags[0..schema.len]);
 }
 
-// Scalar-kinds convenience: each property gets elem = int.
+// Scalar-kinds convenience: each property gets element = int.
 pub fn create(transaction: *WriteTransaction, schema: Schema) !Reference {
     std.debug.assert(schema.len <= 256);
     var catalogRefs: [256]Reference = undefined;
@@ -132,18 +132,18 @@ fn snapshotFlags(transaction: anytype, dir: Reference, out: *[256]bool) !u16 {
 pub const AddTypeResult = struct { dir: Reference, type_id: u16 };
 
 // Append a new type from a full PropertyDefinition schema (supports links/collections).
-pub fn addTypeDefs(transaction: *WriteTransaction, dir: Reference, defs: []const PropertyDefinition) !AddTypeResult {
-    return addTypeDefsEmbedded(transaction, dir, defs, false);
+pub fn addTypeDefinitions(transaction: *WriteTransaction, dir: Reference, definitions: []const PropertyDefinition) !AddTypeResult {
+    return addTypeDefinitionsEmbedded(transaction, dir, definitions, false);
 }
 
-// Like addTypeDefs but marks the new type embedded when `is_embedded` is set.
-pub fn addTypeDefsEmbedded(transaction: *WriteTransaction, dir: Reference, defs: []const PropertyDefinition, is_embedded: bool) !AddTypeResult {
+// Like addTypeDefinitions but marks the new type embedded when `is_embedded` is set.
+pub fn addTypeDefinitionsEmbedded(transaction: *WriteTransaction, dir: Reference, definitions: []const PropertyDefinition, is_embedded: bool) !AddTypeResult {
     var old_refs: [256]Reference = undefined;
     var old_flags: [256]bool = undefined;
     const old_tc = try snapshotRefs(transaction, dir, &old_refs);
     _ = try snapshotFlags(transaction, dir, &old_flags);
     std.debug.assert(old_tc < 256);
-    const newCatalog = try catalog.createDefs(transaction, defs);
+    const newCatalog = try catalog.createFromDefinitions(transaction, definitions);
     const new_dir = try appendCatalog(transaction, old_refs[0..old_tc], old_flags[0..old_tc], newCatalog, is_embedded);
     return .{ .dir = new_dir, .type_id = old_tc };
 }
@@ -208,10 +208,10 @@ pub fn insertEmbedded(transaction: *WriteTransaction, dir: Reference, owner_type
     if (try typeRouting.getLink(transaction, cur, owner_type, ownerPrimaryKey, property)) |oldObjectKey| {
         const childCatalog = try catalogRef(transaction, cur, child_type);
         const propertyCount = (try catalog.loadCatalog(transaction, childCatalog)).propertyCount;
-        var buf: [256]u64 = undefined;
-        if (try rows.getByObjectKey(transaction, childCatalog, oldObjectKey, buf[0..propertyCount])) |old_ver| {
-            const oldPrimaryKey = buf[0];
-            const dres = try typeRouting.deleteNullifyX(transaction, cur, child_type, oldPrimaryKey, old_ver);
+        var buffer: [256]u64 = undefined;
+        if (try rows.getByObjectKey(transaction, childCatalog, oldObjectKey, buffer[0..propertyCount])) |oldVersion| {
+            const oldPrimaryKey = buffer[0];
+            const dres = try typeRouting.deleteNullifyX(transaction, cur, child_type, oldPrimaryKey, oldVersion);
             switch (dres) {
                 .ok => |d| cur = d,
                 else => return error.Blocked,
@@ -232,10 +232,10 @@ pub fn clearEmbedded(transaction: *WriteTransaction, dir: Reference, owner_type:
     const child_type = (try catalog.loadCatalog(transaction, try catalogRef(transaction, dir, owner_type))).linkTarget(property);
     const childCatalog = try catalogRef(transaction, dir, child_type);
     const propertyCount = (try catalog.loadCatalog(transaction, childCatalog)).propertyCount;
-    var buf: [256]u64 = undefined;
-    const child_ver = (try rows.getByObjectKey(transaction, childCatalog, childObjectKey, buf[0..propertyCount])) orelse return dir;
-    const childPrimaryKey = buf[0];
-    const dres = try typeRouting.deleteNullifyX(transaction, dir, child_type, childPrimaryKey, child_ver);
+    var buffer: [256]u64 = undefined;
+    const childVersion = (try rows.getByObjectKey(transaction, childCatalog, childObjectKey, buffer[0..propertyCount])) orelse return dir;
+    const childPrimaryKey = buffer[0];
+    const dres = try typeRouting.deleteNullifyX(transaction, dir, child_type, childPrimaryKey, childVersion);
     return switch (dres) {
         .ok => |d| d,
         // A refused clear must surface: returning the unchanged dir read as

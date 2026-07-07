@@ -6,7 +6,7 @@ const Index = @import("../trees/index.zig");
 const catalog = @import("../schema/catalog.zig");
 
 const PropertyKind = catalog.PropertyKind;
-const ElemKind = catalog.ElemKind;
+const ElementKind = catalog.ElementKind;
 const PropertyDefinition = catalog.PropertyDefinition;
 const Value = catalog.Value;
 const PropertyCount = catalog.PropertyCount;

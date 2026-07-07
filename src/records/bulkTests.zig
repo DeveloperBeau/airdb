@@ -27,9 +27,9 @@ const query = @import("../query.zig");
 const typedir = @import("../schema/typeDirectory.zig");
 
 fn bulkTmpPath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const u8) ![]const u8 {
-    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const dlen = try tmp.dir.realPath(testing.io, &path_buf);
-    return std.fs.path.join(allocator, &.{ path_buf[0..dlen], name });
+    var pathBuffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dlen = try tmp.dir.realPath(testing.io, &pathBuffer);
+    return std.fs.path.join(allocator, &.{ pathBuffer[0..dlen], name });
 }
 
 test "bulk append is refused when the batch does not clear the true max primaryKey" {
@@ -53,8 +53,8 @@ test "bulk append is refused when the batch does not clear the true max primaryK
     var out: [2]u64 = undefined;
     primaryKey = 32;
     while (primaryKey <= 64) : (primaryKey += 1) {
-        const ver = (try rawRows.getByPrimaryKey(&w, catalogRef, primaryKey, &out)).?;
-        catalogRef = (try rawRows.delete(&w, catalogRef, primaryKey, ver)).ok;
+        const version = (try rawRows.getByPrimaryKey(&w, catalogRef, primaryKey, &out)).?;
+        catalogRef = (try rawRows.delete(&w, catalogRef, primaryKey, version)).ok;
     }
     // primaryKeys 0..31 survive; a batch starting at 10 must NOT take the fast path.
     const rows = [_][]const u64{ &.{ 10, 1 }, &.{ 11, 2 } };
@@ -92,8 +92,8 @@ test "bulk append into a primaryKey-history gap takes the fallback" {
     var out: [2]u64 = undefined;
     primaryKey = 40;
     while (primaryKey <= 104) : (primaryKey += 1) {
-        const ver = (try rawRows.getByPrimaryKey(&w, catalogRef, primaryKey, &out)).?;
-        catalogRef = (try rawRows.delete(&w, catalogRef, primaryKey, ver)).ok;
+        const version = (try rawRows.getByPrimaryKey(&w, catalogRef, primaryKey, &out)).?;
+        catalogRef = (try rawRows.delete(&w, catalogRef, primaryKey, version)).ok;
     }
 
     // Below the stale low: NotAppendable; the orchestrator's fallback must
@@ -121,7 +121,7 @@ test "bulk append fallback refuses link-bearing schemas" {
     defer database.deinit();
     var w = try database.beginWrite();
     defer w.deinit();
-    const catalogRef = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
+    const catalogRef = try catalog.createFromDefinitions(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
     const rows = [_][]const u64{&.{ 1, 0 }};
     try testing.expectError(error.UnsupportedForBulk, bulkAppendOrInsert(&w, catalogRef, &rows));
 }
@@ -163,8 +163,8 @@ fn checkColumnSize(w: *WriteTransaction, n: usize) !void {
     var seq = try Column.create(w);
     for (values) |v| seq = try Column.append(w, seq, v);
 
-    try testing.expectEqual(try Column.len(w, seq), try Column.len(w, built));
-    try testing.expectEqual(@as(u64, n), try Column.len(w, built));
+    try testing.expectEqual(try Column.length(w, seq), try Column.length(w, built));
+    try testing.expectEqual(@as(u64, n), try Column.length(w, built));
     var i: u64 = 0;
     while (i < n) : (i += 1) {
         try testing.expectEqual(try Column.get(w, seq, i), try Column.get(w, built, i));
@@ -183,7 +183,7 @@ test "bulkColumn equals sequential appends" {
     w.deinit();
 }
 
-test "bulkColumn boundary sizes: 0, 1, LEAF_CAP, multi-inner-level" {
+test "bulkColumn boundary sizes: 0, 1, leafCap, multi-inner-level" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try bulkTmpPath(testing.allocator, &tmp, "bulkcolsizes.airdb");
@@ -193,8 +193,8 @@ test "bulkColumn boundary sizes: 0, 1, LEAF_CAP, multi-inner-level" {
     var w = try database.beginWrite();
     try checkColumnSize(&w, 0);
     try checkColumnSize(&w, 1);
-    try checkColumnSize(&w, cnode.LEAF_CAP); // single full leaf
-    try checkColumnSize(&w, @as(usize, cnode.LEAF_CAP) * cnode.FANOUT + 1); // 3 levels
+    try checkColumnSize(&w, cnode.leafCap); // single full leaf
+    try checkColumnSize(&w, @as(usize, cnode.leafCap) * cnode.fanout + 1); // 3 levels
     w.deinit();
 }
 
@@ -254,7 +254,7 @@ test "bulkIndex equals sequential inserts" {
     w.deinit();
 }
 
-test "bulkIndex boundary sizes: 0, 1, LEAF_CAP, multi-inner-level" {
+test "bulkIndex boundary sizes: 0, 1, leafCap, multi-inner-level" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try bulkTmpPath(testing.allocator, &tmp, "bulkidxsizes.airdb");
@@ -264,8 +264,8 @@ test "bulkIndex boundary sizes: 0, 1, LEAF_CAP, multi-inner-level" {
     var w = try database.beginWrite();
     try checkIndexSize(&w, 0);
     try checkIndexSize(&w, 1);
-    try checkIndexSize(&w, inode.LEAF_CAP);
-    try checkIndexSize(&w, @as(usize, inode.LEAF_CAP) * inode.FANOUT + 1);
+    try checkIndexSize(&w, inode.leafCap);
+    try checkIndexSize(&w, @as(usize, inode.leafCap) * inode.fanout + 1);
     w.deinit();
 }
 
@@ -339,7 +339,7 @@ test "bulkValueIndex equals sequential maintenance" {
 }
 
 // Schema shared by the orchestrator tests: int primaryKey, int value, int category (indexed).
-const import_defs = [_]catalog.PropertyDefinition{
+const importDefinitions = [_]catalog.PropertyDefinition{
     .{ .kind = .int },
     .{ .kind = .int },
     .{ .kind = .int, .indexed = true },
@@ -378,7 +378,7 @@ test "bulkImport equals row-by-row for a scalar indexed type" {
         var database = try Database.create(testing.allocator, path_a);
         defer database.deinit();
         var w = try database.beginWrite();
-        const dir = try typedir.createTypes(&w, &.{&import_defs}, &.{false});
+        const dir = try typedir.createTypes(&w, &.{&importDefinitions}, &.{false});
         const catalog0 = try typedir.catalogRef(&w, dir, 0);
         const newCatalog = try bulkImport(&w, catalog0, row_slices, .{});
         const new_dir = try typedir.setCatalogRef(&w, dir, 0, newCatalog);
@@ -392,7 +392,7 @@ test "bulkImport equals row-by-row for a scalar indexed type" {
         var database = try Database.create(testing.allocator, path_b);
         defer database.deinit();
         var w = try database.beginWrite();
-        var catalogRef = try catalog.createDefs(&w, &import_defs);
+        var catalogRef = try catalog.createFromDefinitions(&w, &importDefinitions);
         var primaryKey: u64 = 0;
         while (primaryKey < N) : (primaryKey += 1) catalogRef = (try rawRows.insert(&w, catalogRef, &.{ primaryKey, primaryKey * 3, primaryKey % 50 })).catalogRef;
         w.setRoot(catalogRef);
@@ -463,7 +463,7 @@ test "bulkImport rejects a non-empty type" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    var catalogRef = try catalog.createDefs(&w, &import_defs);
+    var catalogRef = try catalog.createFromDefinitions(&w, &importDefinitions);
     catalogRef = (try rawRows.insert(&w, catalogRef, &.{ 1, 3, 1 })).catalogRef;
 
     const more = [_][]const u64{ &.{ 10, 30, 5 }, &.{ 11, 33, 6 } };
@@ -487,7 +487,7 @@ test "bulkImport rejects duplicate primaryKey before committing" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    const catalogRef = try catalog.createDefs(&w, &import_defs);
+    const catalogRef = try catalog.createFromDefinitions(&w, &importDefinitions);
 
     const dup = [_][]const u64{ &.{ 5, 1, 0 }, &.{ 6, 2, 0 }, &.{ 5, 3, 0 } };
     try testing.expectError(error.DuplicateKey, bulkImport(&w, catalogRef, &dup, .{}));
@@ -508,18 +508,18 @@ test "bulkImport rejects a link-bearing type" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    const link_defs = [_]catalog.PropertyDefinition{ .{ .kind = .int }, .{ .kind = .link, .link_target = 0 } };
-    const catalogRef = try catalog.createDefs(&w, &link_defs);
+    const linkDefinitions = [_]catalog.PropertyDefinition{ .{ .kind = .int }, .{ .kind = .link, .link_target = 0 } };
+    const catalogRef = try catalog.createFromDefinitions(&w, &linkDefinitions);
 
     const rws = [_][]const u64{&.{ 1, 0 }};
     try testing.expectError(error.UnsupportedForBulk, bulkImport(&w, catalogRef, &rws, .{}));
     w.deinit();
 }
 
-test "bulkImport edge sizes: empty, single, LEAF_CAP" {
+test "bulkImport edge sizes: empty, single, leafCap" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const sizes = [_]u64{ 0, 1, @as(u64, cnode.LEAF_CAP) };
+    const sizes = [_]u64{ 0, 1, @as(u64, cnode.leafCap) };
     for (sizes, 0..) |n, si| {
         var namebuf: [32]u8 = undefined;
         const name = try std.fmt.bufPrint(&namebuf, "edge_{d}.airdb", .{si});
@@ -540,7 +540,7 @@ test "bulkImport edge sizes: empty, single, LEAF_CAP" {
         defer database.deinit();
         {
             var w = try database.beginWrite();
-            const dir = try typedir.createTypes(&w, &.{&import_defs}, &.{false});
+            const dir = try typedir.createTypes(&w, &.{&importDefinitions}, &.{false});
             const catalog0 = try typedir.catalogRef(&w, dir, 0);
             const newCatalog = try bulkImport(&w, catalog0, row_slices, .{ .presorted = true });
             const new_dir = try typedir.setCatalogRef(&w, dir, 0, newCatalog);
@@ -568,7 +568,7 @@ test "bulkImport edge sizes: empty, single, LEAF_CAP" {
 }
 
 // A no-index, no-link scalar schema: int primaryKey, int value. Qualifies for append.
-const append_defs = [_]catalog.PropertyDefinition{ .{ .kind = .int }, .{ .kind = .int } };
+const appendDefinitions = [_]catalog.PropertyDefinition{ .{ .kind = .int }, .{ .kind = .int } };
 
 test "bulkAppend equals row-by-row for a contiguous monotonic batch" {
     var tmp = testing.tmpDir(.{});
@@ -602,7 +602,7 @@ test "bulkAppend equals row-by-row for a contiguous monotonic batch" {
         var database = try Database.create(testing.allocator, path_a);
         defer database.deinit();
         var w = try database.beginWrite();
-        const dir = try typedir.createTypes(&w, &.{&append_defs}, &.{false});
+        const dir = try typedir.createTypes(&w, &.{&appendDefinitions}, &.{false});
         var catalogRef = try typedir.catalogRef(&w, dir, 0);
         var primaryKey: u64 = 0;
         while (primaryKey < BASE) : (primaryKey += 1) catalogRef = (try rawRows.insert(&w, catalogRef, &.{ primaryKey, primaryKey * 3 })).catalogRef;
@@ -618,7 +618,7 @@ test "bulkAppend equals row-by-row for a contiguous monotonic batch" {
         var database = try Database.create(testing.allocator, path_b);
         defer database.deinit();
         var w = try database.beginWrite();
-        var catalogRef = try catalog.createDefs(&w, &append_defs);
+        var catalogRef = try catalog.createFromDefinitions(&w, &appendDefinitions);
         var primaryKey: u64 = 0;
         while (primaryKey < TOTAL) : (primaryKey += 1) catalogRef = (try rawRows.insert(&w, catalogRef, &.{ primaryKey, primaryKey * 3 })).catalogRef;
         w.setRoot(catalogRef);
@@ -675,7 +675,7 @@ test "bulkAppend returns NotAppendable for a scattered batch" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    var catalogRef = try catalog.createDefs(&w, &append_defs);
+    var catalogRef = try catalog.createFromDefinitions(&w, &appendDefinitions);
     var primaryKey: u64 = 0;
     while (primaryKey < 100) : (primaryKey += 1) catalogRef = (try rawRows.insert(&w, catalogRef, &.{ primaryKey, primaryKey * 3 })).catalogRef;
 
@@ -703,7 +703,7 @@ test "bulkAppend returns NotAppendable for an indexed type" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    var catalogRef = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .int, .indexed = true } });
+    var catalogRef = try catalog.createFromDefinitions(&w, &.{ .{ .kind = .int }, .{ .kind = .int, .indexed = true } });
     catalogRef = (try rawRows.insert(&w, catalogRef, &.{ 1, 10 })).catalogRef;
 
     // Even an ascending batch above the max is rejected: a pure right-edge append
@@ -721,7 +721,7 @@ test "bulkAppend returns NotAppendable for a link-bearing type" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    var catalogRef = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link, .link_target = 0 } });
+    var catalogRef = try catalog.createFromDefinitions(&w, &.{ .{ .kind = .int }, .{ .kind = .link, .link_target = 0 } });
     catalogRef = (try rawRows.insert(&w, catalogRef, &.{ 1, 0 })).catalogRef;
 
     const batch = [_][]const u64{ &.{ 100, 0 }, &.{ 101, 0 } };
@@ -737,7 +737,7 @@ test "bulkAppend returns NotAppendable for a non-ascending or duplicate batch" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    var catalogRef = try catalog.createDefs(&w, &append_defs);
+    var catalogRef = try catalog.createFromDefinitions(&w, &appendDefinitions);
     catalogRef = (try rawRows.insert(&w, catalogRef, &.{ 1, 3 })).catalogRef;
 
     // Non-ascending batch (both primaryKeys above the max, but out of order).
@@ -777,7 +777,7 @@ test "bulkAppendOrInsert falls back and equals row-by-row for a scattered batch"
         var database = try Database.create(testing.allocator, path_a);
         defer database.deinit();
         var w = try database.beginWrite();
-        const dir = try typedir.createTypes(&w, &.{&append_defs}, &.{false});
+        const dir = try typedir.createTypes(&w, &.{&appendDefinitions}, &.{false});
         var catalogRef = try typedir.catalogRef(&w, dir, 0);
         var primaryKey: u64 = 0;
         while (primaryKey < BASE) : (primaryKey += 1) catalogRef = (try rawRows.insert(&w, catalogRef, &.{ primaryKey, primaryKey * 3 })).catalogRef;
@@ -794,7 +794,7 @@ test "bulkAppendOrInsert falls back and equals row-by-row for a scattered batch"
         var database = try Database.create(testing.allocator, path_b);
         defer database.deinit();
         var w = try database.beginWrite();
-        var catalogRef = try catalog.createDefs(&w, &append_defs);
+        var catalogRef = try catalog.createFromDefinitions(&w, &appendDefinitions);
         var primaryKey: u64 = 0;
         while (primaryKey < BASE) : (primaryKey += 1) catalogRef = (try rawRows.insert(&w, catalogRef, &.{ primaryKey, primaryKey * 3 })).catalogRef;
         for (scatteredPrimaryKeys) |scatteredPrimaryKey| catalogRef = (try rawRows.insert(&w, catalogRef, &.{ scatteredPrimaryKey, scatteredPrimaryKey * 3 })).catalogRef;
@@ -850,7 +850,7 @@ test "bulkAppendOrInsert empty batch is a no-op" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    var catalogRef = try catalog.createDefs(&w, &append_defs);
+    var catalogRef = try catalog.createFromDefinitions(&w, &appendDefinitions);
     catalogRef = (try rawRows.insert(&w, catalogRef, &.{ 1, 3 })).catalogRef;
 
     const before = try catalog.liveCount(&w, catalogRef);

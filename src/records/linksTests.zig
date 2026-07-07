@@ -25,9 +25,9 @@ const getTyped = @import("objects.zig").getTyped;
 const deleteTyped = @import("objects.zig").deleteTyped;
 
 fn objTmpPath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const u8) ![]const u8 {
-    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const dlen = try tmp.dir.realPath(testing.io, &path_buf);
-    return std.fs.path.join(allocator, &.{ path_buf[0..dlen], name });
+    var pathBuffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dlen = try tmp.dir.realPath(testing.io, &pathBuffer);
+    return std.fs.path.join(allocator, &.{ pathBuffer[0..dlen], name });
 }
 
 test "link-set accessors return error.NotFound for an absent primaryKey" {
@@ -39,7 +39,7 @@ test "link-set accessors return error.NotFound for an absent primaryKey" {
     defer database.deinit();
     var w = try database.beginWrite();
     defer w.deinit();
-    var catalogRef = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link_set } });
+    var catalogRef = try catalog.createFromDefinitions(&w, &.{ .{ .kind = .int }, .{ .kind = .link_set } });
     catalogRef = (try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .link_set = &.{} } })).catalogRef;
 
     const missing: u64 = 999;
@@ -59,7 +59,7 @@ test "insert stores a link and records the backlink" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    var catalogRef = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .blob }, .{ .kind = .link } });
+    var catalogRef = try catalog.createFromDefinitions(&w, &.{ .{ .kind = .int }, .{ .kind = .blob }, .{ .kind = .link } });
     const boss = try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .bytes = "Boss" }, .{ .link = null } });
     catalogRef = boss.catalogRef;
     const rep = try insertTyped(&w, catalogRef, &.{ .{ .int = 2 }, .{ .bytes = "Report" }, .{ .link = boss.row } });
@@ -83,7 +83,7 @@ test "setLink moves a link and updates both backlink sets" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    var catalogRef = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
+    var catalogRef = try catalog.createFromDefinitions(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
     const a = try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .link = null } });
     catalogRef = a.catalogRef;
     const b = try insertTyped(&w, catalogRef, &.{ .{ .int = 2 }, .{ .link = null } });
@@ -112,7 +112,7 @@ test "nullifying a source's link bumps its version" {
     // Commit 1: target + linked source.
     {
         var w = try database.beginWrite();
-        var catalogRef = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
+        var catalogRef = try catalog.createFromDefinitions(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
         const a = try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .link = null } });
         catalogRef = a.catalogRef;
         objectKeyA = a.row;
@@ -160,7 +160,7 @@ test "a multi-leaf backlink set is pruned and freed when emptied" {
     defer database.deinit();
     var w = try database.beginWrite();
     defer w.deinit();
-    var catalogRef = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
+    var catalogRef = try catalog.createFromDefinitions(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
     const target = try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .link = null } });
     catalogRef = target.catalogRef;
     // >64 sources so the backlink inner set splits past one leaf.
@@ -187,7 +187,7 @@ test "an emptied backlink set is pruned from the backlink index" {
     defer database.deinit();
     var w = try database.beginWrite();
     defer w.deinit();
-    var catalogRef = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
+    var catalogRef = try catalog.createFromDefinitions(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
     const a = try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .link = null } });
     catalogRef = a.catalogRef;
     const b = try insertTyped(&w, catalogRef, &.{ .{ .int = 2 }, .{ .link = a.row } });
@@ -207,7 +207,7 @@ test "setLink clearing a link drops the backlink" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    var catalogRef = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
+    var catalogRef = try catalog.createFromDefinitions(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
     const b = try insertTyped(&w, catalogRef, &.{ .{ .int = 2 }, .{ .link = null } });
     catalogRef = b.catalogRef;
     const c = try insertTyped(&w, catalogRef, &.{ .{ .int = 3 }, .{ .link = b.row } });
@@ -228,7 +228,7 @@ test "nullifyInboundInCatalog clears only links whose target type matches the fi
     defer database.deinit();
     var w = try database.beginWrite();
     // properties: primaryKey(int), property1(link -> type 5), property2(link -> type 9)
-    var catalogRef = try catalog.createDefs(&w, &.{
+    var catalogRef = try catalog.createFromDefinitions(&w, &.{
         .{ .kind = .int },
         .{ .kind = .link, .link_target = 5 },
         .{ .kind = .link, .link_target = 9 },
@@ -257,7 +257,7 @@ test "deleting a target nullifies inbound to-one links" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    var catalogRef = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
+    var catalogRef = try catalog.createFromDefinitions(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
     const a = try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .link = null } });
     catalogRef = a.catalogRef;
     const b = try insertTyped(&w, catalogRef, &.{ .{ .int = 2 }, .{ .link = a.row } });
@@ -282,7 +282,7 @@ test "deleting a source removes its outbound backlink entry" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    var catalogRef = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
+    var catalogRef = try catalog.createFromDefinitions(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
     const a = try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .link = null } });
     catalogRef = a.catalogRef;
     const b = try insertTyped(&w, catalogRef, &.{ .{ .int = 2 }, .{ .link = a.row } });
@@ -305,7 +305,7 @@ test "links and backlinks persist across commit and reopen" {
         var database = try Database.create(testing.allocator, path);
         defer database.deinit();
         var w = try database.beginWrite();
-        var catalogRef = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
+        var catalogRef = try catalog.createFromDefinitions(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
         const boss = try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .link = null } });
         catalogRef = boss.catalogRef;
         boss_row = boss.row;
@@ -332,7 +332,7 @@ test "a self-link is allowed and recorded" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    var catalogRef = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
+    var catalogRef = try catalog.createFromDefinitions(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
     const a = try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .link = null } });
     catalogRef = a.catalogRef;
     catalogRef = try setLink(&w, catalogRef, 1, 1, a.row);
@@ -349,7 +349,7 @@ test "a two-node cycle is allowed" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    var catalogRef = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
+    var catalogRef = try catalog.createFromDefinitions(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
     const a = try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .link = null } });
     catalogRef = a.catalogRef;
     const b = try insertTyped(&w, catalogRef, &.{ .{ .int = 2 }, .{ .link = a.row } });
@@ -371,7 +371,7 @@ test "to-many link set: insert seeds members and backlinks" {
     defer database.deinit();
     var w = try database.beginWrite();
     // properties: primaryKey(int), tags(link_set -> same type)
-    var catalogRef = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link_set } });
+    var catalogRef = try catalog.createFromDefinitions(&w, &.{ .{ .kind = .int }, .{ .kind = .link_set } });
     const a = try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .link_set = &.{} } });
     catalogRef = a.catalogRef;
     const b = try insertTyped(&w, catalogRef, &.{ .{ .int = 2 }, .{ .link_set = &.{} } });
@@ -397,7 +397,7 @@ test "to-many link set: membership query reflects members" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    var catalogRef = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link_set } });
+    var catalogRef = try catalog.createFromDefinitions(&w, &.{ .{ .kind = .int }, .{ .kind = .link_set } });
     const a = try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .link_set = &.{} } });
     catalogRef = a.catalogRef;
     const b = try insertTyped(&w, catalogRef, &.{ .{ .int = 2 }, .{ .link_set = &.{} } });
@@ -417,7 +417,7 @@ test "to-many link set: add inserts a new member" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    var catalogRef = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link_set } });
+    var catalogRef = try catalog.createFromDefinitions(&w, &.{ .{ .kind = .int }, .{ .kind = .link_set } });
     const a = try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .link_set = &.{} } });
     catalogRef = a.catalogRef;
     const b = try insertTyped(&w, catalogRef, &.{ .{ .int = 2 }, .{ .link_set = &.{} } });
@@ -439,7 +439,7 @@ test "to-many link set: adding an existing member is a no-op" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    var catalogRef = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link_set } });
+    var catalogRef = try catalog.createFromDefinitions(&w, &.{ .{ .kind = .int }, .{ .kind = .link_set } });
     const a = try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .link_set = &.{} } });
     catalogRef = a.catalogRef;
     const b = try insertTyped(&w, catalogRef, &.{ .{ .int = 2 }, .{ .link_set = &.{} } });
@@ -460,7 +460,7 @@ test "to-many link set: remove drops a member" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    var catalogRef = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link_set } });
+    var catalogRef = try catalog.createFromDefinitions(&w, &.{ .{ .kind = .int }, .{ .kind = .link_set } });
     const a = try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .link_set = &.{} } });
     catalogRef = a.catalogRef;
     const b = try insertTyped(&w, catalogRef, &.{ .{ .int = 2 }, .{ .link_set = &.{} } });
@@ -485,7 +485,7 @@ test "deleting a to-many target removes it from all linkers" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    var catalogRef = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link_set } });
+    var catalogRef = try catalog.createFromDefinitions(&w, &.{ .{ .kind = .int }, .{ .kind = .link_set } });
     const a = try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .link_set = &.{} } });
     catalogRef = a.catalogRef;
     const b = try insertTyped(&w, catalogRef, &.{ .{ .int = 2 }, .{ .link_set = &.{a.row} } });
@@ -511,7 +511,7 @@ test "deleting a to-many linker cleans its backlinks" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    var catalogRef = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link_set } });
+    var catalogRef = try catalog.createFromDefinitions(&w, &.{ .{ .kind = .int }, .{ .kind = .link_set } });
     const a = try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .link_set = &.{} } });
     catalogRef = a.catalogRef;
     const b = try insertTyped(&w, catalogRef, &.{ .{ .int = 2 }, .{ .link_set = &.{a.row} } });
@@ -535,7 +535,7 @@ test "to-many links persist across commit and reopen" {
         var database = try Database.create(testing.allocator, path);
         defer database.deinit();
         var w = try database.beginWrite();
-        var catalogRef = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link_set } });
+        var catalogRef = try catalog.createFromDefinitions(&w, &.{ .{ .kind = .int }, .{ .kind = .link_set } });
         const hub = try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .link_set = &.{} } });
         catalogRef = hub.catalogRef;
         hub_row = hub.row;

@@ -3,7 +3,7 @@ const Column = @import("column.zig");
 const node = @import("columnNode.zig");
 const Reference = @import("../storage/reference.zig").Reference;
 const create = Column.create;
-const len = Column.len;
+const length = Column.length;
 const get = Column.get;
 const append = Column.append;
 const appendRun = Column.appendRun;
@@ -22,25 +22,25 @@ const Database = @import("../database.zig").Database;
 const WriteTransaction = @import("../database.zig").WriteTransaction;
 
 fn colTmpPath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const u8) ![]const u8 {
-    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const dlen = try tmp.dir.realPath(testing.io, &path_buf);
-    return std.fs.path.join(allocator, &.{ path_buf[0..dlen], name });
+    var pathBuffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dlen = try tmp.dir.realPath(testing.io, &pathBuffer);
+    return std.fs.path.join(allocator, &.{ pathBuffer[0..dlen], name });
 }
 
 test "leaf encode/decode round-trips values" {
-    var buf: [leaf_node_size]u8 = undefined;
+    var buffer: [leaf_node_size]u8 = undefined;
     const vals = [_]u64{ 10, 20, 30 };
-    const n = encodeLeaf(&buf, &vals);
-    const view = try parseLeaf(buf[0..n]);
+    const n = encodeLeaf(&buffer, &vals);
+    const view = try parseLeaf(buffer[0..n]);
     try testing.expectEqual(@as(u16, 3), view.count);
     try testing.expectEqual(@as(u64, 20), view.value(1));
 }
 
 test "parseLeaf rejects a buffer too small for its declared count" {
-    var buf: [16]u8 = undefined;
-    buf[0] = 0; // kind = leaf
-    std.mem.writeInt(u16, buf[1..3], 100, .little); // claims 100 values
-    try testing.expectError(error.Corrupt, parseLeaf(buf[0..16]));
+    var buffer: [16]u8 = undefined;
+    buffer[0] = 0; // kind = leaf
+    std.mem.writeInt(u16, buffer[1..3], 100, .little); // claims 100 values
+    try testing.expectError(error.Corrupt, parseLeaf(buffer[0..16]));
 }
 
 test "a column ref cycle fails with error.Corrupt" {
@@ -62,7 +62,7 @@ test "a column ref cycle fails with error.Corrupt" {
     try testing.expectError(error.Corrupt, append(&w, a.ref, 1));
 }
 
-test "single-leaf column: create, append, get, len, set" {
+test "single-leaf column: create, append, get, length, set" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try colTmpPath(testing.allocator, &tmp, "col1.airdb");
@@ -71,11 +71,11 @@ test "single-leaf column: create, append, get, len, set" {
     defer database.deinit();
     var w = try database.beginWrite();
     var root = try create(&w);
-    try testing.expectEqual(@as(u64, 0), try len(&w, root));
+    try testing.expectEqual(@as(u64, 0), try length(&w, root));
     root = try append(&w, root, 100);
     root = try append(&w, root, 200);
     root = try append(&w, root, 300);
-    try testing.expectEqual(@as(u64, 3), try len(&w, root));
+    try testing.expectEqual(@as(u64, 3), try length(&w, root));
     try testing.expectEqual(@as(u64, 200), try get(&w, root, 1));
     root = try set(&w, root, 1, 222);
     try testing.expectEqual(@as(u64, 222), try get(&w, root, 1));
@@ -92,10 +92,10 @@ test "append grows the tree across many leaves and reads back correctly" {
     defer database.deinit();
     var w = try database.beginWrite();
     var root = try create(&w);
-    const N: u64 = 5000; // > LEAF_CAP and > LEAF_CAP*FANOUT (4096): forces >= 3 levels
+    const N: u64 = 5000; // > leafCap and > leafCap*fanout (4096): forces >= 3 levels
     var i: u64 = 0;
     while (i < N) : (i += 1) root = try append(&w, root, i * 7);
-    try testing.expectEqual(N, try len(&w, root));
+    try testing.expectEqual(N, try length(&w, root));
     try testing.expectEqual(@as(u64, 0), try get(&w, root, 0));
     try testing.expectEqual(@as(u64, 4999 * 7), try get(&w, root, 4999));
     try testing.expectEqual(@as(u64, 2500 * 7), try get(&w, root, 2500));
@@ -105,7 +105,7 @@ test "append grows the tree across many leaves and reads back correctly" {
     w.deinit();
 }
 
-test "get and len traverse an inner node over two leaves" {
+test "get and length traverse an inner node over two leaves" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try colTmpPath(testing.allocator, &tmp, "col3.airdb");
@@ -120,7 +120,7 @@ test "get and len traverse an inner node over two leaves" {
     l1 = try append(&w, l1, 2);
     l1 = try append(&w, l1, 3);
     const inner = try makeInnerForTest(&w, &.{ .{ .ref = l0, .count = 2 }, .{ .ref = l1, .count = 2 } });
-    try testing.expectEqual(@as(u64, 4), try len(&w, inner));
+    try testing.expectEqual(@as(u64, 4), try length(&w, inner));
     try testing.expectEqual(@as(u64, 0), try get(&w, inner, 0));
     try testing.expectEqual(@as(u64, 2), try get(&w, inner, 2));
     try testing.expectEqual(@as(u64, 3), try get(&w, inner, 3));
@@ -143,7 +143,7 @@ test "set on a multi-level column leaves the old root snapshot unchanged" {
     const new_root = try set(&w, root, 500, 999999);
     try testing.expectEqual(@as(u64, 500), try get(&w, old_root, 500)); // old snapshot unchanged
     try testing.expectEqual(@as(u64, 999999), try get(&w, new_root, 500)); // new root updated
-    try testing.expectEqual(try len(&w, old_root), try len(&w, new_root));
+    try testing.expectEqual(try length(&w, old_root), try length(&w, new_root));
     // a few other indices match between old and new (shared subtrees)
     try testing.expectEqual(try get(&w, old_root, 0), try get(&w, new_root, 0));
     try testing.expectEqual(try get(&w, old_root, 999), try get(&w, new_root, 999));
@@ -164,7 +164,7 @@ test "Column.truncate shrinks length and preserves head values" {
     while (i < N) : (i += 1) root = try append(&w, root, i * 7);
     const M: u64 = 300;
     root = try truncate(&w, root, M);
-    try testing.expectEqual(M, try len(&w, root));
+    try testing.expectEqual(M, try length(&w, root));
     var k: u64 = 0;
     while (k < M) : (k += 1) try testing.expectEqual(k * 7, try get(&w, root, k));
     try testing.expectError(error.IndexOutOfBounds, get(&w, root, M));
@@ -183,7 +183,7 @@ test "Column.truncate to zero empties the column" {
     var i: u64 = 0;
     while (i < 1000) : (i += 1) root = try append(&w, root, i);
     root = try truncate(&w, root, 0);
-    try testing.expectEqual(@as(u64, 0), try len(&w, root));
+    try testing.expectEqual(@as(u64, 0), try length(&w, root));
     // Reclamation note: truncate frees every dropped node via transaction.free, which routes
     // them onto the transaction-private pool / committed free list (see WriteTransaction.free).
     // column.zig exposes no in-transaction free-list hook, so reclamation is covered by
@@ -210,7 +210,7 @@ test "a column persisted as the root survives commit and reopen" {
         var database = try Database.open(testing.allocator, path);
         defer database.deinit();
         var r = try database.beginRead();
-        try testing.expectEqual(@as(u64, 2000), try len(&r, r.root()));
+        try testing.expectEqual(@as(u64, 2000), try length(&r, r.root()));
         try testing.expectEqual(@as(u64, 1999 * 3), try get(&r, r.root(), 1999));
         try testing.expectEqual(@as(u64, 0), try get(&r, r.root(), 0));
         try testing.expectEqual(@as(u64, 1000 * 3), try get(&r, r.root(), 1000));
@@ -251,7 +251,7 @@ test "two million element column builds, persists, and reads back" {
         var database = try Database.open(testing.allocator, path);
         defer database.deinit();
         var r = try database.beginRead();
-        try testing.expectEqual(N, try len(&r, r.root()));
+        try testing.expectEqual(N, try length(&r, r.root()));
         // Strided spot-checks across the whole 2M range: get(i) must equal i.
         var i: u64 = 0;
         while (i < N) : (i += 50_000) try testing.expectEqual(i, try get(&r, r.root(), i));
@@ -286,7 +286,7 @@ test "two million element column built in a single transaction" {
         var database = try Database.open(testing.allocator, path);
         defer database.deinit();
         var r = try database.beginRead();
-        try testing.expectEqual(N, try len(&r, r.root()));
+        try testing.expectEqual(N, try length(&r, r.root()));
         var i: u64 = 0;
         while (i < N) : (i += 50_000) try testing.expectEqual(i, try get(&r, r.root(), i));
         try testing.expectEqual(N - 1, try get(&r, r.root(), N - 1));
@@ -325,8 +325,8 @@ fn checkColAppendEquiv(w: *WriteTransaction, base: u64, run: u64) !void {
     while (k < base + run) : (k += 1) expected = try append(w, expected, appendColVal(k));
 
     const total = base + run;
-    try testing.expectEqual(total, try len(w, appended));
-    try testing.expectEqual(try len(w, expected), try len(w, appended));
+    try testing.expectEqual(total, try length(w, appended));
+    try testing.expectEqual(try length(w, expected), try length(w, appended));
 
     var i: u64 = 0;
     while (i < total) : (i += 1) {
@@ -351,7 +351,7 @@ test "appendRun grows height" {
     var database = try appendTmpDatabase(&tmp, "colappend2.airdb");
     defer database.deinit();
     var w = try database.beginWrite();
-    // Single-leaf base, run crossing FANOUT*LEAF_CAP (== 4096) so the result
+    // Single-leaf base, run crossing fanout*leafCap (== 4096) so the result
     // must be three levels tall.
     try checkColAppendEquiv(&w, 50, 4200);
     w.deinit();
@@ -363,7 +363,7 @@ test "appendRun single-leaf base" {
     var database = try appendTmpDatabase(&tmp, "colappend3.airdb");
     defer database.deinit();
     var w = try database.beginWrite();
-    try checkColAppendEquiv(&w, 40, 50); // base < LEAF_CAP
+    try checkColAppendEquiv(&w, 40, 50); // base < leafCap
     w.deinit();
 }
 
@@ -386,9 +386,9 @@ test "appendRun empty run is a no-op" {
     var base_root = try create(&w);
     var k: u64 = 0;
     while (k < 100) : (k += 1) base_root = try append(&w, base_root, appendColVal(k));
-    const before = try len(&w, base_root);
+    const before = try length(&w, base_root);
     const appended = try appendRun(&w, base_root, &.{}, testing.allocator);
     try testing.expectEqual(base_root, appended); // same ref, unchanged
-    try testing.expectEqual(before, try len(&w, appended));
+    try testing.expectEqual(before, try length(&w, appended));
     w.deinit();
 }
