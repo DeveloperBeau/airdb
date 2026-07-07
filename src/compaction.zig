@@ -122,21 +122,10 @@ fn truncatePacked(txn: *WriteTxn, cat: Ref, new_len: u64) !Ref {
 // relocation targets; high_hi scans downward from next_row toward live_count
 // seeking live rows that must move down. Both advance monotonically across
 // steps so no slot is ever revisited (relocateRow is not idempotent).
-pub const CompactCursor = struct {
-    /// The TYPE this cursor belongs to plus the catalog ref it was persisted
-    /// against. Both are required for a resume: live_count/next_row are a
-    /// heuristic two different types can momentarily share, and the catalog
-    /// ref ALONE is recyclable (freed catalog nodes are exact-size-class
-    /// reused, so another type's catalog can land on the same ref). Resuming
-    /// a foreign cursor would leave rows unexamined ahead of the tail
-    /// truncate -- silent live-row loss in release builds.
-    type_id: u16,
-    cat: Ref,
-    live_count: u64,
-    next_row: u64,
-    hole_lo: u64,
-    high_hi: u64,
-};
+//
+// The struct itself lives on the Db (the cursor persists across the write
+// transactions of one packing run), so its definition is in db.zig.
+pub const CompactCursor = @import("db.zig").CompactCursor;
 
 // Map a physical row to its stable object key. There is no reverse key->row
 // index, so we go through the primary key: property 0 holds the pk, and the pk

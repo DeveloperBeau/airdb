@@ -276,7 +276,7 @@ test "after a data-barrier flush failure, the reopened db passes verifyIntegrity
     {
         var db = try airdb.Db.open(testing.allocator, path);
         defer db.deinit();
-        try db.verifyIntegrity();
+        try airdb.verification.verifyIntegrity(&db);
         var r = try db.beginRead();
         try testing.expectEqualStrings("BASELINE", try r.deref(r.root(), 8));
         r.end();
@@ -310,7 +310,7 @@ test "after a header-flush failure, the reopened db passes verifyIntegrity and s
     {
         var db = try airdb.Db.open(testing.allocator, path);
         defer db.deinit();
-        try db.verifyIntegrity();
+        try airdb.verification.verifyIntegrity(&db);
         var r = try db.beginRead();
         try testing.expectEqualStrings("BASELINE", try r.deref(r.root(), 8));
         r.end();
@@ -433,7 +433,7 @@ test "a database grown well past the initial size reopens and verifies" {
     {
         var db = try airdb.Db.open(testing.allocator, path);
         defer db.deinit();
-        try db.verifyIntegrity();
+        try airdb.verification.verifyIntegrity(&db);
         var r = try db.beginRead();
         const got = try r.deref(r.root(), 4096);
         try testing.expectEqual(@as(u8, @intCast(599 & 0xff)), got[0]);

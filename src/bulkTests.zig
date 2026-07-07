@@ -1,4 +1,5 @@
 const std = @import("std");
+const verification = @import("verification.zig");
 const bulk = @import("bulk.zig");
 const WriteTxn = @import("db.zig").WriteTxn;
 const Ref = @import("ref.zig").Ref;
@@ -385,7 +386,7 @@ test "bulkImport equals row-by-row for a scalar indexed type" {
         const new_dir = try typedir.setCatalogRef(&w, dir, 0, new_cat);
         w.setRoot(new_dir);
         _ = try w.commit();
-        try db.verifyIntegrity(); // both value-index directions, in memory
+        try verification.verifyIntegrity(&db); // both value-index directions, in memory
     }
 
     // db B: the same rows inserted one at a time, in ascending-pk order.
@@ -403,7 +404,7 @@ test "bulkImport equals row-by-row for a scalar indexed type" {
     // Reopen A from disk (durability) and compare against B.
     var da = try Db.open(testing.allocator, path_a);
     defer da.deinit();
-    try da.verifyIntegrity(); // audit again after reopen
+    try verification.verifyIntegrity(&da); // audit again after reopen
     var dbb = try Db.open(testing.allocator, path_b);
     defer dbb.deinit();
 
@@ -548,7 +549,7 @@ test "bulkImport edge sizes: empty, single, LEAF_CAP" {
             w.setRoot(new_dir);
             _ = try w.commit();
         }
-        try db.verifyIntegrity();
+        try verification.verifyIntegrity(&db);
 
         var r = try db.beginRead();
         defer r.end();
@@ -850,7 +851,7 @@ test "bulkAppend equals row-by-row for a contiguous monotonic batch" {
         const new_dir = try typedir.setCatalogRef(&w, dir, 0, new_cat);
         w.setRoot(new_dir);
         _ = try w.commit();
-        try db.verifyIntegrity();
+        try verification.verifyIntegrity(&db);
     }
 
     // db B: every row inserted one at a time, in ascending-pk order.
@@ -868,7 +869,7 @@ test "bulkAppend equals row-by-row for a contiguous monotonic batch" {
     // Reopen A from disk (durability) and compare against B.
     var da = try Db.open(testing.allocator, path_a);
     defer da.deinit();
-    try da.verifyIntegrity(); // audit again after reopen
+    try verification.verifyIntegrity(&da); // audit again after reopen
     var dbb = try Db.open(testing.allocator, path_b);
     defer dbb.deinit();
 
@@ -1025,7 +1026,7 @@ test "bulkAppendOrInsert falls back and equals row-by-row for a scattered batch"
         const new_dir = try typedir.setCatalogRef(&w, dir, 0, new_cat);
         w.setRoot(new_dir);
         _ = try w.commit();
-        try db.verifyIntegrity();
+        try verification.verifyIntegrity(&db);
     }
 
     // db B: base via insert, then the same scattered rows inserted one at a time
@@ -1044,7 +1045,7 @@ test "bulkAppendOrInsert falls back and equals row-by-row for a scattered batch"
 
     var da = try Db.open(testing.allocator, path_a);
     defer da.deinit();
-    try da.verifyIntegrity();
+    try verification.verifyIntegrity(&da);
     var dbb = try Db.open(testing.allocator, path_b);
     defer dbb.deinit();
 

@@ -1,4 +1,5 @@
 const std = @import("std");
+const verification = @import("verification.zig");
 const Io = std.Io;
 const compaction = @import("compaction.zig");
 const catalog = @import("catalog.zig");
@@ -907,7 +908,7 @@ test "compactInPlace preserves value indexes and passes verifyIntegrity" {
 
     var db = try Db.open(testing.allocator, path);
     defer db.deinit();
-    try db.verifyIntegrity(); // the audit must agree the indexes are intact
+    try verification.verifyIntegrity(&db); // the audit must agree the indexes are intact
     var r = try db.beginRead();
     defer r.end();
     const cat = try typedir.catalogRef(&r, r.root(), 0);
