@@ -72,7 +72,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     defer database.deinit();
 
     // Two-int type: {pk, value}. Property 0 is the primary key.
-    var cat: Reference = blk: {
+    var catalogRef: Reference = blk: {
         var w = try database.beginWrite();
         const c = try catalog.create(&w, 2);
         w.setRoot(c);
@@ -83,13 +83,13 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     // --- Seed the live working set (setup only, not timed) -------------------
     {
         var w = try database.beginWrite();
-        cat = database.active_root;
+        catalogRef = database.active_root;
         var pk: u64 = 0;
         while (pk < working_set) : (pk += 1) {
-            const r = try rows.insert(&w, cat, &.{ pk, pk });
-            cat = r.cat;
+            const r = try rows.insert(&w, catalogRef, &.{ pk, pk });
+            catalogRef = r.catalogRef;
         }
-        w.setRoot(cat);
+        w.setRoot(catalogRef);
         _ = try w.commit();
     }
 
@@ -111,27 +111,27 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         // Churn: insert k fresh rows and delete the k oldest live pks in one transaction.
         {
             var w = try database.beginWrite();
-            cat = database.active_root;
+            catalogRef = database.active_root;
 
             var j: usize = 0;
             while (j < k) : (j += 1) {
                 const pk = next_pk + j;
-                const r = try rows.insert(&w, cat, &.{ pk, pk });
-                cat = r.cat;
+                const r = try rows.insert(&w, catalogRef, &.{ pk, pk });
+                catalogRef = r.catalogRef;
             }
 
             j = 0;
             while (j < k) : (j += 1) {
                 const pk = oldest_pk + j;
                 var out: [2]u64 = undefined;
-                const ver = (try rows.getByPk(&w, cat, pk, &out)) orelse unreachable;
-                cat = switch (try rows.delete(&w, cat, pk, ver)) {
+                const ver = (try rows.getByPk(&w, catalogRef, pk, &out)) orelse unreachable;
+                catalogRef = switch (try rows.delete(&w, catalogRef, pk, ver)) {
                     .ok => |c| c,
                     else => unreachable,
                 };
             }
 
-            w.setRoot(cat);
+            w.setRoot(catalogRef);
             _ = try w.commit();
 
             next_pk += k;
@@ -141,12 +141,12 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         // Compaction: repack the type until fully packed, one step per write transaction.
         while (true) {
             var w = try database.beginWrite();
-            cat = database.active_root;
+            catalogRef = database.active_root;
             const t0 = nowNs(io);
-            const res = try compaction.compactStep(&w, cat, 0, compact_budget);
+            const res = try compaction.compactStep(&w, catalogRef, 0, compact_budget);
             const dt: u64 = @intCast(nowNs(io) - t0);
-            cat = res.cat;
-            w.setRoot(cat);
+            catalogRef = res.catalogRef;
+            w.setRoot(catalogRef);
             _ = try w.commit();
 
             try step_lat.add(alloc, dt);
@@ -163,9 +163,9 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     {
         var rd = try database.beginRead();
         defer rd.end();
-        cat = rd.root();
-        live = try compaction.liveCount(&rd, cat);
-        next_row = (try catalog.loadCatalog(&rd, cat)).next_row;
+        catalogRef = rd.root();
+        live = try compaction.liveCount(&rd, catalogRef);
+        next_row = (try catalog.loadCatalog(&rd, catalogRef)).next_row;
     }
     const dead_ratio: f64 = if (next_row == 0)
         0

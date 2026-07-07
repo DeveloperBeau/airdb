@@ -39,16 +39,16 @@ test "link-set accessors return error.NotFound for an absent pk" {
     defer database.deinit();
     var w = try database.beginWrite();
     defer w.deinit();
-    var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link_set } });
-    cat = (try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .link_set = &.{} } })).cat;
+    var catalogRef = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link_set } });
+    catalogRef = (try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .link_set = &.{} } })).catalogRef;
 
     const missing: u64 = 999;
-    try testing.expectError(error.NotFound, linkSetContains(&w, cat, missing, 1, 0));
-    try testing.expectError(error.NotFound, linkSetAdd(&w, cat, missing, 1, 0));
-    try testing.expectError(error.NotFound, linkSetRemove(&w, cat, missing, 1, 0));
+    try testing.expectError(error.NotFound, linkSetContains(&w, catalogRef, missing, 1, 0));
+    try testing.expectError(error.NotFound, linkSetAdd(&w, catalogRef, missing, 1, 0));
+    try testing.expectError(error.NotFound, linkSetRemove(&w, catalogRef, missing, 1, 0));
     var out = std.ArrayList(u64).empty;
     defer out.deinit(testing.allocator);
-    try testing.expectError(error.NotFound, linkSetCollect(&w, cat, missing, 1, &out, testing.allocator));
+    try testing.expectError(error.NotFound, linkSetCollect(&w, catalogRef, missing, 1, &out, testing.allocator));
 }
 
 test "insert stores a link and records the backlink" {
@@ -59,17 +59,17 @@ test "insert stores a link and records the backlink" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .blob }, .{ .kind = .link } });
-    const boss = try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .bytes = "Boss" }, .{ .link = null } });
-    cat = boss.cat;
-    const rep = try insertTyped(&w, cat, &.{ .{ .int = 2 }, .{ .bytes = "Report" }, .{ .link = boss.row } });
-    cat = rep.cat;
-    try testing.expectEqual(@as(?u64, null), try getLink(&w, cat, 1, 2));
-    try testing.expectEqual(@as(?u64, boss.row), try getLink(&w, cat, 2, 2));
-    try testing.expectEqual(@as(u64, 1), try backlinkCount(&w, cat, 2, boss.row));
+    var catalogRef = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .blob }, .{ .kind = .link } });
+    const boss = try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .bytes = "Boss" }, .{ .link = null } });
+    catalogRef = boss.catalogRef;
+    const rep = try insertTyped(&w, catalogRef, &.{ .{ .int = 2 }, .{ .bytes = "Report" }, .{ .link = boss.row } });
+    catalogRef = rep.catalogRef;
+    try testing.expectEqual(@as(?u64, null), try getLink(&w, catalogRef, 1, 2));
+    try testing.expectEqual(@as(?u64, boss.row), try getLink(&w, catalogRef, 2, 2));
+    try testing.expectEqual(@as(u64, 1), try backlinkCount(&w, catalogRef, 2, boss.row));
     var srcs = std.ArrayList(u64).empty;
     defer srcs.deinit(testing.allocator);
-    try backlinkCollect(&w, cat, 2, boss.row, &srcs, testing.allocator);
+    try backlinkCollect(&w, catalogRef, 2, boss.row, &srcs, testing.allocator);
     try testing.expectEqual(@as(usize, 1), srcs.items.len);
     try testing.expectEqual(rep.row, srcs.items[0]);
     w.deinit();
@@ -83,17 +83,17 @@ test "setLink moves a link and updates both backlink sets" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
-    const a = try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .link = null } });
-    cat = a.cat;
-    const b = try insertTyped(&w, cat, &.{ .{ .int = 2 }, .{ .link = null } });
-    cat = b.cat;
-    const c = try insertTyped(&w, cat, &.{ .{ .int = 3 }, .{ .link = a.row } });
-    cat = c.cat;
-    cat = try setLink(&w, cat, 3, 1, b.row);
-    try testing.expectEqual(@as(?u64, b.row), try getLink(&w, cat, 3, 1));
-    try testing.expectEqual(@as(u64, 0), try backlinkCount(&w, cat, 1, a.row));
-    try testing.expectEqual(@as(u64, 1), try backlinkCount(&w, cat, 1, b.row));
+    var catalogRef = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
+    const a = try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .link = null } });
+    catalogRef = a.catalogRef;
+    const b = try insertTyped(&w, catalogRef, &.{ .{ .int = 2 }, .{ .link = null } });
+    catalogRef = b.catalogRef;
+    const c = try insertTyped(&w, catalogRef, &.{ .{ .int = 3 }, .{ .link = a.row } });
+    catalogRef = c.catalogRef;
+    catalogRef = try setLink(&w, catalogRef, 3, 1, b.row);
+    try testing.expectEqual(@as(?u64, b.row), try getLink(&w, catalogRef, 3, 1));
+    try testing.expectEqual(@as(u64, 0), try backlinkCount(&w, catalogRef, 1, a.row));
+    try testing.expectEqual(@as(u64, 1), try backlinkCount(&w, catalogRef, 1, b.row));
     w.deinit();
 }
 
@@ -112,12 +112,12 @@ test "nullifying a source's link bumps its version" {
     // Commit 1: target + linked source.
     {
         var w = try database.beginWrite();
-        var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
-        const a = try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .link = null } });
-        cat = a.cat;
+        var catalogRef = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
+        const a = try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .link = null } });
+        catalogRef = a.catalogRef;
         a_okey = a.row;
-        const s = try insertTyped(&w, cat, &.{ .{ .int = 2 }, .{ .link = a.row } });
-        w.setRoot(s.cat);
+        const s = try insertTyped(&w, catalogRef, &.{ .{ .int = 2 }, .{ .link = a.row } });
+        w.setRoot(s.catalogRef);
         _ = try w.commit();
     }
     // Snapshot the source's version, then nullify it via the target's delete
@@ -133,12 +133,12 @@ test "nullifying a source's link bumps its version" {
         var w = try database.beginWrite();
         var raw: [2]u64 = undefined;
         const av = (try @import("rows.zig").getByPk(&w, w.new_root, 1, &raw)).?;
-        const cat = switch (try @import("objects.zig").deleteAndNullify(&w, w.new_root, 1, av)) {
+        const catalogRef = switch (try @import("objects.zig").deleteAndNullify(&w, w.new_root, 1, av)) {
             .ok => |x| x,
             else => unreachable,
         };
-        try testing.expectEqual(@as(?u64, null), try getLink(&w, cat, 2, 1));
-        w.setRoot(cat);
+        try testing.expectEqual(@as(?u64, null), try getLink(&w, catalogRef, 2, 1));
+        w.setRoot(catalogRef);
         _ = try w.commit();
     }
     // The pre-nullify version must now conflict instead of resurrecting the
@@ -160,22 +160,22 @@ test "a multi-leaf backlink set is pruned and freed when emptied" {
     defer database.deinit();
     var w = try database.beginWrite();
     defer w.deinit();
-    var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
-    const target = try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .link = null } });
-    cat = target.cat;
+    var catalogRef = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
+    const target = try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .link = null } });
+    catalogRef = target.catalogRef;
     // >64 sources so the backlink inner set splits past one leaf.
     var pk: u64 = 2;
     while (pk <= 82) : (pk += 1) {
-        const src = try insertTyped(&w, cat, &.{ .{ .int = pk }, .{ .link = target.row } });
-        cat = src.cat;
+        const src = try insertTyped(&w, catalogRef, &.{ .{ .int = pk }, .{ .link = target.row } });
+        catalogRef = src.catalogRef;
     }
-    try testing.expectEqual(@as(u64, 81), try backlinkCount(&w, cat, 1, target.row));
+    try testing.expectEqual(@as(u64, 81), try backlinkCount(&w, catalogRef, 1, target.row));
     // Clear every inbound link; the set (and its inner nodes) must be pruned.
     pk = 2;
-    while (pk <= 82) : (pk += 1) cat = try setLink(&w, cat, pk, 1, null);
-    const v = try catalog.loadCatalog(&w, cat);
+    while (pk <= 82) : (pk += 1) catalogRef = try setLink(&w, catalogRef, pk, 1, null);
+    const v = try catalog.loadCatalog(&w, catalogRef);
     try testing.expectEqual(@as(?u64, null), try Index.get(&w, v.backlinkRef(1), target.row));
-    try testing.expectEqual(@as(u64, 0), try backlinkCount(&w, cat, 1, target.row));
+    try testing.expectEqual(@as(u64, 0), try backlinkCount(&w, catalogRef, 1, target.row));
 }
 
 test "an emptied backlink set is pruned from the backlink index" {
@@ -187,16 +187,16 @@ test "an emptied backlink set is pruned from the backlink index" {
     defer database.deinit();
     var w = try database.beginWrite();
     defer w.deinit();
-    var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
-    const a = try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .link = null } });
-    cat = a.cat;
-    const b = try insertTyped(&w, cat, &.{ .{ .int = 2 }, .{ .link = a.row } });
-    cat = b.cat;
+    var catalogRef = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
+    const a = try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .link = null } });
+    catalogRef = a.catalogRef;
+    const b = try insertTyped(&w, catalogRef, &.{ .{ .int = 2 }, .{ .link = a.row } });
+    catalogRef = b.catalogRef;
     // Clearing the only inbound link must remove a's backlink entry entirely.
-    cat = try setLink(&w, cat, 2, 1, null);
-    const v = try catalog.loadCatalog(&w, cat);
+    catalogRef = try setLink(&w, catalogRef, 2, 1, null);
+    const v = try catalog.loadCatalog(&w, catalogRef);
     try testing.expectEqual(@as(?u64, null), try Index.get(&w, v.backlinkRef(1), a.row));
-    try testing.expectEqual(@as(u64, 0), try backlinkCount(&w, cat, 1, a.row));
+    try testing.expectEqual(@as(u64, 0), try backlinkCount(&w, catalogRef, 1, a.row));
 }
 
 test "setLink clearing a link drops the backlink" {
@@ -207,15 +207,15 @@ test "setLink clearing a link drops the backlink" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
-    const b = try insertTyped(&w, cat, &.{ .{ .int = 2 }, .{ .link = null } });
-    cat = b.cat;
-    const c = try insertTyped(&w, cat, &.{ .{ .int = 3 }, .{ .link = b.row } });
-    cat = c.cat;
-    try testing.expectEqual(@as(u64, 1), try backlinkCount(&w, cat, 1, b.row));
-    cat = try setLink(&w, cat, 3, 1, null);
-    try testing.expectEqual(@as(?u64, null), try getLink(&w, cat, 3, 1));
-    try testing.expectEqual(@as(u64, 0), try backlinkCount(&w, cat, 1, b.row));
+    var catalogRef = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
+    const b = try insertTyped(&w, catalogRef, &.{ .{ .int = 2 }, .{ .link = null } });
+    catalogRef = b.catalogRef;
+    const c = try insertTyped(&w, catalogRef, &.{ .{ .int = 3 }, .{ .link = b.row } });
+    catalogRef = c.catalogRef;
+    try testing.expectEqual(@as(u64, 1), try backlinkCount(&w, catalogRef, 1, b.row));
+    catalogRef = try setLink(&w, catalogRef, 3, 1, null);
+    try testing.expectEqual(@as(?u64, null), try getLink(&w, catalogRef, 3, 1));
+    try testing.expectEqual(@as(u64, 0), try backlinkCount(&w, catalogRef, 1, b.row));
     w.deinit();
 }
 
@@ -228,24 +228,24 @@ test "nullifyInboundInCatalog clears only links whose target type matches the fi
     defer database.deinit();
     var w = try database.beginWrite();
     // props: pk(int), prop1(link -> type 5), prop2(link -> type 9)
-    var cat = try catalog.createDefs(&w, &.{
+    var catalogRef = try catalog.createDefs(&w, &.{
         .{ .kind = .int },
         .{ .kind = .link, .link_target = 5 },
         .{ .kind = .link, .link_target = 9 },
     });
     // Target row T, plus S1 (prop1 -> T) and S2 (prop2 -> T).
-    const t = try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .link = null }, .{ .link = null } });
-    cat = t.cat;
-    const s1 = try insertTyped(&w, cat, &.{ .{ .int = 2 }, .{ .link = t.row }, .{ .link = null } });
-    cat = s1.cat;
-    const s2 = try insertTyped(&w, cat, &.{ .{ .int = 3 }, .{ .link = null }, .{ .link = t.row } });
-    cat = s2.cat;
-    try testing.expectEqual(@as(?u64, t.row), try getLink(&w, cat, 2, 1));
-    try testing.expectEqual(@as(?u64, t.row), try getLink(&w, cat, 3, 2));
+    const t = try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .link = null }, .{ .link = null } });
+    catalogRef = t.catalogRef;
+    const s1 = try insertTyped(&w, catalogRef, &.{ .{ .int = 2 }, .{ .link = t.row }, .{ .link = null } });
+    catalogRef = s1.catalogRef;
+    const s2 = try insertTyped(&w, catalogRef, &.{ .{ .int = 3 }, .{ .link = null }, .{ .link = t.row } });
+    catalogRef = s2.catalogRef;
+    try testing.expectEqual(@as(?u64, t.row), try getLink(&w, catalogRef, 2, 1));
+    try testing.expectEqual(@as(?u64, t.row), try getLink(&w, catalogRef, 3, 2));
     // Filtered nullify on target type 5 clears only prop1's inbound link.
-    cat = try nullifyInboundInCatalog(&w, cat, t.row, 5, false);
-    try testing.expectEqual(@as(?u64, null), try getLink(&w, cat, 2, 1));
-    try testing.expectEqual(@as(?u64, t.row), try getLink(&w, cat, 3, 2));
+    catalogRef = try nullifyInboundInCatalog(&w, catalogRef, t.row, 5, false);
+    try testing.expectEqual(@as(?u64, null), try getLink(&w, catalogRef, 2, 1));
+    try testing.expectEqual(@as(?u64, t.row), try getLink(&w, catalogRef, 3, 2));
     w.deinit();
 }
 
@@ -257,20 +257,20 @@ test "deleting a target nullifies inbound to-one links" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
-    const a = try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .link = null } });
-    cat = a.cat;
-    const b = try insertTyped(&w, cat, &.{ .{ .int = 2 }, .{ .link = a.row } });
-    cat = b.cat;
-    const c = try insertTyped(&w, cat, &.{ .{ .int = 3 }, .{ .link = a.row } });
-    cat = c.cat;
-    try testing.expectEqual(@as(u64, 2), try backlinkCount(&w, cat, 1, a.row));
+    var catalogRef = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
+    const a = try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .link = null } });
+    catalogRef = a.catalogRef;
+    const b = try insertTyped(&w, catalogRef, &.{ .{ .int = 2 }, .{ .link = a.row } });
+    catalogRef = b.catalogRef;
+    const c = try insertTyped(&w, catalogRef, &.{ .{ .int = 3 }, .{ .link = a.row } });
+    catalogRef = c.catalogRef;
+    try testing.expectEqual(@as(u64, 2), try backlinkCount(&w, catalogRef, 1, a.row));
     var out: [2]Value = undefined;
-    const va = (try getTyped(&w, cat, 1, &out)).?;
-    const dres = try deleteTyped(&w, cat, 1, va);
-    cat = dres.ok;
-    try testing.expectEqual(@as(?u64, null), try getLink(&w, cat, 2, 1));
-    try testing.expectEqual(@as(?u64, null), try getLink(&w, cat, 3, 1));
+    const va = (try getTyped(&w, catalogRef, 1, &out)).?;
+    const dres = try deleteTyped(&w, catalogRef, 1, va);
+    catalogRef = dres.ok;
+    try testing.expectEqual(@as(?u64, null), try getLink(&w, catalogRef, 2, 1));
+    try testing.expectEqual(@as(?u64, null), try getLink(&w, catalogRef, 3, 1));
     w.deinit();
 }
 
@@ -282,16 +282,16 @@ test "deleting a source removes its outbound backlink entry" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
-    const a = try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .link = null } });
-    cat = a.cat;
-    const b = try insertTyped(&w, cat, &.{ .{ .int = 2 }, .{ .link = a.row } });
-    cat = b.cat;
-    try testing.expectEqual(@as(u64, 1), try backlinkCount(&w, cat, 1, a.row));
+    var catalogRef = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
+    const a = try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .link = null } });
+    catalogRef = a.catalogRef;
+    const b = try insertTyped(&w, catalogRef, &.{ .{ .int = 2 }, .{ .link = a.row } });
+    catalogRef = b.catalogRef;
+    try testing.expectEqual(@as(u64, 1), try backlinkCount(&w, catalogRef, 1, a.row));
     var out: [2]Value = undefined;
-    const vb = (try getTyped(&w, cat, 2, &out)).?;
-    cat = (try deleteTyped(&w, cat, 2, vb)).ok;
-    try testing.expectEqual(@as(u64, 0), try backlinkCount(&w, cat, 1, a.row));
+    const vb = (try getTyped(&w, catalogRef, 2, &out)).?;
+    catalogRef = (try deleteTyped(&w, catalogRef, 2, vb)).ok;
+    try testing.expectEqual(@as(u64, 0), try backlinkCount(&w, catalogRef, 1, a.row));
     w.deinit();
 }
 
@@ -305,13 +305,13 @@ test "links and backlinks persist across commit and reopen" {
         var database = try Database.create(testing.allocator, path);
         defer database.deinit();
         var w = try database.beginWrite();
-        var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
-        const boss = try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .link = null } });
-        cat = boss.cat;
+        var catalogRef = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
+        const boss = try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .link = null } });
+        catalogRef = boss.catalogRef;
         boss_row = boss.row;
         var i: u64 = 2;
-        while (i <= 50) : (i += 1) cat = (try insertTyped(&w, cat, &.{ .{ .int = i }, .{ .link = boss.row } })).cat;
-        w.setRoot(cat);
+        while (i <= 50) : (i += 1) catalogRef = (try insertTyped(&w, catalogRef, &.{ .{ .int = i }, .{ .link = boss.row } })).catalogRef;
+        w.setRoot(catalogRef);
         _ = try w.commit();
     }
     {
@@ -332,12 +332,12 @@ test "a self-link is allowed and recorded" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
-    const a = try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .link = null } });
-    cat = a.cat;
-    cat = try setLink(&w, cat, 1, 1, a.row);
-    try testing.expectEqual(@as(?u64, a.row), try getLink(&w, cat, 1, 1));
-    try testing.expectEqual(@as(u64, 1), try backlinkCount(&w, cat, 1, a.row));
+    var catalogRef = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
+    const a = try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .link = null } });
+    catalogRef = a.catalogRef;
+    catalogRef = try setLink(&w, catalogRef, 1, 1, a.row);
+    try testing.expectEqual(@as(?u64, a.row), try getLink(&w, catalogRef, 1, 1));
+    try testing.expectEqual(@as(u64, 1), try backlinkCount(&w, catalogRef, 1, a.row));
     w.deinit();
 }
 
@@ -349,16 +349,16 @@ test "a two-node cycle is allowed" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
-    const a = try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .link = null } });
-    cat = a.cat;
-    const b = try insertTyped(&w, cat, &.{ .{ .int = 2 }, .{ .link = a.row } });
-    cat = b.cat;
-    cat = try setLink(&w, cat, 1, 1, b.row);
-    try testing.expectEqual(@as(?u64, b.row), try getLink(&w, cat, 1, 1));
+    var catalogRef = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
+    const a = try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .link = null } });
+    catalogRef = a.catalogRef;
+    const b = try insertTyped(&w, catalogRef, &.{ .{ .int = 2 }, .{ .link = a.row } });
+    catalogRef = b.catalogRef;
+    catalogRef = try setLink(&w, catalogRef, 1, 1, b.row);
+    try testing.expectEqual(@as(?u64, b.row), try getLink(&w, catalogRef, 1, 1));
     // a links to b, and b still links to a, so each keeps one inbound.
-    try testing.expectEqual(@as(u64, 1), try backlinkCount(&w, cat, 1, a.row));
-    try testing.expectEqual(@as(u64, 1), try backlinkCount(&w, cat, 1, b.row));
+    try testing.expectEqual(@as(u64, 1), try backlinkCount(&w, catalogRef, 1, a.row));
+    try testing.expectEqual(@as(u64, 1), try backlinkCount(&w, catalogRef, 1, b.row));
     w.deinit();
 }
 
@@ -371,21 +371,21 @@ test "to-many link set: insert seeds members and backlinks" {
     defer database.deinit();
     var w = try database.beginWrite();
     // props: pk(int), tags(link_set -> same type)
-    var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link_set } });
-    const a = try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .link_set = &.{} } });
-    cat = a.cat;
-    const b = try insertTyped(&w, cat, &.{ .{ .int = 2 }, .{ .link_set = &.{} } });
-    cat = b.cat;
+    var catalogRef = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link_set } });
+    const a = try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .link_set = &.{} } });
+    catalogRef = a.catalogRef;
+    const b = try insertTyped(&w, catalogRef, &.{ .{ .int = 2 }, .{ .link_set = &.{} } });
+    catalogRef = b.catalogRef;
     // c links to both a and b at insert.
-    const c = try insertTyped(&w, cat, &.{ .{ .int = 3 }, .{ .link_set = &.{ a.row, b.row } } });
-    cat = c.cat;
-    try testing.expectEqual(@as(?u64, 2), try linkSetCount(&w, cat, 3, 1));
-    try testing.expectEqual(@as(u64, 1), try backlinkCount(&w, cat, 1, a.row));
-    try testing.expectEqual(@as(u64, 1), try backlinkCount(&w, cat, 1, b.row));
+    const c = try insertTyped(&w, catalogRef, &.{ .{ .int = 3 }, .{ .link_set = &.{ a.row, b.row } } });
+    catalogRef = c.catalogRef;
+    try testing.expectEqual(@as(?u64, 2), try linkSetCount(&w, catalogRef, 3, 1));
+    try testing.expectEqual(@as(u64, 1), try backlinkCount(&w, catalogRef, 1, a.row));
+    try testing.expectEqual(@as(u64, 1), try backlinkCount(&w, catalogRef, 1, b.row));
     // d also links to a, so a now has two inbound.
-    const d = try insertTyped(&w, cat, &.{ .{ .int = 4 }, .{ .link_set = &.{a.row} } });
-    cat = d.cat;
-    try testing.expectEqual(@as(u64, 2), try backlinkCount(&w, cat, 1, a.row));
+    const d = try insertTyped(&w, catalogRef, &.{ .{ .int = 4 }, .{ .link_set = &.{a.row} } });
+    catalogRef = d.catalogRef;
+    try testing.expectEqual(@as(u64, 2), try backlinkCount(&w, catalogRef, 1, a.row));
     w.deinit();
 }
 
@@ -397,15 +397,15 @@ test "to-many link set: membership query reflects members" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link_set } });
-    const a = try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .link_set = &.{} } });
-    cat = a.cat;
-    const b = try insertTyped(&w, cat, &.{ .{ .int = 2 }, .{ .link_set = &.{} } });
-    cat = b.cat;
-    const c = try insertTyped(&w, cat, &.{ .{ .int = 3 }, .{ .link_set = &.{a.row} } });
-    cat = c.cat;
-    try testing.expect(try linkSetContains(&w, cat, 3, 1, a.row));
-    try testing.expect(!(try linkSetContains(&w, cat, 3, 1, b.row)));
+    var catalogRef = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link_set } });
+    const a = try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .link_set = &.{} } });
+    catalogRef = a.catalogRef;
+    const b = try insertTyped(&w, catalogRef, &.{ .{ .int = 2 }, .{ .link_set = &.{} } });
+    catalogRef = b.catalogRef;
+    const c = try insertTyped(&w, catalogRef, &.{ .{ .int = 3 }, .{ .link_set = &.{a.row} } });
+    catalogRef = c.catalogRef;
+    try testing.expect(try linkSetContains(&w, catalogRef, 3, 1, a.row));
+    try testing.expect(!(try linkSetContains(&w, catalogRef, 3, 1, b.row)));
     w.deinit();
 }
 
@@ -417,17 +417,17 @@ test "to-many link set: add inserts a new member" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link_set } });
-    const a = try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .link_set = &.{} } });
-    cat = a.cat;
-    const b = try insertTyped(&w, cat, &.{ .{ .int = 2 }, .{ .link_set = &.{} } });
-    cat = b.cat;
-    const c = try insertTyped(&w, cat, &.{ .{ .int = 3 }, .{ .link_set = &.{a.row} } });
-    cat = c.cat;
-    cat = try linkSetAdd(&w, cat, 3, 1, b.row);
-    try testing.expectEqual(@as(?u64, 2), try linkSetCount(&w, cat, 3, 1));
-    try testing.expect(try linkSetContains(&w, cat, 3, 1, b.row));
-    try testing.expectEqual(@as(u64, 1), try backlinkCount(&w, cat, 1, b.row));
+    var catalogRef = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link_set } });
+    const a = try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .link_set = &.{} } });
+    catalogRef = a.catalogRef;
+    const b = try insertTyped(&w, catalogRef, &.{ .{ .int = 2 }, .{ .link_set = &.{} } });
+    catalogRef = b.catalogRef;
+    const c = try insertTyped(&w, catalogRef, &.{ .{ .int = 3 }, .{ .link_set = &.{a.row} } });
+    catalogRef = c.catalogRef;
+    catalogRef = try linkSetAdd(&w, catalogRef, 3, 1, b.row);
+    try testing.expectEqual(@as(?u64, 2), try linkSetCount(&w, catalogRef, 3, 1));
+    try testing.expect(try linkSetContains(&w, catalogRef, 3, 1, b.row));
+    try testing.expectEqual(@as(u64, 1), try backlinkCount(&w, catalogRef, 1, b.row));
     w.deinit();
 }
 
@@ -439,16 +439,16 @@ test "to-many link set: adding an existing member is a no-op" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link_set } });
-    const a = try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .link_set = &.{} } });
-    cat = a.cat;
-    const b = try insertTyped(&w, cat, &.{ .{ .int = 2 }, .{ .link_set = &.{} } });
-    cat = b.cat;
-    const c = try insertTyped(&w, cat, &.{ .{ .int = 3 }, .{ .link_set = &.{ a.row, b.row } } });
-    cat = c.cat;
-    cat = try linkSetAdd(&w, cat, 3, 1, a.row); // already member, no change
-    try testing.expectEqual(@as(?u64, 2), try linkSetCount(&w, cat, 3, 1));
-    try testing.expectEqual(@as(u64, 1), try backlinkCount(&w, cat, 1, a.row));
+    var catalogRef = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link_set } });
+    const a = try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .link_set = &.{} } });
+    catalogRef = a.catalogRef;
+    const b = try insertTyped(&w, catalogRef, &.{ .{ .int = 2 }, .{ .link_set = &.{} } });
+    catalogRef = b.catalogRef;
+    const c = try insertTyped(&w, catalogRef, &.{ .{ .int = 3 }, .{ .link_set = &.{ a.row, b.row } } });
+    catalogRef = c.catalogRef;
+    catalogRef = try linkSetAdd(&w, catalogRef, 3, 1, a.row); // already member, no change
+    try testing.expectEqual(@as(?u64, 2), try linkSetCount(&w, catalogRef, 3, 1));
+    try testing.expectEqual(@as(u64, 1), try backlinkCount(&w, catalogRef, 1, a.row));
     w.deinit();
 }
 
@@ -460,20 +460,20 @@ test "to-many link set: remove drops a member" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link_set } });
-    const a = try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .link_set = &.{} } });
-    cat = a.cat;
-    const b = try insertTyped(&w, cat, &.{ .{ .int = 2 }, .{ .link_set = &.{} } });
-    cat = b.cat;
-    const c = try insertTyped(&w, cat, &.{ .{ .int = 3 }, .{ .link_set = &.{ a.row, b.row } } });
-    cat = c.cat;
+    var catalogRef = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link_set } });
+    const a = try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .link_set = &.{} } });
+    catalogRef = a.catalogRef;
+    const b = try insertTyped(&w, catalogRef, &.{ .{ .int = 2 }, .{ .link_set = &.{} } });
+    catalogRef = b.catalogRef;
+    const c = try insertTyped(&w, catalogRef, &.{ .{ .int = 3 }, .{ .link_set = &.{ a.row, b.row } } });
+    catalogRef = c.catalogRef;
     // d also links to a, so a has two inbound before the removal.
-    const d = try insertTyped(&w, cat, &.{ .{ .int = 4 }, .{ .link_set = &.{a.row} } });
-    cat = d.cat;
-    try testing.expectEqual(@as(u64, 2), try backlinkCount(&w, cat, 1, a.row));
-    cat = try linkSetRemove(&w, cat, 3, 1, a.row);
-    try testing.expect(!(try linkSetContains(&w, cat, 3, 1, a.row)));
-    try testing.expectEqual(@as(u64, 1), try backlinkCount(&w, cat, 1, a.row)); // only d now
+    const d = try insertTyped(&w, catalogRef, &.{ .{ .int = 4 }, .{ .link_set = &.{a.row} } });
+    catalogRef = d.catalogRef;
+    try testing.expectEqual(@as(u64, 2), try backlinkCount(&w, catalogRef, 1, a.row));
+    catalogRef = try linkSetRemove(&w, catalogRef, 3, 1, a.row);
+    try testing.expect(!(try linkSetContains(&w, catalogRef, 3, 1, a.row)));
+    try testing.expectEqual(@as(u64, 1), try backlinkCount(&w, catalogRef, 1, a.row)); // only d now
     w.deinit();
 }
 
@@ -485,21 +485,21 @@ test "deleting a to-many target removes it from all linkers" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link_set } });
-    const a = try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .link_set = &.{} } });
-    cat = a.cat;
-    const b = try insertTyped(&w, cat, &.{ .{ .int = 2 }, .{ .link_set = &.{a.row} } });
-    cat = b.cat;
-    const c = try insertTyped(&w, cat, &.{ .{ .int = 3 }, .{ .link_set = &.{a.row} } });
-    cat = c.cat;
-    try testing.expectEqual(@as(u64, 2), try backlinkCount(&w, cat, 1, a.row));
+    var catalogRef = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link_set } });
+    const a = try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .link_set = &.{} } });
+    catalogRef = a.catalogRef;
+    const b = try insertTyped(&w, catalogRef, &.{ .{ .int = 2 }, .{ .link_set = &.{a.row} } });
+    catalogRef = b.catalogRef;
+    const c = try insertTyped(&w, catalogRef, &.{ .{ .int = 3 }, .{ .link_set = &.{a.row} } });
+    catalogRef = c.catalogRef;
+    try testing.expectEqual(@as(u64, 2), try backlinkCount(&w, catalogRef, 1, a.row));
     // Delete a: b and c must lose a from their sets.
     var out: [2]Value = undefined;
-    const va = (try getTyped(&w, cat, 1, &out)).?;
-    cat = (try deleteTyped(&w, cat, 1, va)).ok;
-    try testing.expect(!(try linkSetContains(&w, cat, 2, 1, a.row)));
-    try testing.expect(!(try linkSetContains(&w, cat, 3, 1, a.row)));
-    try testing.expectEqual(@as(?u64, 0), try linkSetCount(&w, cat, 2, 1));
+    const va = (try getTyped(&w, catalogRef, 1, &out)).?;
+    catalogRef = (try deleteTyped(&w, catalogRef, 1, va)).ok;
+    try testing.expect(!(try linkSetContains(&w, catalogRef, 2, 1, a.row)));
+    try testing.expect(!(try linkSetContains(&w, catalogRef, 3, 1, a.row)));
+    try testing.expectEqual(@as(?u64, 0), try linkSetCount(&w, catalogRef, 2, 1));
     w.deinit();
 }
 
@@ -511,17 +511,17 @@ test "deleting a to-many linker cleans its backlinks" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link_set } });
-    const a = try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .link_set = &.{} } });
-    cat = a.cat;
-    const b = try insertTyped(&w, cat, &.{ .{ .int = 2 }, .{ .link_set = &.{a.row} } });
-    cat = b.cat;
-    try testing.expectEqual(@as(u64, 1), try backlinkCount(&w, cat, 1, a.row));
+    var catalogRef = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link_set } });
+    const a = try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .link_set = &.{} } });
+    catalogRef = a.catalogRef;
+    const b = try insertTyped(&w, catalogRef, &.{ .{ .int = 2 }, .{ .link_set = &.{a.row} } });
+    catalogRef = b.catalogRef;
+    try testing.expectEqual(@as(u64, 1), try backlinkCount(&w, catalogRef, 1, a.row));
     // Delete b (the linker): no lingering backlink on a's okey.
     var out: [2]Value = undefined;
-    const vb = (try getTyped(&w, cat, 2, &out)).?;
-    cat = (try deleteTyped(&w, cat, 2, vb)).ok;
-    try testing.expectEqual(@as(u64, 0), try backlinkCount(&w, cat, 1, a.row));
+    const vb = (try getTyped(&w, catalogRef, 2, &out)).?;
+    catalogRef = (try deleteTyped(&w, catalogRef, 2, vb)).ok;
+    try testing.expectEqual(@as(u64, 0), try backlinkCount(&w, catalogRef, 1, a.row));
     w.deinit();
 }
 
@@ -535,16 +535,16 @@ test "to-many links persist across commit and reopen" {
         var database = try Database.create(testing.allocator, path);
         defer database.deinit();
         var w = try database.beginWrite();
-        var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link_set } });
-        const hub = try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .link_set = &.{} } });
-        cat = hub.cat;
+        var catalogRef = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link_set } });
+        const hub = try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .link_set = &.{} } });
+        catalogRef = hub.catalogRef;
         hub_row = hub.row;
         var i: u64 = 2;
         while (i <= 30) : (i += 1) {
-            const o = try insertTyped(&w, cat, &.{ .{ .int = i }, .{ .link_set = &.{hub.row} } });
-            cat = o.cat;
+            const o = try insertTyped(&w, catalogRef, &.{ .{ .int = i }, .{ .link_set = &.{hub.row} } });
+            catalogRef = o.catalogRef;
         }
-        w.setRoot(cat);
+        w.setRoot(catalogRef);
         _ = try w.commit();
     }
     {

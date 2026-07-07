@@ -40,31 +40,31 @@ test "compactType packs live rows and drops dead ones" {
     var w = try database.beginWrite();
     defer w.deinit();
 
-    var cat = try catalog.create(&w, 2);
+    var catalogRef = try catalog.create(&w, 2);
     var pk: u64 = 0;
     while (pk < 10) : (pk += 1) {
-        const r = try rows.insert(&w, cat, &.{ pk, pk * 10 });
-        cat = r.cat;
+        const r = try rows.insert(&w, catalogRef, &.{ pk, pk * 10 });
+        catalogRef = r.catalogRef;
     }
 
     for ([_]u64{ 2, 5, 8 }) |dpk| {
         var out: [2]u64 = undefined;
-        const ver = (try rows.getByPk(&w, cat, dpk, &out)).?;
-        cat = switch (try rows.delete(&w, cat, dpk, ver)) {
+        const ver = (try rows.getByPk(&w, catalogRef, dpk, &out)).?;
+        catalogRef = switch (try rows.delete(&w, catalogRef, dpk, ver)) {
             .ok => |c| c,
             else => unreachable,
         };
     }
 
-    cat = try compactType(&w, cat);
+    catalogRef = try compactType(&w, catalogRef);
 
-    try testing.expectEqual(@as(u64, 7), (try catalog.loadCatalog(&w, cat)).next_row);
-    try testing.expectEqual(@as(u64, 7), try liveCount(&w, cat));
+    try testing.expectEqual(@as(u64, 7), (try catalog.loadCatalog(&w, catalogRef)).next_row);
+    try testing.expectEqual(@as(u64, 7), try liveCount(&w, catalogRef));
 
     pk = 0;
     while (pk < 10) : (pk += 1) {
         var out: [2]u64 = undefined;
-        const got = try rows.getByPk(&w, cat, pk, &out);
+        const got = try rows.getByPk(&w, catalogRef, pk, &out);
         if (pk == 2 or pk == 5 or pk == 8) {
             try testing.expect(got == null);
         } else {
@@ -85,16 +85,16 @@ test "compactType frees the replaced column set" {
     // Commit a type with rows and holes so compaction has real work.
     {
         var w = try database.beginWrite();
-        var cat = try catalog.create(&w, 2);
+        var catalogRef = try catalog.create(&w, 2);
         var pk: u64 = 0;
-        while (pk < 100) : (pk += 1) cat = (try rows.insert(&w, cat, &.{ pk, pk * 10 })).cat;
+        while (pk < 100) : (pk += 1) catalogRef = (try rows.insert(&w, catalogRef, &.{ pk, pk * 10 })).catalogRef;
         pk = 0;
         while (pk < 100) : (pk += 5) {
             var out: [2]u64 = undefined;
-            const ver = (try rows.getByPk(&w, cat, pk, &out)).?;
-            cat = (try rows.delete(&w, cat, pk, ver)).ok;
+            const ver = (try rows.getByPk(&w, catalogRef, pk, &out)).?;
+            catalogRef = (try rows.delete(&w, catalogRef, pk, ver)).ok;
         }
-        w.setRoot(cat);
+        w.setRoot(catalogRef);
         _ = try w.commit();
     }
 
@@ -116,34 +116,34 @@ test "object keys and links survive compaction" {
     var w = try database.beginWrite();
     defer w.deinit();
 
-    var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
+    var catalogRef = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
 
-    const a = try objects.insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .link = null } });
-    cat = a.cat;
+    const a = try objects.insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .link = null } });
+    catalogRef = a.catalogRef;
     const a_okey = a.row;
-    const b = try objects.insertTyped(&w, cat, &.{ .{ .int = 2 }, .{ .link = null } });
-    cat = b.cat;
-    const c = try objects.insertTyped(&w, cat, &.{ .{ .int = 3 }, .{ .link = a_okey } });
-    cat = c.cat;
+    const b = try objects.insertTyped(&w, catalogRef, &.{ .{ .int = 2 }, .{ .link = null } });
+    catalogRef = b.catalogRef;
+    const c = try objects.insertTyped(&w, catalogRef, &.{ .{ .int = 3 }, .{ .link = a_okey } });
+    catalogRef = c.catalogRef;
 
     // delete B (pk 2) -- creates a hole
     var out: [2]u64 = undefined;
-    const ver = (try rows.getByPk(&w, cat, 2, &out)).?;
-    cat = switch (try rows.delete(&w, cat, 2, ver)) {
+    const ver = (try rows.getByPk(&w, catalogRef, 2, &out)).?;
+    catalogRef = switch (try rows.delete(&w, catalogRef, 2, ver)) {
         .ok => |x| x,
         else => unreachable,
     };
 
-    cat = try compactType(&w, cat);
+    catalogRef = try compactType(&w, catalogRef);
 
     // C still links to A by object key
-    try testing.expectEqual(a_okey, (try links.getLink(&w, cat, 3, 1)).?);
+    try testing.expectEqual(a_okey, (try links.getLink(&w, catalogRef, 3, 1)).?);
     // A is still resolvable by its object key
     var ao: [2]u64 = undefined;
-    try testing.expect((try rows.getByObjectKey(&w, cat, a_okey, &ao)) != null);
+    try testing.expect((try rows.getByObjectKey(&w, catalogRef, a_okey, &ao)) != null);
     try testing.expectEqual(@as(u64, 1), ao[0]);
     // backlink from C -> A survived
-    try testing.expectEqual(@as(u64, 1), try links.backlinkCount(&w, cat, 1, a_okey));
+    try testing.expectEqual(@as(u64, 1), try links.backlinkCount(&w, catalogRef, 1, a_okey));
 }
 
 test "shouldCompact reflects dead ratio" {
@@ -156,24 +156,24 @@ test "shouldCompact reflects dead ratio" {
     var w = try database.beginWrite();
     defer w.deinit();
 
-    var cat = try catalog.create(&w, 1);
+    var catalogRef = try catalog.create(&w, 1);
     var pk: u64 = 0;
     while (pk < 10) : (pk += 1) {
-        const r = try rows.insert(&w, cat, &.{pk});
-        cat = r.cat;
+        const r = try rows.insert(&w, catalogRef, &.{pk});
+        catalogRef = r.catalogRef;
     }
-    try testing.expect(!(try shouldCompact(&w, cat)));
+    try testing.expect(!(try shouldCompact(&w, catalogRef)));
 
     pk = 0;
     while (pk < 6) : (pk += 1) {
         var out: [1]u64 = undefined;
-        const ver = (try rows.getByPk(&w, cat, pk, &out)).?;
-        cat = switch (try rows.delete(&w, cat, pk, ver)) {
+        const ver = (try rows.getByPk(&w, catalogRef, pk, &out)).?;
+        catalogRef = switch (try rows.delete(&w, catalogRef, pk, ver)) {
             .ok => |c| c,
             else => unreachable,
         };
     }
-    try testing.expect(try shouldCompact(&w, cat));
+    try testing.expect(try shouldCompact(&w, catalogRef));
 }
 
 test "compaction reclaims under churn (scale)" {
@@ -187,35 +187,35 @@ test "compaction reclaims under churn (scale)" {
     defer w.deinit();
 
     const n: u64 = 200_000;
-    var cat = try catalog.create(&w, 2);
+    var catalogRef = try catalog.create(&w, 2);
     var i: u64 = 0;
     while (i < n) : (i += 1) {
-        const r = try rows.insert(&w, cat, &.{ i, i });
-        cat = r.cat;
+        const r = try rows.insert(&w, catalogRef, &.{ i, i });
+        catalogRef = r.catalogRef;
     }
 
     // delete every even pk; all rows carry version == w.new_version this transaction
     i = 0;
     while (i < n) : (i += 2) {
-        cat = switch (try rows.delete(&w, cat, i, w.new_version)) {
+        catalogRef = switch (try rows.delete(&w, catalogRef, i, w.new_version)) {
             .ok => |c| c,
             else => unreachable,
         };
     }
 
-    cat = try compactType(&w, cat);
+    catalogRef = try compactType(&w, catalogRef);
 
-    try testing.expectEqual(@as(u64, 100_000), (try catalog.loadCatalog(&w, cat)).next_row);
-    try testing.expectEqual(@as(u64, 100_000), try liveCount(&w, cat));
+    try testing.expectEqual(@as(u64, 100_000), (try catalog.loadCatalog(&w, catalogRef)).next_row);
+    try testing.expectEqual(@as(u64, 100_000), try liveCount(&w, catalogRef));
 
     var out: [2]u64 = undefined;
-    try testing.expect((try rows.getByPk(&w, cat, 1, &out)) != null);
+    try testing.expect((try rows.getByPk(&w, catalogRef, 1, &out)) != null);
     try testing.expectEqual(@as(u64, 1), out[1]);
-    try testing.expect((try rows.getByPk(&w, cat, 99_999, &out)) != null);
+    try testing.expect((try rows.getByPk(&w, catalogRef, 99_999, &out)) != null);
     try testing.expectEqual(@as(u64, 99_999), out[1]);
-    try testing.expect((try rows.getByPk(&w, cat, 100_001, &out)) != null);
+    try testing.expect((try rows.getByPk(&w, catalogRef, 100_001, &out)) != null);
     try testing.expectEqual(@as(u64, 100_001), out[1]);
-    try testing.expect((try rows.getByPk(&w, cat, 2, &out)) == null);
+    try testing.expect((try rows.getByPk(&w, catalogRef, 2, &out)) == null);
 }
 
 test "all value kinds deep-copy across databases preserving keys" {
@@ -237,45 +237,45 @@ test "all value kinds deep-copy across databases preserving keys" {
     // Build the source database: 3 rows across every value kind, then delete one.
     {
         var w = try sourceDatabase.beginWrite();
-        var cat = try catalog.createDefs(&w, &.{
+        var catalogRef = try catalog.createDefs(&w, &.{
             .{ .kind = .int },
             .{ .kind = .blob },
             .{ .kind = .list, .elem = .int },
             .{ .kind = .set, .elem = .int },
             .{ .kind = .link, .link_target = 0 },
         });
-        const r1 = try objects.insertTyped(&w, cat, &.{
+        const r1 = try objects.insertTyped(&w, catalogRef, &.{
             .{ .int = 1 }, .{ .bytes = "a" }, .{ .list_int = &.{ 10, 20 } }, .{ .set_int = &.{ 5, 6 } }, .{ .link = null },
         });
-        cat = r1.cat;
+        catalogRef = r1.catalogRef;
         pk1_okey = r1.row;
-        const r2 = try objects.insertTyped(&w, cat, &.{
+        const r2 = try objects.insertTyped(&w, catalogRef, &.{
             .{ .int = 2 }, .{ .bytes = "bb" }, .{ .list_int = &.{} }, .{ .set_int = &.{7} }, .{ .link = pk1_okey },
         });
-        cat = r2.cat;
-        const r3 = try objects.insertTyped(&w, cat, &.{
+        catalogRef = r2.catalogRef;
+        const r3 = try objects.insertTyped(&w, catalogRef, &.{
             .{ .int = 3 }, .{ .bytes = "ccc" }, .{ .list_int = &.{ 1, 2, 3 } }, .{ .set_int = &.{} }, .{ .link = null },
         });
-        cat = r3.cat;
+        catalogRef = r3.catalogRef;
 
         // Delete pk 3 -- leaves a gap in the source.
         var dout: [5]catalog.Value = undefined;
-        const v3 = (try objects.getTyped(&w, cat, 3, &dout)).?;
-        cat = (try objects.deleteTyped(&w, cat, 3, v3)).ok;
+        const v3 = (try objects.getTyped(&w, catalogRef, 3, &dout)).?;
+        catalogRef = (try objects.deleteTyped(&w, catalogRef, 3, v3)).ok;
 
-        src_next_key = (try catalog.loadCatalog(&w, cat)).next_key;
-        w.setRoot(cat);
+        src_next_key = (try catalog.loadCatalog(&w, catalogRef)).next_key;
+        w.setRoot(catalogRef);
         _ = try w.commit();
     }
 
     // Deep-copy the live rows into the destination database.
     {
         var src_read = try sourceDatabase.beginRead();
-        const src_cat = src_read.root();
+        const sourceCatalog = src_read.root();
         var dst_w = try destinationDatabase.beginWrite();
-        var dst_cat = try copyTypeRows(&src_read, src_cat, &dst_w);
-        dst_cat = try rebuildBacklinks(&dst_w, dst_cat);
-        dst_w.setRoot(dst_cat);
+        var destinationCatalog = try copyTypeRows(&src_read, sourceCatalog, &dst_w);
+        destinationCatalog = try rebuildBacklinks(&dst_w, destinationCatalog);
+        dst_w.setRoot(destinationCatalog);
         _ = try dst_w.commit();
         src_read.end();
     }
@@ -286,44 +286,44 @@ test "all value kinds deep-copy across databases preserving keys" {
         defer reopenedDestination.deinit();
         var r = try reopenedDestination.beginRead();
         defer r.end();
-        const cat = r.root();
+        const catalogRef = r.root();
 
         // pk 1 and pk 2 readable with identical int + blob.
         var o1: [5]catalog.Value = undefined;
-        try testing.expect((try objects.getTyped(&r, cat, 1, &o1)) != null);
+        try testing.expect((try objects.getTyped(&r, catalogRef, 1, &o1)) != null);
         try testing.expectEqual(@as(u64, 1), o1[0].int);
         try testing.expectEqualStrings("a", o1[1].bytes);
         var o2: [5]catalog.Value = undefined;
-        try testing.expect((try objects.getTyped(&r, cat, 2, &o2)) != null);
+        try testing.expect((try objects.getTyped(&r, catalogRef, 2, &o2)) != null);
         try testing.expectEqual(@as(u64, 2), o2[0].int);
         try testing.expectEqualStrings("bb", o2[1].bytes);
 
         // list/set contents match.
-        try testing.expectEqual(@as(?u64, 2), try collections.listLen(&r, cat, 1, 2));
-        try testing.expectEqual(@as(u64, 10), try collections.listGetInt(&r, cat, 1, 2, 0));
-        try testing.expectEqual(@as(u64, 20), try collections.listGetInt(&r, cat, 1, 2, 1));
-        try testing.expectEqual(@as(?u64, 2), try collections.setCountInt(&r, cat, 1, 3));
-        try testing.expect(try collections.setContainsInt(&r, cat, 1, 3, 5));
-        try testing.expect(try collections.setContainsInt(&r, cat, 1, 3, 6));
-        try testing.expectEqual(@as(?u64, 0), try collections.listLen(&r, cat, 2, 2));
-        try testing.expectEqual(@as(?u64, 1), try collections.setCountInt(&r, cat, 2, 3));
-        try testing.expect(try collections.setContainsInt(&r, cat, 2, 3, 7));
+        try testing.expectEqual(@as(?u64, 2), try collections.listLen(&r, catalogRef, 1, 2));
+        try testing.expectEqual(@as(u64, 10), try collections.listGetInt(&r, catalogRef, 1, 2, 0));
+        try testing.expectEqual(@as(u64, 20), try collections.listGetInt(&r, catalogRef, 1, 2, 1));
+        try testing.expectEqual(@as(?u64, 2), try collections.setCountInt(&r, catalogRef, 1, 3));
+        try testing.expect(try collections.setContainsInt(&r, catalogRef, 1, 3, 5));
+        try testing.expect(try collections.setContainsInt(&r, catalogRef, 1, 3, 6));
+        try testing.expectEqual(@as(?u64, 0), try collections.listLen(&r, catalogRef, 2, 2));
+        try testing.expectEqual(@as(?u64, 1), try collections.setCountInt(&r, catalogRef, 2, 3));
+        try testing.expect(try collections.setContainsInt(&r, catalogRef, 2, 3, 7));
 
         // The link on pk 2 still equals pk 1's original object key and resolves to pk 1.
-        try testing.expectEqual(@as(?u64, pk1_okey), try links.getLink(&r, cat, 2, 4));
+        try testing.expectEqual(@as(?u64, pk1_okey), try links.getLink(&r, catalogRef, 2, 4));
         var ob: [5]u64 = undefined;
-        try testing.expect((try rows.getByObjectKey(&r, cat, pk1_okey, &ob)) != null);
+        try testing.expect((try rows.getByObjectKey(&r, catalogRef, pk1_okey, &ob)) != null);
         try testing.expectEqual(@as(u64, 1), ob[0]);
 
         // Backlink rebuilt from the copied forward link.
-        try testing.expectEqual(@as(u64, 1), try links.backlinkCount(&r, cat, 4, pk1_okey));
+        try testing.expectEqual(@as(u64, 1), try links.backlinkCount(&r, catalogRef, 4, pk1_okey));
 
         // pk 3 was dead in the source and must be absent.
         var o3: [5]catalog.Value = undefined;
-        try testing.expect((try objects.getTyped(&r, cat, 3, &o3)) == null);
+        try testing.expect((try objects.getTyped(&r, catalogRef, 3, &o3)) == null);
 
         // next_key preserved across the copy.
-        try testing.expectEqual(src_next_key, (try catalog.loadCatalog(&r, cat)).next_key);
+        try testing.expectEqual(src_next_key, (try catalog.loadCatalog(&r, catalogRef)).next_key);
     }
 }
 
@@ -477,21 +477,21 @@ test "compaction preserves dict and set-of-blob" {
         var r = try reopenedDestination.beginRead();
         defer r.end();
         const dir = r.root();
-        const cat = try typedir.catalogRef(&r, dir, 0);
+        const catalogRef = try typedir.catalogRef(&r, dir, 0);
 
         try testing.expectEqual(@as(u64, 1), try typeRouting.liveCount(&r, dir, 0));
 
         // Surviving row pk 1: dict entries preserved.
-        try testing.expectEqual(@as(?u64, 2), try collections.dictCount(&r, cat, 1, 1));
-        try testing.expectEqual(@as(?u64, 1), try collections.dictGet(&r, cat, 1, 1, "a"));
-        try testing.expectEqual(@as(?u64, 2), try collections.dictGet(&r, cat, 1, 1, "b"));
-        try testing.expectEqual(@as(?u64, null), try collections.dictGet(&r, cat, 1, 1, "c"));
+        try testing.expectEqual(@as(?u64, 2), try collections.dictCount(&r, catalogRef, 1, 1));
+        try testing.expectEqual(@as(?u64, 1), try collections.dictGet(&r, catalogRef, 1, 1, "a"));
+        try testing.expectEqual(@as(?u64, 2), try collections.dictGet(&r, catalogRef, 1, 1, "b"));
+        try testing.expectEqual(@as(?u64, null), try collections.dictGet(&r, catalogRef, 1, 1, "c"));
 
         // Surviving row pk 1: blob-set members preserved.
-        try testing.expectEqual(@as(?u64, 2), try collections.setCountBlob(&r, cat, 1, 2));
-        try testing.expect(try collections.setContainsBlob(&r, cat, 1, 2, "x"));
-        try testing.expect(try collections.setContainsBlob(&r, cat, 1, 2, "yy"));
-        try testing.expect(!(try collections.setContainsBlob(&r, cat, 1, 2, "zzz")));
+        try testing.expectEqual(@as(?u64, 2), try collections.setCountBlob(&r, catalogRef, 1, 2));
+        try testing.expect(try collections.setContainsBlob(&r, catalogRef, 1, 2, "x"));
+        try testing.expect(try collections.setContainsBlob(&r, catalogRef, 1, 2, "yy"));
+        try testing.expect(!(try collections.setContainsBlob(&r, catalogRef, 1, 2, "zzz")));
 
         // Deleted row pk 2 is absent.
         var o2: [3]catalog.Value = undefined;
@@ -567,20 +567,20 @@ test "compactStep packs a delete-heavy type across several small steps" {
     var w = try database.beginWrite();
     defer w.deinit();
 
-    var cat = try catalog.create(&w, 2);
+    var catalogRef = try catalog.create(&w, 2);
     var okeys: [12]u64 = undefined;
     var pk: u64 = 0;
     while (pk < 12) : (pk += 1) {
-        const r = try rows.insert(&w, cat, &.{ pk, pk * 100 });
-        cat = r.cat;
+        const r = try rows.insert(&w, catalogRef, &.{ pk, pk * 100 });
+        catalogRef = r.catalogRef;
         okeys[@intCast(pk)] = r.row;
     }
 
     const dels = [_]u64{ 0, 2, 3, 5, 7, 8, 11 };
     for (dels) |dpk| {
         var out: [2]u64 = undefined;
-        const ver = (try rows.getByPk(&w, cat, dpk, &out)).?;
-        cat = switch (try rows.delete(&w, cat, dpk, ver)) {
+        const ver = (try rows.getByPk(&w, catalogRef, dpk, &out)).?;
+        catalogRef = switch (try rows.delete(&w, catalogRef, dpk, ver)) {
             .ok => |c| c,
             else => unreachable,
         };
@@ -589,8 +589,8 @@ test "compactStep packs a delete-heavy type across several small steps" {
     // Pack in small budgeted steps until done.
     var guard: usize = 0;
     while (true) {
-        const res = try compactStep(&w, cat, 0, 2);
-        cat = res.cat;
+        const res = try compactStep(&w, catalogRef, 0, 2);
+        catalogRef = res.catalogRef;
         try testing.expect(res.moved <= 2);
         if (res.done) break;
         guard += 1;
@@ -598,7 +598,7 @@ test "compactStep packs a delete-heavy type across several small steps" {
     }
 
     // Fully packed: next_row == live count.
-    try testing.expectEqual(try liveCount(&w, cat), (try catalog.loadCatalog(&w, cat)).next_row);
+    try testing.expectEqual(try liveCount(&w, catalogRef), (try catalog.loadCatalog(&w, catalogRef)).next_row);
 
     // Every survivor reads back its exact values; deleted keys are gone.
     pk = 0;
@@ -608,7 +608,7 @@ test "compactStep packs a delete-heavy type across several small steps" {
             break :blk false;
         };
         var out: [2]catalog.Value = undefined;
-        const got = try objects.getTypedByOkey(&w, cat, okeys[@intCast(pk)], &out);
+        const got = try objects.getTypedByOkey(&w, catalogRef, okeys[@intCast(pk)], &out);
         if (is_del) {
             try testing.expect(got == null);
         } else {
@@ -629,17 +629,17 @@ test "compactStep on an all-dead type truncates to zero" {
     var w = try database.beginWrite();
     defer w.deinit();
 
-    var cat = try catalog.create(&w, 2);
+    var catalogRef = try catalog.create(&w, 2);
     var pk: u64 = 0;
     while (pk < 6) : (pk += 1) {
-        const r = try rows.insert(&w, cat, &.{ pk, pk });
-        cat = r.cat;
+        const r = try rows.insert(&w, catalogRef, &.{ pk, pk });
+        catalogRef = r.catalogRef;
     }
     pk = 0;
     while (pk < 6) : (pk += 1) {
         var out: [2]u64 = undefined;
-        const ver = (try rows.getByPk(&w, cat, pk, &out)).?;
-        cat = switch (try rows.delete(&w, cat, pk, ver)) {
+        const ver = (try rows.getByPk(&w, catalogRef, pk, &out)).?;
+        catalogRef = switch (try rows.delete(&w, catalogRef, pk, ver)) {
             .ok => |c| c,
             else => unreachable,
         };
@@ -647,15 +647,15 @@ test "compactStep on an all-dead type truncates to zero" {
 
     var guard: usize = 0;
     while (true) {
-        const res = try compactStep(&w, cat, 0, 2);
-        cat = res.cat;
+        const res = try compactStep(&w, catalogRef, 0, 2);
+        catalogRef = res.catalogRef;
         if (res.done) break;
         guard += 1;
         try testing.expect(guard < 100);
     }
 
-    try testing.expectEqual(@as(u64, 0), (try catalog.loadCatalog(&w, cat)).next_row);
-    try testing.expectEqual(@as(u64, 0), try liveCount(&w, cat));
+    try testing.expectEqual(@as(u64, 0), (try catalog.loadCatalog(&w, catalogRef)).next_row);
+    try testing.expectEqual(@as(u64, 0), try liveCount(&w, catalogRef));
 }
 
 test "compactStep is a no-op on an already-packed type" {
@@ -668,24 +668,24 @@ test "compactStep is a no-op on an already-packed type" {
     var w = try database.beginWrite();
     defer w.deinit();
 
-    var cat = try catalog.create(&w, 2);
+    var catalogRef = try catalog.create(&w, 2);
     var okeys: [5]u64 = undefined;
     var pk: u64 = 0;
     while (pk < 5) : (pk += 1) {
-        const r = try rows.insert(&w, cat, &.{ pk, pk * 7 });
-        cat = r.cat;
+        const r = try rows.insert(&w, catalogRef, &.{ pk, pk * 7 });
+        catalogRef = r.catalogRef;
         okeys[@intCast(pk)] = r.row;
     }
 
-    const res = try compactStep(&w, cat, 0, 4);
-    cat = res.cat;
+    const res = try compactStep(&w, catalogRef, 0, 4);
+    catalogRef = res.catalogRef;
     try testing.expect(res.done);
     try testing.expectEqual(@as(usize, 0), res.moved);
 
     pk = 0;
     while (pk < 5) : (pk += 1) {
         var out: [2]catalog.Value = undefined;
-        const got = try objects.getTypedByOkey(&w, cat, okeys[@intCast(pk)], &out);
+        const got = try objects.getTypedByOkey(&w, catalogRef, okeys[@intCast(pk)], &out);
         try testing.expect(got != null);
         try testing.expectEqual(pk, out[0].int);
         try testing.expectEqual(pk * 7, out[1].int);
@@ -721,33 +721,33 @@ test "compactStep cursor path packs identically to the scan path" {
     var ctrl_w = try controlDatabase.beginWrite();
     defer ctrl_w.deinit();
 
-    var step_cat = try catalog.create(&step_w, 2);
-    var ctrl_cat = try catalog.create(&ctrl_w, 2);
+    var stepCatalog = try catalog.create(&step_w, 2);
+    var controlCatalog = try catalog.create(&ctrl_w, 2);
     var step_okeys: [20]u64 = undefined;
     var pk: u64 = 0;
     while (pk < 20) : (pk += 1) {
-        const rs = try rows.insert(&step_w, step_cat, &.{ pk, pk * 100 });
-        step_cat = rs.cat;
+        const rs = try rows.insert(&step_w, stepCatalog, &.{ pk, pk * 100 });
+        stepCatalog = rs.catalogRef;
         step_okeys[@intCast(pk)] = rs.row;
-        const rc = try rows.insert(&ctrl_w, ctrl_cat, &.{ pk, pk * 100 });
-        ctrl_cat = rc.cat;
+        const rc = try rows.insert(&ctrl_w, controlCatalog, &.{ pk, pk * 100 });
+        controlCatalog = rc.catalogRef;
     }
     for (dels) |dpk| {
         var out: [2]u64 = undefined;
-        const vs = (try rows.getByPk(&step_w, step_cat, dpk, &out)).?;
-        step_cat = (try rows.delete(&step_w, step_cat, dpk, vs)).ok;
-        const vc = (try rows.getByPk(&ctrl_w, ctrl_cat, dpk, &out)).?;
-        ctrl_cat = (try rows.delete(&ctrl_w, ctrl_cat, dpk, vc)).ok;
+        const vs = (try rows.getByPk(&step_w, stepCatalog, dpk, &out)).?;
+        stepCatalog = (try rows.delete(&step_w, stepCatalog, dpk, vs)).ok;
+        const vc = (try rows.getByPk(&ctrl_w, controlCatalog, dpk, &out)).?;
+        controlCatalog = (try rows.delete(&ctrl_w, controlCatalog, dpk, vc)).ok;
     }
 
     // Control: one full-pass compaction.
-    ctrl_cat = try compactType(&ctrl_w, ctrl_cat);
+    controlCatalog = try compactType(&ctrl_w, controlCatalog);
 
     // Step path: budgeted cursor steps until done.
     var guard: usize = 0;
     while (true) {
-        const res = try compactStep(&step_w, step_cat, 0, 3);
-        step_cat = res.cat;
+        const res = try compactStep(&step_w, stepCatalog, 0, 3);
+        stepCatalog = res.catalogRef;
         try testing.expect(res.moved <= 3);
         if (res.done) break;
         guard += 1;
@@ -755,19 +755,19 @@ test "compactStep cursor path packs identically to the scan path" {
     }
 
     // Both fully packed to the same dense length.
-    const step_len = (try catalog.loadCatalog(&step_w, step_cat)).next_row;
-    try testing.expectEqual(try liveCount(&step_w, step_cat), step_len);
-    try testing.expectEqual((try catalog.loadCatalog(&ctrl_w, ctrl_cat)).next_row, step_len);
-    try testing.expectEqual(try liveCount(&ctrl_w, ctrl_cat), try liveCount(&step_w, step_cat));
+    const step_len = (try catalog.loadCatalog(&step_w, stepCatalog)).next_row;
+    try testing.expectEqual(try liveCount(&step_w, stepCatalog), step_len);
+    try testing.expectEqual((try catalog.loadCatalog(&ctrl_w, controlCatalog)).next_row, step_len);
+    try testing.expectEqual(try liveCount(&ctrl_w, controlCatalog), try liveCount(&step_w, stepCatalog));
 
     // Every survivor reads its exact values via its stable object key in the
     // stepped database; deleted keys are gone. Cross-check pk presence vs the control.
     pk = 0;
     while (pk < 20) : (pk += 1) {
         var so: [2]catalog.Value = undefined;
-        const sg = try objects.getTypedByOkey(&step_w, step_cat, step_okeys[@intCast(pk)], &so);
+        const sg = try objects.getTypedByOkey(&step_w, stepCatalog, step_okeys[@intCast(pk)], &so);
         var co: [2]u64 = undefined;
-        const cg = try rows.getByPk(&ctrl_w, ctrl_cat, pk, &co);
+        const cg = try rows.getByPk(&ctrl_w, controlCatalog, pk, &co);
         if (isDel(pk)) {
             try testing.expect(sg == null);
             try testing.expect(cg == null);
@@ -778,7 +778,7 @@ test "compactStep cursor path packs identically to the scan path" {
             try testing.expectEqual(pk * 100, so[1].int);
             // Same primary key reads back in the control (survivor sets match).
             var sp: [2]u64 = undefined;
-            try testing.expect((try rows.getByPk(&step_w, step_cat, pk, &sp)) != null);
+            try testing.expect((try rows.getByPk(&step_w, stepCatalog, pk, &sp)) != null);
             try testing.expectEqual(pk * 100, sp[1]);
         }
     }
@@ -797,39 +797,39 @@ test "compactStep truncation never drops a live row at the top" {
     // Insert 10 rows at physical 0..9, then delete the LOW pks (0..4). The five
     // survivors (pks 5..9) all sit at physical rows >= live_count (=5): every
     // live row is a "high" row that must be relocated downward before truncation.
-    var cat = try catalog.create(&w, 2);
+    var catalogRef = try catalog.create(&w, 2);
     var okeys: [10]u64 = undefined;
     var pk: u64 = 0;
     while (pk < 10) : (pk += 1) {
-        const r = try rows.insert(&w, cat, &.{ pk, pk * 1000 });
-        cat = r.cat;
+        const r = try rows.insert(&w, catalogRef, &.{ pk, pk * 1000 });
+        catalogRef = r.catalogRef;
         okeys[@intCast(pk)] = r.row;
     }
     pk = 0;
     while (pk < 5) : (pk += 1) {
         var out: [2]u64 = undefined;
-        const ver = (try rows.getByPk(&w, cat, pk, &out)).?;
-        cat = (try rows.delete(&w, cat, pk, ver)).ok;
+        const ver = (try rows.getByPk(&w, catalogRef, pk, &out)).?;
+        catalogRef = (try rows.delete(&w, catalogRef, pk, ver)).ok;
     }
-    try testing.expectEqual(@as(u64, 5), try liveCount(&w, cat));
+    try testing.expectEqual(@as(u64, 5), try liveCount(&w, catalogRef));
 
     // Pack in tiny steps; the downward cursor must examine the entire top range.
     var guard: usize = 0;
     while (true) {
-        const res = try compactStep(&w, cat, 0, 2);
-        cat = res.cat;
+        const res = try compactStep(&w, catalogRef, 0, 2);
+        catalogRef = res.catalogRef;
         try testing.expect(res.moved <= 2);
         if (res.done) break;
         guard += 1;
         try testing.expect(guard < 100);
     }
 
-    try testing.expectEqual(@as(u64, 5), (try catalog.loadCatalog(&w, cat)).next_row);
+    try testing.expectEqual(@as(u64, 5), (try catalog.loadCatalog(&w, catalogRef)).next_row);
     // Every top-stranded survivor is intact with its exact values.
     pk = 5;
     while (pk < 10) : (pk += 1) {
         var out: [2]catalog.Value = undefined;
-        const got = try objects.getTypedByOkey(&w, cat, okeys[@intCast(pk)], &out);
+        const got = try objects.getTypedByOkey(&w, catalogRef, okeys[@intCast(pk)], &out);
         try testing.expect(got != null);
         try testing.expectEqual(pk, out[0].int);
         try testing.expectEqual(pk * 1000, out[1].int);
@@ -848,16 +848,16 @@ test "compactStep moves at most budget rows per call" {
 
     // A large set with heavy churn so many high rows need relocating.
     const n: u64 = 400;
-    var cat = try catalog.create(&w, 2);
+    var catalogRef = try catalog.create(&w, 2);
     var pk: u64 = 0;
     while (pk < n) : (pk += 1) {
-        const r = try rows.insert(&w, cat, &.{ pk, pk });
-        cat = r.cat;
+        const r = try rows.insert(&w, catalogRef, &.{ pk, pk });
+        catalogRef = r.catalogRef;
     }
     // Delete every even pk -> ~200 holes scattered through the low half.
     pk = 0;
     while (pk < n) : (pk += 2) {
-        cat = switch (try rows.delete(&w, cat, pk, w.new_version)) {
+        catalogRef = switch (try rows.delete(&w, catalogRef, pk, w.new_version)) {
             .ok => |c| c,
             else => unreachable,
         };
@@ -867,8 +867,8 @@ test "compactStep moves at most budget rows per call" {
     var guard: usize = 0;
     var saw_full_budget = false;
     while (true) {
-        const res = try compactStep(&w, cat, 0, budget);
-        cat = res.cat;
+        const res = try compactStep(&w, catalogRef, 0, budget);
+        catalogRef = res.catalogRef;
         try testing.expect(res.moved <= budget);
         if (res.moved == budget) saw_full_budget = true;
         if (res.done) break;
@@ -877,7 +877,7 @@ test "compactStep moves at most budget rows per call" {
     }
     // The set is large enough that at least one step hit the cap.
     try testing.expect(saw_full_budget);
-    try testing.expectEqual(try liveCount(&w, cat), (try catalog.loadCatalog(&w, cat)).next_row);
+    try testing.expectEqual(try liveCount(&w, catalogRef), (try catalog.loadCatalog(&w, catalogRef)).next_row);
 }
 
 test "compactInPlace preserves value indexes and passes verifyIntegrity" {
@@ -912,10 +912,10 @@ test "compactInPlace preserves value indexes and passes verifyIntegrity" {
     try verification.verifyIntegrity(&database); // the audit must agree the indexes are intact
     var r = try database.beginRead();
     defer r.end();
-    const cat = try typedir.catalogRef(&r, r.root(), 0);
+    const catalogRef = try typedir.catalogRef(&r, r.root(), 0);
     var hits = std.ArrayList(u64).empty;
     defer hits.deinit(testing.allocator);
-    try query.where(&r, cat, &.{.{ .prop = 1, .op = .eq, .value = 3 }}, &hits, testing.allocator);
+    try query.where(&r, catalogRef, &.{.{ .prop = 1, .op = .eq, .value = 3 }}, &hits, testing.allocator);
     try testing.expectEqual(@as(usize, 10), hits.items.len);
 }
 

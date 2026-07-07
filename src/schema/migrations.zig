@@ -27,8 +27,8 @@ const max_prop_count = catalog.max_prop_count;
 // Append a new property to the type. The new column is filled with
 // `default_value` for every existing row (live or tombstoned). For a link or
 // link_set property a fresh backlink index is created. Returns the new catalog.
-pub fn addProperty(transaction: *WriteTransaction, cat: Reference, def: PropDef, default_value: u64) !Reference {
-    var s = try catalog.CatalogSnapshot.load(transaction, cat);
+pub fn addProperty(transaction: *WriteTransaction, catalogRef: Reference, def: PropDef, default_value: u64) !Reference {
+    var s = try catalog.CatalogSnapshot.load(transaction, catalogRef);
     const pc = s.prop_count;
     std.debug.assert(pc + 1 <= max_prop_count);
 
@@ -139,9 +139,9 @@ fn blobDup(transaction: *WriteTransaction, ref: u64) !u64 {
 
 // Remove property `prop` (must be >= 1; the primary key at 0 cannot be removed).
 // The dropped column is left for compaction to reclaim. Returns the new catalog.
-pub fn removeProperty(transaction: *WriteTransaction, cat: Reference, prop: usize) !Reference {
+pub fn removeProperty(transaction: *WriteTransaction, catalogRef: Reference, prop: usize) !Reference {
     std.debug.assert(prop >= 1);
-    var s = try catalog.CatalogSnapshot.load(transaction, cat);
+    var s = try catalog.CatalogSnapshot.load(transaction, catalogRef);
     std.debug.assert(prop < s.prop_count);
     var j: usize = prop;
     while (j + 1 < s.prop_count) : (j += 1) s.props[j] = s.props[j + 1];

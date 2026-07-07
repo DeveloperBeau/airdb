@@ -228,9 +228,9 @@ test "multi-type directory carries links and collections via createWithDefs" {
 
     // insert two type-1 rows; row a links to nothing, b's set links to a.
     const a = try Objects.insertTyped(&w, try catalogRef(&w, dir, 1), &.{ .{ .int = 10 }, .{ .link = null }, .{ .link_set = &.{} } });
-    dir = try setCatalogRef(&w, dir, 1, a.cat);
+    dir = try setCatalogRef(&w, dir, 1, a.catalogRef);
     const b = try Objects.insertTyped(&w, try catalogRef(&w, dir, 1), &.{ .{ .int = 20 }, .{ .link = a.row }, .{ .link_set = &.{a.row} } });
-    dir = try setCatalogRef(&w, dir, 1, b.cat);
+    dir = try setCatalogRef(&w, dir, 1, b.catalogRef);
 
     // route a to-many add through the directory
     dir = try linkSetAdd(&w, dir, 1, 20, 2, a.row); // already member -> no-op
@@ -564,8 +564,8 @@ test "directory delete works after relocating the target" {
     try testing.expectEqual(@as(?u64, author_okey), try getLink(&w, dir, 1, 1, 1));
 
     // Free the throwaway's physical slot, then relocate the author into it.
-    const author_cat = try catalogRef(&w, dir, 0);
-    const dead_row = (try catalog.okeyToRow(&w, author_cat, throwaway_okey)).?;
+    const authorCatalog = try catalogRef(&w, dir, 0);
+    const dead_row = (try catalog.okeyToRow(&w, authorCatalog, throwaway_okey)).?;
     var vbuf: [2]Value = undefined;
     const tv = (try get(&w, dir, 0, 99, &vbuf)).?;
     const dthrow = try delete(&w, dir, 0, 99, tv);

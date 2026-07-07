@@ -65,7 +65,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     // Two-int type: {pk, category}. Property 0 is the primary key, property 1
     // is the low-cardinality category, declared indexed so the equality query
     // is served by its value index rather than a full scan.
-    var cat: Reference = blk: {
+    var catalogRef: Reference = blk: {
         var w = try database.beginWrite();
         const c = try catalog.createDefs(&w, &.{
             .{ .kind = .int },
@@ -80,14 +80,14 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     while (inserted < ctx.n) {
         const this_batch = @min(batch_size, ctx.n - inserted);
         var w = try database.beginWrite();
-        cat = database.active_root; // reload the committed catalog ref
+        catalogRef = database.active_root; // reload the committed catalog ref
         var j: usize = 0;
         while (j < this_batch) : (j += 1) {
             const pk: u64 = inserted + j;
-            const r = try rows.insert(&w, cat, &.{ pk, pk % category_mod });
-            cat = r.cat;
+            const r = try rows.insert(&w, catalogRef, &.{ pk, pk % category_mod });
+            catalogRef = r.catalogRef;
         }
-        w.setRoot(cat);
+        w.setRoot(catalogRef);
         _ = try w.commit();
         inserted += this_batch;
     }
@@ -97,7 +97,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     defer lat.deinit(alloc);
 
     var rd = try database.beginRead();
-    cat = rd.root();
+    catalogRef = rd.root();
 
     // Deterministic xorshift64 over a fixed seed; index = x % n keeps every
     // lookup inside [0, n). No clock/RNG dependency, so the run is reproducible.
@@ -113,7 +113,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         const pk: u64 = x % n_u64;
         var out: [2]u64 = undefined;
         const t0 = nowNs(io);
-        _ = try rows.getByPk(&rd, cat, pk, &out);
+        _ = try rows.getByPk(&rd, catalogRef, pk, &out);
         const dt: u64 = @intCast(nowNs(io) - t0);
         try lat.add(alloc, dt);
     }
@@ -129,7 +129,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     while (e < idx_eq_reps) : (e += 1) {
         rows_eq = try query.countWhere(
             &rd,
-            cat,
+            catalogRef,
             &.{.{ .prop = 1, .op = .eq, .value = eq_category }},
             alloc,
         );
@@ -139,7 +139,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
 
     // Full scan: no predicate matches every live row.
     const full_start = nowNs(io);
-    _ = try query.countWhere(&rd, cat, &.{}, alloc);
+    _ = try query.countWhere(&rd, catalogRef, &.{}, alloc);
     const full_ns: u64 = @intCast(nowNs(io) - full_start);
 
     rd.end();

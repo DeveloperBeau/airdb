@@ -20,13 +20,13 @@ const collectKeyRowPairs = compactionCopy.collectKeyRowPairs;
 pub const copyTypeRows = compactionCopy.copyTypeRows;
 pub const rebuildBacklinks = compactionCopy.rebuildBacklinks;
 
-pub fn liveCount(transaction: anytype, cat: Reference) !u64 {
-    const v = try catalog.loadCatalog(transaction, cat);
+pub fn liveCount(transaction: anytype, catalogRef: Reference) !u64 {
+    const v = try catalog.loadCatalog(transaction, catalogRef);
     return Index.count(transaction, v.keyrow_index_ref);
 }
 
-pub fn shouldCompact(transaction: anytype, cat: Reference) !bool {
-    const v = try catalog.loadCatalog(transaction, cat);
+pub fn shouldCompact(transaction: anytype, catalogRef: Reference) !bool {
+    const v = try catalog.loadCatalog(transaction, catalogRef);
     const n = v.next_row;
     if (n == 0) return false;
     const live = try Index.count(transaction, v.keyrow_index_ref);
@@ -36,8 +36,8 @@ pub fn shouldCompact(transaction: anytype, cat: Reference) !bool {
 // Rebuild the type's columns to contain only live rows, packed densely, and
 // remap the key->row index. Object keys, pk index, and backlink indexes are
 // preserved (keyed by object key). Returns the new catalog ref.
-pub fn compactType(transaction: *WriteTransaction, cat: Reference) !Reference {
-    var s = try catalog.CatalogSnapshot.load(transaction, cat);
+pub fn compactType(transaction: *WriteTransaction, catalogRef: Reference) !Reference {
+    var s = try catalog.CatalogSnapshot.load(transaction, catalogRef);
     const pc = s.prop_count;
     // Keep the old column/index roots to read from while the snapshot's fields
     // are re-pointed at the fresh dense structures.
@@ -100,8 +100,8 @@ pub fn compactType(transaction: *WriteTransaction, cat: Reference) !Reference {
 // catalog with next_row == new_len. All live rows must already lie in
 // [0, new_len); the dead tail is dropped. Object key/pk/backlink indexes are
 // preserved unchanged. Returns the new catalog ref.
-fn truncatePacked(transaction: *WriteTransaction, cat: Reference, new_len: u64) !Reference {
-    var s = try catalog.CatalogSnapshot.load(transaction, cat);
+fn truncatePacked(transaction: *WriteTransaction, catalogRef: Reference, new_len: u64) !Reference {
+    var s = try catalog.CatalogSnapshot.load(transaction, catalogRef);
     {
         var j: usize = 0;
         while (j < s.prop_count) : (j += 1) s.props[j].col = try Column.truncate(transaction, s.props[j].col, new_len);
@@ -139,9 +139,9 @@ fn rowToOkey(transaction: anytype, v: catalog.CatalogView, row: u64) !u64 {
 // Hard safety check before truncating a packed type's dead tail: no live row
 // may survive in [live_count, next_row). Bounded, debug-only, and runs once
 // per pack at the final step.
-fn assertTailDead(transaction: *WriteTransaction, cat: Reference, live_count: u64, next_row: u64) !void {
+fn assertTailDead(transaction: *WriteTransaction, catalogRef: Reference, live_count: u64, next_row: u64) !void {
     if (!std.debug.runtime_safety) return;
-    const v = try catalog.loadCatalog(transaction, cat);
+    const v = try catalog.loadCatalog(transaction, catalogRef);
     var r: u64 = live_count;
     while (r < next_row) : (r += 1) {
         std.debug.assert((try Column.get(transaction, v.live_col_ref, r)) == 0);
@@ -150,15 +150,15 @@ fn assertTailDead(transaction: *WriteTransaction, cat: Reference, live_count: u6
 
 // Advance cursor.hole_lo upward to the next dead slot (relocation target) in
 // [0, live_count).
-fn advanceHoleCursor(transaction: *WriteTransaction, cat: Reference, live_count: u64, cursor: *CompactCursor) !void {
-    const v = try catalog.loadCatalog(transaction, cat);
+fn advanceHoleCursor(transaction: *WriteTransaction, catalogRef: Reference, live_count: u64, cursor: *CompactCursor) !void {
+    const v = try catalog.loadCatalog(transaction, catalogRef);
     while (cursor.hole_lo < live_count and (try Column.get(transaction, v.live_col_ref, cursor.hole_lo)) == 1) : (cursor.hole_lo += 1) {}
 }
 
 // Advance cursor.high_hi down past dead rows to the next live row at
 // >= live_count.
-fn advanceHighCursor(transaction: *WriteTransaction, cat: Reference, live_count: u64, cursor: *CompactCursor) !void {
-    const v = try catalog.loadCatalog(transaction, cat);
+fn advanceHighCursor(transaction: *WriteTransaction, catalogRef: Reference, live_count: u64, cursor: *CompactCursor) !void {
+    const v = try catalog.loadCatalog(transaction, catalogRef);
     while (cursor.high_hi > live_count and (try Column.get(transaction, v.live_col_ref, cursor.high_hi - 1)) == 0) : (cursor.high_hi -= 1) {}
 }
 
@@ -187,8 +187,8 @@ fn advanceHighCursor(transaction: *WriteTransaction, cat: Reference, live_count:
 // in [live_count, next_row) before the truncate. A debug-only bounded scan
 // asserts exactly that immediately before truncating. Returns the updated
 // catalog ref, the rows moved this call, and whether packing finished.
-pub fn compactStep(transaction: *WriteTransaction, cat: Reference, type_id: u16, budget: usize) !struct { cat: Reference, moved: usize, done: bool } {
-    var cur = cat;
+pub fn compactStep(transaction: *WriteTransaction, catalogRef: Reference, type_id: u16, budget: usize) !struct { catalogRef: Reference, moved: usize, done: bool } {
+    var cur = catalogRef;
     const lc = try liveCount(transaction, cur);
     const next_row = (try catalog.loadCatalog(transaction, cur)).next_row;
 
@@ -196,7 +196,7 @@ pub fn compactStep(transaction: *WriteTransaction, cat: Reference, type_id: u16,
     // gone (next_row == live_count), so there is nothing to truncate.
     if (next_row == lc) {
         transaction.database.compact_cursor = null;
-        return .{ .cat = cur, .moved = 0, .done = true };
+        return .{ .catalogRef = cur, .moved = 0, .done = true };
     }
 
     // Resume the stored cursor only if it pins this exact CATALOG (the ref
@@ -204,9 +204,9 @@ pub fn compactStep(transaction: *WriteTransaction, cat: Reference, type_id: u16,
     // shape; otherwise (another type, churn, or a fresh run) restart the scan.
     var cursor: CompactCursor = blk: {
         if (transaction.database.compact_cursor) |c| {
-            if (c.type_id == type_id and c.cat == cat and c.live_count == lc and c.next_row == next_row) break :blk c;
+            if (c.type_id == type_id and c.catalogRef == catalogRef and c.live_count == lc and c.next_row == next_row) break :blk c;
         }
-        break :blk .{ .type_id = type_id, .cat = cat, .live_count = lc, .next_row = next_row, .hole_lo = 0, .high_hi = next_row };
+        break :blk .{ .type_id = type_id, .catalogRef = catalogRef, .live_count = lc, .next_row = next_row, .hole_lo = 0, .high_hi = next_row };
     };
 
     var moved: usize = 0;
@@ -233,14 +233,14 @@ pub fn compactStep(transaction: *WriteTransaction, cat: Reference, type_id: u16,
         try assertTailDead(transaction, cur, lc, next_row);
         cur = try truncatePacked(transaction, cur, lc);
         transaction.database.compact_cursor = null;
-        return .{ .cat = cur, .moved = moved, .done = true };
+        return .{ .catalogRef = cur, .moved = moved, .done = true };
     }
 
     // Persist against the catalog ref the NEXT call will see: relocations COW
     // the catalog, so `cur` is what the caller publishes and later re-derives.
-    cursor.cat = cur;
+    cursor.catalogRef = cur;
     transaction.database.compact_cursor = cursor;
-    return .{ .cat = cur, .moved = moved, .done = false };
+    return .{ .catalogRef = cur, .moved = moved, .done = false };
 }
 
 // ---------------------------------------------------------------------------
@@ -258,8 +258,8 @@ inline fn mixPk(pk: u64) u64 {
 // Walk a catalog's key->row index, reading each live row's primary key (prop 0),
 // and fold the pk set into `fold` (XOR of mixed pks) while counting rows. The
 // fold is identity-preserving and order-independent.
-fn foldPks(allocator: std.mem.Allocator, transaction: anytype, cat: Reference, fold: *u64, count: *u64) !void {
-    const v = try catalog.loadCatalog(transaction, cat);
+fn foldPks(allocator: std.mem.Allocator, transaction: anytype, catalogRef: Reference, fold: *u64, count: *u64) !void {
+    const v = try catalog.loadCatalog(transaction, catalogRef);
     const prop0 = v.propColRef(0);
     var pairs = try collectKeyRowPairs(allocator, transaction, v.keyrow_index_ref);
     defer pairs.deinit(allocator);

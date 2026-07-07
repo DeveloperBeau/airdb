@@ -139,14 +139,14 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     while (inserted < pitr_rows) {
         const this_batch = @min(pitr_batch, pitr_rows - inserted);
         var w = try pitrDatabase.beginWrite();
-        var cat = pitrDatabase.active_root;
+        var catalogRef = pitrDatabase.active_root;
         var j: usize = 0;
         while (j < this_batch) : (j += 1) {
             const pk: u64 = inserted + j;
-            const r = try rows.insert(&w, cat, &.{ pk, pk *% 7 });
-            cat = r.cat;
+            const r = try rows.insert(&w, catalogRef, &.{ pk, pk *% 7 });
+            catalogRef = r.catalogRef;
         }
-        w.setRoot(cat);
+        w.setRoot(catalogRef);
         const v = try w.commit();
         if (inserted == 0) v_old = v; // pks [0, pitr_batch) exist from here on
         inserted += this_batch;
@@ -161,7 +161,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     defer lat_latest.deinit(alloc);
     {
         var rl = try pitrDatabase.beginRead();
-        const cat = rl.root();
+        const catalogRef = rl.root();
         var x: u64 = 0x9E3779B97F4A7C15;
         var k: usize = 0;
         while (k < pitr_lookups) : (k += 1) {
@@ -171,7 +171,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
             const pk: u64 = x % pk_mod;
             var out: [2]u64 = undefined;
             const t0 = nowNs(io);
-            _ = try rows.getByPk(&rl, cat, pk, &out);
+            _ = try rows.getByPk(&rl, catalogRef, pk, &out);
             const dt: u64 = @intCast(nowNs(io) - t0);
             try lat_latest.add(alloc, dt);
         }
@@ -183,7 +183,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     defer lat_hist.deinit(alloc);
     {
         var rh = try pitrDatabase.beginReadAt(v_old);
-        const cat = rh.root();
+        const catalogRef = rh.root();
         var x: u64 = 0x9E3779B97F4A7C15;
         var k: usize = 0;
         while (k < pitr_lookups) : (k += 1) {
@@ -193,7 +193,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
             const pk: u64 = x % pk_mod;
             var out: [2]u64 = undefined;
             const t0 = nowNs(io);
-            _ = try rows.getByPk(&rh, cat, pk, &out);
+            _ = try rows.getByPk(&rh, catalogRef, pk, &out);
             const dt: u64 = @intCast(nowNs(io) - t0);
             try lat_hist.add(alloc, dt);
         }

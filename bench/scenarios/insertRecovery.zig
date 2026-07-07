@@ -45,7 +45,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     errdefer database.deinit();
 
     // Simple two-int type: {pk, value}. The first value is the primary key.
-    var cat: Reference = blk: {
+    var catalogRef: Reference = blk: {
         var w = try database.beginWrite();
         const c = try catalog.create(&w, 2);
         w.setRoot(c);
@@ -57,14 +57,14 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     while (inserted < ctx.n) {
         const this_batch = @min(batch_size, ctx.n - inserted);
         var w = try database.beginWrite();
-        cat = database.active_root; // reload the committed catalog ref
+        catalogRef = database.active_root; // reload the committed catalog ref
         var j: usize = 0;
         while (j < this_batch) : (j += 1) {
             const pk: u64 = inserted + j;
-            const r = try rows.insert(&w, cat, &.{ pk, pk });
-            cat = r.cat;
+            const r = try rows.insert(&w, catalogRef, &.{ pk, pk });
+            catalogRef = r.catalogRef;
         }
-        w.setRoot(cat);
+        w.setRoot(catalogRef);
         _ = try w.commit();
         inserted += this_batch;
     }
@@ -89,9 +89,9 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     // forcing the freshly reopened mapping live. Time a single lookup with it.
     const read_start = nowNs(io);
     var r = try reopened.beginRead();
-    cat = r.root();
+    catalogRef = r.root();
     var out: [2]u64 = undefined;
-    _ = try rows.getByPk(&r, cat, 0, &out);
+    _ = try rows.getByPk(&r, catalogRef, 0, &out);
     const first_read_ns: u64 = @intCast(nowNs(io) - read_start);
     r.end();
 

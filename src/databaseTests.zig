@@ -287,15 +287,15 @@ test "verifyIntegrity detects a corrupted value index" {
     {
         var w = try database.beginWrite();
         const dir = database.active_root;
-        const cat = try typedir.catalogRef(&w, dir, tid);
-        const cv = try catalog.loadCatalog(&w, cat);
-        const okey = (try catalog.pkToOkey(&w, cat, 0)).?; // row pk 0 has value 0
+        const catalogRef = try typedir.catalogRef(&w, dir, tid);
+        const cv = try catalog.loadCatalog(&w, catalogRef);
+        const okey = (try catalog.pkToOkey(&w, catalogRef, 0)).?; // row pk 0 has value 0
         const bogus_value: u64 = 999_999; // no row carries this value
         var set_root = try Index.create(&w);
         set_root = try Index.insert(&w, set_root, okey, 1);
         const new_vi = try Index.insert(&w, cv.valueIndexRef(p), bogus_value, set_root);
-        const new_cat = try catalog.setValueIndexRef(&w, cat, p, new_vi);
-        const new_dir = try typedir.setCatalogRef(&w, dir, tid, new_cat);
+        const newCatalog = try catalog.setValueIndexRef(&w, catalogRef, p, new_vi);
+        const new_dir = try typedir.setCatalogRef(&w, dir, tid, newCatalog);
         w.setRoot(new_dir);
         _ = try w.commit();
     }
@@ -326,9 +326,9 @@ test "verifyIntegrity passes on a clean link graph after churn" {
         dir = (try typeRouting.insert(&w, dir, 1, &.{ .{ .int = 2 }, .{ .link = b.row }, .{ .link_set = &.{} } })).dir;
         // Churn: move source 1's to-one link, drop one set member.
         dir = try typeRouting.setLink(&w, dir, 1, 1, 1, b.row);
-        const src_cat = try typedir.catalogRef(&w, dir, 1);
-        const new_cat = try links.linkSetRemove(&w, src_cat, 1, 2, a.row);
-        dir = try typedir.setCatalogRef(&w, dir, 1, new_cat);
+        const sourceCatalog = try typedir.catalogRef(&w, dir, 1);
+        const newCatalog = try links.linkSetRemove(&w, sourceCatalog, 1, 2, a.row);
+        dir = try typedir.setCatalogRef(&w, dir, 1, newCatalog);
         w.setRoot(dir);
         _ = try w.commit();
     }
@@ -363,11 +363,11 @@ test "verifyIntegrity detects a corrupted backlink index" {
     {
         var w = try database.beginWrite();
         const dir = database.active_root;
-        const cat = try typedir.catalogRef(&w, dir, 0);
-        const cv = try catalog.loadCatalog(&w, cat);
+        const catalogRef = try typedir.catalogRef(&w, dir, 0);
+        const cv = try catalog.loadCatalog(&w, catalogRef);
         const new_bl = try Index.remove(&w, cv.backlinkRef(1), target_okey);
-        const new_cat = try catalog.setBacklinkRef(&w, cat, 1, new_bl);
-        const new_dir = try typedir.setCatalogRef(&w, dir, 0, new_cat);
+        const newCatalog = try catalog.setBacklinkRef(&w, catalogRef, 1, new_bl);
+        const new_dir = try typedir.setCatalogRef(&w, dir, 0, newCatalog);
         w.setRoot(new_dir);
         _ = try w.commit();
     }
@@ -790,21 +790,21 @@ test "beginReadAt opens a past version within the retention window" {
     var vc: u64 = undefined;
     {
         var w = try database.beginWrite();
-        var cat = try catalog.create(&w, 2);
-        cat = (try rows.insert(&w, cat, &.{ 1, 100 })).cat;
-        w.setRoot(cat);
+        var catalogRef = try catalog.create(&w, 2);
+        catalogRef = (try rows.insert(&w, catalogRef, &.{ 1, 100 })).catalogRef;
+        w.setRoot(catalogRef);
         va = try w.commit();
     }
     {
         var w = try database.beginWrite();
-        const cat = (try rows.insert(&w, w.new_root, &.{ 2, 200 })).cat;
-        w.setRoot(cat);
+        const catalogRef = (try rows.insert(&w, w.new_root, &.{ 2, 200 })).catalogRef;
+        w.setRoot(catalogRef);
         vb = try w.commit();
     }
     {
         var w = try database.beginWrite();
-        const cat = (try rows.insert(&w, w.new_root, &.{ 3, 300 })).cat;
-        w.setRoot(cat);
+        const catalogRef = (try rows.insert(&w, w.new_root, &.{ 3, 300 })).catalogRef;
+        w.setRoot(catalogRef);
         vc = try w.commit();
     }
 
@@ -912,15 +912,15 @@ test "beginReadAt rejects a version aged out of the retention window" {
     var va: u64 = undefined;
     {
         var w = try database.beginWrite();
-        var cat = try catalog.create(&w, 2);
-        cat = (try rows.insert(&w, cat, &.{ 1, 100 })).cat;
-        w.setRoot(cat);
+        var catalogRef = try catalog.create(&w, 2);
+        catalogRef = (try rows.insert(&w, catalogRef, &.{ 1, 100 })).catalogRef;
+        w.setRoot(catalogRef);
         va = try w.commit();
     }
     {
         var w = try database.beginWrite();
-        const cat = (try rows.insert(&w, w.new_root, &.{ 2, 200 })).cat;
-        w.setRoot(cat);
+        const catalogRef = (try rows.insert(&w, w.new_root, &.{ 2, 200 })).catalogRef;
+        w.setRoot(catalogRef);
         _ = try w.commit();
     }
     // v_a is older than active - retain_versions(0) -> aged out.
@@ -997,10 +997,10 @@ fn churnNetZero(path: []const u8, live: u64, iters: u64, auto: bool) !struct { n
 
     var r = try database.beginRead();
     defer r.end();
-    const cat = try typedir.catalogRef(&r, r.root(), tid);
+    const catalogRef = try typedir.catalogRef(&r, r.root(), tid);
     return .{
-        .next_row = (try catalog.loadCatalog(&r, cat)).next_row,
-        .live = try compaction.liveCount(&r, cat),
+        .next_row = (try catalog.loadCatalog(&r, catalogRef)).next_row,
+        .live = try compaction.liveCount(&r, catalogRef),
     };
 }
 
@@ -1160,8 +1160,8 @@ test "the compaction cursor never resumes across types" {
         while (pk < 12) : (pk += 1) {
             try testing.expect((try typeRouting.get(&r, r.root(), t, pk, &out)) != null);
         }
-        const cat = try typedir.catalogRef(&r, r.root(), t);
-        try testing.expectEqual(@as(u64, 4), (try catalog.loadCatalog(&r, cat)).next_row);
+        const catalogRef = try typedir.catalogRef(&r, r.root(), t);
+        try testing.expectEqual(@as(u64, 4), (try catalog.loadCatalog(&r, catalogRef)).next_row);
     }
 }
 
@@ -1247,9 +1247,9 @@ test "maybeCompactStep is a no-op when nothing to compact" {
     // The type is untouched: all three rows remain live and packed.
     var r = try database.beginRead();
     defer r.end();
-    const cat = try typedir.catalogRef(&r, r.root(), tid);
-    try testing.expectEqual(@as(u64, 3), try compaction.liveCount(&r, cat));
-    try testing.expectEqual(@as(u64, 3), (try catalog.loadCatalog(&r, cat)).next_row);
+    const catalogRef = try typedir.catalogRef(&r, r.root(), tid);
+    try testing.expectEqual(@as(u64, 3), try compaction.liveCount(&r, catalogRef));
+    try testing.expectEqual(@as(u64, 3), (try catalog.loadCatalog(&r, catalogRef)).next_row);
 }
 
 test "a free list spanning multiple chunks survives commit and reopen" {

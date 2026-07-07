@@ -46,38 +46,38 @@ fn blRemove(transaction: *WriteTransaction, bl_ref: Reference, target: u64, sour
 }
 
 // Add source->target to link property p's backlink index. Returns new catalog.
-pub fn addBacklink(transaction: *WriteTransaction, cat: Reference, p: usize, target: u64, source: u64) !Reference {
-    const v = try catalog.loadCatalog(transaction, cat);
+pub fn addBacklink(transaction: *WriteTransaction, catalogRef: Reference, p: usize, target: u64, source: u64) !Reference {
+    const v = try catalog.loadCatalog(transaction, catalogRef);
     const new_bl = try blAdd(transaction, v.backlinkRef(p), target, source);
-    return try catalog.setBacklinkRef(transaction, cat, p, new_bl);
+    return try catalog.setBacklinkRef(transaction, catalogRef, p, new_bl);
 }
 
 // Remove source from link property p's backlink set for target.
-pub fn removeBacklink(transaction: *WriteTransaction, cat: Reference, p: usize, target: u64, source: u64) !Reference {
-    const v = try catalog.loadCatalog(transaction, cat);
+pub fn removeBacklink(transaction: *WriteTransaction, catalogRef: Reference, p: usize, target: u64, source: u64) !Reference {
+    const v = try catalog.loadCatalog(transaction, catalogRef);
     const new_bl = try blRemove(transaction, v.backlinkRef(p), target, source);
-    return try catalog.setBacklinkRef(transaction, cat, p, new_bl);
+    return try catalog.setBacklinkRef(transaction, catalogRef, p, new_bl);
 }
 
 // Read the target okey of link property `prop` for the object with primary key
 // `pk`. Returns null if the link is unset (or the object is absent).
-pub fn getLink(transaction: anytype, cat: Reference, pk: u64, prop: usize) !?u64 {
-    const r = (try catalog.resolveProp(transaction, cat, pk, prop)) orelse return null;
+pub fn getLink(transaction: anytype, catalogRef: Reference, pk: u64, prop: usize) !?u64 {
+    const r = (try catalog.resolveProp(transaction, catalogRef, pk, prop)) orelse return null;
     const raw = try Column.get(transaction, r.prop_col, r.row);
     return if (raw == 0) null else raw - 1;
 }
 
 // Number of objects whose link property `prop` points at `target` okey.
-pub fn backlinkCount(transaction: anytype, cat: Reference, prop: usize, target: u64) !u64 {
-    const v = try catalog.loadCatalog(transaction, cat);
+pub fn backlinkCount(transaction: anytype, catalogRef: Reference, prop: usize, target: u64) !u64 {
+    const v = try catalog.loadCatalog(transaction, catalogRef);
     const set_root = (try Index.get(transaction, v.backlinkRef(prop), target)) orelse return 0;
     return try Index.count(transaction, set_root);
 }
 
 // True when `source` is recorded in link property `prop`'s backlink set for
 // `target`.
-pub fn backlinkContains(transaction: anytype, cat: Reference, prop: usize, target: u64, source: u64) !bool {
-    const v = try catalog.loadCatalog(transaction, cat);
+pub fn backlinkContains(transaction: anytype, catalogRef: Reference, prop: usize, target: u64, source: u64) !bool {
+    const v = try catalog.loadCatalog(transaction, catalogRef);
     const set_root = (try Index.get(transaction, v.backlinkRef(prop), target)) orelse return false;
     return (try Index.get(transaction, set_root, source)) != null;
 }
@@ -85,13 +85,13 @@ pub fn backlinkContains(transaction: anytype, cat: Reference, prop: usize, targe
 // Collect the source okeys whose link property `prop` points at `target`.
 pub fn backlinkCollect(
     transaction: anytype,
-    cat: Reference,
+    catalogRef: Reference,
     prop: usize,
     target: u64,
     out: *std.ArrayList(u64),
     allocator: std.mem.Allocator,
 ) !void {
-    const v = try catalog.loadCatalog(transaction, cat);
+    const v = try catalog.loadCatalog(transaction, catalogRef);
     const set_root = (try Index.get(transaction, v.backlinkRef(prop), target)) orelse return;
     const Sink = struct {
         list: *std.ArrayList(u64),
@@ -111,46 +111,46 @@ pub fn backlinkCollect(
 // (nullifyInboundInCatalog, cleanOutboundInCatalog, rebuildBacklinks) resolves
 // sources through the key->row index. Recording the row here would corrupt the
 // graph the moment a source row is relocated.
-pub fn setLink(transaction: *WriteTransaction, cat: Reference, pk: u64, prop: usize, target: ?u64) !Reference {
-    const r0 = (try catalog.resolveProp(transaction, cat, pk, prop)) orelse return cat;
-    const okey = (try catalog.pkToOkey(transaction, cat, pk)) orelse return cat;
+pub fn setLink(transaction: *WriteTransaction, catalogRef: Reference, pk: u64, prop: usize, target: ?u64) !Reference {
+    const r0 = (try catalog.resolveProp(transaction, catalogRef, pk, prop)) orelse return catalogRef;
+    const okey = (try catalog.pkToOkey(transaction, catalogRef, pk)) orelse return catalogRef;
     const row = r0.row;
     const old_raw = try Column.get(transaction, r0.prop_col, row);
     const old_target: ?u64 = if (old_raw == 0) null else old_raw - 1;
-    if (old_target == target) return cat; // unchanged
+    if (old_target == target) return catalogRef; // unchanged
 
     const new_raw: u64 = if (target) |t| t + 1 else 0;
-    var new_cat = try catalog.replaceCollRoot(transaction, cat, row, prop, new_raw);
-    if (old_target) |ot| new_cat = try removeBacklink(transaction, new_cat, prop, ot, okey);
-    if (target) |nt| new_cat = try addBacklink(transaction, new_cat, prop, nt, okey);
-    return new_cat;
+    var newCatalog = try catalog.replaceCollRoot(transaction, catalogRef, row, prop, new_raw);
+    if (old_target) |ot| newCatalog = try removeBacklink(transaction, newCatalog, prop, ot, okey);
+    if (target) |nt| newCatalog = try addBacklink(transaction, newCatalog, prop, nt, okey);
+    return newCatalog;
 }
 
 // ---------------------------------------------------------------------------
 // To-many links (link_set): a set of target okeys with backlink maintenance.
 // ---------------------------------------------------------------------------
 
-pub fn linkSetCount(transaction: anytype, cat: Reference, pk: u64, prop: usize) !?u64 {
-    const r = (try catalog.resolveProp(transaction, cat, pk, prop)) orelse return null;
+pub fn linkSetCount(transaction: anytype, catalogRef: Reference, pk: u64, prop: usize) !?u64 {
+    const r = (try catalog.resolveProp(transaction, catalogRef, pk, prop)) orelse return null;
     const set_root = try Column.get(transaction, r.prop_col, r.row);
     return try Index.count(transaction, set_root);
 }
 
-pub fn linkSetContains(transaction: anytype, cat: Reference, pk: u64, prop: usize, target: u64) !bool {
-    const r = (try catalog.resolveProp(transaction, cat, pk, prop)) orelse return error.NotFound;
+pub fn linkSetContains(transaction: anytype, catalogRef: Reference, pk: u64, prop: usize, target: u64) !bool {
+    const r = (try catalog.resolveProp(transaction, catalogRef, pk, prop)) orelse return error.NotFound;
     const set_root = try Column.get(transaction, r.prop_col, r.row);
     return (try Index.get(transaction, set_root, target)) != null;
 }
 
 pub fn linkSetCollect(
     transaction: anytype,
-    cat: Reference,
+    catalogRef: Reference,
     pk: u64,
     prop: usize,
     out: *std.ArrayList(u64),
     allocator: std.mem.Allocator,
 ) !void {
-    const r = (try catalog.resolveProp(transaction, cat, pk, prop)) orelse return error.NotFound;
+    const r = (try catalog.resolveProp(transaction, catalogRef, pk, prop)) orelse return error.NotFound;
     const set_root = try Column.get(transaction, r.prop_col, r.row);
     const Sink = struct {
         list: *std.ArrayList(u64),
@@ -164,39 +164,39 @@ pub fn linkSetCollect(
 
 // Add `target` to the to-many link set of object `pk`; records the backlink.
 // No-op if already a member. The backlink source is the okey (see setLink).
-pub fn linkSetAdd(transaction: *WriteTransaction, cat: Reference, pk: u64, prop: usize, target: u64) !Reference {
-    const r = (try catalog.resolveProp(transaction, cat, pk, prop)) orelse return error.NotFound;
-    const okey = (try catalog.pkToOkey(transaction, cat, pk)) orelse return error.NotFound;
+pub fn linkSetAdd(transaction: *WriteTransaction, catalogRef: Reference, pk: u64, prop: usize, target: u64) !Reference {
+    const r = (try catalog.resolveProp(transaction, catalogRef, pk, prop)) orelse return error.NotFound;
+    const okey = (try catalog.pkToOkey(transaction, catalogRef, pk)) orelse return error.NotFound;
     const row = r.row;
     const old_root = try Column.get(transaction, r.prop_col, row);
-    if ((try Index.get(transaction, old_root, target)) != null) return cat; // already a member
+    if ((try Index.get(transaction, old_root, target)) != null) return catalogRef; // already a member
     const new_root = try Index.insert(transaction, old_root, target, 1);
-    var new_cat = try catalog.replaceCollRoot(transaction, cat, row, prop, new_root);
-    new_cat = try addBacklink(transaction, new_cat, prop, target, okey);
-    return new_cat;
+    var newCatalog = try catalog.replaceCollRoot(transaction, catalogRef, row, prop, new_root);
+    newCatalog = try addBacklink(transaction, newCatalog, prop, target, okey);
+    return newCatalog;
 }
 
 // Remove `target` from the to-many link set of object `pk`; drops the backlink.
 // No-op if not a member. The backlink source is the okey (see setLink).
-pub fn linkSetRemove(transaction: *WriteTransaction, cat: Reference, pk: u64, prop: usize, target: u64) !Reference {
-    const r = (try catalog.resolveProp(transaction, cat, pk, prop)) orelse return error.NotFound;
-    const okey = (try catalog.pkToOkey(transaction, cat, pk)) orelse return error.NotFound;
+pub fn linkSetRemove(transaction: *WriteTransaction, catalogRef: Reference, pk: u64, prop: usize, target: u64) !Reference {
+    const r = (try catalog.resolveProp(transaction, catalogRef, pk, prop)) orelse return error.NotFound;
+    const okey = (try catalog.pkToOkey(transaction, catalogRef, pk)) orelse return error.NotFound;
     const row = r.row;
     const old_root = try Column.get(transaction, r.prop_col, row);
-    if ((try Index.get(transaction, old_root, target)) == null) return cat; // not a member
+    if ((try Index.get(transaction, old_root, target)) == null) return catalogRef; // not a member
     const new_root = try Index.remove(transaction, old_root, target);
-    var new_cat = try catalog.replaceCollRoot(transaction, cat, row, prop, new_root);
-    new_cat = try removeBacklink(transaction, new_cat, prop, target, okey);
-    return new_cat;
+    var newCatalog = try catalog.replaceCollRoot(transaction, catalogRef, row, prop, new_root);
+    newCatalog = try removeBacklink(transaction, newCatalog, prop, target, okey);
+    return newCatalog;
 }
 
 // Nullify every inbound link pointing at `okey` (and drop those backlink
 // entries) for each link/link_set property, restricted to properties where
 // `match_all` is true OR the property's link target type equals `target_type`.
 // Returns the new catalog ref.
-pub fn nullifyInboundInCatalog(transaction: *WriteTransaction, cat: Reference, okey: u64, target_type: u16, match_all: bool) !Reference {
-    var cur = cat;
-    const v0 = try catalog.loadCatalog(transaction, cat);
+pub fn nullifyInboundInCatalog(transaction: *WriteTransaction, catalogRef: Reference, okey: u64, target_type: u16, match_all: bool) !Reference {
+    var cur = catalogRef;
+    const v0 = try catalog.loadCatalog(transaction, catalogRef);
     const pc = v0.prop_count;
     const alloc = transaction.database.store.allocator;
     var p: usize = 0;
@@ -249,8 +249,8 @@ pub fn nullifyInboundInCatalog(transaction: *WriteTransaction, cat: Reference, o
 // resurrecting a dangling link. The SELF-link case passes false: bumping the
 // row being deleted would make the follow-up tombstone's version check fail
 // forever, leaving self-linked objects undeletable.
-fn nullifySourceLink(transaction: *WriteTransaction, cat: Reference, prop: usize, src_row: u64, bump_version: bool) !Reference {
-    var s = try catalog.CatalogSnapshot.load(transaction, cat);
+fn nullifySourceLink(transaction: *WriteTransaction, catalogRef: Reference, prop: usize, src_row: u64, bump_version: bool) !Reference {
+    var s = try catalog.CatalogSnapshot.load(transaction, catalogRef);
     s.props[prop].col = try Column.set(transaction, s.props[prop].col, src_row, 0);
     if (bump_version) {
         s.version_col_ref = try Column.set(transaction, s.version_col_ref, src_row, transaction.new_version);
@@ -261,8 +261,8 @@ fn nullifySourceLink(transaction: *WriteTransaction, cat: Reference, prop: usize
 // Nullify one source row's to-many link (the link_set path of inbound
 // nullify): remove `okey` from the source's set. `bump_version` follows the
 // same conflict-surfacing rule as nullifySourceLink.
-fn nullifySourceLinkSet(transaction: *WriteTransaction, cat: Reference, prop: usize, src_row: u64, okey: u64, bump_version: bool) !Reference {
-    var s = try catalog.CatalogSnapshot.load(transaction, cat);
+fn nullifySourceLinkSet(transaction: *WriteTransaction, catalogRef: Reference, prop: usize, src_row: u64, okey: u64, bump_version: bool) !Reference {
+    var s = try catalog.CatalogSnapshot.load(transaction, catalogRef);
     const src_set = try Column.get(transaction, s.props[prop].col, src_row);
     const new_set = try Index.remove(transaction, src_set, okey);
     s.props[prop].col = try Column.set(transaction, s.props[prop].col, src_row, new_set);
@@ -275,21 +275,21 @@ fn nullifySourceLinkSet(transaction: *WriteTransaction, cat: Reference, prop: us
 // Drop the whole backlink set for okey under property `prop` (its inbound
 // links are now clear): remove the outer entry and free the set's nodes,
 // rather than inserting a fresh empty set and orphaning the old tree.
-fn dropBacklinkSet(transaction: *WriteTransaction, cat: Reference, prop: usize, okey: u64) !Reference {
-    const vv = try catalog.loadCatalog(transaction, cat);
+fn dropBacklinkSet(transaction: *WriteTransaction, catalogRef: Reference, prop: usize, okey: u64) !Reference {
+    const vv = try catalog.loadCatalog(transaction, catalogRef);
     if (try Index.get(transaction, vv.backlinkRef(prop), okey)) |set_root| {
         const new_bl = try Index.remove(transaction, vv.backlinkRef(prop), okey);
         try Index.freeTree(transaction, set_root);
-        return catalog.setBacklinkRef(transaction, cat, prop, new_bl);
+        return catalog.setBacklinkRef(transaction, catalogRef, prop, new_bl);
     }
-    return cat;
+    return catalogRef;
 }
 
 // Remove `okey`'s own outbound link entries from its targets' backlink sets for
 // each link/link_set property. Returns the new catalog ref.
-pub fn cleanOutboundInCatalog(transaction: *WriteTransaction, cat: Reference, okey: u64) !Reference {
-    var cur = cat;
-    const v0 = try catalog.loadCatalog(transaction, cat);
+pub fn cleanOutboundInCatalog(transaction: *WriteTransaction, catalogRef: Reference, okey: u64) !Reference {
+    var cur = catalogRef;
+    const v0 = try catalog.loadCatalog(transaction, catalogRef);
     const pc = v0.prop_count;
     const alloc = transaction.database.store.allocator;
     var p: usize = 0;
@@ -333,8 +333,8 @@ pub fn cleanOutboundInCatalog(transaction: *WriteTransaction, cat: Reference, ok
 // For each link property: (1) nullify every inbound link pointing at `okey`
 // (and drop those backlink entries); (2) remove the deleted row's own outbound
 // link entry from its target's backlink set. Returns the new catalog ref.
-pub fn fixBacklinksForDelete(transaction: *WriteTransaction, cat: Reference, okey: u64) !Reference {
-    const c1 = try nullifyInboundInCatalog(transaction, cat, okey, 0, true);
+pub fn fixBacklinksForDelete(transaction: *WriteTransaction, catalogRef: Reference, okey: u64) !Reference {
+    const c1 = try nullifyInboundInCatalog(transaction, catalogRef, okey, 0, true);
     return try cleanOutboundInCatalog(transaction, c1, okey);
 }
 

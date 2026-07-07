@@ -103,8 +103,8 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     const bulk_start = nowNs(io);
     {
         var w = try databaseA.beginWrite();
-        const new_cat = try bulk.bulkAppendOrInsert(&w, w.new_root, batch);
-        w.setRoot(new_cat);
+        const newCatalog = try bulk.bulkAppendOrInsert(&w, w.new_root, batch);
+        w.setRoot(newCatalog);
         _ = try w.commit();
     }
     const bulk_ns: u64 = @intCast(nowNs(io) - bulk_start);
@@ -123,14 +123,14 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     while (inserted < m) {
         const this_batch = @min(batch_size, m - inserted);
         var w = try databaseB.beginWrite();
-        var cat: Reference = databaseB.active_root; // reload the committed catalog ref
+        var catalogRef: Reference = databaseB.active_root; // reload the committed catalog ref
         var j: usize = 0;
         while (j < this_batch) : (j += 1) {
             const pk: u64 = base + inserted + j;
-            const r = try rows.insert(&w, cat, &.{ pk, pk });
-            cat = r.cat;
+            const r = try rows.insert(&w, catalogRef, &.{ pk, pk });
+            catalogRef = r.catalogRef;
         }
-        w.setRoot(cat);
+        w.setRoot(catalogRef);
         _ = try w.commit();
         inserted += this_batch;
     }

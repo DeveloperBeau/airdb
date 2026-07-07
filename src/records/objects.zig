@@ -31,8 +31,8 @@ pub const DeleteResult = rows.DeleteResult;
 
 // insertTyped encodes a []Value row into raw u64 storage, allocating a blob
 // node for each .blob property, then delegates to rows.insert.
-pub fn insertTyped(transaction: *WriteTransaction, cat: Reference, values: []const Value) !struct { cat: Reference, row: u64 } {
-    const v = try loadCatalog(transaction, cat);
+pub fn insertTyped(transaction: *WriteTransaction, catalogRef: Reference, values: []const Value) !struct { catalogRef: Reference, row: u64 } {
+    const v = try loadCatalog(transaction, catalogRef);
     const pc = v.prop_count;
     std.debug.assert(values.len == pc);
     std.debug.assert(pc <= max_prop_count);
@@ -66,28 +66,28 @@ pub fn insertTyped(transaction: *WriteTransaction, cat: Reference, values: []con
             .link_set => try collections.buildSetInt(transaction, values[i].link_set),
         };
     }
-    const r = try rows.insert(transaction, cat, raw[0..pc]);
+    const r = try rows.insert(transaction, catalogRef, raw[0..pc]);
     // Maintain backlinks for any links the new row carries.
-    var cat_ref = r.cat;
+    var updatedCatalog = r.catalogRef;
     {
         var p: usize = 0;
         while (p < pc) : (p += 1) {
             switch (kinds[p]) {
                 .link => {
                     if (values[p].link) |target| {
-                        cat_ref = try links.addBacklink(transaction, cat_ref, p, target, r.row);
+                        updatedCatalog = try links.addBacklink(transaction, updatedCatalog, p, target, r.row);
                     }
                 },
                 .link_set => {
                     for (values[p].link_set) |target| {
-                        cat_ref = try links.addBacklink(transaction, cat_ref, p, target, r.row);
+                        updatedCatalog = try links.addBacklink(transaction, updatedCatalog, p, target, r.row);
                     }
                 },
                 else => {},
             }
         }
     }
-    return .{ .cat = cat_ref, .row = r.row };
+    return .{ .catalogRef = updatedCatalog, .row = r.row };
 }
 
 // getTyped reads a row by primary key and decodes each property into a Value.
@@ -95,8 +95,8 @@ pub fn insertTyped(transaction: *WriteTransaction, cat: Reference, values: []con
 // storage; a blob larger than the inline cap (stored chunked) decodes to a
 // .blob_ref the caller materializes with blob.getAlloc.
 // Returns the row version, or null when the key is not found.
-pub fn getTyped(transaction: anytype, cat: Reference, pk: u64, out: []Value) !?u64 {
-    const v = try loadCatalog(transaction, cat);
+pub fn getTyped(transaction: anytype, catalogRef: Reference, pk: u64, out: []Value) !?u64 {
+    const v = try loadCatalog(transaction, catalogRef);
     const pc = v.prop_count;
     std.debug.assert(out.len == pc);
     std.debug.assert(pc <= max_prop_count);
@@ -107,7 +107,7 @@ pub fn getTyped(transaction: anytype, cat: Reference, pk: u64, out: []Value) !?u
         while (j < pc) : (j += 1) kinds[j] = v.kind(j);
     }
     var raw: [max_prop_count]u64 = undefined;
-    const ver = (try rows.getByPk(transaction, cat, pk, raw[0..pc])) orelse return null;
+    const ver = (try rows.getByPk(transaction, catalogRef, pk, raw[0..pc])) orelse return null;
     var i: usize = 0;
     while (i < pc) : (i += 1) {
         out[i] = switch (kinds[i]) {
@@ -124,8 +124,8 @@ pub fn getTyped(transaction: anytype, cat: Reference, pk: u64, out: []Value) !?u
 }
 
 // getTypedByOkey decodes a row addressed by stable object key into Values.
-pub fn getTypedByOkey(transaction: anytype, cat: Reference, okey: u64, out: []Value) !?u64 {
-    const v = try loadCatalog(transaction, cat);
+pub fn getTypedByOkey(transaction: anytype, catalogRef: Reference, okey: u64, out: []Value) !?u64 {
+    const v = try loadCatalog(transaction, catalogRef);
     const pc = v.prop_count;
     std.debug.assert(out.len == pc);
     std.debug.assert(pc <= max_prop_count);
@@ -135,7 +135,7 @@ pub fn getTypedByOkey(transaction: anytype, cat: Reference, okey: u64, out: []Va
         while (j < pc) : (j += 1) kinds[j] = v.kind(j);
     }
     var raw: [max_prop_count]u64 = undefined;
-    const ver = (try rows.getByObjectKey(transaction, cat, okey, raw[0..pc])) orelse return null;
+    const ver = (try rows.getByObjectKey(transaction, catalogRef, okey, raw[0..pc])) orelse return null;
     var i: usize = 0;
     while (i < pc) : (i += 1) {
         out[i] = switch (kinds[i]) {
@@ -153,13 +153,13 @@ pub fn getTypedByOkey(transaction: anytype, cat: Reference, okey: u64, out: []Va
 
 // Delete an object and keep the graph consistent: nullify inbound links and
 // clean the deleted object's outbound backlink entries.
-pub fn deleteAndNullify(transaction: *WriteTransaction, cat: Reference, pk: u64, expected_version: u64) !DeleteResult {
-    const v = try loadCatalog(transaction, cat);
+pub fn deleteAndNullify(transaction: *WriteTransaction, catalogRef: Reference, pk: u64, expected_version: u64) !DeleteResult {
+    const v = try loadCatalog(transaction, catalogRef);
     const okey = (try Index.get(transaction, v.pk_index_ref, pk)) orelse return .not_found;
-    const row = (try catalog.okeyToRow(transaction, cat, okey)) orelse return .not_found;
+    const row = (try catalog.okeyToRow(transaction, catalogRef, okey)) orelse return .not_found;
     const cur_ver = try Column.get(transaction, v.version_col_ref, row);
     if (cur_ver != expected_version) return .{ .conflict = .{ .current_version = cur_ver } };
-    const fixed = try links.fixBacklinksForDelete(transaction, cat, okey);
+    const fixed = try links.fixBacklinksForDelete(transaction, catalogRef, okey);
     return try rows.delete(transaction, fixed, pk, expected_version);
 }
 
@@ -171,12 +171,12 @@ pub fn deleteAndNullify(transaction: *WriteTransaction, cat: Reference, pk: u64,
 // the version check that alone makes them safe.
 pub fn updateTyped(
     transaction: *WriteTransaction,
-    cat: Reference,
+    catalogRef: Reference,
     pk: u64,
     values: []const Value,
     expected_version: u64,
 ) !UpdateResult {
-    const v = try loadCatalog(transaction, cat);
+    const v = try loadCatalog(transaction, catalogRef);
     const pc = v.prop_count;
     std.debug.assert(values.len == pc);
     std.debug.assert(pc <= max_prop_count);
@@ -188,7 +188,7 @@ pub fn updateTyped(
     }
     // Step 1: read the current row into cur_raw.
     var cur_raw: [max_prop_count]u64 = undefined;
-    const current_version = (try rows.getByPk(transaction, cat, pk, cur_raw[0..pc])) orelse return .not_found;
+    const current_version = (try rows.getByPk(transaction, catalogRef, pk, cur_raw[0..pc])) orelse return .not_found;
     // Step 2: version check BEFORE freeing or allocating any blob.
     if (current_version != expected_version)
         return .{ .conflict = .{ .current_version = current_version } };
@@ -210,14 +210,14 @@ pub fn updateTyped(
         };
     }
     // Step 4: delegate to the core update; it will re-check the version (match).
-    const result = try rows.update(transaction, cat, pk, new_raw[0..pc], expected_version);
+    const result = try rows.update(transaction, catalogRef, pk, new_raw[0..pc], expected_version);
     // Step 5: maintain backlinks for any changed to-one link, mirroring
     // setLink. Skipping this left the old target's backlink set naming this
     // source forever and the new target's set missing it -- corrupting
     // nullify/cascade/block enforcement. The backlink source is the okey.
     switch (result) {
         .ok => |ok| {
-            var cat_out = ok.cat;
+            var updatedCatalog = ok.catalogRef;
             var changed = false;
             var p: usize = 0;
             while (p < pc) : (p += 1) {
@@ -225,12 +225,12 @@ pub fn updateTyped(
                 // The row was just updated successfully, so its pk must
                 // resolve; anything else is index divergence, and bailing
                 // mid-loop would leave the backlinks half-moved.
-                const okey = (try catalog.pkToOkey(transaction, cat_out, pk)) orelse return error.Corrupt;
-                if (cur_raw[p] != 0) cat_out = try links.removeBacklink(transaction, cat_out, p, cur_raw[p] - 1, okey);
-                if (new_raw[p] != 0) cat_out = try links.addBacklink(transaction, cat_out, p, new_raw[p] - 1, okey);
+                const okey = (try catalog.pkToOkey(transaction, updatedCatalog, pk)) orelse return error.Corrupt;
+                if (cur_raw[p] != 0) updatedCatalog = try links.removeBacklink(transaction, updatedCatalog, p, cur_raw[p] - 1, okey);
+                if (new_raw[p] != 0) updatedCatalog = try links.addBacklink(transaction, updatedCatalog, p, new_raw[p] - 1, okey);
                 changed = true;
             }
-            if (changed) return .{ .ok = .{ .cat = cat_out, .version = ok.version } };
+            if (changed) return .{ .ok = .{ .catalogRef = updatedCatalog, .version = ok.version } };
             return result;
         },
         else => return result,
@@ -241,11 +241,11 @@ pub fn updateTyped(
 // conflict or not_found.
 pub fn deleteTyped(
     transaction: *WriteTransaction,
-    cat: Reference,
+    catalogRef: Reference,
     pk: u64,
     expected_version: u64,
 ) !DeleteResult {
-    const v = try loadCatalog(transaction, cat);
+    const v = try loadCatalog(transaction, catalogRef);
     const pc = v.prop_count;
     std.debug.assert(pc <= max_prop_count);
     // Capture kinds/elems before any mutation.
@@ -260,12 +260,12 @@ pub fn deleteTyped(
     }
     // Step 1: read the current row.
     var cur_raw: [max_prop_count]u64 = undefined;
-    const current_version = (try rows.getByPk(transaction, cat, pk, cur_raw[0..pc])) orelse return .not_found;
+    const current_version = (try rows.getByPk(transaction, catalogRef, pk, cur_raw[0..pc])) orelse return .not_found;
     // Step 2: version check BEFORE freeing any blob.
     if (current_version != expected_version)
         return .{ .conflict = .{ .current_version = current_version } };
     // Step 3: delegate to the graph-safe delete (nullifies inbound links).
-    const result = try deleteAndNullify(transaction, cat, pk, expected_version);
+    const result = try deleteAndNullify(transaction, catalogRef, pk, expected_version);
     // Step 4: on the apply path, free the row's blob and collection storage.
     // This runs AFTER deleteAndNullify because the outbound backlink cleanup
     // reads the link_set roots; the tombstoned row's columns still hold the

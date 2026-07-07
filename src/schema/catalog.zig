@@ -259,7 +259,7 @@ pub const CatalogView = struct {
     }
 };
 
-// Deref the catalog at cat, read prop_count, then deref the full node and parse
+// Deref the catalog at catalogRef, read prop_count, then deref the full node and parse
 // all fixed fields. Returns a CatalogView whose bytes slice is valid for the
 // lifetime of the transaction.
 //
@@ -268,11 +268,11 @@ pub const CatalogView = struct {
 // come straight from the mapped file: a corrupted value must surface as
 // error.Corrupt, never as a panic (ReleaseSafe) or undefined behavior
 // (ReleaseFast) from an unchecked @enumFromInt.
-pub fn loadCatalog(transaction: anytype, cat: Reference) !CatalogView {
-    const pc_bytes = try transaction.deref(cat, 2);
+pub fn loadCatalog(transaction: anytype, catalogRef: Reference) !CatalogView {
+    const pc_bytes = try transaction.deref(catalogRef, 2);
     const prop_count = std.mem.readInt(u16, pc_bytes[0..2], .little);
     if (prop_count > max_prop_count) return error.Corrupt;
-    const bytes = try transaction.deref(cat, catalogSize(prop_count));
+    const bytes = try transaction.deref(catalogRef, catalogSize(prop_count));
     {
         const ko = kindsOffset(prop_count);
         const eo = elemsOffset(prop_count);
@@ -330,10 +330,10 @@ pub const CatalogSnapshot = struct {
     source: Reference,
     source_len: usize,
 
-    pub fn load(transaction: anytype, cat: Reference) !CatalogSnapshot {
-        const v = try loadCatalog(transaction, cat);
+    pub fn load(transaction: anytype, catalogRef: Reference) !CatalogSnapshot {
+        const v = try loadCatalog(transaction, catalogRef);
         var s: CatalogSnapshot = undefined;
-        s.source = cat;
+        s.source = catalogRef;
         s.source_len = catalogSize(v.prop_count);
         s.prop_count = v.prop_count;
         s.next_row = v.next_row;
@@ -414,36 +414,36 @@ pub const CatalogSnapshot = struct {
     }
 };
 
-pub fn propCount(transaction: anytype, cat: Reference) !PropCount {
-    const view = try loadCatalog(transaction, cat);
+pub fn propCount(transaction: anytype, catalogRef: Reference) !PropCount {
+    const view = try loadCatalog(transaction, catalogRef);
     return view.prop_count;
 }
 
 // liveCount returns the number of live rows tracked by the pk index.
-pub fn liveCount(transaction: anytype, cat: Reference) !u64 {
-    const view = try loadCatalog(transaction, cat);
+pub fn liveCount(transaction: anytype, catalogRef: Reference) !u64 {
+    const view = try loadCatalog(transaction, catalogRef);
     return Index.count(transaction, view.pk_index_ref);
 }
 
 // Resolve an object key to its physical row via the key-to-row index.
 // Returns null if the okey has no mapping.
-pub fn okeyToRow(transaction: anytype, cat: Reference, okey: u64) !?u64 {
-    const v = try loadCatalog(transaction, cat);
+pub fn okeyToRow(transaction: anytype, catalogRef: Reference, okey: u64) !?u64 {
+    const v = try loadCatalog(transaction, catalogRef);
     return Index.get(transaction, v.keyrow_index_ref, okey);
 }
 
 // Resolve a primary key to its stable object key via the pk index.
 // Returns null if the pk has no mapping.
-pub fn pkToOkey(transaction: anytype, cat: Reference, pk: u64) !?u64 {
-    const v = try loadCatalog(transaction, cat);
+pub fn pkToOkey(transaction: anytype, catalogRef: Reference, pk: u64) !?u64 {
+    const v = try loadCatalog(transaction, catalogRef);
     return Index.get(transaction, v.pk_index_ref, pk);
 }
 
-// Resolve (cat, pk, prop) to the property column ref and the row;
+// Resolve (catalogRef, pk, prop) to the property column ref and the row;
 // null if pk absent or row tombstoned. The pk index maps pk -> okey, and the
 // keyrow index maps okey -> physical row.
-pub fn resolveProp(transaction: anytype, cat: Reference, pk: u64, prop: usize) !?struct { row: u64, prop_col: Reference } {
-    const v = try loadCatalog(transaction, cat);
+pub fn resolveProp(transaction: anytype, catalogRef: Reference, pk: u64, prop: usize) !?struct { row: u64, prop_col: Reference } {
+    const v = try loadCatalog(transaction, catalogRef);
     const okey = (try Index.get(transaction, v.pk_index_ref, pk)) orelse return null;
     const row = (try Index.get(transaction, v.keyrow_index_ref, okey)) orelse return null;
     if ((try Column.get(transaction, v.live_col_ref, row)) == 0) return null;
@@ -452,30 +452,30 @@ pub fn resolveProp(transaction: anytype, cat: Reference, pk: u64, prop: usize) !
 
 // Write new_root into property `prop` at `row`, bump that row's version stamp,
 // return the new catalog ref.
-pub fn replaceCollRoot(transaction: *WriteTransaction, cat: Reference, row: u64, prop: usize, new_root: Reference) !Reference {
-    var s = try CatalogSnapshot.load(transaction, cat);
+pub fn replaceCollRoot(transaction: *WriteTransaction, catalogRef: Reference, row: u64, prop: usize, new_root: Reference) !Reference {
+    var s = try CatalogSnapshot.load(transaction, catalogRef);
     s.props[prop].col = try Column.set(transaction, s.props[prop].col, row, new_root);
     s.version_col_ref = try Column.set(transaction, s.version_col_ref, row, transaction.new_version);
     return s.replace(transaction);
 }
 
 // Write a new backlink ref into property `p`, preserving everything else.
-pub fn setBacklinkRef(transaction: *WriteTransaction, cat: Reference, p: usize, new_bl: Reference) !Reference {
-    var s = try CatalogSnapshot.load(transaction, cat);
+pub fn setBacklinkRef(transaction: *WriteTransaction, catalogRef: Reference, p: usize, new_bl: Reference) !Reference {
+    var s = try CatalogSnapshot.load(transaction, catalogRef);
     s.props[p].backlink = new_bl;
     return s.replace(transaction);
 }
 
 // Write a new value-index ref into property `p`, preserving everything else.
-pub fn setValueIndexRef(transaction: *WriteTransaction, cat: Reference, p: usize, new_vi: Reference) !Reference {
-    var s = try CatalogSnapshot.load(transaction, cat);
+pub fn setValueIndexRef(transaction: *WriteTransaction, catalogRef: Reference, p: usize, new_vi: Reference) !Reference {
+    var s = try CatalogSnapshot.load(transaction, catalogRef);
     s.props[p].value_index = new_vi;
     return s.replace(transaction);
 }
 
 // Write a new column ref into property `p`, preserving everything else.
-pub fn setPropColRef(transaction: *WriteTransaction, cat: Reference, p: usize, new_col: Reference) !Reference {
-    var s = try CatalogSnapshot.load(transaction, cat);
+pub fn setPropColRef(transaction: *WriteTransaction, catalogRef: Reference, p: usize, new_col: Reference) !Reference {
+    var s = try CatalogSnapshot.load(transaction, catalogRef);
     s.props[p].col = new_col;
     return s.replace(transaction);
 }
@@ -501,9 +501,9 @@ test "create allocates an empty type and load reads it back" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    const cat = try create(&w, 3);
-    try testing.expectEqual(@as(PropCount, 3), try propCount(&w, cat));
-    try testing.expectEqual(@as(u64, 0), try liveCount(&w, cat));
+    const catalogRef = try create(&w, 3);
+    try testing.expectEqual(@as(PropCount, 3), try propCount(&w, catalogRef));
+    try testing.expectEqual(@as(u64, 0), try liveCount(&w, catalogRef));
     w.deinit();
 }
 
@@ -516,15 +516,15 @@ test "CatalogSnapshot round-trips every field through load and write" {
     defer database.deinit();
     var w = try database.beginWrite();
     defer w.deinit();
-    const cat = try createDefs(&w, &.{
+    const catalogRef = try createDefs(&w, &.{
         .{ .kind = .int },
         .{ .kind = .int, .indexed = true },
         .{ .kind = .link, .link_target = 3, .del_rule = .cascade },
         .{ .kind = .list, .elem = .blob },
     });
-    const s = try CatalogSnapshot.load(&w, cat);
+    const s = try CatalogSnapshot.load(&w, catalogRef);
     const copy_ref = try s.write(&w);
-    const v0 = try loadCatalog(&w, cat);
+    const v0 = try loadCatalog(&w, catalogRef);
     const v1 = try loadCatalog(&w, copy_ref);
     try testing.expectEqual(v0.prop_count, v1.prop_count);
     try testing.expectEqual(v0.next_row, v1.next_row);
@@ -555,21 +555,21 @@ test "loadCatalog rejects corrupt disk values instead of panicking" {
     defer database.deinit();
     var w = try database.beginWrite();
     defer w.deinit();
-    const cat = try create(&w, 2);
-    _ = try loadCatalog(&w, cat); // clean before corruption
+    const catalogRef = try create(&w, 2);
+    _ = try loadCatalog(&w, catalogRef); // clean before corruption
 
     // Corrupt a kind byte (out-of-range enum value) directly in the mapping.
-    const cat_off: usize = @intCast(cat);
-    const kind_byte_off = cat_off + off_prop_cols + 2 * 8; // kindsOffset(2), prop 0
+    const catalogOffset: usize = @intCast(catalogRef);
+    const kind_byte_off = catalogOffset + off_prop_cols + 2 * 8; // kindsOffset(2), prop 0
     const saved_kind = database.store.map[kind_byte_off];
     database.store.map[kind_byte_off] = 200;
-    try testing.expectError(error.Corrupt, loadCatalog(&w, cat));
+    try testing.expectError(error.Corrupt, loadCatalog(&w, catalogRef));
     database.store.map[kind_byte_off] = saved_kind;
-    _ = try loadCatalog(&w, cat); // restored
+    _ = try loadCatalog(&w, catalogRef); // restored
 
     // Corrupt the prop count to an implausible value.
-    std.mem.writeInt(u16, database.store.map[cat_off..][0..2], 6000, .little);
-    try testing.expectError(error.Corrupt, loadCatalog(&w, cat));
+    std.mem.writeInt(u16, database.store.map[catalogOffset..][0..2], 6000, .little);
+    try testing.expectError(error.Corrupt, loadCatalog(&w, catalogRef));
 }
 
 test "createTyped records property kinds; create defaults to all int" {
@@ -580,13 +580,13 @@ test "createTyped records property kinds; create defaults to all int" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    const cat = try createTyped(&w, &.{ .int, .blob, .int });
-    const v = try loadCatalog(&w, cat);
+    const catalogRef = try createTyped(&w, &.{ .int, .blob, .int });
+    const v = try loadCatalog(&w, catalogRef);
     try testing.expectEqual(PropKind.int, v.kind(0));
     try testing.expectEqual(PropKind.blob, v.kind(1));
     try testing.expectEqual(PropKind.int, v.kind(2));
-    const cat2 = try create(&w, 2);
-    const v2 = try loadCatalog(&w, cat2);
+    const catalog2 = try create(&w, 2);
+    const v2 = try loadCatalog(&w, catalog2);
     try testing.expectEqual(PropKind.int, v2.kind(0));
     try testing.expectEqual(PropKind.int, v2.kind(1));
     w.deinit();
@@ -600,13 +600,13 @@ test "createDefs records kind and element kind per property" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    const cat = try createDefs(&w, &.{
+    const catalogRef = try createDefs(&w, &.{
         .{ .kind = .int },
         .{ .kind = .list, .elem = .int },
         .{ .kind = .set, .elem = .int },
         .{ .kind = .list, .elem = .blob },
     });
-    const v = try loadCatalog(&w, cat);
+    const v = try loadCatalog(&w, catalogRef);
     try testing.expectEqual(@as(PropCount, 4), v.prop_count);
     try testing.expectEqual(PropKind.int, v.kind(0));
     try testing.expectEqual(PropKind.list, v.kind(1));
@@ -615,8 +615,8 @@ test "createDefs records kind and element kind per property" {
     try testing.expectEqual(ElemKind.int, v.elemKind(2));
     try testing.expectEqual(PropKind.list, v.kind(3));
     try testing.expectEqual(ElemKind.blob, v.elemKind(3));
-    const cat2 = try createTyped(&w, &.{ .int, .blob });
-    const v2 = try loadCatalog(&w, cat2);
+    const catalog2 = try createTyped(&w, &.{ .int, .blob });
+    const v2 = try loadCatalog(&w, catalog2);
     try testing.expectEqual(PropKind.blob, v2.kind(1));
     try testing.expectEqual(ElemKind.int, v2.elemKind(1));
     w.deinit();
@@ -630,12 +630,12 @@ test "createDefs builds a backlink index for each link property" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    const cat = try createDefs(&w, &.{
+    const catalogRef = try createDefs(&w, &.{
         .{ .kind = .int },
         .{ .kind = .int },
         .{ .kind = .link },
     });
-    const v = try loadCatalog(&w, cat);
+    const v = try loadCatalog(&w, catalogRef);
     try testing.expectEqual(PropKind.link, v.kind(2));
     try testing.expect(v.backlinkRef(2) != 0);
     try testing.expectEqual(@as(Reference, 0), v.backlinkRef(0));
@@ -651,12 +651,12 @@ test "createDefs records a link target type id" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    const cat = try createDefs(&w, &.{
+    const catalogRef = try createDefs(&w, &.{
         .{ .kind = .int },
         .{ .kind = .link, .link_target = 3 },
         .{ .kind = .link_set, .link_target = 7 },
     });
-    const v = try loadCatalog(&w, cat);
+    const v = try loadCatalog(&w, catalogRef);
     try testing.expectEqual(@as(u16, 0), v.linkTarget(0));
     try testing.expectEqual(@as(u16, 3), v.linkTarget(1));
     try testing.expectEqual(@as(u16, 7), v.linkTarget(2));
@@ -671,8 +671,8 @@ test "createDefs creates an empty key-to-row index and zero next_key" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    const cat = try createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .int } });
-    const v = try loadCatalog(&w, cat);
+    const catalogRef = try createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .int } });
+    const v = try loadCatalog(&w, catalogRef);
     try testing.expect(v.keyrow_index_ref != 0);
     try testing.expectEqual(@as(u64, 0), v.next_key);
     w.deinit();
@@ -686,12 +686,12 @@ test "catalog persists indexed flag and value index ref" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    const cat = try createDefs(&w, &.{
+    const catalogRef = try createDefs(&w, &.{
         .{ .kind = .int },
         .{ .kind = .int, .indexed = true },
         .{ .kind = .int },
     });
-    const v = try loadCatalog(&w, cat);
+    const v = try loadCatalog(&w, catalogRef);
     try testing.expect(v.indexed(1));
     try testing.expect(!v.indexed(0));
     try testing.expect(!v.indexed(2));
@@ -701,8 +701,8 @@ test "catalog persists indexed flag and value index ref" {
     const vidx1 = v.valueIndexRef(1);
     // Round-trip through a full catalog rebuild (setPropColRef rewrites every
     // field) and assert both the flag and the value-index ref survive.
-    const cat2 = try setPropColRef(&w, cat, 2, v.propColRef(2));
-    const v2 = try loadCatalog(&w, cat2);
+    const catalog2 = try setPropColRef(&w, catalogRef, 2, v.propColRef(2));
+    const v2 = try loadCatalog(&w, catalog2);
     try testing.expect(v2.indexed(1));
     try testing.expect(!v2.indexed(0));
     try testing.expect(!v2.indexed(2));
@@ -720,12 +720,12 @@ test "non-indexed catalog: value index refs zero and existing fields intact" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    const cat = try createDefs(&w, &.{
+    const catalogRef = try createDefs(&w, &.{
         .{ .kind = .int },
         .{ .kind = .list, .elem = .blob },
         .{ .kind = .link, .link_target = 4, .del_rule = .cascade },
     });
-    const v = try loadCatalog(&w, cat);
+    const v = try loadCatalog(&w, catalogRef);
     var i: usize = 0;
     while (i < v.prop_count) : (i += 1) {
         try testing.expect(!v.indexed(i));
@@ -757,12 +757,12 @@ test "createDefs records a per-property deletion rule" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    const cat = try createDefs(&w, &.{
+    const catalogRef = try createDefs(&w, &.{
         .{ .kind = .int },
         .{ .kind = .link, .link_target = 2, .del_rule = .cascade },
         .{ .kind = .link, .link_target = 3, .del_rule = .block },
     });
-    const v = try loadCatalog(&w, cat);
+    const v = try loadCatalog(&w, catalogRef);
     try testing.expectEqual(DeletionRule.nullify, v.delRule(0));
     try testing.expectEqual(DeletionRule.cascade, v.delRule(1));
     try testing.expectEqual(DeletionRule.block, v.delRule(2));

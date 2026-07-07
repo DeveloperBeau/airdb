@@ -38,14 +38,14 @@ test "addProperty backfills the default for existing rows" {
     defer database.deinit();
     var w = try database.beginWrite();
     // start with pk + one value
-    var cat = try create(&w, 2);
-    cat = (try insert(&w, cat, &.{ 1, 10 })).cat;
-    cat = (try insert(&w, cat, &.{ 2, 20 })).cat;
+    var catalogRef = try create(&w, 2);
+    catalogRef = (try insert(&w, catalogRef, &.{ 1, 10 })).catalogRef;
+    catalogRef = (try insert(&w, catalogRef, &.{ 2, 20 })).catalogRef;
     // add a third int property defaulting to 7
-    cat = try addProperty(&w, cat, .{ .kind = .int }, 7);
-    try testing.expectEqual(@as(PropCount, 3), try propCount(&w, cat));
+    catalogRef = try addProperty(&w, catalogRef, .{ .kind = .int }, 7);
+    try testing.expectEqual(@as(PropCount, 3), try propCount(&w, catalogRef));
     var out: [3]u64 = undefined;
-    _ = (try getByPk(&w, cat, 1, &out)).?;
+    _ = (try getByPk(&w, catalogRef, 1, &out)).?;
     try testing.expectEqual(@as(u64, 10), out[1]);
     try testing.expectEqual(@as(u64, 7), out[2]); // backfilled
     w.deinit();
@@ -59,14 +59,14 @@ test "addProperty: new inserts supply the added property" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    var cat = try create(&w, 2);
-    cat = (try insert(&w, cat, &.{ 1, 10 })).cat;
-    cat = (try insert(&w, cat, &.{ 2, 20 })).cat;
-    cat = try addProperty(&w, cat, .{ .kind = .int }, 7);
+    var catalogRef = try create(&w, 2);
+    catalogRef = (try insert(&w, catalogRef, &.{ 1, 10 })).catalogRef;
+    catalogRef = (try insert(&w, catalogRef, &.{ 2, 20 })).catalogRef;
+    catalogRef = try addProperty(&w, catalogRef, .{ .kind = .int }, 7);
     // new inserts provide all three
-    cat = (try insert(&w, cat, &.{ 3, 30, 99 })).cat;
+    catalogRef = (try insert(&w, catalogRef, &.{ 3, 30, 99 })).catalogRef;
     var out: [3]u64 = undefined;
-    _ = (try getByPk(&w, cat, 3, &out)).?;
+    _ = (try getByPk(&w, catalogRef, 3, &out)).?;
     try testing.expectEqual(@as(u64, 99), out[2]);
     w.deinit();
 }
@@ -79,15 +79,15 @@ test "removeProperty drops a property and shifts the rest" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    var cat = try create(&w, 2);
-    cat = (try insert(&w, cat, &.{ 1, 10 })).cat;
-    cat = try addProperty(&w, cat, .{ .kind = .int }, 7);
-    cat = (try insert(&w, cat, &.{ 3, 30, 99 })).cat;
+    var catalogRef = try create(&w, 2);
+    catalogRef = (try insert(&w, catalogRef, &.{ 1, 10 })).catalogRef;
+    catalogRef = try addProperty(&w, catalogRef, .{ .kind = .int }, 7);
+    catalogRef = (try insert(&w, catalogRef, &.{ 3, 30, 99 })).catalogRef;
     // remove the middle property (index 1); now pk + the added prop
-    cat = try removeProperty(&w, cat, 1);
-    try testing.expectEqual(@as(PropCount, 2), try propCount(&w, cat));
+    catalogRef = try removeProperty(&w, catalogRef, 1);
+    try testing.expectEqual(@as(PropCount, 2), try propCount(&w, catalogRef));
     var out2: [2]u64 = undefined;
-    _ = (try getByPk(&w, cat, 3, &out2)).?;
+    _ = (try getByPk(&w, catalogRef, 3, &out2)).?;
     try testing.expectEqual(@as(u64, 3), out2[0]); // pk preserved
     try testing.expectEqual(@as(u64, 99), out2[1]); // the formerly-third prop shifted to index 1
     w.deinit();
@@ -105,13 +105,13 @@ test "addProperty(indexed) backfills the value index for existing rows" {
     defer database.deinit();
     {
         var w = try database.beginWrite();
-        var cat = try create(&w, 2);
-        cat = (try insert(&w, cat, &.{ 1, 10 })).cat;
-        cat = (try insert(&w, cat, &.{ 2, 20 })).cat;
-        cat = try addProperty(&w, cat, .{ .kind = .int, .indexed = true }, 7);
+        var catalogRef = try create(&w, 2);
+        catalogRef = (try insert(&w, catalogRef, &.{ 1, 10 })).catalogRef;
+        catalogRef = (try insert(&w, catalogRef, &.{ 2, 20 })).catalogRef;
+        catalogRef = try addProperty(&w, catalogRef, .{ .kind = .int, .indexed = true }, 7);
         // A post-migration insert supplies its own value.
-        cat = (try insert(&w, cat, &.{ 3, 30, 9 })).cat;
-        w.setRoot(cat);
+        catalogRef = (try insert(&w, catalogRef, &.{ 3, 30, 9 })).catalogRef;
+        w.setRoot(catalogRef);
         _ = try w.commit();
     }
     try verification.verifyIntegrity(&database);
@@ -144,9 +144,9 @@ test "addProperty(link_set) leaves pre-migration rows deletable" {
         var dir = try typedir.createTypes(&w, &.{&.{.{ .kind = .int }}}, &.{false});
         dir = (try typeRouting.insert(&w, dir, 0, &.{.{ .int = 1 }})).dir;
         // Migrate: add a link_set property targeting the same type.
-        const cat = try typedir.catalogRef(&w, dir, 0);
-        const new_cat = try addProperty(&w, cat, .{ .kind = .link_set, .link_target = 0 }, 0);
-        dir = try typedir.setCatalogRef(&w, dir, 0, new_cat);
+        const catalogRef = try typedir.catalogRef(&w, dir, 0);
+        const newCatalog = try addProperty(&w, catalogRef, .{ .kind = .link_set, .link_target = 0 }, 0);
+        dir = try typedir.setCatalogRef(&w, dir, 0, newCatalog);
         w.setRoot(dir);
         _ = try w.commit();
     }
@@ -171,8 +171,8 @@ test "addProperty rejects an indexed collection" {
     defer database.deinit();
     var w = try database.beginWrite();
     defer w.deinit();
-    const cat = try create(&w, 1);
-    try testing.expectError(error.Unsupported, addProperty(&w, cat, .{ .kind = .list, .indexed = true }, 0));
+    const catalogRef = try create(&w, 1);
+    try testing.expectError(error.Unsupported, addProperty(&w, catalogRef, .{ .kind = .list, .indexed = true }, 0));
 }
 
 test "addProperty link type gets a backlink index" {
@@ -183,14 +183,14 @@ test "addProperty link type gets a backlink index" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    var cat = try create(&w, 1); // just a pk
-    cat = (try insert(&w, cat, &.{1})).cat;
-    cat = try addProperty(&w, cat, .{ .kind = .link }, 0); // 0 == null link
-    const v = try catalog.loadCatalog(&w, cat);
+    var catalogRef = try create(&w, 1); // just a pk
+    catalogRef = (try insert(&w, catalogRef, &.{1})).catalogRef;
+    catalogRef = try addProperty(&w, catalogRef, .{ .kind = .link }, 0); // 0 == null link
+    const v = try catalog.loadCatalog(&w, catalogRef);
     try testing.expectEqual(PropKind.link, v.kind(1));
     try testing.expect(v.backlinkRef(1) != 0);
     // a row created before the migration reads as a null link
-    try testing.expectEqual(@as(?u64, null), try getLink(&w, cat, 1, 1));
+    try testing.expectEqual(@as(?u64, null), try getLink(&w, catalogRef, 1, 1));
     w.deinit();
 }
 
@@ -208,12 +208,12 @@ test "addProperty copies a blob default per row instead of sharing one node" {
 
     {
         var w = try database.beginWrite();
-        var cat = try catalog.createTyped(&w, &.{ .int, .int });
-        cat = (try insert(&w, cat, &.{ 1, 10 })).cat;
-        cat = (try insert(&w, cat, &.{ 2, 20 })).cat;
+        var catalogRef = try catalog.createTyped(&w, &.{ .int, .int });
+        catalogRef = (try insert(&w, catalogRef, &.{ 1, 10 })).catalogRef;
+        catalogRef = (try insert(&w, catalogRef, &.{ 2, 20 })).catalogRef;
         const dflt = try blob.put(&w, "default-bytes");
-        cat = try addProperty(&w, cat, .{ .kind = .blob }, dflt);
-        w.setRoot(cat);
+        catalogRef = try addProperty(&w, catalogRef, .{ .kind = .blob }, dflt);
+        w.setRoot(catalogRef);
         _ = try w.commit();
     }
     var w = try database.beginWrite();
@@ -227,13 +227,13 @@ test "addProperty copies a blob default per row instead of sharing one node" {
     try testing.expectEqualStrings("default-bytes", try blob.get(&w, raw2[2]));
     try testing.expect(raw1[2] != raw2[2]);
     // Deleting both rows must not free any extent twice.
-    var cat = w.new_root;
-    switch (try objects.deleteTyped(&w, cat, 1, v1)) {
-        .ok => |c| cat = c,
+    var catalogRef = w.new_root;
+    switch (try objects.deleteTyped(&w, catalogRef, 1, v1)) {
+        .ok => |c| catalogRef = c,
         else => return error.TestUnexpectedResult,
     }
-    switch (try objects.deleteTyped(&w, cat, 2, v2)) {
-        .ok => |c| cat = c,
+    switch (try objects.deleteTyped(&w, catalogRef, 2, v2)) {
+        .ok => |c| catalogRef = c,
         else => return error.TestUnexpectedResult,
     }
     var seen = std.AutoHashMap(u64, void).init(testing.allocator);

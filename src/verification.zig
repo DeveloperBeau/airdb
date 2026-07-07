@@ -91,8 +91,8 @@ fn auditValueIndexes(database: *Database) VerifyError!void {
     if (tc > 256) return;
     var t: u16 = 0;
     while (t < tc) : (t += 1) {
-        const cat = typedir.catalogRef(&r, database.active_root, t) catch return;
-        const cv = catalog.loadCatalog(&r, cat) catch return;
+        const catalogRef = typedir.catalogRef(&r, database.active_root, t) catch return;
+        const cv = catalog.loadCatalog(&r, catalogRef) catch return;
         var p: usize = 0;
         while (p < cv.prop_count) : (p += 1) {
             const kind = cv.kind(p);

@@ -107,11 +107,11 @@ fn createFresh(self: *DatabaseHandle, path: []const u8, prop_count: u16) ?*Datab
         return null;
     };
     var w = self.database.beginWrite() catch return abandonHandle(self);
-    const cat = catalog.create(&w, prop_count) catch {
+    const catalogRef = catalog.create(&w, prop_count) catch {
         w.deinit();
         return abandonHandle(self);
     };
-    w.setRoot(cat);
+    w.setRoot(catalogRef);
     _ = w.commit() catch return abandonHandle(self);
     self.prop_count = prop_count;
     return self;
@@ -140,7 +140,7 @@ export fn airdb_insert(handle: ?*DatabaseHandle, vals: [*]const u64, len: usize)
         w.deinit();
         return if (e == error.DuplicateKey) AIRDB_E_DUPLICATE else AIRDB_E_GENERIC;
     };
-    w.setRoot(r.cat);
+    w.setRoot(r.catalogRef);
     _ = w.commit() catch return commitErrCode(self);
     return @intCast(r.row);
 }
@@ -188,7 +188,7 @@ export fn airdb_update(handle: ?*DatabaseHandle, vals: [*]const u64, len: usize)
     };
     switch (res) {
         .ok => |ok| {
-            w.setRoot(ok.cat);
+            w.setRoot(ok.catalogRef);
             _ = w.commit() catch return commitErrCode(self);
             return AIRDB_OK;
         },
@@ -221,8 +221,8 @@ export fn airdb_delete(handle: ?*DatabaseHandle, pk: u64) i64 {
         return AIRDB_E_GENERIC;
     };
     switch (res) {
-        .ok => |new_cat| {
-            w.setRoot(new_cat);
+        .ok => |newCatalog| {
+            w.setRoot(newCatalog);
             _ = w.commit() catch return commitErrCode(self);
             return AIRDB_OK;
         },
@@ -260,7 +260,7 @@ export fn airdb_bulk_insert(handle: ?*DatabaseHandle, rows_flat: [*]const u64, r
     }
 
     var w = self.database.beginWrite() catch return commitErrCode(self);
-    const newcat = bulk.bulkImport(&w, w.new_root, rows_slices, .{}) catch |e| {
+    const newCatalog = bulk.bulkImport(&w, w.new_root, rows_slices, .{}) catch |e| {
         w.deinit(); // releases the write lock; nothing was made durable
         return switch (e) {
             error.TypeNotEmpty => AIRDB_E_NOT_EMPTY,
@@ -270,7 +270,7 @@ export fn airdb_bulk_insert(handle: ?*DatabaseHandle, rows_flat: [*]const u64, r
             else => AIRDB_E_GENERIC,
         };
     };
-    w.setRoot(newcat);
+    w.setRoot(newCatalog);
     // commit releases the lock on BOTH its success and its own error paths, so
     // do not unlock again here.
     _ = w.commit() catch return commitErrCode(self);
@@ -302,7 +302,7 @@ export fn airdb_bulk_append(handle: ?*DatabaseHandle, rows_flat: [*]const u64, r
     }
 
     var w = self.database.beginWrite() catch return commitErrCode(self);
-    const newcat = bulk.bulkAppendOrInsert(&w, w.new_root, rows_slices) catch |e| {
+    const newCatalog = bulk.bulkAppendOrInsert(&w, w.new_root, rows_slices) catch |e| {
         w.deinit(); // releases the write lock; nothing was made durable
         return switch (e) {
             error.BadRow => AIRDB_E_BAD_ARGS,
@@ -310,7 +310,7 @@ export fn airdb_bulk_append(handle: ?*DatabaseHandle, rows_flat: [*]const u64, r
             else => AIRDB_E_GENERIC,
         };
     };
-    w.setRoot(newcat);
+    w.setRoot(newCatalog);
     // commit releases the lock on BOTH its success and its own error paths, so
     // do not unlock again here.
     _ = w.commit() catch return commitErrCode(self);
@@ -344,7 +344,7 @@ export fn airdb_bulk_append(handle: ?*DatabaseHandle, rows_flat: [*]const u64, r
 const Transaction = struct {
     databaseHandle: *DatabaseHandle,
     w: WriteTransaction,
-    cat: Reference, // current catalog ref, threaded across operations
+    catalogRef: Reference, // current catalog ref, threaded across operations
     poisoned: bool = false, // structural op failure: commit must not proceed
 };
 
@@ -359,7 +359,7 @@ export fn airdb_begin(handle: ?*DatabaseHandle) ?*Transaction {
         alloc.destroy(t);
         return null;
     };
-    t.cat = t.w.new_root;
+    t.catalogRef = t.w.new_root;
     t.poisoned = false;
     return t;
 }
@@ -380,12 +380,12 @@ export fn airdb_txn_insert(transaction: ?*Transaction, vals: [*]const u64, len: 
     const t = transaction orelse return AIRDB_E_GENERIC;
     if (t.poisoned) return AIRDB_E_GENERIC;
     if (len != t.databaseHandle.prop_count) return AIRDB_E_BAD_ARGS;
-    const r = rows.insert(&t.w, t.cat, vals[0..len]) catch |e| {
+    const r = rows.insert(&t.w, t.catalogRef, vals[0..len]) catch |e| {
         if (e == error.DuplicateKey) return AIRDB_E_DUPLICATE; // pre-mutation check: transaction stays usable
         t.poisoned = true; // mid-mutation failure: the batch may reference freed nodes
         return AIRDB_E_GENERIC;
     };
-    t.cat = r.cat; // thread the new catalog ref; do NOT commit
+    t.catalogRef = r.catalogRef; // thread the new catalog ref; do NOT commit
     return @intCast(r.row);
 }
 
@@ -398,15 +398,15 @@ export fn airdb_txn_update(transaction: ?*Transaction, vals: [*]const u64, len: 
     if (len != t.databaseHandle.prop_count) return AIRDB_E_BAD_ARGS;
     const pk = vals[0];
     var cur: [MAX_PROPS]u64 = undefined;
-    const ver = rows.getByPk(&t.w, t.cat, pk, cur[0..len]) catch return AIRDB_E_GENERIC;
+    const ver = rows.getByPk(&t.w, t.catalogRef, pk, cur[0..len]) catch return AIRDB_E_GENERIC;
     if (ver == null) return AIRDB_E_NOT_FOUND;
-    const res = rows.update(&t.w, t.cat, pk, vals[0..len], ver.?) catch {
+    const res = rows.update(&t.w, t.catalogRef, pk, vals[0..len], ver.?) catch {
         t.poisoned = true; // mid-mutation failure
         return AIRDB_E_GENERIC;
     };
     switch (res) {
         .ok => |ok| {
-            t.cat = ok.cat;
+            t.catalogRef = ok.catalogRef;
             return AIRDB_OK;
         },
         .conflict => return AIRDB_E_CONFLICT,
@@ -421,15 +421,15 @@ export fn airdb_txn_delete(transaction: ?*Transaction, pk: u64) i64 {
     const t = transaction orelse return AIRDB_E_GENERIC;
     if (t.poisoned) return AIRDB_E_GENERIC;
     var cur: [MAX_PROPS]u64 = undefined;
-    const ver = rows.getByPk(&t.w, t.cat, pk, cur[0..t.databaseHandle.prop_count]) catch return AIRDB_E_GENERIC;
+    const ver = rows.getByPk(&t.w, t.catalogRef, pk, cur[0..t.databaseHandle.prop_count]) catch return AIRDB_E_GENERIC;
     if (ver == null) return AIRDB_E_NOT_FOUND;
-    const res = rows.delete(&t.w, t.cat, pk, ver.?) catch {
+    const res = rows.delete(&t.w, t.catalogRef, pk, ver.?) catch {
         t.poisoned = true; // mid-mutation failure
         return AIRDB_E_GENERIC;
     };
     switch (res) {
-        .ok => |new_cat| {
-            t.cat = new_cat;
+        .ok => |newCatalog| {
+            t.catalogRef = newCatalog;
             return AIRDB_OK;
         },
         .conflict => return AIRDB_E_CONFLICT,
@@ -453,7 +453,7 @@ export fn airdb_commit(transaction: ?*Transaction) i64 {
         alloc.destroy(t);
         return AIRDB_E_GENERIC;
     }
-    t.w.setRoot(t.cat);
+    t.w.setRoot(t.catalogRef);
     _ = t.w.commit() catch {
         // commit already released the lock per WriteTransaction.commit's contract; just
         // free the handle. Do NOT double-unlock.

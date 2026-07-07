@@ -24,13 +24,13 @@ pub fn maybeCompactStep(database: *Database, type_id: u16, budget: usize) !Compa
     var w = try database.beginWrite();
     errdefer w.deinit();
     const dir = database.active_root;
-    const cat = try typedir.catalogRef(&w, dir, type_id);
-    if (!try compaction.shouldCompact(&w, cat)) {
+    const catalogRef = try typedir.catalogRef(&w, dir, type_id);
+    if (!try compaction.shouldCompact(&w, catalogRef)) {
         w.deinit();
         return .{ .ran = false, .moved = 0, .done = false };
     }
-    const step = try compaction.compactStep(&w, cat, type_id, budget);
-    const new_dir = try typedir.setCatalogRef(&w, dir, type_id, step.cat);
+    const step = try compaction.compactStep(&w, catalogRef, type_id, budget);
+    const new_dir = try typedir.setCatalogRef(&w, dir, type_id, step.catalogRef);
     w.setRoot(new_dir);
     _ = try w.commit();
     return .{ .ran = true, .moved = step.moved, .done = step.done };

@@ -74,8 +74,8 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     const bulk_start = nowNs(io);
     {
         var w = try databaseA.beginWrite();
-        const new_cat = try bulk.bulkImport(&w, w.new_root, rows, .{});
-        w.setRoot(new_cat);
+        const newCatalog = try bulk.bulkImport(&w, w.new_root, rows, .{});
+        w.setRoot(newCatalog);
         _ = try w.commit();
     }
     const bulk_ns: u64 = @intCast(nowNs(io) - bulk_start);
@@ -89,7 +89,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     // --- Path B: row-by-row inserts in batched commits ----------------------
     var databaseB = try airdb.Database.create(alloc, path_b);
     errdefer databaseB.deinit();
-    var cat: Reference = blk: {
+    var catalogRef: Reference = blk: {
         var w = try databaseB.beginWrite();
         const c = try catalog.create(&w, 2);
         w.setRoot(c);
@@ -104,14 +104,14 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     while (inserted < ctx.n) {
         const this_batch = @min(batch_size, ctx.n - inserted);
         var w = try databaseB.beginWrite();
-        cat = databaseB.active_root; // reload the committed catalog ref
+        catalogRef = databaseB.active_root; // reload the committed catalog ref
         var j: usize = 0;
         while (j < this_batch) : (j += 1) {
             const pk: u64 = inserted + j;
-            const r = try rawRows.insert(&w, cat, &.{ pk, pk });
-            cat = r.cat;
+            const r = try rawRows.insert(&w, catalogRef, &.{ pk, pk });
+            catalogRef = r.catalogRef;
         }
-        w.setRoot(cat);
+        w.setRoot(catalogRef);
         _ = try w.commit();
         inserted += this_batch;
     }

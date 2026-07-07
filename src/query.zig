@@ -53,8 +53,8 @@ const Scan = struct {
     next_row: u64,
 };
 
-fn openScan(transaction: anytype, cat: Reference) !Scan {
-    const v = try catalog.loadCatalog(transaction, cat);
+fn openScan(transaction: anytype, catalogRef: Reference) !Scan {
+    const v = try catalog.loadCatalog(transaction, catalogRef);
     var s: Scan = undefined;
     s.prop_count = v.prop_count;
     s.live_ref = v.live_col_ref;
@@ -250,8 +250,8 @@ fn runQuery(
 
 // Test-only: expose the driving-predicate choice so equivalence tests can assert
 // which path the planner takes.
-fn drivingPredicateIndex(transaction: anytype, cat: Reference, preds: []const Predicate) !?usize {
-    const s = try openScan(transaction, cat);
+fn drivingPredicateIndex(transaction: anytype, catalogRef: Reference, preds: []const Predicate) !?usize {
+    const s = try openScan(transaction, catalogRef);
     return pickDriving(&s, preds);
 }
 
@@ -259,12 +259,12 @@ fn drivingPredicateIndex(transaction: anytype, cat: Reference, preds: []const Pr
 // AND). An empty predicate list matches every live row.
 pub fn where(
     transaction: anytype,
-    cat: Reference,
+    catalogRef: Reference,
     preds: []const Predicate,
     out: *std.ArrayList(u64),
     allocator: std.mem.Allocator,
 ) !void {
-    const s = try openScan(transaction, cat);
+    const s = try openScan(transaction, catalogRef);
     try validateProps(&s, preds);
     const Sink = struct {
         out: *std.ArrayList(u64),
@@ -278,8 +278,8 @@ pub fn where(
 
 // Number of live rows satisfying all predicates. The full-scan path streams,
 // so this allocates nothing proportional to the table.
-pub fn countWhere(transaction: anytype, cat: Reference, preds: []const Predicate, allocator: std.mem.Allocator) !u64 {
-    const s = try openScan(transaction, cat);
+pub fn countWhere(transaction: anytype, catalogRef: Reference, preds: []const Predicate, allocator: std.mem.Allocator) !u64 {
+    const s = try openScan(transaction, catalogRef);
     try validateProps(&s, preds);
     var n: u64 = 0;
     const Sink = struct {
@@ -296,8 +296,8 @@ pub const Aggregate = struct { count: u64, sum: u64, min: ?u64, max: ?u64 };
 
 // Aggregate an int property over the live rows satisfying all predicates.
 // `sum` wraps on overflow (wrapping add); min/max are null when no row matches.
-pub fn aggregateInt(transaction: anytype, cat: Reference, prop: usize, preds: []const Predicate, allocator: std.mem.Allocator) !Aggregate {
-    const s = try openScan(transaction, cat);
+pub fn aggregateInt(transaction: anytype, catalogRef: Reference, prop: usize, preds: []const Predicate, allocator: std.mem.Allocator) !Aggregate {
+    const s = try openScan(transaction, catalogRef);
     try validateProps(&s, preds);
     if (prop >= s.prop_count) return error.BadProp;
     var agg = Aggregate{ .count = 0, .sum = 0, .min = null, .max = null };
@@ -323,7 +323,7 @@ pub fn aggregateInt(transaction: anytype, cat: Reference, prop: usize, preds: []
 // is a later optimization.
 pub fn rangeInclusive(
     transaction: anytype,
-    cat: Reference,
+    catalogRef: Reference,
     prop: usize,
     lo: u64,
     hi: u64,
@@ -334,19 +334,19 @@ pub fn rangeInclusive(
         .{ .prop = prop, .op = .ge, .value = lo },
         .{ .prop = prop, .op = .le, .value = hi },
     };
-    try where(transaction, cat, &preds, out, allocator);
+    try where(transaction, catalogRef, &preds, out, allocator);
 }
 
 // Sort a slice of okeys in place by an int property, ascending. Reads each
 // row's value once into a temporary pair array, then sorts.
 pub fn sortByPropAsc(
     transaction: anytype,
-    cat: Reference,
+    catalogRef: Reference,
     okeys: []u64,
     prop: usize,
     allocator: std.mem.Allocator,
 ) !void {
-    const v = try catalog.loadCatalog(transaction, cat);
+    const v = try catalog.loadCatalog(transaction, catalogRef);
     if (prop >= v.prop_count) return error.BadProp;
     const col = v.propColRef(prop);
     const SortPair = struct { val: u64, key: u64 };
@@ -355,7 +355,7 @@ pub fn sortByPropAsc(
     for (okeys, 0..) |k, i| {
         // A caller-supplied okey that no longer resolves (stale or deleted) is
         // an input error, not a crash.
-        const row = (try catalog.okeyToRow(transaction, cat, k)) orelse return error.NotFound;
+        const row = (try catalog.okeyToRow(transaction, catalogRef, k)) orelse return error.NotFound;
         pairs[i] = .{ .val = try Column.get(transaction, col, row), .key = k };
     }
     std.mem.sort(SortPair, pairs, {}, struct {
@@ -390,16 +390,16 @@ fn qTmpPath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const u8
 
 // Build a 3-prop type: prop0 = pk, prop1 = value (indexed iff `idx`), prop2 =
 // secondary. Inserts n rows with pk=i, prop1=i%100, prop2=i.
-fn seedPlannerCat(w: *@import("database.zig").WriteTransaction, idx: bool, n: u64) !Reference {
+fn seedPlannerCatalog(w: *@import("database.zig").WriteTransaction, idx: bool, n: u64) !Reference {
     const defs = [_]catalog.PropDef{
         .{ .kind = .int },
         .{ .kind = .int, .indexed = idx },
         .{ .kind = .int },
     };
-    var cat = try catalog.createDefs(w, &defs);
+    var catalogRef = try catalog.createDefs(w, &defs);
     var i: u64 = 0;
-    while (i < n) : (i += 1) cat = (try rows.insert(w, cat, &.{ i, i % 100, i })).cat;
-    return cat;
+    while (i < n) : (i += 1) catalogRef = (try rows.insert(w, catalogRef, &.{ i, i % 100, i })).catalogRef;
+    return catalogRef;
 }
 
 test "planner picks an indexed eq predicate as the driver, prefers eq over range, ignores ne and non-indexed" {
@@ -410,28 +410,28 @@ test "planner picks an indexed eq predicate as the driver, prefers eq over range
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    const cat = try seedPlannerCat(&w, true, 10);
+    const catalogRef = try seedPlannerCatalog(&w, true, 10);
 
     // prop 1 is indexed; prop 0 and prop 2 are not.
     // eq on the indexed prop drives.
-    try testing.expectEqual(@as(?usize, 0), try drivingPredicateIndex(&w, cat, &.{
+    try testing.expectEqual(@as(?usize, 0), try drivingPredicateIndex(&w, catalogRef, &.{
         .{ .prop = 1, .op = .eq, .value = 5 },
     }));
     // Prefer the eq over a range, even when the range appears first.
-    try testing.expectEqual(@as(?usize, 1), try drivingPredicateIndex(&w, cat, &.{
+    try testing.expectEqual(@as(?usize, 1), try drivingPredicateIndex(&w, catalogRef, &.{
         .{ .prop = 1, .op = .ge, .value = 5 },
         .{ .prop = 1, .op = .eq, .value = 5 },
     }));
     // A range on the indexed prop drives when there is no eq.
-    try testing.expectEqual(@as(?usize, 0), try drivingPredicateIndex(&w, cat, &.{
+    try testing.expectEqual(@as(?usize, 0), try drivingPredicateIndex(&w, catalogRef, &.{
         .{ .prop = 1, .op = .lt, .value = 5 },
     }));
     // ne is not index-friendly: stays on the scan.
-    try testing.expectEqual(@as(?usize, null), try drivingPredicateIndex(&w, cat, &.{
+    try testing.expectEqual(@as(?usize, null), try drivingPredicateIndex(&w, catalogRef, &.{
         .{ .prop = 1, .op = .ne, .value = 5 },
     }));
     // eq on a non-indexed prop: no driver.
-    try testing.expectEqual(@as(?usize, null), try drivingPredicateIndex(&w, cat, &.{
+    try testing.expectEqual(@as(?usize, null), try drivingPredicateIndex(&w, catalogRef, &.{
         .{ .prop = 0, .op = .eq, .value = 5 },
         .{ .prop = 2, .op = .ge, .value = 5 },
     }));

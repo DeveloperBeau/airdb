@@ -136,11 +136,11 @@ pub fn bulkValueIndex(transaction: *WriteTransaction, entries: []const ValueOkey
 // half-commit. Phase 1 excludes link/link_set properties. The CALLER commits.
 pub fn bulkImport(
     transaction: *WriteTransaction,
-    cat: Reference,
+    catalogRef: Reference,
     rows: []const []const u64,
     opts: struct { presorted: bool = false },
 ) !Reference {
-    var s = try catalog.CatalogSnapshot.load(transaction, cat);
+    var s = try catalog.CatalogSnapshot.load(transaction, catalogRef);
     if (s.next_row != 0) return error.TypeNotEmpty;
     const old_next_key = s.next_key;
     try validateImportInput(&s, rows);
@@ -353,14 +353,14 @@ fn buildPropValueIndex(
 // Crucially, every qualification check is read-only and runs BEFORE the first
 // node is allocated, so a NotAppendable return leaves the catalog and all trees
 // untouched. The CALLER commits.
-pub fn bulkAppend(transaction: *WriteTransaction, cat: Reference, rows: []const []const u64) !Reference {
-    var s = try catalog.CatalogSnapshot.load(transaction, cat);
+pub fn bulkAppend(transaction: *WriteTransaction, catalogRef: Reference, rows: []const []const u64) !Reference {
+    var s = try catalog.CatalogSnapshot.load(transaction, catalogRef);
 
     // Validate row widths first: a single malformed row aborts before any work.
     for (rows) |row| {
         if (row.len != s.prop_count) return error.BadRow;
     }
-    if (rows.len == 0) return cat;
+    if (rows.len == 0) return catalogRef;
 
     try qualifyRightEdgeAppend(transaction, &s, rows);
 
@@ -481,33 +481,33 @@ fn qualifyRightEdgeAppend(
 
 // Try the right-edge fast path; on NotAppendable, fall back to row-by-row
 // rows.insert, which handles any schema and detects duplicate keys per row.
-pub fn bulkAppendOrInsert(transaction: *WriteTransaction, cat: Reference, rows: []const []const u64) !Reference {
-    return bulkAppend(transaction, cat, rows) catch |e| switch (e) {
-        error.NotAppendable => fallbackInsert(transaction, cat, rows),
+pub fn bulkAppendOrInsert(transaction: *WriteTransaction, catalogRef: Reference, rows: []const []const u64) !Reference {
+    return bulkAppend(transaction, catalogRef, rows) catch |e| switch (e) {
+        error.NotAppendable => fallbackInsert(transaction, catalogRef, rows),
         else => e,
     };
 }
 
 // Insert every row one at a time, threading the catalog ref. A DuplicateKey from
-// rows.insert propagates to the caller. Empty rows return cat unchanged.
+// rows.insert propagates to the caller. Empty rows return catalogRef unchanged.
 //
 // Link-bearing schemas are rejected outright: rows.insert writes raw column
 // values without backlink maintenance (that is insertTyped's job), so silently
 // accepting them here would corrupt the link graph -- the same reason
 // bulkImport refuses them.
-fn fallbackInsert(transaction: *WriteTransaction, cat: Reference, rows: []const []const u64) !Reference {
-    if (rows.len == 0) return cat;
+fn fallbackInsert(transaction: *WriteTransaction, catalogRef: Reference, rows: []const []const u64) !Reference {
+    if (rows.len == 0) return catalogRef;
     {
-        const v = try catalog.loadCatalog(transaction, cat);
+        const v = try catalog.loadCatalog(transaction, catalogRef);
         var j: usize = 0;
         while (j < v.prop_count) : (j += 1) {
             const k = v.kind(j);
             if (k == .link or k == .link_set) return error.UnsupportedForBulk;
         }
     }
-    var c = cat;
+    var c = catalogRef;
     for (rows) |row| {
-        c = (try rawRows.insert(transaction, c, row)).cat;
+        c = (try rawRows.insert(transaction, c, row)).catalogRef;
     }
     return c;
 }

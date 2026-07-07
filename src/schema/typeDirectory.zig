@@ -23,15 +23,15 @@ fn dirSize(tc: u16) usize {
 }
 
 // Pack `tc` catalog refs + per-type embedded flags into a fresh directory node.
-fn writeDir(transaction: *WriteTransaction, cat_refs: []const Reference, embedded: []const bool) !Reference {
-    std.debug.assert(embedded.len == cat_refs.len);
-    const tc: u16 = @intCast(cat_refs.len);
+fn writeDir(transaction: *WriteTransaction, catalogRefs: []const Reference, embedded: []const bool) !Reference {
+    std.debug.assert(embedded.len == catalogRefs.len);
+    const tc: u16 = @intCast(catalogRefs.len);
     const a = try transaction.alloc(dirSize(tc));
     std.mem.writeInt(u16, a.bytes[0..2], tc, .little);
-    for (cat_refs, 0..) |cref, i| {
+    for (catalogRefs, 0..) |cref, i| {
         std.mem.writeInt(u64, a.bytes[2 + i * 8 ..][0..8], cref, .little);
     }
-    for (embedded, 0..) |e, i| a.bytes[2 + cat_refs.len * 8 + i] = if (e) 1 else 0;
+    for (embedded, 0..) |e, i| a.bytes[2 + catalogRefs.len * 8 + i] = if (e) 1 else 0;
     return a.ref;
 }
 
@@ -40,10 +40,10 @@ fn writeDir(transaction: *WriteTransaction, cat_refs: []const Reference, embedde
 pub fn createTypes(transaction: *WriteTransaction, schema: DefSchema, embedded: []const bool) !Reference {
     std.debug.assert(schema.len <= 256);
     std.debug.assert(embedded.len == schema.len);
-    var cat_refs: [256]Reference = undefined;
+    var catalogRefs: [256]Reference = undefined;
     var t: usize = 0;
-    while (t < schema.len) : (t += 1) cat_refs[t] = try catalog.createDefs(transaction, schema[t]);
-    return writeDir(transaction, cat_refs[0..schema.len], embedded);
+    while (t < schema.len) : (t += 1) catalogRefs[t] = try catalog.createDefs(transaction, schema[t]);
+    return writeDir(transaction, catalogRefs[0..schema.len], embedded);
 }
 
 // Create a directory from a full PropDef schema (supports links/collections).
@@ -56,14 +56,14 @@ pub fn createWithDefs(transaction: *WriteTransaction, schema: DefSchema) !Refere
 // Scalar-kinds convenience: each property gets elem = int.
 pub fn create(transaction: *WriteTransaction, schema: Schema) !Reference {
     std.debug.assert(schema.len <= 256);
-    var cat_refs: [256]Reference = undefined;
+    var catalogRefs: [256]Reference = undefined;
     var t: usize = 0;
     while (t < schema.len) : (t += 1) {
-        cat_refs[t] = try catalog.createTyped(transaction, schema[t]);
+        catalogRefs[t] = try catalog.createTyped(transaction, schema[t]);
     }
     var flags: [256]bool = undefined;
     @memset(flags[0..schema.len], false);
-    return writeDir(transaction, cat_refs[0..schema.len], flags[0..schema.len]);
+    return writeDir(transaction, catalogRefs[0..schema.len], flags[0..schema.len]);
 }
 
 fn loadDir(transaction: anytype, dir: Reference) !struct { type_count: u16, bytes: []const u8 } {
@@ -84,17 +84,17 @@ pub fn catalogRef(transaction: anytype, dir: Reference, type_id: u16) !Reference
     return std.mem.readInt(u64, d.bytes[2 + @as(usize, type_id) * 8 ..][0..8], .little);
 }
 
-pub fn setCatalogRef(transaction: *WriteTransaction, dir: Reference, type_id: u16, new_cat: Reference) !Reference {
+pub fn setCatalogRef(transaction: *WriteTransaction, dir: Reference, type_id: u16, newCatalog: Reference) !Reference {
     const d = try loadDir(transaction, dir);
     if (type_id >= d.type_count) return error.NoSuchType;
     const a = try transaction.writableCopy(dir, dirSize(d.type_count));
-    std.mem.writeInt(u64, a.bytes[2 + @as(usize, type_id) * 8 ..][0..8], new_cat, .little);
+    std.mem.writeInt(u64, a.bytes[2 + @as(usize, type_id) * 8 ..][0..8], newCatalog, .little);
     return a.ref;
 }
 
 // Append an already-created catalog to the directory; returns grown dir + id.
 // Carries the existing per-type embedded flags and appends the new type's flag.
-fn appendCatalog(transaction: *WriteTransaction, old_refs: []const Reference, old_embedded: []const bool, new_cat: Reference, new_embedded: bool) !Reference {
+fn appendCatalog(transaction: *WriteTransaction, old_refs: []const Reference, old_embedded: []const bool, newCatalog: Reference, new_embedded: bool) !Reference {
     std.debug.assert(old_refs.len == old_embedded.len);
     const old_tc = old_refs.len;
     var refs: [256]Reference = undefined;
@@ -104,7 +104,7 @@ fn appendCatalog(transaction: *WriteTransaction, old_refs: []const Reference, ol
         refs[t] = old_refs[t];
         flags[t] = old_embedded[t];
     }
-    refs[old_tc] = new_cat;
+    refs[old_tc] = newCatalog;
     flags[old_tc] = new_embedded;
     return writeDir(transaction, refs[0 .. old_tc + 1], flags[0 .. old_tc + 1]);
 }
@@ -143,8 +143,8 @@ pub fn addTypeDefsEmbedded(transaction: *WriteTransaction, dir: Reference, defs:
     const old_tc = try snapshotRefs(transaction, dir, &old_refs);
     _ = try snapshotFlags(transaction, dir, &old_flags);
     std.debug.assert(old_tc < 256);
-    const new_cat = try catalog.createDefs(transaction, defs);
-    const new_dir = try appendCatalog(transaction, old_refs[0..old_tc], old_flags[0..old_tc], new_cat, is_embedded);
+    const newCatalog = try catalog.createDefs(transaction, defs);
+    const new_dir = try appendCatalog(transaction, old_refs[0..old_tc], old_flags[0..old_tc], newCatalog, is_embedded);
     return .{ .dir = new_dir, .type_id = old_tc };
 }
 
@@ -158,8 +158,8 @@ pub fn addType(transaction: *WriteTransaction, dir: Reference, type_schema: []co
     const old_tc = try snapshotRefs(transaction, dir, &old_refs);
     _ = try snapshotFlags(transaction, dir, &old_flags);
     std.debug.assert(old_tc < 256);
-    const new_cat = try catalog.createTyped(transaction, type_schema);
-    const new_dir = try appendCatalog(transaction, old_refs[0..old_tc], old_flags[0..old_tc], new_cat, false);
+    const newCatalog = try catalog.createTyped(transaction, type_schema);
+    const new_dir = try appendCatalog(transaction, old_refs[0..old_tc], old_flags[0..old_tc], newCatalog, false);
     return .{ .dir = new_dir, .type_id = old_tc };
 }
 
@@ -206,10 +206,10 @@ pub fn insertEmbedded(transaction: *WriteTransaction, dir: Reference, owner_type
     // object. (.blocked is reachable when another type block-links the child;
     // conflict/not_found are impossible for a version read in this transaction.)
     if (try typeRouting.getLink(transaction, cur, owner_type, owner_pk, prop)) |old_okey| {
-        const child_cat = try catalogRef(transaction, cur, child_type);
-        const pc = (try catalog.loadCatalog(transaction, child_cat)).prop_count;
+        const childCatalog = try catalogRef(transaction, cur, child_type);
+        const pc = (try catalog.loadCatalog(transaction, childCatalog)).prop_count;
         var buf: [256]u64 = undefined;
-        if (try rows.getByObjectKey(transaction, child_cat, old_okey, buf[0..pc])) |old_ver| {
+        if (try rows.getByObjectKey(transaction, childCatalog, old_okey, buf[0..pc])) |old_ver| {
             const old_pk = buf[0];
             const dres = try typeRouting.deleteNullifyX(transaction, cur, child_type, old_pk, old_ver);
             switch (dres) {
@@ -230,10 +230,10 @@ pub fn insertEmbedded(transaction: *WriteTransaction, dir: Reference, owner_type
 pub fn clearEmbedded(transaction: *WriteTransaction, dir: Reference, owner_type: u16, owner_pk: u64, prop: usize) !Reference {
     const child_okey = (try typeRouting.getLink(transaction, dir, owner_type, owner_pk, prop)) orelse return dir;
     const child_type = (try catalog.loadCatalog(transaction, try catalogRef(transaction, dir, owner_type))).linkTarget(prop);
-    const child_cat = try catalogRef(transaction, dir, child_type);
-    const pc = (try catalog.loadCatalog(transaction, child_cat)).prop_count;
+    const childCatalog = try catalogRef(transaction, dir, child_type);
+    const pc = (try catalog.loadCatalog(transaction, childCatalog)).prop_count;
     var buf: [256]u64 = undefined;
-    const child_ver = (try rows.getByObjectKey(transaction, child_cat, child_okey, buf[0..pc])) orelse return dir;
+    const child_ver = (try rows.getByObjectKey(transaction, childCatalog, child_okey, buf[0..pc])) orelse return dir;
     const child_pk = buf[0];
     const dres = try typeRouting.deleteNullifyX(transaction, dir, child_type, child_pk, child_ver);
     return switch (dres) {

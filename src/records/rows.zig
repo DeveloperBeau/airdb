@@ -57,24 +57,24 @@ fn viRemove(transaction: *WriteTransaction, vi_ref: Reference, value: u64, okey:
 }
 
 // Add okey->value to indexed property p's value index. Returns the new catalog.
-fn addValueIndex(transaction: *WriteTransaction, cat: Reference, p: usize, value: u64, okey: u64) !Reference {
-    const v = try loadCatalog(transaction, cat);
+fn addValueIndex(transaction: *WriteTransaction, catalogRef: Reference, p: usize, value: u64, okey: u64) !Reference {
+    const v = try loadCatalog(transaction, catalogRef);
     const new_vi = try viAdd(transaction, v.valueIndexRef(p), value, okey);
-    return try catalog.setValueIndexRef(transaction, cat, p, new_vi);
+    return try catalog.setValueIndexRef(transaction, catalogRef, p, new_vi);
 }
 
 // Remove okey from indexed property p's value-index set for `value`.
-fn removeValueIndex(transaction: *WriteTransaction, cat: Reference, p: usize, value: u64, okey: u64) !Reference {
-    const v = try loadCatalog(transaction, cat);
+fn removeValueIndex(transaction: *WriteTransaction, catalogRef: Reference, p: usize, value: u64, okey: u64) !Reference {
+    const v = try loadCatalog(transaction, catalogRef);
     const new_vi = try viRemove(transaction, v.valueIndexRef(p), value, okey);
-    return try catalog.setValueIndexRef(transaction, cat, p, new_vi);
+    return try catalog.setValueIndexRef(transaction, catalogRef, p, new_vi);
 }
 
 /// Append a new row to all columns and update the pk index.
 /// values.len must equal the prop_count stored in the catalog.
 /// Returns error.DuplicateKey if values[0] (the primary key) already exists.
-pub fn insert(transaction: *WriteTransaction, cat: Reference, values: []const u64) !struct { cat: Reference, row: u64 } {
-    var s = try catalog.CatalogSnapshot.load(transaction, cat);
+pub fn insert(transaction: *WriteTransaction, catalogRef: Reference, values: []const u64) !struct { catalogRef: Reference, row: u64 } {
+    var s = try catalog.CatalogSnapshot.load(transaction, catalogRef);
     std.debug.assert(values.len == s.prop_count);
     const prop_count = s.prop_count;
     const row = s.next_row;
@@ -98,24 +98,24 @@ pub fn insert(transaction: *WriteTransaction, cat: Reference, values: []const u6
     s.next_row = row + 1;
     s.next_key = okey + 1;
 
-    const new_cat = try s.replace(transaction);
+    const newCatalog = try s.replace(transaction);
     // Maintain the value index for each indexed property: add this row's okey to
     // the inner set at its stored value, in the same transaction as the row.
-    var cat_out = new_cat;
+    var updatedCatalog = newCatalog;
     {
         var p: usize = 0;
         while (p < prop_count) : (p += 1) {
-            if (s.props[p].indexed) cat_out = try addValueIndex(transaction, cat_out, p, values[p], okey);
+            if (s.props[p].indexed) updatedCatalog = try addValueIndex(transaction, updatedCatalog, p, values[p], okey);
         }
     }
-    return .{ .cat = cat_out, .row = okey };
+    return .{ .catalogRef = updatedCatalog, .row = okey };
 }
 
 /// The row's current version, reported when an optimistic write loses the race.
 pub const Conflict = struct { current_version: u64 };
 /// Outcome of a raw or typed update: new catalog + version, conflict, or absent.
 pub const UpdateResult = union(enum) {
-    ok: struct { cat: Reference, version: u64 },
+    ok: struct { catalogRef: Reference, version: u64 },
     conflict: Conflict,
     not_found,
 };
@@ -130,8 +130,8 @@ pub const DeleteResult = union(enum) {
 /// Overwrite the row identified by `pk` with `values`, guarded by the row's
 /// expected version. Copy-on-writes only the columns whose value changed and
 /// keeps every indexed property's value index in sync.
-pub fn update(transaction: *WriteTransaction, cat: Reference, pk: u64, values: []const u64, expected_version: u64) !UpdateResult {
-    var s = try catalog.CatalogSnapshot.load(transaction, cat);
+pub fn update(transaction: *WriteTransaction, catalogRef: Reference, pk: u64, values: []const u64, expected_version: u64) !UpdateResult {
+    var s = try catalog.CatalogSnapshot.load(transaction, catalogRef);
     std.debug.assert(values.len == s.prop_count);
     std.debug.assert(values[0] == pk); // pk is identity, must not change
     const okey = (try Index.get(transaction, s.pk_index_ref, pk)) orelse return .not_found;
@@ -162,26 +162,26 @@ pub fn update(transaction: *WriteTransaction, cat: Reference, pk: u64, values: [
     }
     s.version_col_ref = try Column.set(transaction, s.version_col_ref, row, transaction.new_version);
 
-    const new_cat = try s.replace(transaction);
+    const newCatalog = try s.replace(transaction);
     // Re-point the value index for any indexed property whose value changed.
-    var cat_out = new_cat;
+    var updatedCatalog = newCatalog;
     {
         var p: usize = 0;
         while (p < pc) : (p += 1) {
             if (s.props[p].indexed and old_vals[p] != values[p]) {
-                cat_out = try removeValueIndex(transaction, cat_out, p, old_vals[p], okey);
-                cat_out = try addValueIndex(transaction, cat_out, p, values[p], okey);
+                updatedCatalog = try removeValueIndex(transaction, updatedCatalog, p, old_vals[p], okey);
+                updatedCatalog = try addValueIndex(transaction, updatedCatalog, p, values[p], okey);
             }
         }
     }
-    return .{ .ok = .{ .cat = cat_out, .version = transaction.new_version } };
+    return .{ .ok = .{ .catalogRef = updatedCatalog, .version = transaction.new_version } };
 }
 
 /// Tombstone the row identified by `pk`, guarded by the row's expected version.
 /// Drops the pk and key->row index entries and every value-index entry, but
 /// leaves the physical column cells intact for pinned readers.
-pub fn delete(transaction: *WriteTransaction, cat: Reference, pk: u64, expected_version: u64) !DeleteResult {
-    var s = try catalog.CatalogSnapshot.load(transaction, cat);
+pub fn delete(transaction: *WriteTransaction, catalogRef: Reference, pk: u64, expected_version: u64) !DeleteResult {
+    var s = try catalog.CatalogSnapshot.load(transaction, catalogRef);
     const okey = (try Index.get(transaction, s.pk_index_ref, pk)) orelse return .not_found;
     const row = (try Index.get(transaction, s.keyrow_index_ref, okey)) orelse return .not_found;
     const cur = try Column.get(transaction, s.version_col_ref, row);
@@ -208,34 +208,34 @@ pub fn delete(transaction: *WriteTransaction, cat: Reference, pk: u64, expected_
     // relocation reuses.
     s.keyrow_index_ref = try Index.remove(transaction, s.keyrow_index_ref, okey);
 
-    const new_cat = try s.replace(transaction);
+    const newCatalog = try s.replace(transaction);
     // Drop this row's okey from the value index for every indexed property.
-    var cat_out = new_cat;
+    var updatedCatalog = newCatalog;
     {
         var p: usize = 0;
         while (p < pc) : (p += 1) {
-            if (s.props[p].indexed) cat_out = try removeValueIndex(transaction, cat_out, p, old_vals[p], okey);
+            if (s.props[p].indexed) updatedCatalog = try removeValueIndex(transaction, updatedCatalog, p, old_vals[p], okey);
         }
     }
-    return .{ .ok = cat_out };
+    return .{ .ok = updatedCatalog };
 }
 
 /// Read a row by primary key into `out` (raw u64 cells). Returns the row
 /// version, or null when the key is not found or the row is tombstoned.
-pub fn getByPk(transaction: anytype, cat: Reference, pk: u64, out: []u64) !?u64 {
-    const v = try loadCatalog(transaction, cat);
+pub fn getByPk(transaction: anytype, catalogRef: Reference, pk: u64, out: []u64) !?u64 {
+    const v = try loadCatalog(transaction, catalogRef);
     std.debug.assert(out.len == v.prop_count);
     const okey = (try Index.get(transaction, v.pk_index_ref, pk)) orelse return null;
-    return getByObjectKey(transaction, cat, okey, out);
+    return getByObjectKey(transaction, catalogRef, okey, out);
 }
 
 /// Read a row by its stable object key. Resolves the okey to a physical row via
 /// the key-to-row index. Returns the row version, or null if the okey is unknown
 /// or the row is tombstoned.
-pub fn getByObjectKey(transaction: anytype, cat: Reference, okey: u64, out: []u64) !?u64 {
-    const v = try loadCatalog(transaction, cat);
+pub fn getByObjectKey(transaction: anytype, catalogRef: Reference, okey: u64, out: []u64) !?u64 {
+    const v = try loadCatalog(transaction, catalogRef);
     std.debug.assert(out.len == v.prop_count);
-    const row = (try catalog.okeyToRow(transaction, cat, okey)) orelse return null;
+    const row = (try catalog.okeyToRow(transaction, catalogRef, okey)) orelse return null;
     const live_col_ref = v.live_col_ref;
     const version_col_ref = v.version_col_ref;
     var prop_refs: [max_prop_count]Reference = undefined;

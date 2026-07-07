@@ -23,7 +23,7 @@ fn churnLogicalSize(path: []const u8, retain: u64, n: u64) !u64 {
     defer database.deinit();
     database.setRetainVersions(retain);
 
-    var cat: Reference = blk: {
+    var catalogRef: Reference = blk: {
         var w = try database.beginWrite();
         const c = try catalog.create(&w, 1);
         w.setRoot(c);
@@ -35,22 +35,22 @@ fn churnLogicalSize(path: []const u8, retain: u64, n: u64) !u64 {
     while (i < n) : (i += 1) {
         {
             var w = try database.beginWrite();
-            cat = database.active_root; // reload the committed catalog ref
-            const r = try rows.insert(&w, cat, &.{i});
-            cat = r.cat;
-            w.setRoot(cat);
+            catalogRef = database.active_root; // reload the committed catalog ref
+            const r = try rows.insert(&w, catalogRef, &.{i});
+            catalogRef = r.catalogRef;
+            w.setRoot(catalogRef);
             _ = try w.commit();
         }
         {
             var w = try database.beginWrite();
-            cat = database.active_root;
+            catalogRef = database.active_root;
             var out: [1]u64 = undefined;
-            const ver = (try rows.getByPk(&w, cat, i, &out)).?;
-            cat = switch (try rows.delete(&w, cat, i, ver)) {
+            const ver = (try rows.getByPk(&w, catalogRef, i, &out)).?;
+            catalogRef = switch (try rows.delete(&w, catalogRef, i, ver)) {
                 .ok => |c| c,
                 else => unreachable,
             };
-            w.setRoot(cat);
+            w.setRoot(catalogRef);
             _ = try w.commit();
         }
     }
@@ -71,8 +71,8 @@ test "steady-state batched inserts keep the free list bounded" {
     defer database.deinit();
     {
         var w = try database.beginWrite();
-        const cat = try catalog.create(&w, 2);
-        w.setRoot(cat);
+        const catalogRef = try catalog.create(&w, 2);
+        w.setRoot(catalogRef);
         _ = try w.commit();
     }
     const batches: usize = 10;
@@ -81,13 +81,13 @@ test "steady-state batched inserts keep the free list bounded" {
     var batch: usize = 0;
     while (batch < batches) : (batch += 1) {
         var w = try database.beginWrite();
-        var cat = w.new_root;
+        var catalogRef = w.new_root;
         var i: usize = 0;
         while (i < inserts_per_batch) : (i += 1) {
-            cat = (try rows.insert(&w, cat, &.{ pk, pk })).cat;
+            catalogRef = (try rows.insert(&w, catalogRef, &.{ pk, pk })).catalogRef;
             pk += 1;
         }
-        w.setRoot(cat);
+        w.setRoot(catalogRef);
         _ = try w.commit();
     }
     // The committed list legitimately tracks the copy-on-write working set (the

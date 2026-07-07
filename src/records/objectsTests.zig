@@ -45,12 +45,12 @@ test "insert appends a row" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    var cat = try create(&w, 3);
-    const r1 = try insert(&w, cat, &.{ 100, 7, 1 });
-    cat = r1.cat;
-    const r2 = try insert(&w, cat, &.{ 200, 8, 0 });
-    cat = r2.cat;
-    try testing.expectEqual(@as(u64, 2), try liveCount(&w, cat));
+    var catalogRef = try create(&w, 3);
+    const r1 = try insert(&w, catalogRef, &.{ 100, 7, 1 });
+    catalogRef = r1.catalogRef;
+    const r2 = try insert(&w, catalogRef, &.{ 200, 8, 0 });
+    catalogRef = r2.catalogRef;
+    try testing.expectEqual(@as(u64, 2), try liveCount(&w, catalogRef));
     w.deinit();
 }
 
@@ -62,9 +62,9 @@ test "insert rejects a duplicate primary key" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    var cat = try create(&w, 3);
-    cat = (try insert(&w, cat, &.{ 100, 7, 1 })).cat;
-    try testing.expectError(error.DuplicateKey, insert(&w, cat, &.{ 100, 9, 1 }));
+    var catalogRef = try create(&w, 3);
+    catalogRef = (try insert(&w, catalogRef, &.{ 100, 7, 1 })).catalogRef;
+    try testing.expectError(error.DuplicateKey, insert(&w, catalogRef, &.{ 100, 9, 1 }));
     w.deinit();
 }
 
@@ -76,17 +76,17 @@ test "getByPk reads property values and the row version" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    var cat = try create(&w, 3);
-    cat = (try insert(&w, cat, &.{ 100, 7, 1 })).cat;
-    cat = (try insert(&w, cat, &.{ 200, 8, 0 })).cat;
+    var catalogRef = try create(&w, 3);
+    catalogRef = (try insert(&w, catalogRef, &.{ 100, 7, 1 })).catalogRef;
+    catalogRef = (try insert(&w, catalogRef, &.{ 200, 8, 0 })).catalogRef;
 
     var out: [3]u64 = undefined;
-    const ver = try getByPk(&w, cat, 200, &out);
+    const ver = try getByPk(&w, catalogRef, 200, &out);
     try testing.expect(ver != null);
     try testing.expectEqual(@as(u64, 200), out[0]);
     try testing.expectEqual(@as(u64, 8), out[1]);
     try testing.expectEqual(@as(u64, 0), out[2]);
-    try testing.expectEqual(@as(?u64, null), try getByPk(&w, cat, 999, &out));
+    try testing.expectEqual(@as(?u64, null), try getByPk(&w, catalogRef, 999, &out));
     w.deinit();
 }
 
@@ -97,13 +97,13 @@ test "update applies on a matching version" {
     defer testing.allocator.free(path);
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
-    var cat: Reference = undefined;
+    var catalogRef: Reference = undefined;
     var fetched_version: u64 = undefined;
     {
         var w = try database.beginWrite();
-        cat = try create(&w, 3);
-        cat = (try insert(&w, cat, &.{ 100, 7, 1 })).cat;
-        w.setRoot(cat);
+        catalogRef = try create(&w, 3);
+        catalogRef = (try insert(&w, catalogRef, &.{ 100, 7, 1 })).catalogRef;
+        w.setRoot(catalogRef);
         _ = try w.commit();
     }
     {
@@ -116,8 +116,8 @@ test "update applies on a matching version" {
         var w = try database.beginWrite();
         const res = try update(&w, w.new_root, 100, &.{ 100, 77, 1 }, fetched_version);
         try testing.expect(res == .ok);
-        cat = res.ok.cat;
-        w.setRoot(cat);
+        catalogRef = res.ok.catalogRef;
+        w.setRoot(catalogRef);
         _ = try w.commit();
     }
     {
@@ -137,27 +137,27 @@ test "update copies only the columns whose value changed" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    var cat = try create(&w, 3);
-    cat = (try insert(&w, cat, &.{ 1, 10, 20 })).cat;
+    var catalogRef = try create(&w, 3);
+    catalogRef = (try insert(&w, catalogRef, &.{ 1, 10, 20 })).catalogRef;
 
-    const before = try loadCatalog(&w, cat);
+    const before = try loadCatalog(&w, catalogRef);
     const col0 = before.propColRef(0);
     const col1 = before.propColRef(1);
     const col2 = before.propColRef(2);
 
     var out: [3]u64 = undefined;
-    const ver = (try getByPk(&w, cat, 1, &out)).?;
-    const res = try update(&w, cat, 1, &.{ 1, 99, 20 }, ver);
+    const ver = (try getByPk(&w, catalogRef, 1, &out)).?;
+    const res = try update(&w, catalogRef, 1, &.{ 1, 99, 20 }, ver);
     try testing.expect(res == .ok);
-    cat = res.ok.cat;
+    catalogRef = res.ok.catalogRef;
 
-    const after = try loadCatalog(&w, cat);
+    const after = try loadCatalog(&w, catalogRef);
     // Unchanged columns keep their exact roots (no copy-on-write happened).
     try testing.expectEqual(col0, after.propColRef(0));
     try testing.expectEqual(col2, after.propColRef(2));
     // The changed column was rewritten.
     try testing.expect(after.propColRef(1) != col1);
-    _ = (try getByPk(&w, cat, 1, &out)).?;
+    _ = (try getByPk(&w, catalogRef, 1, &out)).?;
     try testing.expectEqual(@as(u64, 99), out[1]);
     try testing.expectEqual(@as(u64, 20), out[2]);
     w.deinit();
@@ -170,13 +170,13 @@ test "update conflicts on a stale version" {
     defer testing.allocator.free(path);
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
-    var cat: Reference = undefined;
+    var catalogRef: Reference = undefined;
     var fetched_version: u64 = undefined;
     {
         var w = try database.beginWrite();
-        cat = try create(&w, 3);
-        cat = (try insert(&w, cat, &.{ 100, 7, 1 })).cat;
-        w.setRoot(cat);
+        catalogRef = try create(&w, 3);
+        catalogRef = (try insert(&w, catalogRef, &.{ 100, 7, 1 })).catalogRef;
+        w.setRoot(catalogRef);
         _ = try w.commit();
     }
     {
@@ -189,8 +189,8 @@ test "update conflicts on a stale version" {
         var w = try database.beginWrite();
         const res = try update(&w, w.new_root, 100, &.{ 100, 77, 1 }, fetched_version);
         try testing.expect(res == .ok);
-        cat = res.ok.cat;
-        const res2 = try update(&w, cat, 100, &.{ 100, 88, 1 }, fetched_version); // stale now
+        catalogRef = res.ok.catalogRef;
+        const res2 = try update(&w, catalogRef, 100, &.{ 100, 88, 1 }, fetched_version); // stale now
         try testing.expect(res2 == .conflict);
         w.deinit();
     }
@@ -204,12 +204,12 @@ test "delete conflicts on a stale version" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    var cat = try create(&w, 3);
-    cat = (try insert(&w, cat, &.{ 100, 7, 1 })).cat;
-    cat = (try insert(&w, cat, &.{ 200, 8, 0 })).cat;
+    var catalogRef = try create(&w, 3);
+    catalogRef = (try insert(&w, catalogRef, &.{ 100, 7, 1 })).catalogRef;
+    catalogRef = (try insert(&w, catalogRef, &.{ 200, 8, 0 })).catalogRef;
     var out: [3]u64 = undefined;
-    const v100 = (try getByPk(&w, cat, 100, &out)).?;
-    const stale = try delete(&w, cat, 100, v100 + 1);
+    const v100 = (try getByPk(&w, catalogRef, 100, &out)).?;
+    const stale = try delete(&w, catalogRef, 100, v100 + 1);
     try testing.expect(stale == .conflict);
     w.deinit();
 }
@@ -222,16 +222,16 @@ test "delete tombstones a row" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    var cat = try create(&w, 3);
-    cat = (try insert(&w, cat, &.{ 100, 7, 1 })).cat;
-    cat = (try insert(&w, cat, &.{ 200, 8, 0 })).cat;
+    var catalogRef = try create(&w, 3);
+    catalogRef = (try insert(&w, catalogRef, &.{ 100, 7, 1 })).catalogRef;
+    catalogRef = (try insert(&w, catalogRef, &.{ 200, 8, 0 })).catalogRef;
     var out: [3]u64 = undefined;
-    const v100 = (try getByPk(&w, cat, 100, &out)).?;
-    const ok = try delete(&w, cat, 100, v100);
+    const v100 = (try getByPk(&w, catalogRef, 100, &out)).?;
+    const ok = try delete(&w, catalogRef, 100, v100);
     try testing.expect(ok == .ok);
-    cat = ok.ok;
-    try testing.expectEqual(@as(?u64, null), try getByPk(&w, cat, 100, &out));
-    try testing.expectEqual(@as(u64, 1), try liveCount(&w, cat));
+    catalogRef = ok.ok;
+    try testing.expectEqual(@as(?u64, null), try getByPk(&w, catalogRef, 100, &out));
+    try testing.expectEqual(@as(u64, 1), try liveCount(&w, catalogRef));
     w.deinit();
 }
 
@@ -243,15 +243,15 @@ test "a deleted primary key can be reinserted" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    var cat = try create(&w, 3);
-    cat = (try insert(&w, cat, &.{ 100, 7, 1 })).cat;
-    cat = (try insert(&w, cat, &.{ 200, 8, 0 })).cat;
+    var catalogRef = try create(&w, 3);
+    catalogRef = (try insert(&w, catalogRef, &.{ 100, 7, 1 })).catalogRef;
+    catalogRef = (try insert(&w, catalogRef, &.{ 200, 8, 0 })).catalogRef;
     var out: [3]u64 = undefined;
-    const v100 = (try getByPk(&w, cat, 100, &out)).?;
-    cat = (try delete(&w, cat, 100, v100)).ok;
+    const v100 = (try getByPk(&w, catalogRef, 100, &out)).?;
+    catalogRef = (try delete(&w, catalogRef, 100, v100)).ok;
     // pk 100 can be reinserted after deletion
-    cat = (try insert(&w, cat, &.{ 100, 70, 1 })).cat;
-    try testing.expectEqual(@as(u64, 2), try liveCount(&w, cat));
+    catalogRef = (try insert(&w, catalogRef, &.{ 100, 70, 1 })).catalogRef;
+    try testing.expectEqual(@as(u64, 2), try liveCount(&w, catalogRef));
     w.deinit();
 }
 
@@ -264,10 +264,10 @@ test "objects persist across commit and reopen" {
         var database = try Database.create(testing.allocator, path);
         defer database.deinit();
         var w = try database.beginWrite();
-        var cat = try create(&w, 2); // pk + one value
+        var catalogRef = try create(&w, 2); // pk + one value
         var i: u64 = 0;
-        while (i < 1000) : (i += 1) cat = (try insert(&w, cat, &.{ i, i * 2 })).cat;
-        w.setRoot(cat);
+        while (i < 1000) : (i += 1) catalogRef = (try insert(&w, catalogRef, &.{ i, i * 2 })).catalogRef;
+        w.setRoot(catalogRef);
         _ = try w.commit();
     }
     {
@@ -296,13 +296,13 @@ test "100k objects with updates and deletes match a reference map after reopen" 
         var database = try Database.create(testing.allocator, path);
         defer database.deinit();
         var w = try database.beginWrite();
-        var cat = try create(&w, 2);
+        var catalogRef = try create(&w, 2);
         var out: [2]u64 = undefined;
         var i: u64 = 0;
         while (i < N) : (i += 1) {
             const pk = (i *% 2654435761) % 5_000_011;
-            if ((try getByPk(&w, cat, pk, &out)) != null) continue; // skip hash collision (dup pk)
-            cat = (try insert(&w, cat, &.{ pk, i })).cat;
+            if ((try getByPk(&w, catalogRef, pk, &out)) != null) continue; // skip hash collision (dup pk)
+            catalogRef = (try insert(&w, catalogRef, &.{ pk, i })).catalogRef;
             try ref.put(pk, i);
         }
         // Snapshot the live keys, then update every 5th and delete every 7th.
@@ -311,18 +311,18 @@ test "100k objects with updates and deletes match a reference map after reopen" 
         var kit = ref.keyIterator();
         while (kit.next()) |k| try keys.append(testing.allocator, k.*);
         for (keys.items, 0..) |pk, idx| {
-            const ver = (try getByPk(&w, cat, pk, &out)).?;
+            const ver = (try getByPk(&w, catalogRef, pk, &out)).?;
             if (idx % 5 == 0) {
-                const res = try update(&w, cat, pk, &.{ pk, out[1] +% 1 }, ver);
-                cat = res.ok.cat;
+                const res = try update(&w, catalogRef, pk, &.{ pk, out[1] +% 1 }, ver);
+                catalogRef = res.ok.catalogRef;
                 try ref.put(pk, out[1] +% 1);
             } else if (idx % 7 == 0) {
-                const res = try delete(&w, cat, pk, ver);
-                cat = res.ok;
+                const res = try delete(&w, catalogRef, pk, ver);
+                catalogRef = res.ok;
                 _ = ref.remove(pk);
             }
         }
-        w.setRoot(cat);
+        w.setRoot(catalogRef);
         _ = try w.commit();
     }
     {
@@ -349,11 +349,11 @@ test "typed insert and get round-trip a string property" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    var cat = try createTyped(&w, &.{ .int, .blob, .int });
-    cat = (try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .bytes = "Ada" }, .{ .int = 30 } })).cat;
-    cat = (try insertTyped(&w, cat, &.{ .{ .int = 2 }, .{ .bytes = "Linus" }, .{ .int = 54 } })).cat;
+    var catalogRef = try createTyped(&w, &.{ .int, .blob, .int });
+    catalogRef = (try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .bytes = "Ada" }, .{ .int = 30 } })).catalogRef;
+    catalogRef = (try insertTyped(&w, catalogRef, &.{ .{ .int = 2 }, .{ .bytes = "Linus" }, .{ .int = 54 } })).catalogRef;
     var out: [3]Value = undefined;
-    const ver = try getTyped(&w, cat, 2, &out);
+    const ver = try getTyped(&w, catalogRef, 2, &out);
     try testing.expect(ver != null);
     try testing.expectEqual(@as(u64, 2), out[0].int);
     try testing.expectEqualStrings("Linus", out[1].bytes);
@@ -369,14 +369,14 @@ test "typed update on a stale version does not free the old blob" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    var cat = try createTyped(&w, &.{ .int, .blob });
-    cat = (try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .bytes = "short" } })).cat;
+    var catalogRef = try createTyped(&w, &.{ .int, .blob });
+    catalogRef = (try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .bytes = "short" } })).catalogRef;
     var out: [2]Value = undefined;
-    const ver = (try getTyped(&w, cat, 1, &out)).?;
+    const ver = (try getTyped(&w, catalogRef, 1, &out)).?;
     // stale-version update must NOT free the old blob (conflict path)
-    const conflict = try updateTyped(&w, cat, 1, &.{ .{ .int = 1 }, .{ .bytes = "X" } }, ver + 1);
+    const conflict = try updateTyped(&w, catalogRef, 1, &.{ .{ .int = 1 }, .{ .bytes = "X" } }, ver + 1);
     try testing.expect(conflict == .conflict);
-    _ = (try getTyped(&w, cat, 1, &out)).?;
+    _ = (try getTyped(&w, catalogRef, 1, &out)).?;
     try testing.expectEqualStrings("short", out[1].bytes);
     w.deinit();
 }
@@ -389,13 +389,13 @@ test "typed update replaces a string" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    var cat = try createTyped(&w, &.{ .int, .blob });
-    cat = (try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .bytes = "short" } })).cat;
+    var catalogRef = try createTyped(&w, &.{ .int, .blob });
+    catalogRef = (try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .bytes = "short" } })).catalogRef;
     var out: [2]Value = undefined;
-    const ver = (try getTyped(&w, cat, 1, &out)).?;
-    const ures = try updateTyped(&w, cat, 1, &.{ .{ .int = 1 }, .{ .bytes = "a much longer value" } }, ver);
-    cat = ures.ok.cat;
-    _ = try getTyped(&w, cat, 1, &out);
+    const ver = (try getTyped(&w, catalogRef, 1, &out)).?;
+    const ures = try updateTyped(&w, catalogRef, 1, &.{ .{ .int = 1 }, .{ .bytes = "a much longer value" } }, ver);
+    catalogRef = ures.ok.catalogRef;
+    _ = try getTyped(&w, catalogRef, 1, &out);
     try testing.expectEqualStrings("a much longer value", out[1].bytes);
     w.deinit();
 }
@@ -408,13 +408,13 @@ test "typed delete removes the row" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    var cat = try createTyped(&w, &.{ .int, .blob });
-    cat = (try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .bytes = "short" } })).cat;
+    var catalogRef = try createTyped(&w, &.{ .int, .blob });
+    catalogRef = (try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .bytes = "short" } })).catalogRef;
     var out: [2]Value = undefined;
-    const v2 = (try getTyped(&w, cat, 1, &out)).?;
-    const dres = try deleteTyped(&w, cat, 1, v2);
-    cat = dres.ok;
-    try testing.expectEqual(@as(?u64, null), try getTyped(&w, cat, 1, &out));
+    const v2 = (try getTyped(&w, catalogRef, 1, &out)).?;
+    const dres = try deleteTyped(&w, catalogRef, 1, v2);
+    catalogRef = dres.ok;
+    try testing.expectEqual(@as(?u64, null), try getTyped(&w, catalogRef, 1, &out));
     w.deinit();
 }
 
@@ -427,14 +427,14 @@ test "strings persist across reopen" {
         var database = try Database.create(testing.allocator, path);
         defer database.deinit();
         var w = try database.beginWrite();
-        var cat = try createTyped(&w, &.{ .int, .blob });
+        var catalogRef = try createTyped(&w, &.{ .int, .blob });
         var i: u64 = 0;
         var buf: [32]u8 = undefined;
         while (i < 500) : (i += 1) {
             const s = try std.fmt.bufPrint(&buf, "name-{d}", .{i});
-            cat = (try insertTyped(&w, cat, &.{ .{ .int = i }, .{ .bytes = s } })).cat;
+            catalogRef = (try insertTyped(&w, catalogRef, &.{ .{ .int = i }, .{ .bytes = s } })).catalogRef;
         }
-        w.setRoot(cat);
+        w.setRoot(catalogRef);
         _ = try w.commit();
     }
     {
@@ -456,7 +456,7 @@ test "a large blob property decodes to a ref and materializes; small stays inlin
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    var cat = try createTyped(&w, &.{ .int, .blob });
+    var catalogRef = try createTyped(&w, &.{ .int, .blob });
 
     // A blob well past the inline cap (section_size is 16 MiB) forces chunking.
     const n: usize = 20 * 1024 * 1024;
@@ -464,12 +464,12 @@ test "a large blob property decodes to a ref and materializes; small stays inlin
     defer testing.allocator.free(big);
     for (big, 0..) |*b, i| b.* = @intCast(i % 251);
 
-    cat = (try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .bytes = big } })).cat;
-    cat = (try insertTyped(&w, cat, &.{ .{ .int = 2 }, .{ .bytes = "small" } })).cat;
+    catalogRef = (try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .bytes = big } })).catalogRef;
+    catalogRef = (try insertTyped(&w, catalogRef, &.{ .{ .int = 2 }, .{ .bytes = "small" } })).catalogRef;
 
     // The large blob decodes to a ref, not an inline slice.
     var out: [2]Value = undefined;
-    try testing.expect((try getTyped(&w, cat, 1, &out)) != null);
+    try testing.expect((try getTyped(&w, catalogRef, 1, &out)) != null);
     try testing.expect(out[1] == .blob_ref);
 
     // Materialize it and verify length + sampled offsets + first/last KB.
@@ -482,7 +482,7 @@ test "a large blob property decodes to a ref and materializes; small stays inlin
     try testing.expectEqual(big[12_345_678], got[12_345_678]);
 
     // A small blob in the same property still decodes to a zero-copy slice.
-    try testing.expect((try getTyped(&w, cat, 2, &out)) != null);
+    try testing.expect((try getTyped(&w, catalogRef, 2, &out)) != null);
     try testing.expect(out[1] == .bytes);
     try testing.expectEqualStrings("small", out[1].bytes);
     w.deinit();
@@ -496,21 +496,21 @@ test "getByObjectKey reads a row by its stable object key" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    var cat = try create(&w, 2);
-    const r0 = try insert(&w, cat, &.{ 100, 7 });
-    cat = r0.cat;
-    const r1 = try insert(&w, cat, &.{ 200, 8 });
-    cat = r1.cat;
+    var catalogRef = try create(&w, 2);
+    const r0 = try insert(&w, catalogRef, &.{ 100, 7 });
+    catalogRef = r0.catalogRef;
+    const r1 = try insert(&w, catalogRef, &.{ 200, 8 });
+    catalogRef = r1.catalogRef;
     var out: [2]u64 = undefined;
-    const v1 = try getByObjectKey(&w, cat, r1.row, &out);
+    const v1 = try getByObjectKey(&w, catalogRef, r1.row, &out);
     try testing.expect(v1 != null);
     try testing.expectEqual(@as(u64, 200), out[0]);
     try testing.expectEqual(@as(u64, 8), out[1]);
-    try testing.expectEqual(@as(?u64, null), try getByObjectKey(&w, cat, 999, &out));
-    const vk = (try getByObjectKey(&w, cat, r0.row, &out)).?;
-    const dres = try delete(&w, cat, 100, vk);
-    cat = dres.ok;
-    try testing.expectEqual(@as(?u64, null), try getByObjectKey(&w, cat, r0.row, &out));
+    try testing.expectEqual(@as(?u64, null), try getByObjectKey(&w, catalogRef, 999, &out));
+    const vk = (try getByObjectKey(&w, catalogRef, r0.row, &out)).?;
+    const dres = try delete(&w, catalogRef, 100, vk);
+    catalogRef = dres.ok;
+    try testing.expectEqual(@as(?u64, null), try getByObjectKey(&w, catalogRef, r0.row, &out));
     w.deinit();
 }
 
@@ -522,34 +522,34 @@ test "getByObjectKey resolves through the key-to-row index" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    var cat = try create(&w, 2);
-    const r0 = try insert(&w, cat, &.{ 100, 7 });
-    cat = r0.cat;
-    const r1 = try insert(&w, cat, &.{ 200, 8 });
-    cat = r1.cat;
+    var catalogRef = try create(&w, 2);
+    const r0 = try insert(&w, catalogRef, &.{ 100, 7 });
+    catalogRef = r0.catalogRef;
+    const r1 = try insert(&w, catalogRef, &.{ 200, 8 });
+    catalogRef = r1.catalogRef;
     var out: [2]u64 = undefined;
-    try testing.expect((try getByObjectKey(&w, cat, r0.row, &out)) != null);
+    try testing.expect((try getByObjectKey(&w, catalogRef, r0.row, &out)) != null);
     try testing.expectEqual(@as(u64, 100), out[0]);
     try testing.expectEqual(@as(u64, 7), out[1]);
-    try testing.expect((try getByObjectKey(&w, cat, r1.row, &out)) != null);
+    try testing.expect((try getByObjectKey(&w, catalogRef, r1.row, &out)) != null);
     try testing.expectEqual(@as(u64, 200), out[0]);
     try testing.expectEqual(@as(u64, 8), out[1]);
     // An object key with no mapping resolves to null.
-    try testing.expectEqual(@as(?u64, null), try getByObjectKey(&w, cat, 999, &out));
+    try testing.expectEqual(@as(?u64, null), try getByObjectKey(&w, catalogRef, 999, &out));
     w.deinit();
 }
 
 // Collect, in ascending order, the object keys held in the value index's inner
-// set for (cat, prop, value). Empty/absent yields an empty list.
+// set for (catalogRef, prop, value). Empty/absent yields an empty list.
 fn collectIndexOkeys(
     transaction: anytype,
-    cat: Reference,
+    catalogRef: Reference,
     prop: usize,
     value: u64,
     out: *std.ArrayList(u64),
     allocator: std.mem.Allocator,
 ) !void {
-    const v = try loadCatalog(transaction, cat);
+    const v = try loadCatalog(transaction, catalogRef);
     const vi = v.valueIndexRef(prop);
     const inner = (try Index.get(transaction, vi, value)) orelse return;
     const Sink = struct {
@@ -564,14 +564,14 @@ fn collectIndexOkeys(
 
 fn expectIndexOkeys(
     transaction: anytype,
-    cat: Reference,
+    catalogRef: Reference,
     prop: usize,
     value: u64,
     expected: []const u64,
 ) !void {
     var got = std.ArrayList(u64).empty;
     defer got.deinit(testing.allocator);
-    try collectIndexOkeys(transaction, cat, prop, value, &got, testing.allocator);
+    try collectIndexOkeys(transaction, catalogRef, prop, value, &got, testing.allocator);
     try testing.expectEqualSlices(u64, expected, got.items);
 }
 
@@ -583,18 +583,18 @@ test "value index tracks inserts" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .int, .indexed = true } });
-    const o0 = try insert(&w, cat, &.{ 1, 10 });
-    cat = o0.cat;
-    const o1 = try insert(&w, cat, &.{ 2, 20 });
-    cat = o1.cat;
-    const o2 = try insert(&w, cat, &.{ 3, 10 });
-    cat = o2.cat;
-    const o3 = try insert(&w, cat, &.{ 4, 30 });
-    cat = o3.cat;
-    try expectIndexOkeys(&w, cat, 1, 10, &.{ o0.row, o2.row });
-    try expectIndexOkeys(&w, cat, 1, 20, &.{o1.row});
-    try expectIndexOkeys(&w, cat, 1, 30, &.{o3.row});
+    var catalogRef = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .int, .indexed = true } });
+    const o0 = try insert(&w, catalogRef, &.{ 1, 10 });
+    catalogRef = o0.catalogRef;
+    const o1 = try insert(&w, catalogRef, &.{ 2, 20 });
+    catalogRef = o1.catalogRef;
+    const o2 = try insert(&w, catalogRef, &.{ 3, 10 });
+    catalogRef = o2.catalogRef;
+    const o3 = try insert(&w, catalogRef, &.{ 4, 30 });
+    catalogRef = o3.catalogRef;
+    try expectIndexOkeys(&w, catalogRef, 1, 10, &.{ o0.row, o2.row });
+    try expectIndexOkeys(&w, catalogRef, 1, 20, &.{o1.row});
+    try expectIndexOkeys(&w, catalogRef, 1, 30, &.{o3.row});
     w.deinit();
 }
 
@@ -606,22 +606,22 @@ test "value index tracks updates" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .int, .indexed = true } });
-    const o0 = try insert(&w, cat, &.{ 1, 10 });
-    cat = o0.cat;
-    const o1 = try insert(&w, cat, &.{ 2, 20 });
-    cat = o1.cat;
-    const o2 = try insert(&w, cat, &.{ 3, 10 });
-    cat = o2.cat;
+    var catalogRef = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .int, .indexed = true } });
+    const o0 = try insert(&w, catalogRef, &.{ 1, 10 });
+    catalogRef = o0.catalogRef;
+    const o1 = try insert(&w, catalogRef, &.{ 2, 20 });
+    catalogRef = o1.catalogRef;
+    const o2 = try insert(&w, catalogRef, &.{ 3, 10 });
+    catalogRef = o2.catalogRef;
     // Move o1's indexed prop from 20 to 10.
     var out: [2]u64 = undefined;
-    const ver = (try getByPk(&w, cat, 2, &out)).?;
-    const res = try update(&w, cat, 2, &.{ 2, 10 }, ver);
+    const ver = (try getByPk(&w, catalogRef, 2, &out)).?;
+    const res = try update(&w, catalogRef, 2, &.{ 2, 10 }, ver);
     try testing.expect(res == .ok);
-    cat = res.ok.cat;
-    try expectIndexOkeys(&w, cat, 1, 10, &.{ o0.row, o1.row, o2.row });
+    catalogRef = res.ok.catalogRef;
+    try expectIndexOkeys(&w, catalogRef, 1, 10, &.{ o0.row, o1.row, o2.row });
     // The 20 entry is now empty.
-    try expectIndexOkeys(&w, cat, 1, 20, &.{});
+    try expectIndexOkeys(&w, catalogRef, 1, 20, &.{});
     w.deinit();
 }
 
@@ -633,20 +633,20 @@ test "value index tracks deletes" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .int, .indexed = true } });
-    const o0 = try insert(&w, cat, &.{ 1, 10 });
-    cat = o0.cat;
-    const o1 = try insert(&w, cat, &.{ 2, 20 });
-    cat = o1.cat;
-    const o2 = try insert(&w, cat, &.{ 3, 10 });
-    cat = o2.cat;
-    try expectIndexOkeys(&w, cat, 1, 10, &.{ o0.row, o2.row });
+    var catalogRef = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .int, .indexed = true } });
+    const o0 = try insert(&w, catalogRef, &.{ 1, 10 });
+    catalogRef = o0.catalogRef;
+    const o1 = try insert(&w, catalogRef, &.{ 2, 20 });
+    catalogRef = o1.catalogRef;
+    const o2 = try insert(&w, catalogRef, &.{ 3, 10 });
+    catalogRef = o2.catalogRef;
+    try expectIndexOkeys(&w, catalogRef, 1, 10, &.{ o0.row, o2.row });
     // Delete o0 (value 10); only o2 should remain under 10.
     var out: [2]u64 = undefined;
-    const ver = (try getByPk(&w, cat, 1, &out)).?;
-    cat = (try delete(&w, cat, 1, ver)).ok;
-    try expectIndexOkeys(&w, cat, 1, 10, &.{o2.row});
-    try expectIndexOkeys(&w, cat, 1, 20, &.{o1.row});
+    const ver = (try getByPk(&w, catalogRef, 1, &out)).?;
+    catalogRef = (try delete(&w, catalogRef, 1, ver)).ok;
+    try expectIndexOkeys(&w, catalogRef, 1, 10, &.{o2.row});
+    try expectIndexOkeys(&w, catalogRef, 1, 20, &.{o1.row});
     w.deinit();
 }
 
@@ -662,19 +662,19 @@ test "updateTyped carries collection properties through unchanged" {
     defer database.deinit();
     var w = try database.beginWrite();
     defer w.deinit();
-    var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .int }, .{ .kind = .list, .elem = .int } });
-    cat = (try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .int = 10 }, .{ .list_int = &.{ 7, 8, 9 } } })).cat;
+    var catalogRef = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .int }, .{ .kind = .list, .elem = .int } });
+    catalogRef = (try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .int = 10 }, .{ .list_int = &.{ 7, 8, 9 } } })).catalogRef;
 
     var out: [3]Value = undefined;
-    const ver = (try getTyped(&w, cat, 1, &out)).?;
-    const res = try updateTyped(&w, cat, 1, &.{ .{ .int = 1 }, .{ .int = 20 }, out[2] }, ver);
+    const ver = (try getTyped(&w, catalogRef, 1, &out)).?;
+    const res = try updateTyped(&w, catalogRef, 1, &.{ .{ .int = 1 }, .{ .int = 20 }, out[2] }, ver);
     try testing.expect(res == .ok);
-    cat = res.ok.cat;
+    catalogRef = res.ok.catalogRef;
 
-    _ = (try getTyped(&w, cat, 1, &out)).?;
+    _ = (try getTyped(&w, catalogRef, 1, &out)).?;
     try testing.expectEqual(@as(u64, 20), out[1].int);
-    try testing.expectEqual(@as(?u64, 3), try collections.listLen(&w, cat, 1, 2));
-    try testing.expectEqual(@as(u64, 8), try collections.listGetInt(&w, cat, 1, 2, 1));
+    try testing.expectEqual(@as(?u64, 3), try collections.listLen(&w, catalogRef, 1, 2));
+    try testing.expectEqual(@as(u64, 8), try collections.listGetInt(&w, catalogRef, 1, 2, 1));
 }
 
 test "deleteTyped frees the row's collection storage" {
@@ -690,19 +690,19 @@ test "deleteTyped frees the row's collection storage" {
     // Commit a row carrying every collection kind so its trees are committed.
     {
         var w = try database.beginWrite();
-        var cat = try catalog.createDefs(&w, &.{
+        var catalogRef = try catalog.createDefs(&w, &.{
             .{ .kind = .int },
             .{ .kind = .list, .elem = .blob },
             .{ .kind = .set, .elem = .int },
             .{ .kind = .dict },
         });
-        cat = (try insertTyped(&w, cat, &.{
+        catalogRef = (try insertTyped(&w, catalogRef, &.{
             .{ .int = 1 },
             .{ .list_blob = &.{ "alpha", "beta" } },
             .{ .set_int = &.{ 1, 2, 3 } },
             .{ .dict_int = &.{ .{ .key = "k1", .val = 10 }, .{ .key = "k2", .val = 20 } } },
-        })).cat;
-        w.setRoot(cat);
+        })).catalogRef;
+        w.setRoot(catalogRef);
         _ = try w.commit();
     }
     // Deleting the row must record the collection trees as in-flight frees.
@@ -730,31 +730,31 @@ test "updateTyped moves backlinks when a link value changes" {
     defer database.deinit();
     var w = try database.beginWrite();
     defer w.deinit();
-    var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
-    const a = try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .link = null } });
-    cat = a.cat;
-    const b = try insertTyped(&w, cat, &.{ .{ .int = 2 }, .{ .link = null } });
-    cat = b.cat;
-    const c = try insertTyped(&w, cat, &.{ .{ .int = 3 }, .{ .link = a.row } });
-    cat = c.cat;
+    var catalogRef = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
+    const a = try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .link = null } });
+    catalogRef = a.catalogRef;
+    const b = try insertTyped(&w, catalogRef, &.{ .{ .int = 2 }, .{ .link = null } });
+    catalogRef = b.catalogRef;
+    const c = try insertTyped(&w, catalogRef, &.{ .{ .int = 3 }, .{ .link = a.row } });
+    catalogRef = c.catalogRef;
 
     var out: [2]Value = undefined;
-    const ver = (try getTyped(&w, cat, 3, &out)).?;
-    const res = try updateTyped(&w, cat, 3, &.{ .{ .int = 3 }, .{ .link = b.row } }, ver);
+    const ver = (try getTyped(&w, catalogRef, 3, &out)).?;
+    const res = try updateTyped(&w, catalogRef, 3, &.{ .{ .int = 3 }, .{ .link = b.row } }, ver);
     try testing.expect(res == .ok);
-    cat = res.ok.cat;
+    catalogRef = res.ok.catalogRef;
 
     const links_mod = @import("links.zig");
-    try testing.expectEqual(@as(u64, 0), try links_mod.backlinkCount(&w, cat, 1, a.row));
-    try testing.expectEqual(@as(u64, 1), try links_mod.backlinkCount(&w, cat, 1, b.row));
+    try testing.expectEqual(@as(u64, 0), try links_mod.backlinkCount(&w, catalogRef, 1, a.row));
+    try testing.expectEqual(@as(u64, 1), try links_mod.backlinkCount(&w, catalogRef, 1, b.row));
     // Deleting the NEW target nullifies the source's link.
     var raw: [2]u64 = undefined;
-    const bv = (try getByPk(&w, cat, 2, &raw)).?;
-    cat = switch (try deleteAndNullify(&w, cat, 2, bv)) {
+    const bv = (try getByPk(&w, catalogRef, 2, &raw)).?;
+    catalogRef = switch (try deleteAndNullify(&w, catalogRef, 2, bv)) {
         .ok => |x| x,
         else => unreachable,
     };
-    try testing.expectEqual(@as(?u64, null), try links_mod.getLink(&w, cat, 3, 1));
+    try testing.expectEqual(@as(?u64, null), try links_mod.getLink(&w, catalogRef, 3, 1));
 }
 
 test "a multi-leaf value-index set is pruned and freed when emptied" {
@@ -768,17 +768,17 @@ test "a multi-leaf value-index set is pruned and freed when emptied" {
     defer database.deinit();
     var w = try database.beginWrite();
     defer w.deinit();
-    var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .int, .indexed = true } });
+    var catalogRef = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .int, .indexed = true } });
     const n: u64 = 80;
     var pk: u64 = 1;
-    while (pk <= n) : (pk += 1) cat = (try insert(&w, cat, &.{ pk, 7 })).cat;
+    while (pk <= n) : (pk += 1) catalogRef = (try insert(&w, catalogRef, &.{ pk, 7 })).catalogRef;
     var out: [2]u64 = undefined;
     pk = 1;
     while (pk <= n) : (pk += 1) {
-        const ver = (try getByPk(&w, cat, pk, &out)).?;
-        cat = (try delete(&w, cat, pk, ver)).ok;
+        const ver = (try getByPk(&w, catalogRef, pk, &out)).?;
+        catalogRef = (try delete(&w, catalogRef, pk, ver)).ok;
     }
-    const v = try loadCatalog(&w, cat);
+    const v = try loadCatalog(&w, catalogRef);
     try testing.expectEqual(@as(?u64, null), try Index.get(&w, v.valueIndexRef(1), 7));
     try testing.expectEqual(@as(u64, 0), try Index.count(&w, v.valueIndexRef(1)));
 }
@@ -792,18 +792,18 @@ test "an emptied value-index set is pruned from the outer index" {
     defer database.deinit();
     var w = try database.beginWrite();
     defer w.deinit();
-    var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .int, .indexed = true } });
-    cat = (try insert(&w, cat, &.{ 1, 10 })).cat;
-    cat = (try insert(&w, cat, &.{ 2, 10 })).cat;
+    var catalogRef = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .int, .indexed = true } });
+    catalogRef = (try insert(&w, catalogRef, &.{ 1, 10 })).catalogRef;
+    catalogRef = (try insert(&w, catalogRef, &.{ 2, 10 })).catalogRef;
     // Delete both rows carrying value 10: the 10 entry must disappear entirely,
     // not linger as an empty set.
     var out: [2]u64 = undefined;
     var pk: u64 = 1;
     while (pk <= 2) : (pk += 1) {
-        const ver = (try getByPk(&w, cat, pk, &out)).?;
-        cat = (try delete(&w, cat, pk, ver)).ok;
+        const ver = (try getByPk(&w, catalogRef, pk, &out)).?;
+        catalogRef = (try delete(&w, catalogRef, pk, ver)).ok;
     }
-    const v = try loadCatalog(&w, cat);
+    const v = try loadCatalog(&w, catalogRef);
     try testing.expectEqual(@as(?u64, null), try Index.get(&w, v.valueIndexRef(1), 10));
     try testing.expectEqual(@as(u64, 0), try Index.count(&w, v.valueIndexRef(1)));
 }
@@ -816,15 +816,15 @@ test "non-indexed prop has no index" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .int } });
-    const r0 = try insert(&w, cat, &.{ 1, 100 });
-    cat = r0.cat;
+    var catalogRef = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .int } });
+    const r0 = try insert(&w, catalogRef, &.{ 1, 100 });
+    catalogRef = r0.catalogRef;
     var out: [2]u64 = undefined;
-    const ver = (try getByPk(&w, cat, 1, &out)).?;
-    cat = (try update(&w, cat, 1, &.{ 1, 200 }, ver)).ok.cat;
-    const ver2 = (try getByPk(&w, cat, 1, &out)).?;
-    cat = (try delete(&w, cat, 1, ver2)).ok;
-    const v = try loadCatalog(&w, cat);
+    const ver = (try getByPk(&w, catalogRef, 1, &out)).?;
+    catalogRef = (try update(&w, catalogRef, 1, &.{ 1, 200 }, ver)).ok.catalogRef;
+    const ver2 = (try getByPk(&w, catalogRef, 1, &out)).?;
+    catalogRef = (try delete(&w, catalogRef, 1, ver2)).ok;
+    const v = try loadCatalog(&w, catalogRef);
     var i: usize = 0;
     while (i < v.prop_count) : (i += 1) try testing.expectEqual(@as(Reference, 0), v.valueIndexRef(i));
     w.deinit();
@@ -838,24 +838,24 @@ test "reinserting a primary key after delete yields a new object key" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    var cat = try create(&w, 2);
-    const first = try insert(&w, cat, &.{ 100, 7 });
-    cat = first.cat;
+    var catalogRef = try create(&w, 2);
+    const first = try insert(&w, catalogRef, &.{ 100, 7 });
+    catalogRef = first.catalogRef;
     const okey_a = first.row;
     var out: [2]u64 = undefined;
-    const v = (try getByPk(&w, cat, 100, &out)).?;
-    cat = (try delete(&w, cat, 100, v)).ok;
-    const second = try insert(&w, cat, &.{ 100, 70 });
-    cat = second.cat;
+    const v = (try getByPk(&w, catalogRef, 100, &out)).?;
+    catalogRef = (try delete(&w, catalogRef, 100, v)).ok;
+    const second = try insert(&w, catalogRef, &.{ 100, 70 });
+    catalogRef = second.catalogRef;
     const okey_b = second.row;
     try testing.expect(okey_a != okey_b);
     // The old object key is tombstoned and resolves to null.
-    try testing.expectEqual(@as(?u64, null), try getByObjectKey(&w, cat, okey_a, &out));
+    try testing.expectEqual(@as(?u64, null), try getByObjectKey(&w, catalogRef, okey_a, &out));
     // The new object key returns the new row.
-    try testing.expect((try getByObjectKey(&w, cat, okey_b, &out)) != null);
+    try testing.expect((try getByObjectKey(&w, catalogRef, okey_b, &out)) != null);
     try testing.expectEqual(@as(u64, 70), out[1]);
     // Lookup by pk returns the new values.
-    try testing.expect((try getByPk(&w, cat, 100, &out)) != null);
+    try testing.expect((try getByPk(&w, catalogRef, 100, &out)) != null);
     try testing.expectEqual(@as(u64, 70), out[1]);
     w.deinit();
 }
@@ -876,14 +876,14 @@ test "deleteTyped frees a self-referencing link_set root exactly once" {
 
     {
         var w = try database.beginWrite();
-        var cat = try catalog.createDefs(&w, &.{
+        var catalogRef = try catalog.createDefs(&w, &.{
             .{ .kind = .int },
             .{ .kind = .link_set },
         });
-        const ins = try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .link_set = &.{} } });
-        cat = ins.cat;
-        cat = try links.linkSetAdd(&w, cat, 1, 1, ins.row); // set contains own okey
-        w.setRoot(cat);
+        const ins = try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .link_set = &.{} } });
+        catalogRef = ins.catalogRef;
+        catalogRef = try links.linkSetAdd(&w, catalogRef, 1, 1, ins.row); // set contains own okey
+        w.setRoot(catalogRef);
         _ = try w.commit();
     }
     var w = try database.beginWrite();

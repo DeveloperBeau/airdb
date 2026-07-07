@@ -126,16 +126,16 @@ fn createDestinationStructures(dst: *WriteTransaction, s: *catalog.CatalogSnapsh
     s.pk_index_ref = try Index.create(dst);
 }
 
-/// Copy all live rows of `src_cat` (in the source database) into a fresh catalog in the
+/// Copy all live rows of `sourceCatalog` (in the source database) into a fresh catalog in the
 /// destination database, preserving object keys, primary keys, and next_key. Backlink
 /// indexes are created empty (rebuild with rebuildBacklinks afterward); value
 /// indexes are repopulated inline. Returns the new destination catalog ref.
 /// O(live rows x properties), plus the deep copies' own costs.
-pub fn copyTypeRows(src: anytype, src_cat: Reference, dst: *WriteTransaction) !Reference {
+pub fn copyTypeRows(src: anytype, sourceCatalog: Reference, dst: *WriteTransaction) !Reference {
     // Load the source snapshot, then re-point every ref field at structures
     // created in the DESTINATION database before writing. Kinds, elem kinds, targets,
     // rules, and indexed flags carry over as plain values.
-    var s = try catalog.CatalogSnapshot.load(src, src_cat);
+    var s = try catalog.CatalogSnapshot.load(src, sourceCatalog);
     const pc = s.prop_count;
     // Keep the source refs to read from.
     var s_prop: [catalog.max_prop_count]Reference = undefined;
@@ -182,11 +182,11 @@ pub fn copyTypeRows(src: anytype, src_cat: Reference, dst: *WriteTransaction) !R
     return s.write(dst);
 }
 
-/// Rebuild backlink indexes for `cat` (in dst) from its copied forward links.
+/// Rebuild backlink indexes for `catalogRef` (in dst) from its copied forward links.
 /// O(live rows x link properties x link fan-out).
-pub fn rebuildBacklinks(dst: *WriteTransaction, cat: Reference) !Reference {
-    var cur = cat;
-    const v0 = try catalog.loadCatalog(dst, cat);
+pub fn rebuildBacklinks(dst: *WriteTransaction, catalogRef: Reference) !Reference {
+    var cur = catalogRef;
+    const v0 = try catalog.loadCatalog(dst, catalogRef);
     const pc = v0.prop_count;
     const alloc = dst.database.store.allocator;
     var p: usize = 0;

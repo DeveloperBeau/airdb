@@ -69,7 +69,7 @@ pub const CompactCursor = struct {
     /// a foreign cursor would leave rows unexamined ahead of the tail
     /// truncate -- silent live-row loss in release builds.
     type_id: u16,
-    cat: Reference,
+    catalogRef: Reference,
     live_count: u64,
     next_row: u64,
     hole_lo: u64,

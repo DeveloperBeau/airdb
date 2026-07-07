@@ -93,7 +93,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     // One type carrying a property of each exercised kind.
     {
         var w = try database.beginWrite();
-        const cat = try catalog.createDefs(&w, &.{
+        const catalogRef = try catalog.createDefs(&w, &.{
             .{ .kind = .int }, // 0 pk
             .{ .kind = .int }, // 1 int
             .{ .kind = .int }, // 2 bool (0/1)
@@ -103,7 +103,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
             .{ .kind = .set, .elem = .int }, // 6 set of int
             .{ .kind = .set, .elem = .blob }, // 7 set of blob
         });
-        w.setRoot(cat);
+        w.setRoot(catalogRef);
         _ = try w.commit();
     }
 
@@ -127,7 +127,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         while (inserted < rows) {
             const this_batch = @min(batch_size, rows - inserted);
             var w = try database.beginWrite();
-            var cat = w.new_root;
+            var catalogRef = w.new_root;
             var j: usize = 0;
             while (j < this_batch) : (j += 1) {
                 const pk: u64 = inserted + j;
@@ -158,13 +158,13 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
                 };
 
                 const t0 = nowNs(io);
-                const r = try objects.insertTyped(&w, cat, &row);
+                const r = try objects.insertTyped(&w, catalogRef, &row);
                 const dt: u64 = @intCast(nowNs(io) - t0);
-                cat = r.cat;
+                catalogRef = r.catalogRef;
                 try create_lat.add(alloc, dt);
                 try combined.add(alloc, dt);
             }
-            w.setRoot(cat);
+            w.setRoot(catalogRef);
             _ = try w.commit();
             inserted += this_batch;
         }
@@ -183,18 +183,18 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     {
         const phase_start = nowNs(io);
         var r = try database.beginRead();
-        const cat = r.root();
+        const catalogRef = r.root();
         var out: [prop_count]Value = undefined;
         var k: usize = 0;
         while (k < read_n) : (k += 1) {
             const pk: u64 = (k * read_stride) % rows;
             const t0 = nowNs(io);
-            _ = try objects.getTyped(&r, cat, pk, &out); // int/bool/blob/link
-            _ = try collections.dictCount(&r, cat, pk, p_dict);
-            _ = try collections.dictGet(&r, cat, pk, p_dict, "alpha");
-            _ = try collections.setCountInt(&r, cat, pk, p_set_int);
-            _ = try collections.setCountBlob(&r, cat, pk, p_set_blob);
-            _ = try collections.setContainsBlob(&r, cat, pk, p_set_blob, "m1");
+            _ = try objects.getTyped(&r, catalogRef, pk, &out); // int/bool/blob/link
+            _ = try collections.dictCount(&r, catalogRef, pk, p_dict);
+            _ = try collections.dictGet(&r, catalogRef, pk, p_dict, "alpha");
+            _ = try collections.setCountInt(&r, catalogRef, pk, p_set_int);
+            _ = try collections.setCountBlob(&r, catalogRef, pk, p_set_blob);
+            _ = try collections.setContainsBlob(&r, catalogRef, pk, p_set_blob, "m1");
             const dt: u64 = @intCast(nowNs(io) - t0);
             try read_lat.add(alloc, dt);
             try combined.add(alloc, dt);
@@ -210,20 +210,20 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         while (done < update_n) {
             const this_batch = @min(batch_size, update_n - done);
             var w = try database.beginWrite();
-            var cat = w.new_root;
+            var catalogRef = w.new_root;
             var j: usize = 0;
             while (j < this_batch) : (j += 1) {
                 const pk: u64 = ((done + j) * update_stride) % rows;
                 const target: u64 = (pk + 7) % rows;
                 const t0 = nowNs(io);
-                cat = try collections.setAddInt(&w, cat, pk, p_set_int, 1_000_000 + pk);
-                cat = try collections.dictPut(&w, cat, pk, p_dict, "delta", pk);
-                cat = try links.setLink(&w, cat, pk, p_link, target);
+                catalogRef = try collections.setAddInt(&w, catalogRef, pk, p_set_int, 1_000_000 + pk);
+                catalogRef = try collections.dictPut(&w, catalogRef, pk, p_dict, "delta", pk);
+                catalogRef = try links.setLink(&w, catalogRef, pk, p_link, target);
                 const dt: u64 = @intCast(nowNs(io) - t0);
                 try update_lat.add(alloc, dt);
                 try combined.add(alloc, dt);
             }
-            w.setRoot(cat);
+            w.setRoot(catalogRef);
             _ = try w.commit();
             done += this_batch;
         }
@@ -238,18 +238,18 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         while (done < delete_n) {
             const this_batch = @min(batch_size, delete_n - done);
             var w = try database.beginWrite();
-            var cat = w.new_root;
+            var catalogRef = w.new_root;
             var raw: [prop_count]u64 = undefined;
             var j: usize = 0;
             while (j < this_batch) : (j += 1) {
                 const pk: u64 = ((done + j) * delete_stride) % rows;
-                const ver = (try rawRows.getByPk(&w, cat, pk, &raw)) orelse continue;
+                const ver = (try rawRows.getByPk(&w, catalogRef, pk, &raw)) orelse continue;
                 const t0 = nowNs(io);
-                const dres = try objects.deleteTyped(&w, cat, pk, ver);
+                const dres = try objects.deleteTyped(&w, catalogRef, pk, ver);
                 const dt: u64 = @intCast(nowNs(io) - t0);
                 switch (dres) {
                     .ok => |c| {
-                        cat = c;
+                        catalogRef = c;
                         deleted += 1;
                         try delete_lat.add(alloc, dt);
                         try combined.add(alloc, dt);
@@ -257,7 +257,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
                     else => {},
                 }
             }
-            w.setRoot(cat);
+            w.setRoot(catalogRef);
             _ = try w.commit();
             done += this_batch;
         }
