@@ -10,14 +10,8 @@
 
 const std = @import("std");
 const Ref = @import("ref.zig").Ref;
-const node = @import("index_node.zig");
 const blob = @import("blob.zig");
 const bTreeCore = @import("bTreeCore.zig");
-
-// Local aliases for the on-disk node format, used by the entry walker below.
-const kind_leaf = node.kind_leaf;
-const parseLeaf = node.parseLeaf;
-const parseInner = node.parseInner;
 
 /// Keying for blob-ref keys: the stored u64 refs the key bytes in the blob
 /// heap, and ordering dereferences and byte-compares them.
@@ -93,33 +87,22 @@ pub fn forEachEntry(
     ctx: anytype,
     comptime onEntry: fn (@TypeOf(ctx), key: []const u8, val: u64) anyerror!void,
 ) !void {
-    return forEachEntryAt(txn, root, ctx, onEntry, 0);
-}
-
-fn forEachEntryAt(
-    txn: anytype,
-    root: Ref,
-    ctx: anytype,
-    comptime onEntry: fn (@TypeOf(ctx), key: []const u8, val: u64) anyerror!void,
-    depth: usize,
-) !void {
-    if (depth >= bTreeCore.maxDepth) return error.Corrupt;
-    const bytes = try Tree.derefNode(txn, root);
-    if (bytes[0] == kind_leaf) {
-        const leaf = try parseLeaf(bytes);
-        var i: usize = 0;
-        while (i < leaf.count) : (i += 1) {
-            const key_bytes = try blob.get(txn, leaf.key(i));
-            try onEntry(ctx, key_bytes, leaf.value(i));
+    // Adapt the core's raw (storedKey, value) walker: each stored key is a
+    // blob ref, dereferenced here before reaching the caller's callback.
+    const KeyDereferencing = struct {
+        transaction: @TypeOf(txn),
+        context: @TypeOf(ctx),
+        fn visit(self: @This(), storedKeyRef: u64, value: u64) anyerror!void {
+            const keyBytes = try blob.get(self.transaction, storedKeyRef);
+            return onEntry(self.context, keyBytes, value);
         }
-        return;
-    }
-    const inner = try parseInner(bytes);
-    var i: usize = 0;
-    while (i < inner.child_count) : (i += 1) {
-        const child_ref: Ref = inner.childRef(i);
-        try forEachEntryAt(txn, child_ref, ctx, onEntry, depth + 1);
-    }
+    };
+    return Tree.forEachEntry(
+        txn,
+        root,
+        KeyDereferencing{ .transaction = txn, .context = ctx },
+        KeyDereferencing.visit,
+    );
 }
 
 test {
