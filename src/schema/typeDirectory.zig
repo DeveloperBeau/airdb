@@ -1,8 +1,8 @@
-// typeDirectory.zig -- type directory node mapping type ids to catalog refs.
-//
-// Node layout: [typeCount u16 LE @0][typeCount * (catalogRef u64 LE) @2]
-//              [typeCount * (isEmbedded u8) @ 2 + tc*8]
-// dirSize(tc) = 2 + tc * 8 + tc
+//! Type directory node mapping type ids to catalog refs.
+//!
+//! Node layout: [typeCount u16 LE @0][typeCount * (catalogRef u64 LE) @2]
+//!              [typeCount * (isEmbedded u8) @ 2 + tc*8]
+//! dirSize(tc) = 2 + tc * 8 + tc
 
 const std = @import("std");
 const WriteTransaction = @import("../database.zig").WriteTransaction;
@@ -10,10 +10,13 @@ const Reference = @import("../storage/reference.zig").Reference;
 const rows = @import("../records/rows.zig");
 const catalog = @import("catalog.zig");
 
+/// Scalar-kinds schema: each type is a slice of bare PropertyKinds (every
+/// property defaults to element = int, no links).
 pub const Schema = []const []const catalog.PropertyKind;
-// Full schema: each type is a slice of PropertyDefinitions, so a multi-type directory can
-// hold link and collection properties (not just scalar kinds).
+/// Full schema: each type is a slice of PropertyDefinitions, so a multi-type directory can
+/// hold link and collection properties (not just scalar kinds).
 pub const DefinitionSchema = []const []const catalog.PropertyDefinition;
+/// One property's typed value (re-exported from the catalog).
 pub const Value = catalog.Value;
 const PropertyKind = catalog.PropertyKind;
 const PropertyDefinition = catalog.PropertyDefinition;
@@ -35,8 +38,9 @@ fn writeDir(transaction: *WriteTransaction, catalogRefs: []const Reference, embe
     return allocation.ref;
 }
 
-// Create a directory from a full PropertyDefinition schema (supports links/collections),
-// with the given per-type embedded flags.
+/// Create a directory from a full PropertyDefinition schema (supports
+/// links/collections) with the given per-type embedded flags, creating one
+/// catalog per type. Returns the directory ref. One catalog build per type.
 pub fn createTypes(transaction: *WriteTransaction, schema: DefinitionSchema, embedded: []const bool) !Reference {
     std.debug.assert(schema.len <= 256);
     std.debug.assert(embedded.len == schema.len);
@@ -46,14 +50,16 @@ pub fn createTypes(transaction: *WriteTransaction, schema: DefinitionSchema, emb
     return writeDir(transaction, catalogRefs[0..schema.len], embedded);
 }
 
-// Create a directory from a full PropertyDefinition schema (supports links/collections).
+/// Create a directory from a full PropertyDefinition schema (supports
+/// links/collections); no type is marked embedded.
 pub fn createWithDefinitions(transaction: *WriteTransaction, schema: DefinitionSchema) !Reference {
     var flags: [256]bool = undefined;
     @memset(flags[0..schema.len], false);
     return createTypes(transaction, schema, flags[0..schema.len]);
 }
 
-// Scalar-kinds convenience: each property gets element = int.
+/// Create a directory from a scalar-kinds Schema; each property gets
+/// element = int and no type is marked embedded.
 pub fn create(transaction: *WriteTransaction, schema: Schema) !Reference {
     std.debug.assert(schema.len <= 256);
     var catalogRefs: [256]Reference = undefined;
@@ -73,17 +79,21 @@ fn loadDir(transaction: anytype, dir: Reference) !struct { typeCount: u16, bytes
     return .{ .typeCount = storedTypeCount, .bytes = bytes };
 }
 
+/// Number of types recorded in the directory at `dir`.
 pub fn typeCount(transaction: anytype, dir: Reference) !u16 {
     const directory = try loadDir(transaction, dir);
     return directory.typeCount;
 }
 
+/// The catalog ref of `typeId`, or error.NoSuchType past the directory's end.
 pub fn catalogRef(transaction: anytype, dir: Reference, typeId: u16) !Reference {
     const directory = try loadDir(transaction, dir);
     if (typeId >= directory.typeCount) return error.NoSuchType;
     return std.mem.readInt(u64, directory.bytes[2 + @as(usize, typeId) * 8 ..][0..8], .little);
 }
 
+/// Point `typeId` at `newCatalog` and return the new directory ref
+/// (copy-on-write; the caller must adopt it).
 pub fn setCatalogRef(transaction: *WriteTransaction, dir: Reference, typeId: u16, newCatalog: Reference) !Reference {
     const directory = try loadDir(transaction, dir);
     if (typeId >= directory.typeCount) return error.NoSuchType;
@@ -129,14 +139,17 @@ fn snapshotFlags(transaction: anytype, dir: Reference, out: *[256]bool) !u16 {
     return directory.typeCount;
 }
 
+/// Outcome of adding a type: the grown directory ref and the new type's id.
 pub const AddTypeResult = struct { dir: Reference, typeId: u16 };
 
-// Append a new type from a full PropertyDefinition schema (supports links/collections).
+/// Append a new type from a full PropertyDefinition schema (supports
+/// links/collections) and return the grown directory ref plus the new type id.
 pub fn addTypeDefinitions(transaction: *WriteTransaction, dir: Reference, definitions: []const PropertyDefinition) !AddTypeResult {
     return addTypeDefinitionsEmbedded(transaction, dir, definitions, false);
 }
 
-// Like addTypeDefinitions but marks the new type embedded when `embedded` is set.
+/// Like addTypeDefinitions but marks the new type embedded (single-owner)
+/// when `embedded` is set.
 pub fn addTypeDefinitionsEmbedded(transaction: *WriteTransaction, dir: Reference, definitions: []const PropertyDefinition, embedded: bool) !AddTypeResult {
     var oldRefs: [256]Reference = undefined;
     var oldFlags: [256]bool = undefined;
@@ -148,8 +161,9 @@ pub fn addTypeDefinitionsEmbedded(transaction: *WriteTransaction, dir: Reference
     return .{ .dir = newDir, .typeId = oldTc };
 }
 
-// Append a new object type to the directory and return the grown directory ref
-// plus the new type id. The new type's catalog is created from `typeSchema`.
+/// Append a new object type to the directory and return the grown directory
+/// ref plus the new type id. The new type's catalog is created from the
+/// scalar `typeSchema` (element = int, no links).
 pub fn addType(transaction: *WriteTransaction, dir: Reference, typeSchema: []const PropertyKind) !AddTypeResult {
     // Capture existing catalog refs and embedded flags before createTyped, which
     // can grow the file and invalidate the directory deref slice.
@@ -163,13 +177,16 @@ pub fn addType(transaction: *WriteTransaction, dir: Reference, typeSchema: []con
     return .{ .dir = newDir, .typeId = oldTc };
 }
 
-// Report whether `typeId` was created as an embedded (single-owner) type.
+/// True when `typeId` was created as an embedded (single-owner) type.
 pub fn isEmbedded(transaction: anytype, dir: Reference, typeId: u16) !bool {
     const directory = try loadDir(transaction, dir);
     if (typeId >= directory.typeCount) return error.NoSuchType;
     return directory.bytes[2 + @as(usize, directory.typeCount) * 8 + typeId] != 0;
 }
 
+/// Check the directory's stored types against `expected`, failing with
+/// error.SchemaMismatch on any type-count, property-count, or kind
+/// difference. Walks every type's catalog, O(types x properties).
 pub fn validate(transaction: anytype, dir: Reference, expected: Schema) !void {
     const typeCountTotal = try typeCount(transaction, dir);
     if (typeCountTotal != expected.len) return error.SchemaMismatch;
@@ -193,9 +210,11 @@ const typeRouting = @import("typeRouting.zig");
 // their owner via a cascade-rule to-one link.
 // ---------------------------------------------------------------------------
 
-// Create an embedded child for `owner`'s to-one link `property` and link it in.
-// If the owner already has a child via `property`, the old child is deleted first
-// (replace semantics). Returns the new directory ref.
+/// Create an embedded child for the owner's to-one link `property` and link
+/// it in, returning the new directory ref. If the owner already has a child
+/// via `property`, the old child is deleted first (replace semantics); a
+/// delete refused by a block-rule link surfaces as error.Blocked rather than
+/// leaking an ownerless object.
 pub fn insertEmbedded(transaction: *WriteTransaction, dir: Reference, ownerType: u16, ownerPrimaryKey: u64, property: usize, childValues: []const Value) !Reference {
     var currentDir = dir;
     const childType = (try catalog.loadCatalog(transaction, try catalogRef(transaction, currentDir, ownerType))).linkTarget(property);
@@ -224,9 +243,10 @@ pub fn insertEmbedded(transaction: *WriteTransaction, dir: Reference, ownerType:
     return try typeRouting.setLink(transaction, currentDir, ownerType, ownerPrimaryKey, property, ins.row);
 }
 
-// Delete the embedded child owned by `owner` via to-one link `property`. Deleting
-// the child cross-type-nullifies the owner's inbound link automatically.
-// Returns the new directory ref (unchanged if there is no child).
+/// Delete the embedded child owned via to-one link `property`, returning the
+/// new directory ref (unchanged if there is no child). Deleting the child
+/// cross-type-nullifies the owner's inbound link automatically; a delete
+/// refused by a block-rule link surfaces as error.Blocked.
 pub fn clearEmbedded(transaction: *WriteTransaction, dir: Reference, ownerType: u16, ownerPrimaryKey: u64, property: usize) !Reference {
     const childObjectKey = (try typeRouting.getLink(transaction, dir, ownerType, ownerPrimaryKey, property)) orelse return dir;
     const childType = (try catalog.loadCatalog(transaction, try catalogRef(transaction, dir, ownerType))).linkTarget(property);
