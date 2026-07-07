@@ -1,9 +1,9 @@
 const std = @import("std");
-const rows = @import("rows.zig");
-const catalog = @import("catalog.zig");
-const index = @import("index.zig");
-const Column = @import("column.zig");
-const Ref = @import("reference.zig").Ref;
+const rows = @import("records/rows.zig");
+const catalog = @import("schema/catalog.zig");
+const index = @import("trees/index.zig");
+const Column = @import("trees/column.zig");
+const Ref = @import("storage/reference.zig").Ref;
 
 // Query engine over an object catalog. Operates on the stable object key (okey)
 // space: a scan walks the per-type key->row index, so each entry maps an okey to

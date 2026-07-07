@@ -6,14 +6,14 @@ const Io = std.Io;
 const db_mod = @import("database.zig");
 const Db = db_mod.Db;
 const ring_capacity = db_mod.ring_capacity;
-const Ref = @import("reference.zig").Ref;
-const FreeList = @import("freeList.zig").FreeList;
-const coord_mod = @import("coordination.zig");
-const typedir = @import("typeDirectory.zig");
-const typeRouting = @import("typeRouting.zig");
-const compaction = @import("compaction.zig");
-const catalog = @import("catalog.zig");
-const Index = @import("index.zig");
+const Ref = @import("storage/reference.zig").Ref;
+const FreeList = @import("storage/freeList.zig").FreeList;
+const coord_mod = @import("transactions/coordination.zig");
+const typedir = @import("schema/typeDirectory.zig");
+const typeRouting = @import("schema/typeRouting.zig");
+const compaction = @import("storage/compaction.zig");
+const catalog = @import("schema/catalog.zig");
+const Index = @import("trees/index.zig");
 
 fn tmpFilePath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const u8) ![]const u8 {
     var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
@@ -310,7 +310,7 @@ test "verifyIntegrity passes on a clean link graph after churn" {
     defer testing.allocator.free(path);
     var db = try Db.create(testing.allocator, path);
     defer db.deinit();
-    const links = @import("links.zig");
+    const links = @import("records/links.zig");
 
     {
         var w = try db.beginWrite();
@@ -728,7 +728,7 @@ test "a retried commit's ring entry wins over the aborted duplicate" {
     // behind; the retry reuses the same version number and appends a second
     // entry. versionRoot must return the retry's root (the committed one), not
     // the aborted duplicate, or beginReadAt would expose never-committed data.
-    const FailingSyncer = @import("syncer.zig").FailingSyncer;
+    const FailingSyncer = @import("storage/syncer.zig").FailingSyncer;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try tmpFilePath(testing.allocator, &tmp, "ringdup.airdb");
@@ -775,7 +775,7 @@ test "a retried commit's ring entry wins over the aborted duplicate" {
 }
 
 test "beginReadAt opens a past version within the retention window" {
-    const rows = @import("rows.zig");
+    const rows = @import("records/rows.zig");
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try tmpFilePath(testing.allocator, &tmp, "pit.airdb");
@@ -901,7 +901,7 @@ test "a writer honors a retention floor raised by another instance" {
 }
 
 test "beginReadAt rejects a version aged out of the retention window" {
-    const rows = @import("rows.zig");
+    const rows = @import("records/rows.zig");
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try tmpFilePath(testing.allocator, &tmp, "pit2.airdb");
@@ -1008,7 +1008,7 @@ test "a failed commit-point flush poisons the instance until reopen" {
     // The flipped header pointer sits in the mapped page before the failed
     // barrier, so its on-disk fate is indeterminate; further writes from this
     // instance could scribble the maybe-published version. Reopen resolves.
-    const FailingSyncer = @import("syncer.zig").FailingSyncer;
+    const FailingSyncer = @import("storage/syncer.zig").FailingSyncer;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try tmpFilePath(testing.allocator, &tmp, "poison.airdb");
@@ -1047,7 +1047,7 @@ test "a failed commit inside maybeCompactStep neither crashes nor wedges the wri
     // lists itself on error, so the errdefer double-freed them (heap
     // corruption); and non-durability commit errors leaked the cross-process
     // write lock. Commit now concludes uniformly and deinit is a no-op after.
-    const FailingSyncer = @import("syncer.zig").FailingSyncer;
+    const FailingSyncer = @import("storage/syncer.zig").FailingSyncer;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try tmpFilePath(testing.allocator, &tmp, "compactfail.airdb");

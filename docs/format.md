@@ -36,20 +36,20 @@ previous node's space is recycled through the next list.
 Three node families share the `[kind u8][count u16]` header. Fanout and leaf
 capacity are both 64.
 
-**Index (u64 → u64)** — `indexNode.zig`, used for pk indexes, key→row
+**Index (u64 → u64)** — `trees/indexNode.zig`, used for pk indexes, key→row
 indexes, sets of okeys, and value-index outer/inner trees:
 
 - leaf (1027 B): count × (key u64, value u64), sorted by key
 - inner (1539 B): count × (child_ref u64, low_key u64, subtree_count u64) —
   the subtree counts make `count()` a single-node read
 
-**Column (row → u64)** — `columnNode.zig`, one per property plus version and
+**Column (row → u64)** — `trees/columnNode.zig`, one per property plus version and
 liveness columns:
 
 - leaf (515 B): count × value u64, addressed by position
 - inner (1027 B): count × (child_ref u64, subtree_count u64)
 
-**Bindex (bytes → u64)** — `byteKeyIndex.zig`, byte-keyed dictionary/set: identical
+**Bindex (bytes → u64)** — `trees/byteKeyIndex.zig`, byte-keyed dictionary/set: identical
 layout to the index, except each key slot holds a blob ref to the key bytes
 and ordering compares the dereferenced bytes.
 

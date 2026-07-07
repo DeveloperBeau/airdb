@@ -8,19 +8,19 @@ const std = @import("std");
 const testing = std.testing;
 const Io = std.Io;
 const platform = @import("platform.zig");
-const FileStore = @import("fileStore.zig").FileStore;
-const RealSyncer = @import("syncer.zig").RealSyncer;
-const Syncer = @import("syncer.zig").Syncer;
-const default_page_size = @import("fileStore.zig").default_page_size;
-const Arena = @import("arena.zig").Arena;
-const Allocation = @import("arena.zig").Allocation;
-const Ref = @import("reference.zig").Ref;
-const Slot = @import("slots.zig").Slot;
-const FreeList = @import("freeList.zig").FreeList;
-const Coord = @import("coordination.zig").Coord;
-const coord_mod = @import("coordination.zig");
-const versioning = @import("versioning.zig");
-const freeListRecovery = @import("freeListRecovery.zig");
+const FileStore = @import("storage/fileStore.zig").FileStore;
+const RealSyncer = @import("storage/syncer.zig").RealSyncer;
+const Syncer = @import("storage/syncer.zig").Syncer;
+const default_page_size = @import("storage/fileStore.zig").default_page_size;
+const Arena = @import("storage/arena.zig").Arena;
+const Allocation = @import("storage/arena.zig").Allocation;
+const Ref = @import("storage/reference.zig").Ref;
+const Slot = @import("storage/slots.zig").Slot;
+const FreeList = @import("storage/freeList.zig").FreeList;
+const Coord = @import("transactions/coordination.zig").Coord;
+const coord_mod = @import("transactions/coordination.zig");
+const versioning = @import("transactions/versioning.zig");
+const freeListRecovery = @import("storage/freeListRecovery.zig");
 
 /// Byte offset of commit slot A in the header page.
 pub const slot_a_off: usize = 64;
@@ -528,8 +528,8 @@ pub const Db = struct {
 // call sites that do @import("database.zig").ReadTxn / .WriteTxn keep working).
 // ---------------------------------------------------------------------------
 
-pub const ReadTxn = @import("readTransaction.zig").ReadTxn;
-pub const WriteTxn = @import("writeTransaction.zig").WriteTxn;
+pub const ReadTxn = @import("transactions/readTransaction.zig").ReadTxn;
+pub const WriteTxn = @import("transactions/writeTransaction.zig").WriteTxn;
 
 test {
     _ = @import("databaseTests.zig");

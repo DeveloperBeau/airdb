@@ -1,0 +1,249 @@
+// typeDirectory.zig -- type directory node mapping type ids to catalog refs.
+//
+// Node layout: [type_count u16 LE @0][type_count * (catalog_ref u64 LE) @2]
+//              [type_count * (is_embedded u8) @ 2 + tc*8]
+// dirSize(tc) = 2 + tc * 8 + tc
+
+const std = @import("std");
+const WriteTxn = @import("../database.zig").WriteTxn;
+const Ref = @import("../storage/reference.zig").Ref;
+const rows = @import("../records/rows.zig");
+const catalog = @import("catalog.zig");
+
+pub const Schema = []const []const catalog.PropKind;
+// Full schema: each type is a slice of PropDefs, so a multi-type directory can
+// hold link and collection properties (not just scalar kinds).
+pub const DefSchema = []const []const catalog.PropDef;
+pub const Value = catalog.Value;
+const PropKind = catalog.PropKind;
+const PropDef = catalog.PropDef;
+
+fn dirSize(tc: u16) usize {
+    return 2 + @as(usize, tc) * 8 + tc;
+}
+
+// Pack `tc` catalog refs + per-type embedded flags into a fresh directory node.
+fn writeDir(txn: *WriteTxn, cat_refs: []const Ref, embedded: []const bool) !Ref {
+    std.debug.assert(embedded.len == cat_refs.len);
+    const tc: u16 = @intCast(cat_refs.len);
+    const a = try txn.alloc(dirSize(tc));
+    std.mem.writeInt(u16, a.bytes[0..2], tc, .little);
+    for (cat_refs, 0..) |cref, i| {
+        std.mem.writeInt(u64, a.bytes[2 + i * 8 ..][0..8], cref, .little);
+    }
+    for (embedded, 0..) |e, i| a.bytes[2 + cat_refs.len * 8 + i] = if (e) 1 else 0;
+    return a.ref;
+}
+
+// Create a directory from a full PropDef schema (supports links/collections),
+// with the given per-type embedded flags.
+pub fn createTypes(txn: *WriteTxn, schema: DefSchema, embedded: []const bool) !Ref {
+    std.debug.assert(schema.len <= 256);
+    std.debug.assert(embedded.len == schema.len);
+    var cat_refs: [256]Ref = undefined;
+    var t: usize = 0;
+    while (t < schema.len) : (t += 1) cat_refs[t] = try catalog.createDefs(txn, schema[t]);
+    return writeDir(txn, cat_refs[0..schema.len], embedded);
+}
+
+// Create a directory from a full PropDef schema (supports links/collections).
+pub fn createWithDefs(txn: *WriteTxn, schema: DefSchema) !Ref {
+    var flags: [256]bool = undefined;
+    @memset(flags[0..schema.len], false);
+    return createTypes(txn, schema, flags[0..schema.len]);
+}
+
+// Scalar-kinds convenience: each property gets elem = int.
+pub fn create(txn: *WriteTxn, schema: Schema) !Ref {
+    std.debug.assert(schema.len <= 256);
+    var cat_refs: [256]Ref = undefined;
+    var t: usize = 0;
+    while (t < schema.len) : (t += 1) {
+        cat_refs[t] = try catalog.createTyped(txn, schema[t]);
+    }
+    var flags: [256]bool = undefined;
+    @memset(flags[0..schema.len], false);
+    return writeDir(txn, cat_refs[0..schema.len], flags[0..schema.len]);
+}
+
+fn loadDir(txn: anytype, dir: Ref) !struct { type_count: u16, bytes: []const u8 } {
+    const tc_bytes = try txn.deref(dir, 2);
+    const type_count = std.mem.readInt(u16, tc_bytes[0..2], .little);
+    const bytes = try txn.deref(dir, dirSize(type_count));
+    return .{ .type_count = type_count, .bytes = bytes };
+}
+
+pub fn typeCount(txn: anytype, dir: Ref) !u16 {
+    const d = try loadDir(txn, dir);
+    return d.type_count;
+}
+
+pub fn catalogRef(txn: anytype, dir: Ref, type_id: u16) !Ref {
+    const d = try loadDir(txn, dir);
+    if (type_id >= d.type_count) return error.NoSuchType;
+    return std.mem.readInt(u64, d.bytes[2 + @as(usize, type_id) * 8 ..][0..8], .little);
+}
+
+pub fn setCatalogRef(txn: *WriteTxn, dir: Ref, type_id: u16, new_cat: Ref) !Ref {
+    const d = try loadDir(txn, dir);
+    if (type_id >= d.type_count) return error.NoSuchType;
+    const a = try txn.writableCopy(dir, dirSize(d.type_count));
+    std.mem.writeInt(u64, a.bytes[2 + @as(usize, type_id) * 8 ..][0..8], new_cat, .little);
+    return a.ref;
+}
+
+// Append an already-created catalog to the directory; returns grown dir + id.
+// Carries the existing per-type embedded flags and appends the new type's flag.
+fn appendCatalog(txn: *WriteTxn, old_refs: []const Ref, old_embedded: []const bool, new_cat: Ref, new_embedded: bool) !Ref {
+    std.debug.assert(old_refs.len == old_embedded.len);
+    const old_tc = old_refs.len;
+    var refs: [256]Ref = undefined;
+    var flags: [256]bool = undefined;
+    var t: usize = 0;
+    while (t < old_tc) : (t += 1) {
+        refs[t] = old_refs[t];
+        flags[t] = old_embedded[t];
+    }
+    refs[old_tc] = new_cat;
+    flags[old_tc] = new_embedded;
+    return writeDir(txn, refs[0 .. old_tc + 1], flags[0 .. old_tc + 1]);
+}
+
+// Snapshot existing catalog refs (before any file-growing create call).
+fn snapshotRefs(txn: anytype, dir: Ref, out: *[256]Ref) !u16 {
+    const d = try loadDir(txn, dir);
+    var t: usize = 0;
+    while (t < d.type_count) : (t += 1) {
+        out[t] = std.mem.readInt(u64, d.bytes[2 + t * 8 ..][0..8], .little);
+    }
+    return d.type_count;
+}
+
+// Snapshot existing per-type embedded flags (before any file-growing call).
+fn snapshotFlags(txn: anytype, dir: Ref, out: *[256]bool) !u16 {
+    const d = try loadDir(txn, dir);
+    var t: usize = 0;
+    while (t < d.type_count) : (t += 1) {
+        out[t] = d.bytes[2 + @as(usize, d.type_count) * 8 + t] != 0;
+    }
+    return d.type_count;
+}
+
+pub const AddTypeResult = struct { dir: Ref, type_id: u16 };
+
+// Append a new type from a full PropDef schema (supports links/collections).
+pub fn addTypeDefs(txn: *WriteTxn, dir: Ref, defs: []const PropDef) !AddTypeResult {
+    return addTypeDefsEmbedded(txn, dir, defs, false);
+}
+
+// Like addTypeDefs but marks the new type embedded when `is_embedded` is set.
+pub fn addTypeDefsEmbedded(txn: *WriteTxn, dir: Ref, defs: []const PropDef, is_embedded: bool) !AddTypeResult {
+    var old_refs: [256]Ref = undefined;
+    var old_flags: [256]bool = undefined;
+    const old_tc = try snapshotRefs(txn, dir, &old_refs);
+    _ = try snapshotFlags(txn, dir, &old_flags);
+    std.debug.assert(old_tc < 256);
+    const new_cat = try catalog.createDefs(txn, defs);
+    const new_dir = try appendCatalog(txn, old_refs[0..old_tc], old_flags[0..old_tc], new_cat, is_embedded);
+    return .{ .dir = new_dir, .type_id = old_tc };
+}
+
+// Append a new object type to the directory and return the grown directory ref
+// plus the new type id. The new type's catalog is created from `type_schema`.
+pub fn addType(txn: *WriteTxn, dir: Ref, type_schema: []const PropKind) !AddTypeResult {
+    // Capture existing catalog refs and embedded flags before createTyped, which
+    // can grow the file and invalidate the directory deref slice.
+    var old_refs: [256]Ref = undefined;
+    var old_flags: [256]bool = undefined;
+    const old_tc = try snapshotRefs(txn, dir, &old_refs);
+    _ = try snapshotFlags(txn, dir, &old_flags);
+    std.debug.assert(old_tc < 256);
+    const new_cat = try catalog.createTyped(txn, type_schema);
+    const new_dir = try appendCatalog(txn, old_refs[0..old_tc], old_flags[0..old_tc], new_cat, false);
+    return .{ .dir = new_dir, .type_id = old_tc };
+}
+
+// Report whether `type_id` was created as an embedded (single-owner) type.
+pub fn isEmbedded(txn: anytype, dir: Ref, type_id: u16) !bool {
+    const d = try loadDir(txn, dir);
+    if (type_id >= d.type_count) return error.NoSuchType;
+    return d.bytes[2 + @as(usize, d.type_count) * 8 + type_id] != 0;
+}
+
+pub fn validate(txn: anytype, dir: Ref, expected: Schema) !void {
+    const tc = try typeCount(txn, dir);
+    if (tc != expected.len) return error.SchemaMismatch;
+    var t: u16 = 0;
+    while (t < tc) : (t += 1) {
+        const v = try catalog.loadCatalog(txn, try catalogRef(txn, dir, t));
+        if (v.prop_count != expected[t].len) return error.SchemaMismatch;
+        var j: usize = 0;
+        while (j < v.prop_count) : (j += 1) {
+            if (v.kind(j) != expected[t][j]) return error.SchemaMismatch;
+        }
+    }
+}
+
+// Object/link/delete routing through the directory (the type_id -> catalog
+// lookup + forward pattern) lives in typeRouting.zig.
+const typeRouting = @import("typeRouting.zig");
+
+// ---------------------------------------------------------------------------
+// Embedded-object lifecycle: single-owner objects created and cleared through
+// their owner via a cascade-rule to-one link.
+// ---------------------------------------------------------------------------
+
+// Create an embedded child for `owner`'s to-one link `prop` and link it in.
+// If the owner already has a child via `prop`, the old child is deleted first
+// (replace semantics). Returns the new directory ref.
+pub fn insertEmbedded(txn: *WriteTxn, dir: Ref, owner_type: u16, owner_pk: u64, prop: usize, child_values: []const Value) !Ref {
+    var cur = dir;
+    const child_type = (try catalog.loadCatalog(txn, try catalogRef(txn, cur, owner_type))).linkTarget(prop);
+
+    // Replace: delete any existing owned child first. A refused delete must
+    // SURFACE, not be swallowed: silently linking the new child while the old
+    // one survives breaks the single-owner invariant and leaks an ownerless
+    // object. (.blocked is reachable when another type block-links the child;
+    // conflict/not_found are impossible for a version read in this txn.)
+    if (try typeRouting.getLink(txn, cur, owner_type, owner_pk, prop)) |old_okey| {
+        const child_cat = try catalogRef(txn, cur, child_type);
+        const pc = (try catalog.loadCatalog(txn, child_cat)).prop_count;
+        var buf: [256]u64 = undefined;
+        if (try rows.getByObjectKey(txn, child_cat, old_okey, buf[0..pc])) |old_ver| {
+            const old_pk = buf[0];
+            const dres = try typeRouting.deleteNullifyX(txn, cur, child_type, old_pk, old_ver);
+            switch (dres) {
+                .ok => |d| cur = d,
+                else => return error.Blocked,
+            }
+        }
+    }
+
+    const ins = try typeRouting.insert(txn, cur, child_type, child_values);
+    cur = ins.dir;
+    return try typeRouting.setLink(txn, cur, owner_type, owner_pk, prop, ins.row);
+}
+
+// Delete the embedded child owned by `owner` via to-one link `prop`. Deleting
+// the child cross-type-nullifies the owner's inbound link automatically.
+// Returns the new directory ref (unchanged if there is no child).
+pub fn clearEmbedded(txn: *WriteTxn, dir: Ref, owner_type: u16, owner_pk: u64, prop: usize) !Ref {
+    const child_okey = (try typeRouting.getLink(txn, dir, owner_type, owner_pk, prop)) orelse return dir;
+    const child_type = (try catalog.loadCatalog(txn, try catalogRef(txn, dir, owner_type))).linkTarget(prop);
+    const child_cat = try catalogRef(txn, dir, child_type);
+    const pc = (try catalog.loadCatalog(txn, child_cat)).prop_count;
+    var buf: [256]u64 = undefined;
+    const child_ver = (try rows.getByObjectKey(txn, child_cat, child_okey, buf[0..pc])) orelse return dir;
+    const child_pk = buf[0];
+    const dres = try typeRouting.deleteNullifyX(txn, dir, child_type, child_pk, child_ver);
+    return switch (dres) {
+        .ok => |d| d,
+        // A refused clear must surface: returning the unchanged dir read as
+        // success while the child and its link silently survived.
+        else => error.Blocked,
+    };
+}
+
+test {
+    _ = @import("typeDirectoryTests.zig");
+}

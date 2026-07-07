@@ -13,10 +13,10 @@
 const std = @import("std");
 const Db = @import("database.zig").Db;
 const WriteTxn = @import("database.zig").WriteTxn;
-const Ref = @import("reference.zig").Ref;
-const rows = @import("rows.zig");
-const catalog = @import("catalog.zig");
-const bulk = @import("bulk.zig");
+const Ref = @import("storage/reference.zig").Ref;
+const rows = @import("records/rows.zig");
+const catalog = @import("schema/catalog.zig");
+const bulk = @import("records/bulk.zig");
 
 pub const AIRDB_OK: i64 = 0;
 pub const AIRDB_E_GENERIC: i64 = -1;
