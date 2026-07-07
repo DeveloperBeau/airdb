@@ -32,7 +32,7 @@ const linkSetAdd = typeRouting.linkSetAdd;
 const linkSetContains = typeRouting.linkSetContains;
 const resolveLink = typeRouting.resolveLink;
 const getLinked = typeRouting.getLinked;
-const deleteNullifyX = typeRouting.deleteNullifyX;
+const deleteNullifyCrossType = typeRouting.deleteNullifyCrossType;
 const insertEmbedded = typedir.insertEmbedded;
 const clearEmbedded = typedir.clearEmbedded;
 
@@ -303,7 +303,7 @@ test "deleting a target nullifies inbound links from another type" {
 
     var abuf: [2]Value = undefined;
     const authorVersion = (try get(&w, dir, 0, 1, &abuf)).?;
-    const dres = try deleteNullifyX(&w, dir, 0, 1, authorVersion);
+    const dres = try deleteNullifyCrossType(&w, dir, 0, 1, authorVersion);
     dir = dres.ok;
 
     try testing.expectEqual(@as(?u64, null), try getLink(&w, dir, 1, 1, 1));
@@ -374,17 +374,17 @@ test "block prevents deleting a referenced object" {
 
     var av: [2]Value = undefined;
     const aver = (try get(&w, dir, 0, 1, &av)).?;
-    const blocked = try deleteNullifyX(&w, dir, 0, 1, aver);
+    const blocked = try deleteNullifyCrossType(&w, dir, 0, 1, aver);
     try testing.expect(blocked == .blocked);
     try testing.expect((try get(&w, dir, 0, 1, &av)) != null); // author still there
 
     // Remove the book, then the author deletes fine.
     var bv: [2]Value = undefined;
     const versionB = (try get(&w, dir, 1, 1, &bv)).?;
-    const dbk = try deleteNullifyX(&w, dir, 1, 1, versionB);
+    const dbk = try deleteNullifyCrossType(&w, dir, 1, 1, versionB);
     dir = dbk.ok;
     const aver2 = (try get(&w, dir, 0, 1, &av)).?;
-    const da = try deleteNullifyX(&w, dir, 0, 1, aver2);
+    const da = try deleteNullifyCrossType(&w, dir, 0, 1, aver2);
     try testing.expect(da == .ok);
     dir = da.ok;
     try testing.expectEqual(@as(?u64, null), try get(&w, dir, 0, 1, &av));
@@ -417,7 +417,7 @@ test "cascade deletes owned children" {
 
     var pv: [2]Value = undefined;
     const pver = (try get(&w, dir, 0, 1, &pv)).?;
-    const dp = try deleteNullifyX(&w, dir, 0, 1, pver);
+    const dp = try deleteNullifyCrossType(&w, dir, 0, 1, pver);
     dir = dp.ok;
     try testing.expectEqual(@as(?u64, null), try get(&w, dir, 0, 1, &pv)); // parent gone
     try testing.expectEqual(@as(u64, 0), try liveCount(&w, dir, 1)); // all children gone
@@ -528,7 +528,7 @@ test "deleting the owner cascades to the embedded child" {
 
     var ov: [2]Value = undefined;
     const ownerVersion = (try get(&w, dir, 0, 1, &ov)).?;
-    const dres = try deleteNullifyX(&w, dir, 0, 1, ownerVersion);
+    const dres = try deleteNullifyCrossType(&w, dir, 0, 1, ownerVersion);
     dir = dres.ok;
     try testing.expectEqual(@as(?u64, null), try get(&w, dir, 0, 1, &ov));
     try testing.expectEqual(@as(u64, 0), try liveCount(&w, dir, 1));
@@ -577,7 +577,7 @@ test "directory delete works after relocating the target" {
     // the object key rather than a stale physical row.
     var abuf: [2]Value = undefined;
     const authorVersion = (try get(&w, dir, 0, 1, &abuf)).?;
-    const dres = try deleteNullifyX(&w, dir, 0, 1, authorVersion);
+    const dres = try deleteNullifyCrossType(&w, dir, 0, 1, authorVersion);
     dir = dres.ok;
     try testing.expectEqual(@as(?u64, null), try getLink(&w, dir, 1, 1, 1));
     w.deinit();
@@ -615,7 +615,7 @@ test "a self-linked object is deletable across transactions" {
         var w = try database.beginWrite();
         var out: [2]Value = undefined;
         const version = (try get(&w, w.newRoot, 0, 1, &out)).?;
-        const res = try deleteNullifyX(&w, w.newRoot, 0, 1, version);
+        const res = try deleteNullifyCrossType(&w, w.newRoot, 0, 1, version);
         try testing.expect(res == .ok);
         w.setRoot(res.ok);
         _ = try w.commit();
@@ -649,7 +649,7 @@ test "cascade is cycle-safe" {
 
     var av: [2]Value = undefined;
     const aver = (try get(&w, dir, 0, 1, &av)).?;
-    const da = try deleteNullifyX(&w, dir, 0, 1, aver); // must terminate
+    const da = try deleteNullifyCrossType(&w, dir, 0, 1, aver); // must terminate
     dir = da.ok;
     try testing.expectEqual(@as(u64, 0), try liveCount(&w, dir, 0)); // both gone
     w.deinit();
@@ -681,7 +681,7 @@ test "a directory delete of a self-referencing linkSet row frees its set root ex
     defer w.deinit();
     var out: [2]Value = undefined;
     const version = (try get(&w, w.newRoot, 0, 1, &out)).?;
-    const res = try deleteNullifyX(&w, w.newRoot, 0, 1, version);
+    const res = try deleteNullifyCrossType(&w, w.newRoot, 0, 1, version);
     try testing.expect(res == .ok);
     var seen = std.AutoHashMap(u64, void).init(testing.allocator);
     defer seen.deinit();
@@ -721,7 +721,7 @@ test "a directory delete frees the row's collection storage" {
     _ = (try rows.getByPrimaryKey(&w, try catalogRef(&w, w.newRoot, 0), 1, &raw)).?;
     var out: [3]Value = undefined;
     const version = (try get(&w, w.newRoot, 0, 1, &out)).?;
-    const res = try deleteNullifyX(&w, w.newRoot, 0, 1, version);
+    const res = try deleteNullifyCrossType(&w, w.newRoot, 0, 1, version);
     try testing.expect(res == .ok);
     var freedSet = false;
     var freedList = false;
@@ -765,7 +765,7 @@ test "a cascade delete frees the child's collection storage" {
     _ = (try rows.getByPrimaryKey(&w, try catalogRef(&w, w.newRoot, 1), 100, &raw)).?;
     var out: [2]Value = undefined;
     const version = (try get(&w, w.newRoot, 0, 1, &out)).?;
-    const res = try deleteNullifyX(&w, w.newRoot, 0, 1, version);
+    const res = try deleteNullifyCrossType(&w, w.newRoot, 0, 1, version);
     try testing.expect(res == .ok);
     try testing.expectEqual(@as(u64, 0), try liveCount(&w, res.ok, 1)); // child cascaded
     var freedChildSet = false;

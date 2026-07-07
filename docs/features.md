@@ -53,7 +53,7 @@ Code pointers use `module.function` names under `src/`.
   automatic backlink maintenance.
 - Delete rules per property: `nullify` (clear inbound links), `cascade`
   (delete owned children, cycle-safe), `block` (refuse while referenced) —
-  enforced by `typedir.deleteNullifyX`.
+  enforced by `typeRouting.deleteNullifyCrossType`.
 - Embedded (single-owner) objects: `insertEmbedded` / `clearEmbedded` with
   replace semantics.
 

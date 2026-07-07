@@ -368,7 +368,7 @@ test "compactToNewFile produces a verified, smaller, equivalent file" {
         while (i < 300) : (i += 3) {
             var out: [3]catalog.Value = undefined;
             const version = (try typeRouting.get(&w, dir, 1, i, &out)).?;
-            const dres = try typeRouting.deleteNullifyX(&w, dir, 1, i, version);
+            const dres = try typeRouting.deleteNullifyCrossType(&w, dir, 1, i, version);
             dir = dres.ok;
         }
         w.setRoot(dir);
@@ -460,7 +460,7 @@ test "compaction preserves dict and set-of-blob" {
         // Delete primaryKey 2 -- leaves a gap in the source.
         var out: [3]catalog.Value = undefined;
         const version = (try typeRouting.get(&w, dir, 0, 2, &out)).?;
-        const dres = try typeRouting.deleteNullifyX(&w, dir, 0, 2, version);
+        const dres = try typeRouting.deleteNullifyCrossType(&w, dir, 0, 2, version);
         dir = dres.ok;
 
         w.setRoot(dir);
@@ -959,7 +959,7 @@ test "compactInPlace shrinks and preserves data" {
         while (i < 200) : (i += 2) {
             var out: [2]catalog.Value = undefined;
             const version = (try typeRouting.get(&w, dir, 1, i, &out)).?;
-            const dres = try typeRouting.deleteNullifyX(&w, dir, 1, i, version);
+            const dres = try typeRouting.deleteNullifyCrossType(&w, dir, 1, i, version);
             dir = dres.ok;
         }
         w.setRoot(dir);

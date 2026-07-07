@@ -155,7 +155,7 @@ test "addProperty(linkSet) leaves pre-migration rows deletable" {
         var w = try database.beginWrite();
         var out: [2]catalog.Value = undefined;
         const version = (try typeRouting.get(&w, w.newRoot, 0, 1, &out)).?;
-        const res = try typeRouting.deleteNullifyX(&w, w.newRoot, 0, 1, version);
+        const res = try typeRouting.deleteNullifyCrossType(&w, w.newRoot, 0, 1, version);
         try testing.expect(res == .ok); // previously error.BadRef
         w.setRoot(res.ok);
         _ = try w.commit();

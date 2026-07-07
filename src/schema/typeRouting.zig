@@ -3,7 +3,7 @@
 //! Every function here follows the same pattern: resolve typeId to its catalog
 //! ref via the directory (typeDirectory.zig owns the directory node format), forward
 //! to the object/link layer, and COW the directory when the catalog changed.
-//! The cross-type delete machinery (deleteNullifyX and its worker) also lives
+//! The cross-type delete machinery (deleteNullifyCrossType and its worker) also lives
 //! here because it routes across every type in the directory.
 
 const std = @import("std");
@@ -132,7 +132,7 @@ pub fn getLinked(transaction: anytype, dir: Reference, srcType: u16, primaryKey:
 /// block (refuse while a block-rule link points at it), cascade (delete owned
 /// children first), nullify (clear dangling inbound links). Cascade is recursive
 /// and cycle-safe.
-pub fn deleteNullifyX(transaction: *WriteTransaction, dir: Reference, typeId: u16, primaryKey: u64, expectedVersion: u64) !DeleteResult {
+pub fn deleteNullifyCrossType(transaction: *WriteTransaction, dir: Reference, typeId: u16, primaryKey: u64, expectedVersion: u64) !DeleteResult {
     const catalog0 = try typedir.catalogRef(transaction, dir, typeId);
     const propertyCount = (try catalog.loadCatalog(transaction, catalog0)).propertyCount;
     var buffer: [256]u64 = undefined;
