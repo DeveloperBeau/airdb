@@ -16,7 +16,11 @@ pub const Value = union(enum) {
     int: u64,
     // A blob property decodes to one of two read-side shapes:
     //   .bytes    -- a small blob (<= inline cap): a zero-copy slice into the
-    //                mapped storage, valid for the lifetime of the transaction.
+    //                mapped storage. Valid until the next MUTATING call on the
+    //                same transaction: an update/delete that frees the blob
+    //                routes a txn-private node to the immediate-reuse pool, so
+    //                the next allocation may scribble it. Copy the bytes out
+    //                before mutating if they must survive.
     //   .blob_ref -- a blob larger than the inline cap, stored chunked and thus
     //                without a single contiguous slice. The caller materializes
     //                it with `blob.getAlloc(txn, ref, allocator)` and frees the
@@ -258,11 +262,28 @@ pub const CatalogView = struct {
 // Deref the catalog at cat, read prop_count, then deref the full node and parse
 // all fixed fields. Returns a CatalogView whose bytes slice is valid for the
 // lifetime of the transaction.
+//
+// All per-property enum bytes (kind, elem kind, deletion rule) are validated
+// here, ONCE, so the CatalogView accessors can stay infallible. These bytes
+// come straight from the mapped file: a corrupted value must surface as
+// error.Corrupt, never as a panic (ReleaseSafe) or undefined behavior
+// (ReleaseFast) from an unchecked @enumFromInt.
 pub fn loadCatalog(txn: anytype, cat: Ref) !CatalogView {
     const pc_bytes = try txn.deref(cat, 2);
     const prop_count = std.mem.readInt(u16, pc_bytes[0..2], .little);
-    std.debug.assert(prop_count <= max_prop_count);
+    if (prop_count > max_prop_count) return error.Corrupt;
     const bytes = try txn.deref(cat, catalogSize(prop_count));
+    {
+        const ko = kindsOffset(prop_count);
+        const eo = elemsOffset(prop_count);
+        const ro = rulesOffset(prop_count);
+        var p: usize = 0;
+        while (p < prop_count) : (p += 1) {
+            if (std.enums.fromInt(PropKind, bytes[ko + p]) == null) return error.Corrupt;
+            if (std.enums.fromInt(ElemKind, bytes[eo + p]) == null) return error.Corrupt;
+            if (std.enums.fromInt(DeletionRule, bytes[ro + p]) == null) return error.Corrupt;
+        }
+    }
     return CatalogView{
         .prop_count = prop_count,
         .next_row = std.mem.readInt(u64, bytes[off_next_row..][0..8], .little),
@@ -274,6 +295,124 @@ pub fn loadCatalog(txn: anytype, cat: Ref) !CatalogView {
         .bytes = bytes,
     };
 }
+
+/// One property's full catalog record, as carried by CatalogSnapshot.
+pub const PropSnap = struct {
+    col: Ref,
+    kind: PropKind,
+    elem: ElemKind,
+    backlink: Ref,
+    target: u16,
+    rule: DeletionRule,
+    value_index: Ref,
+    indexed: bool,
+};
+
+/// A mutable, owned copy of every catalog field. This is THE way to rewrite a
+/// catalog: load, mutate the fields that change, write. It replaces the
+/// hand-rolled eight-parallel-arrays snapshot ritual (and the 15-positional-
+/// argument writeCatalog call) that was previously duplicated at every mutation
+/// site -- a pattern where transposing two Ref arguments compiles fine and
+/// corrupts data. Because the snapshot owns plain values, it is also immune to
+/// the CatalogView invalidation hazard: file growth cannot invalidate it.
+pub const CatalogSnapshot = struct {
+    prop_count: PropCount,
+    next_row: u64,
+    keyrow_index_ref: Ref,
+    next_key: u64,
+    pk_index_ref: Ref,
+    version_col_ref: Ref,
+    live_col_ref: Ref,
+    props: [max_prop_count]PropSnap,
+    /// The node this snapshot was loaded from and its on-disk size, so
+    /// replace() can free it. prop_count may change after load (migrations),
+    /// so the size is captured here, not recomputed.
+    source: Ref,
+    source_len: usize,
+
+    pub fn load(txn: anytype, cat: Ref) !CatalogSnapshot {
+        const v = try loadCatalog(txn, cat);
+        var s: CatalogSnapshot = undefined;
+        s.source = cat;
+        s.source_len = catalogSize(v.prop_count);
+        s.prop_count = v.prop_count;
+        s.next_row = v.next_row;
+        s.keyrow_index_ref = v.keyrow_index_ref;
+        s.next_key = v.next_key;
+        s.pk_index_ref = v.pk_index_ref;
+        s.version_col_ref = v.version_col_ref;
+        s.live_col_ref = v.live_col_ref;
+        var j: usize = 0;
+        while (j < v.prop_count) : (j += 1) {
+            s.props[j] = .{
+                .col = v.propColRef(j),
+                .kind = v.kind(j),
+                .elem = v.elemKind(j),
+                .backlink = v.backlinkRef(j),
+                .target = v.linkTarget(j),
+                .rule = v.delRule(j),
+                .value_index = v.valueIndexRef(j),
+                .indexed = v.indexed(j),
+            };
+        }
+        return s;
+    }
+
+    /// Allocate and encode a fresh catalog node from this snapshot.
+    pub fn write(self: *const CatalogSnapshot, txn: *WriteTxn) !Ref {
+        var cols: [max_prop_count]Ref = undefined;
+        var kinds: [max_prop_count]PropKind = undefined;
+        var elems: [max_prop_count]ElemKind = undefined;
+        var backlinks: [max_prop_count]Ref = undefined;
+        var targets: [max_prop_count]u16 = undefined;
+        var rules: [max_prop_count]DeletionRule = undefined;
+        var vidx: [max_prop_count]Ref = undefined;
+        var idxf: [max_prop_count]bool = undefined;
+        const pc = self.prop_count;
+        var j: usize = 0;
+        while (j < pc) : (j += 1) {
+            const p = self.props[j];
+            cols[j] = p.col;
+            kinds[j] = p.kind;
+            elems[j] = p.elem;
+            backlinks[j] = p.backlink;
+            targets[j] = p.target;
+            rules[j] = p.rule;
+            vidx[j] = p.value_index;
+            idxf[j] = p.indexed;
+        }
+        return writeCatalog(
+            txn,
+            pc,
+            self.next_row,
+            self.keyrow_index_ref,
+            self.next_key,
+            self.pk_index_ref,
+            self.version_col_ref,
+            self.live_col_ref,
+            cols[0..pc],
+            kinds[0..pc],
+            elems[0..pc],
+            backlinks[0..pc],
+            targets[0..pc],
+            rules[0..pc],
+            vidx[0..pc],
+            idxf[0..pc],
+        );
+    }
+
+    /// Write the snapshot as a fresh node and free the node it was loaded
+    /// from. This is the normal way to rewrite a catalog within one database:
+    /// the old node is garbage the moment the caller adopts the new ref, and a
+    /// txn-private old node is reused by the very next same-size catalog write,
+    /// so catalog churn stops growing the file. Do NOT use when the source
+    /// lives in a different database (copyTypeRows) or must stay readable.
+    pub fn replace(self: *const CatalogSnapshot, txn: *WriteTxn) !Ref {
+        const new_ref = try self.write(txn);
+        try txn.free(self.source, self.source_len);
+        return new_ref;
+    }
+};
 
 pub fn propCount(txn: anytype, cat: Ref) !PropCount {
     const view = try loadCatalog(txn, cat);
@@ -312,137 +451,33 @@ pub fn resolveProp(txn: anytype, cat: Ref, pk: u64, prop: usize) !?struct { row:
 }
 
 // Write new_root into property `prop` at `row`, bump that row's version stamp,
-// return the new catalog ref. Reloads the catalog fresh and captures all refs.
+// return the new catalog ref.
 pub fn replaceCollRoot(txn: *WriteTxn, cat: Ref, row: u64, prop: usize, new_root: Ref) !Ref {
-    const v = try loadCatalog(txn, cat);
-    const pc = v.prop_count;
-    const next_row = v.next_row;
-    const idx_ref = v.pk_index_ref;
-    const live_ref = v.live_col_ref;
-    var prop_refs: [max_prop_count]Ref = undefined;
-    var kinds: [max_prop_count]PropKind = undefined;
-    var elems: [max_prop_count]ElemKind = undefined;
-    var bl: [max_prop_count]Ref = undefined;
-    var targets_buf: [max_prop_count]u16 = undefined;
-    var rules_buf: [max_prop_count]DeletionRule = undefined;
-    var vidx_buf: [max_prop_count]Ref = undefined;
-    var idxf_buf: [max_prop_count]bool = undefined;
-    {
-        var j: usize = 0;
-        while (j < pc) : (j += 1) {
-            prop_refs[j] = v.propColRef(j);
-            kinds[j] = v.kind(j);
-            elems[j] = v.elemKind(j);
-            bl[j] = v.backlinkRef(j);
-            targets_buf[j] = v.linkTarget(j);
-            rules_buf[j] = v.delRule(j);
-            vidx_buf[j] = v.valueIndexRef(j);
-            idxf_buf[j] = v.indexed(j);
-        }
-    }
-    var ver_ref = v.version_col_ref;
-    prop_refs[prop] = try Column.set(txn, prop_refs[prop], row, new_root);
-    ver_ref = try Column.set(txn, ver_ref, row, txn.new_version);
-    return writeCatalog(txn, pc, next_row, v.keyrow_index_ref, v.next_key, idx_ref, ver_ref, live_ref, prop_refs[0..pc], kinds[0..pc], elems[0..pc], bl[0..pc], targets_buf[0..pc], rules_buf[0..pc], vidx_buf[0..pc], idxf_buf[0..pc]);
+    var s = try CatalogSnapshot.load(txn, cat);
+    s.props[prop].col = try Column.set(txn, s.props[prop].col, row, new_root);
+    s.version_col_ref = try Column.set(txn, s.version_col_ref, row, txn.new_version);
+    return s.replace(txn);
 }
 
 // Write a new backlink ref into property `p`, preserving everything else.
 pub fn setBacklinkRef(txn: *WriteTxn, cat: Ref, p: usize, new_bl: Ref) !Ref {
-    const v = try loadCatalog(txn, cat);
-    const pc = v.prop_count;
-    const next_row = v.next_row;
-    const idx_ref = v.pk_index_ref;
-    const ver_ref = v.version_col_ref;
-    const live_ref = v.live_col_ref;
-    var prop_refs: [max_prop_count]Ref = undefined;
-    var kinds: [max_prop_count]PropKind = undefined;
-    var elems: [max_prop_count]ElemKind = undefined;
-    var bl: [max_prop_count]Ref = undefined;
-    var targets_buf: [max_prop_count]u16 = undefined;
-    var rules_buf: [max_prop_count]DeletionRule = undefined;
-    var vidx_buf: [max_prop_count]Ref = undefined;
-    var idxf_buf: [max_prop_count]bool = undefined;
-    {
-        var j: usize = 0;
-        while (j < pc) : (j += 1) {
-            prop_refs[j] = v.propColRef(j);
-            kinds[j] = v.kind(j);
-            elems[j] = v.elemKind(j);
-            bl[j] = v.backlinkRef(j);
-            targets_buf[j] = v.linkTarget(j);
-            rules_buf[j] = v.delRule(j);
-            vidx_buf[j] = v.valueIndexRef(j);
-            idxf_buf[j] = v.indexed(j);
-        }
-    }
-    bl[p] = new_bl;
-    return writeCatalog(txn, pc, next_row, v.keyrow_index_ref, v.next_key, idx_ref, ver_ref, live_ref, prop_refs[0..pc], kinds[0..pc], elems[0..pc], bl[0..pc], targets_buf[0..pc], rules_buf[0..pc], vidx_buf[0..pc], idxf_buf[0..pc]);
+    var s = try CatalogSnapshot.load(txn, cat);
+    s.props[p].backlink = new_bl;
+    return s.replace(txn);
 }
 
 // Write a new value-index ref into property `p`, preserving everything else.
 pub fn setValueIndexRef(txn: *WriteTxn, cat: Ref, p: usize, new_vi: Ref) !Ref {
-    const v = try loadCatalog(txn, cat);
-    const pc = v.prop_count;
-    const next_row = v.next_row;
-    const idx_ref = v.pk_index_ref;
-    const ver_ref = v.version_col_ref;
-    const live_ref = v.live_col_ref;
-    var prop_refs: [max_prop_count]Ref = undefined;
-    var kinds: [max_prop_count]PropKind = undefined;
-    var elems: [max_prop_count]ElemKind = undefined;
-    var bl: [max_prop_count]Ref = undefined;
-    var targets_buf: [max_prop_count]u16 = undefined;
-    var rules_buf: [max_prop_count]DeletionRule = undefined;
-    var vidx_buf: [max_prop_count]Ref = undefined;
-    var idxf_buf: [max_prop_count]bool = undefined;
-    {
-        var j: usize = 0;
-        while (j < pc) : (j += 1) {
-            prop_refs[j] = v.propColRef(j);
-            kinds[j] = v.kind(j);
-            elems[j] = v.elemKind(j);
-            bl[j] = v.backlinkRef(j);
-            targets_buf[j] = v.linkTarget(j);
-            rules_buf[j] = v.delRule(j);
-            vidx_buf[j] = v.valueIndexRef(j);
-            idxf_buf[j] = v.indexed(j);
-        }
-    }
-    vidx_buf[p] = new_vi;
-    return writeCatalog(txn, pc, next_row, v.keyrow_index_ref, v.next_key, idx_ref, ver_ref, live_ref, prop_refs[0..pc], kinds[0..pc], elems[0..pc], bl[0..pc], targets_buf[0..pc], rules_buf[0..pc], vidx_buf[0..pc], idxf_buf[0..pc]);
+    var s = try CatalogSnapshot.load(txn, cat);
+    s.props[p].value_index = new_vi;
+    return s.replace(txn);
 }
 
 // Write a new column ref into property `p`, preserving everything else.
 pub fn setPropColRef(txn: *WriteTxn, cat: Ref, p: usize, new_col: Ref) !Ref {
-    const v = try loadCatalog(txn, cat);
-    const pc = v.prop_count;
-    const next_row = v.next_row;
-    const idx_ref = v.pk_index_ref;
-    const ver_ref = v.version_col_ref;
-    const live_ref = v.live_col_ref;
-    var prop_refs: [max_prop_count]Ref = undefined;
-    var kinds: [max_prop_count]PropKind = undefined;
-    var elems: [max_prop_count]ElemKind = undefined;
-    var bl: [max_prop_count]Ref = undefined;
-    var targets_buf: [max_prop_count]u16 = undefined;
-    var rules_buf: [max_prop_count]DeletionRule = undefined;
-    var vidx_buf: [max_prop_count]Ref = undefined;
-    var idxf_buf: [max_prop_count]bool = undefined;
-    {
-        var j: usize = 0;
-        while (j < pc) : (j += 1) {
-            prop_refs[j] = v.propColRef(j);
-            kinds[j] = v.kind(j);
-            elems[j] = v.elemKind(j);
-            bl[j] = v.backlinkRef(j);
-            targets_buf[j] = v.linkTarget(j);
-            rules_buf[j] = v.delRule(j);
-            vidx_buf[j] = v.valueIndexRef(j);
-            idxf_buf[j] = v.indexed(j);
-        }
-    }
-    prop_refs[p] = new_col;
-    return writeCatalog(txn, pc, next_row, v.keyrow_index_ref, v.next_key, idx_ref, ver_ref, live_ref, prop_refs[0..pc], kinds[0..pc], elems[0..pc], bl[0..pc], targets_buf[0..pc], rules_buf[0..pc], vidx_buf[0..pc], idxf_buf[0..pc]);
+    var s = try CatalogSnapshot.load(txn, cat);
+    s.props[p].col = new_col;
+    return s.replace(txn);
 }
 
 // ---------------------------------------------------------------------------
@@ -470,6 +505,71 @@ test "create allocates an empty type and load reads it back" {
     try testing.expectEqual(@as(PropCount, 3), try propCount(&w, cat));
     try testing.expectEqual(@as(u64, 0), try liveCount(&w, cat));
     w.deinit();
+}
+
+test "CatalogSnapshot round-trips every field through load and write" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "snap_rt.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    defer w.deinit();
+    const cat = try createDefs(&w, &.{
+        .{ .kind = .int },
+        .{ .kind = .int, .indexed = true },
+        .{ .kind = .link, .link_target = 3, .del_rule = .cascade },
+        .{ .kind = .list, .elem = .blob },
+    });
+    const s = try CatalogSnapshot.load(&w, cat);
+    const copy_ref = try s.write(&w);
+    const v0 = try loadCatalog(&w, cat);
+    const v1 = try loadCatalog(&w, copy_ref);
+    try testing.expectEqual(v0.prop_count, v1.prop_count);
+    try testing.expectEqual(v0.next_row, v1.next_row);
+    try testing.expectEqual(v0.next_key, v1.next_key);
+    try testing.expectEqual(v0.pk_index_ref, v1.pk_index_ref);
+    try testing.expectEqual(v0.keyrow_index_ref, v1.keyrow_index_ref);
+    try testing.expectEqual(v0.version_col_ref, v1.version_col_ref);
+    try testing.expectEqual(v0.live_col_ref, v1.live_col_ref);
+    var j: usize = 0;
+    while (j < v0.prop_count) : (j += 1) {
+        try testing.expectEqual(v0.propColRef(j), v1.propColRef(j));
+        try testing.expectEqual(v0.kind(j), v1.kind(j));
+        try testing.expectEqual(v0.elemKind(j), v1.elemKind(j));
+        try testing.expectEqual(v0.backlinkRef(j), v1.backlinkRef(j));
+        try testing.expectEqual(v0.linkTarget(j), v1.linkTarget(j));
+        try testing.expectEqual(v0.delRule(j), v1.delRule(j));
+        try testing.expectEqual(v0.valueIndexRef(j), v1.valueIndexRef(j));
+        try testing.expectEqual(v0.indexed(j), v1.indexed(j));
+    }
+}
+
+test "loadCatalog rejects corrupt disk values instead of panicking" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "corruptcat.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    defer w.deinit();
+    const cat = try create(&w, 2);
+    _ = try loadCatalog(&w, cat); // clean before corruption
+
+    // Corrupt a kind byte (out-of-range enum value) directly in the mapping.
+    const cat_off: usize = @intCast(cat);
+    const kind_byte_off = cat_off + off_prop_cols + 2 * 8; // kindsOffset(2), prop 0
+    const saved_kind = db.store.map[kind_byte_off];
+    db.store.map[kind_byte_off] = 200;
+    try testing.expectError(error.Corrupt, loadCatalog(&w, cat));
+    db.store.map[kind_byte_off] = saved_kind;
+    _ = try loadCatalog(&w, cat); // restored
+
+    // Corrupt the prop count to an implausible value.
+    std.mem.writeInt(u16, db.store.map[cat_off..][0..2], 6000, .little);
+    try testing.expectError(error.Corrupt, loadCatalog(&w, cat));
 }
 
 test "createTyped records property kinds; create defaults to all int" {

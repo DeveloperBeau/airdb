@@ -53,6 +53,46 @@ int main(void) {
     CHECK(out[1] == 88);
     airdb_close(db2);
 
+    /* Explicit transaction: two staged inserts commit as one durable batch. */
+    AirdbDatabase *db3 = airdb_open(path, 3);
+    CHECK(db3 != NULL);
+    AirdbTxn *txn = airdb_begin(db3);
+    CHECK(txn != NULL);
+    uint64_t t1[3] = {300, 1, 1};
+    uint64_t t2[3] = {400, 2, 2};
+    CHECK(airdb_txn_insert(txn, t1, 3) >= 0);
+    CHECK(airdb_txn_insert(txn, t2, 3) >= 0);
+    CHECK(airdb_commit(txn) == AIRDB_OK);
+    CHECK(airdb_count(db3) == 3);
+
+    /* Abort makes nothing durable. */
+    AirdbTxn *txn2 = airdb_begin(db3);
+    CHECK(txn2 != NULL);
+    uint64_t t3[3] = {500, 3, 3};
+    CHECK(airdb_txn_insert(txn2, t3, 3) >= 0);
+    airdb_abort(txn2);
+    CHECK(airdb_count(db3) == 3);
+
+    /* Bulk append: ascending keys above the current max, one commit. */
+    uint64_t batch[2 * 3] = {600, 6, 6, 700, 7, 7};
+    CHECK(airdb_bulk_append(db3, batch, 2, 3) == 2);
+    CHECK(airdb_count(db3) == 5);
+    airdb_close(db3);
+
+    /* Bulk import requires an empty type: use a fresh file. */
+    const char *bulk_path = "/tmp/airdb_ffi_smoke_bulk.airdb";
+    remove(bulk_path);
+    remove("/tmp/airdb_ffi_smoke_bulk.airdb.coord");
+    AirdbDatabase *bdb = airdb_open(bulk_path, 2);
+    CHECK(bdb != NULL);
+    uint64_t rows[3 * 2] = {1, 10, 2, 20, 3, 30};
+    CHECK(airdb_bulk_insert(bdb, rows, 3, 2) == 3);
+    CHECK(airdb_count(bdb) == 3);
+    CHECK(airdb_bulk_insert(bdb, rows, 3, 2) == AIRDB_E_NOT_EMPTY);
+    airdb_close(bdb);
+    remove(bulk_path);
+    remove("/tmp/airdb_ffi_smoke_bulk.airdb.coord");
+
     remove(path);
     remove("/tmp/airdb_ffi_smoke_test.airdb.coord");
     printf("ffi_smoke: ok\n");

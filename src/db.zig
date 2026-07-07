@@ -32,13 +32,25 @@ const slot_b_off: usize = 128;
 // Version->root ring log, in the reserved header page (page 0, [0, default_page_size)).
 // The arena's data starts at default_page_size, so the header page has free room past
 // the FileStore header ([0,32)) and the two commit slots (A: [64,100), B: [128,164)).
-//   ring_head_off: u32 LE, monotonically increasing count of entries ever written.
-//                  The live head index is ring_head % ring_capacity.
+//   ring_head_off: u64 LE, monotonically increasing count of entries ever written.
+//                  The live head index is ring_head % ring_capacity. u64 so the
+//                  counter cannot overflow within any plausible commit volume (a
+//                  u32 wraps after ~4 billion commits and would panic mid-commit).
 //   ring_off:      ring_capacity entries, each 16 bytes [version u64 LE][root_ref u64 LE].
 // End of ring = ring_off + ring_capacity*16 = 1024 + 128*16 = 3072 < 4096. No overlap.
 pub const ring_head_off: usize = 1016;
 pub const ring_off: usize = 1024;
 pub const ring_capacity: u32 = 128;
+
+// Retention window, persisted in the header page so EVERY process honors the
+// same reclaim floor: committed-free space is withheld from reuse until it is
+// older than `active_version - retain`. A per-instance in-memory setting would
+// let a default-configured writer in another process reuse space under a
+// point-in-time reader that relies on the window. u64 LE at [192, 200);
+// 8-aligned, clear of slot B ([128, 164)) and the ring head (1016). Zero on a
+// fresh (zero-filled) file, matching the old default. maxInt means "retain
+// everything". Read/written atomically through the shared mapping.
+pub const retain_off: usize = 192;
 
 // ---------------------------------------------------------------------------
 // Db
@@ -56,6 +68,12 @@ pub const VerifyError = error{
     // A value-index entry points at a dead/absent row, or at a live row whose
     // property value differs from the indexed value (backward direction).
     ValueIndexStaleEntry,
+    // A live row's outbound link/link_set target is missing from the target's
+    // backlink set (forward direction of the backlink invariant).
+    BacklinkMissingEntry,
+    // A backlink entry names a source that is dead/absent or whose link column
+    // does not actually point at the target (backward direction).
+    BacklinkStaleEntry,
 };
 
 pub const Db = struct {
@@ -75,9 +93,9 @@ pub const Db = struct {
     /// Index into the coord participant slot array claimed by this Db instance, or null
     /// if all 64 slots were occupied at open/create time.
     participant_slot: ?usize,
-    /// Retention window: committed-free space is withheld from reuse until it is
-    /// older than `active_version - retain_versions`. 0 disables the window.
-    retain_versions: u64 = 0,
+    // NOTE: the retention window is NOT an in-memory field. It lives in the
+    // header page (see retain_off) so all attached processes share one floor;
+    // read it with retainVersions() and set it with setRetainVersions().
     /// Opt-in: when set, the caller drives `maybeCompactStep` to amortize compaction.
     auto_compact: bool = false,
     /// In-flight cursor for budget-proportional packing. Holds the two-pointer
@@ -85,6 +103,19 @@ pub const Db = struct {
     /// `compactStep` calls; null between runs (and reset on any churn that moves
     /// the type's live_count/next_row). See `compaction.compactStep`.
     compact_cursor: ?compaction.CompactCursor = null,
+    /// Set when recovery could not use the primary commit slot (its checksum or
+    /// the header's was bad) and fell back to the other slot -- i.e. the database
+    /// silently resumed from the previous version. Surfaced via metrics() so
+    /// callers can log/alert on it; never set on a clean open.
+    recovered_fallback: bool = false,
+    /// Set when a commit's HEADER flush (the commit point) failed. The flipped
+    /// commit pointer was already in the mapped header page before the failed
+    /// barrier, so async writeback may persist it regardless -- the commit's
+    /// on-disk fate is indeterminate. Further writes from this instance could
+    /// scribble the maybe-published version's nodes, so beginWrite refuses
+    /// until the database is reopened (open re-reads the header and resolves
+    /// which side won).
+    poisoned: bool = false,
 
     /// Measurement-only counters accumulated since open. Updated by commit; never
     /// affect behavior. fl_encode_ns is the total nanoseconds spent encoding the
@@ -138,7 +169,11 @@ pub const Db = struct {
             coord.deinit();
         }
         _ = coord.attach();
-        slot = try coord.claimSlot();
+        // A participant slot is MANDATORY: without one this instance's reader
+        // pins are invisible to other processes' reclaim horizons, so any
+        // snapshot it opened could be scribbled by a concurrent writer. Refuse
+        // the attach rather than silently degrade to corruptible reads.
+        slot = (try coord.claimSlot()) orelse return error.TooManyAttachments;
 
         return Db{
             .store = store,
@@ -151,7 +186,6 @@ pub const Db = struct {
             .free_list_node_len = 0,
             .coord = coord,
             .participant_slot = slot,
-            .retain_versions = 0,
             .auto_compact = false,
         };
     }
@@ -186,7 +220,6 @@ pub const Db = struct {
             .free_list_node_len = 0,
             .coord = undefined,
             .participant_slot = null,
-            .retain_versions = 0,
             .auto_compact = false,
         };
         errdefer db.free_list.deinit();
@@ -208,7 +241,9 @@ pub const Db = struct {
             coord.deinit();
         }
         _ = coord.attach();
-        slot = try coord.claimSlot();
+        // Mandatory for the same reason as in createWith: invisible pins mean
+        // corruptible snapshots.
+        slot = (try coord.claimSlot()) orelse return error.TooManyAttachments;
 
         db.coord = coord;
         db.participant_slot = slot;
@@ -240,39 +275,78 @@ pub const Db = struct {
 
             // Try the primary slot first (normal path and correct crash-recovery path).
             // Fall back to the other slot only if the primary checksum is bad, which
-            // indicates a crash mid-slot-write into the primary region itself.
-            return Slot.decode(self.store.map[primary_off..][0..Slot.size]) catch
-                Slot.decode(self.store.map[other_off..][0..Slot.size]) catch
-                return error.Corrupt;
+            // indicates a crash mid-slot-write into the primary region itself. The
+            // fallback silently resumes from the previous version, so it is recorded
+            // on the Db and surfaced via metrics().
+            return Slot.decode(self.store.map[primary_off..][0..Slot.size]) catch {
+                const s = Slot.decode(self.store.map[other_off..][0..Slot.size]) catch return error.Corrupt;
+                self.recovered_fallback = true;
+                return s;
+            };
         } else {
             // Header checksum failed: the authoritative active_slot pointer is unreadable,
             // so fall back to the highest valid-version slot. This last-resort heuristic is
-            // used ONLY when the header itself is corrupt.
+            // used ONLY when the header itself is corrupt, and is likewise surfaced.
             const maybe_a: ?Slot = Slot.decode(self.store.map[slot_a_off..][0..Slot.size]) catch null;
             const maybe_b: ?Slot = Slot.decode(self.store.map[slot_b_off..][0..Slot.size]) catch null;
-            if (maybe_a != null and maybe_b != null) {
-                return if (maybe_a.?.version >= maybe_b.?.version) maybe_a.? else maybe_b.?;
-            } else if (maybe_a != null) {
-                return maybe_a.?;
-            } else if (maybe_b != null) {
-                return maybe_b.?;
-            } else {
-                return error.Corrupt;
-            }
+            const chosen: Slot = blk: {
+                if (maybe_a != null and maybe_b != null) {
+                    break :blk if (maybe_a.?.version >= maybe_b.?.version) maybe_a.? else maybe_b.?;
+                } else if (maybe_a != null) {
+                    break :blk maybe_a.?;
+                } else if (maybe_b != null) {
+                    break :blk maybe_b.?;
+                } else {
+                    return error.Corrupt;
+                }
+            };
+            self.recovered_fallback = true;
+            return chosen;
         }
+    }
+
+    /// Decode the persisted free-list chain headed at free_list_ref into
+    /// `out`, returning the HEAD chunk's byte length. `out` must already be
+    /// initialized; its previous contents are discarded.
+    fn decodeFreeListNode(self: *Db, free_list_ref: Ref, out: *FreeList) !usize {
+        out.reset();
+        const limit: u64 = @intCast(self.store.sectionsView().len * platform.section_size);
+        var head_len: usize = 0;
+        var cref = free_list_ref;
+        var hops: usize = 0;
+        while (cref != 0) : (hops += 1) {
+            if (hops >= FreeList.max_chunks) return error.Corrupt; // ref cycle
+            // Read the chunk header to learn the chunk size and successor.
+            const hdr = try self.arena.deref(cref, FreeList.chunk_header_bytes);
+            const count = std.mem.readInt(u32, hdr[0..4], .little);
+            const node_len = FreeList.chunkByteLen(count);
+            const node_bytes = try self.arena.deref(cref, node_len);
+            const next = try out.decodeChunkAppend(node_bytes);
+            // Chunks are written back-to-front, so a legitimate chain's refs
+            // strictly DECREASE along the walk. Enforcing that kills forged or
+            // bit-rotted cycles outright: a next_ref pointing at itself or any
+            // up-chain chunk re-decoded its extents every hop, demanding
+            // terabytes of heap before the hop guard could ever fire.
+            if (next != 0 and (next % 8 != 0 or next >= cref)) return error.Corrupt;
+            if (hops == 0) head_len = node_len;
+            cref = next;
+        }
+        // Validate every decoded extent before trusting it for reuse: the
+        // free-list chunks carry no checksum of their own, and the reuse path
+        // translates offsets without bounds checks -- a bit-rotted extent
+        // would silently hand out live or out-of-bounds bytes as free space.
+        for (out.extents.items) |ex| {
+            if (ex.len == 0 or ex.offset % 8 != 0) return error.Corrupt;
+            if (ex.offset > limit or ex.len > limit - ex.offset) return error.Corrupt;
+        }
+        return head_len;
     }
 
     /// Decode the persisted free-list node at free_list_ref into self.free_list.
     /// Sets self.free_list_node_ref and self.free_list_node_len.
     /// self.free_list must already be initialized (possibly empty).
     fn loadFreeList(self: *Db, free_list_ref: Ref) !void {
-        // First read the 4-byte count prefix to know the full node size.
-        const count_bytes = try self.arena.deref(free_list_ref, 4);
-        const count = std.mem.readInt(u32, count_bytes[0..4], .little);
-        const node_len = 4 + @as(usize, count) * 24;
-        // Now read the full node and decode it.
-        const node_bytes = try self.arena.deref(free_list_ref, node_len);
-        try self.free_list.decode(node_bytes);
+        const node_len = try self.decodeFreeListNode(free_list_ref, &self.free_list);
         self.free_list_node_ref = free_list_ref;
         self.free_list_node_len = node_len;
     }
@@ -316,14 +390,25 @@ pub const Db = struct {
         }
         const published = self.selectPublishedSlot(lv) orelse return; // no qualifying published slot visible yet
         if (published.version <= self.active_version) return;
+        // Decode the published free list into a temporary FIRST. A decode
+        // failure must leave this instance's committed state (version, root,
+        // top, free list) fully intact: advancing the version with an empty
+        // free list would make the next commit durably persist that empty list
+        // and permanently drop every reclaimable-extent record.
+        var new_fl = FreeList.init(self.store.allocator);
+        errdefer new_fl.deinit();
+        var node_len: usize = 0;
+        if (published.free_list_ref != 0) {
+            node_len = try self.decodeFreeListNode(published.free_list_ref, &new_fl);
+        }
+        // All decoding succeeded: install everything together.
         self.active_version = published.version;
         self.active_root = published.root_ref;
         self.arena.top = @intCast(published.logical_size);
         self.free_list.deinit();
-        self.free_list = FreeList.init(self.store.allocator);
-        self.free_list_node_ref = 0;
-        self.free_list_node_len = 0;
-        if (published.free_list_ref != 0) try self.loadFreeList(published.free_list_ref);
+        self.free_list = new_fl;
+        self.free_list_node_ref = published.free_list_ref;
+        self.free_list_node_len = node_len;
     }
 
     /// Returns the minimum pinned version among all active readers, or sentinel_max if none.
@@ -343,17 +428,42 @@ pub const Db = struct {
     }
 
     pub fn beginRead(self: *Db) !ReadTxn {
-        // Refresh from the shared mapping before pinning. Safe here because no
-        // write transaction is in progress when beginRead is called.
-        try self.refreshToLatest();
-        const v = self.active_version;
-        if (self.pins.getPtr(v)) |ptr| {
-            ptr.* += 1;
-        } else {
-            try self.pins.put(v, 1);
+        // Pin-then-validate loop. Between refreshing to the latest published
+        // version and this process's pin becoming visible in the coord slot, a
+        // writer in another process may commit a NEWER version and compute a
+        // reclaim horizon that does not include the pin -- admitting reuse of
+        // exactly the nodes this snapshot references (with a zero retention
+        // window, the previous version's replaced spine). Publishing the pin
+        // FIRST and then re-reading the published latest version closes the
+        // window: if the world moved past the pinned version while it was in
+        // flight, unpin and chase the new version. The loop terminates because
+        // versions only move forward and each retry pins the newest one seen.
+        var prev_v: ?u64 = null;
+        while (true) {
+            try self.refreshToLatest();
+            const v = self.active_version;
+            const root = self.active_root;
+            // A retry that made no progress means the published version keeps
+            // running ahead of anything this instance can adopt (e.g. newer
+            // slots do not decode). Fail rather than spin forever.
+            if (prev_v != null and prev_v.? == v) return error.Corrupt;
+            prev_v = v;
+            if (self.pins.getPtr(v)) |ptr| {
+                ptr.* += 1;
+            } else {
+                try self.pins.put(v, 1);
+            }
+            self.publishPins();
+            const lv = self.coord.latestVersion();
+            const retain = self.retainVersions();
+            const floor = if (retain == coord_mod.sentinel_max) 0 else lv -| retain;
+            if (v >= floor) {
+                return ReadTxn{ .db = self, .root_ref = root, .version = v };
+            }
+            // The pin landed too late; release it and pin the newer version.
+            var stale = ReadTxn{ .db = self, .root_ref = root, .version = v };
+            stale.end();
         }
-        self.publishPins();
-        return ReadTxn{ .db = self, .root_ref = self.active_root, .version = v };
     }
 
     /// Open a read snapshot at a past committed `version`. Returns
@@ -364,9 +474,10 @@ pub const Db = struct {
         try self.refreshToLatest();
         if (version > self.active_version) return error.VersionUnavailable;
         // Must be inside the retention window: older versions' nodes may already
-        // be reclaimed. maxInt retain_versions means "retain everything".
-        if (self.retain_versions != std.math.maxInt(u64)) {
-            if (version < self.active_version -| self.retain_versions) return error.VersionUnavailable;
+        // be reclaimed. maxInt means "retain everything".
+        const retain = self.retainVersions();
+        if (retain != coord_mod.sentinel_max) {
+            if (version < self.active_version -| retain) return error.VersionUnavailable;
         }
         const root = if (version == self.active_version)
             self.active_root
@@ -378,6 +489,22 @@ pub const Db = struct {
             try self.pins.put(version, 1);
         }
         self.publishPins();
+        // Pin-then-validate. A writer in another process whose reclaim-horizon
+        // load happened BEFORE our pin became visible may reuse extents freed
+        // above `version` -- but only extents with freed_version <= its
+        // active_version - retain. So once the pin is published, re-read the
+        // published latest version: if `version` still clears the shared
+        // retention floor of the newest possible in-flight writer, no such
+        // writer can have reused a node this snapshot references. Otherwise
+        // unpin and refuse the read rather than risk a corrupt snapshot.
+        if (retain != coord_mod.sentinel_max) {
+            const lv = self.coord.latestVersion();
+            if (version < lv -| retain) {
+                var txn = ReadTxn{ .db = self, .root_ref = root, .version = version };
+                txn.end(); // unpin
+                return error.VersionUnavailable;
+            }
+        }
         return ReadTxn{ .db = self, .root_ref = root, .version = version };
     }
 
@@ -412,9 +539,23 @@ pub const Db = struct {
         return self.store.fileLen();
     }
 
+    fn retainPtr(self: *Db) *u64 {
+        return @ptrCast(@alignCast(&self.store.map[retain_off]));
+    }
+
+    /// The shared retention window: recently-freed space is withheld from reuse
+    /// for the most recent `retainVersions()` versions, across ALL processes.
+    pub fn retainVersions(self: *Db) u64 {
+        return @atomicLoad(u64, self.retainPtr(), .acquire);
+    }
+
     /// Withhold recently-freed space from reuse for the most recent `n` versions.
+    /// Shared and durable: the value lives in the header page, so every attached
+    /// process honors it immediately, and it is carried to disk by the next
+    /// commit's flush. Lowering the window while point-in-time readers are
+    /// active in other processes is unsafe; raise-only while readers may exist.
     pub fn setRetainVersions(self: *Db, n: u64) void {
-        self.retain_versions = n;
+        @atomicStore(u64, self.retainPtr(), n, .release);
     }
 
     /// Perform at most one budgeted incremental-compaction step on `type_id`,
@@ -434,7 +575,7 @@ pub const Db = struct {
             w.deinit();
             return .{ .ran = false, .moved = 0, .done = false };
         }
-        const step = try compaction.compactStep(&w, cat, budget);
+        const step = try compaction.compactStep(&w, cat, type_id, budget);
         const new_dir = try typedir.setCatalogRef(&w, dir, type_id, step.cat);
         w.setRoot(new_dir);
         _ = try w.commit();
@@ -445,14 +586,21 @@ pub const Db = struct {
     /// The `version > active_version` guard rejects a ring entry written during a
     /// commit that crashed/aborted before publishing (the slot flip never happened),
     /// so a recorded-but-unpublished pair is never trusted.
+    ///
+    /// The ring is scanned newest-to-oldest. A commit that failed its durability
+    /// barrier leaves its (version, root) entry behind, and the retry commit --
+    /// which reuses the same version number -- writes a second entry for that
+    /// version. The retry's entry is always written later, so the newest match is
+    /// the committed root and the aborted duplicate is never returned.
     pub fn versionRoot(self: *Db, version: u64) ?u64 {
         if (version > self.active_version) return null;
         const map = self.store.map;
-        const head = std.mem.readInt(u32, map[ring_head_off..][0..4], .little);
+        const head = std.mem.readInt(u64, map[ring_head_off..][0..8], .little);
         const n = @min(head, ring_capacity);
-        var i: u32 = 0;
-        while (i < n) : (i += 1) {
-            const e = ring_off + @as(usize, i) * 16;
+        var j: u64 = 0;
+        while (j < n) : (j += 1) {
+            const slot_idx: usize = @intCast((head - 1 - j) % ring_capacity);
+            const e = ring_off + slot_idx * 16;
             const v = std.mem.readInt(u64, map[e..][0..8], .little);
             if (v == version) return std.mem.readInt(u64, map[e + 8 ..][0..8], .little);
         }
@@ -464,12 +612,12 @@ pub const Db = struct {
     /// above active_version (an unpublished/aborted commit) are ignored.
     pub fn oldestRetainedVersion(self: *Db) u64 {
         const map = self.store.map;
-        const head = std.mem.readInt(u32, map[ring_head_off..][0..4], .little);
+        const head = std.mem.readInt(u64, map[ring_head_off..][0..8], .little);
         const n = @min(head, ring_capacity);
+        var i: u64 = 0;
         var min: ?u64 = null;
-        var i: u32 = 0;
         while (i < n) : (i += 1) {
-            const e = ring_off + @as(usize, i) * 16;
+            const e = ring_off + @as(usize, @intCast(i)) * 16;
             const v = std.mem.readInt(u64, map[e..][0..8], .little);
             if (v > self.active_version) continue;
             if (min == null or v < min.?) min = v;
@@ -481,14 +629,19 @@ pub const Db = struct {
     /// and the retention-window floor. Versions in [this, active_version] open.
     pub fn oldestReadableVersion(self: *Db) u64 {
         const ring_floor = self.oldestRetainedVersion();
-        if (self.retain_versions == std.math.maxInt(u64)) return ring_floor;
-        return @max(ring_floor, self.active_version -| self.retain_versions);
+        const retain = self.retainVersions();
+        if (retain == coord_mod.sentinel_max) return ring_floor;
+        return @max(ring_floor, self.active_version -| retain);
     }
 
     /// Shared body for beginWrite and beginWriteTry. Caller must hold the coord
     /// lock before calling; an errdefer in the caller releases the lock if this
     /// function returns an error.
     fn beginWriteLocked(self: *Db) !WriteTxn {
+        // A failed commit-point flush left the on-disk header indeterminate;
+        // writing further could corrupt the version that may in fact have been
+        // published. Reopen to resolve.
+        if (self.poisoned) return error.CommitIndeterminate;
         // Refresh under the lock so the writer sees the truly-latest committed version.
         try self.refreshToLatest();
         // Clone the committed free list into work_freelist so the transaction
@@ -570,6 +723,12 @@ pub const Db = struct {
         fl_clone_ns: u64,
         setlength_ns: u64,
         setlength_calls: u64,
+        /// True when open had to fall back past a corrupt primary slot or header
+        /// and resumed from the previous version. Worth logging/alerting on.
+        recovered_fallback: bool,
+        /// True when a commit-point flush failed and the instance refuses
+        /// writes until reopen. Strictly more alarming than recovered_fallback.
+        poisoned: bool,
     };
 
     pub fn metrics(self: *Db) Metrics {
@@ -588,6 +747,8 @@ pub const Db = struct {
             .fl_clone_ns = self.fl_clone_ns,
             .setlength_ns = self.store.setlength_ns,
             .setlength_calls = self.store.setlength_calls,
+            .recovered_fallback = self.recovered_fallback,
+            .poisoned = self.poisoned,
         };
     }
 
@@ -644,6 +805,11 @@ pub const Db = struct {
             const cv = catalog.loadCatalog(&r, cat) catch return;
             var p: usize = 0;
             while (p < cv.prop_count) : (p += 1) {
+                const kind = cv.kind(p);
+                if (kind == .link or kind == .link_set) {
+                    try auditBacklinksForward(&r, cv, p, kind);
+                    try auditBacklinksBackward(&r, cv, p, kind);
+                }
                 if (!cv.indexed(p)) continue;
                 const vi_ref = cv.valueIndexRef(p);
                 const prop_col = cv.propColRef(p);
@@ -688,8 +854,9 @@ fn auditValueIndexForward(r: *ReadTxn, keyrow_ref: Ref, vi_ref: Ref, prop_col: R
 // entry of the value index and, for each okey in a non-empty inner set, assert it
 // resolves through the keyrow index to a live row whose property value equals
 // that value. A stale/dangling okey or a value mismatch is
-// error.ValueIndexStaleEntry. Empty inner sets are skipped: delete leaves them in
-// place (it does not free them), so an empty set is not a violation.
+// error.ValueIndexStaleEntry. Empty inner sets are skipped defensively: current
+// maintenance removes an entry the moment its set empties, but tolerating one
+// keeps the audit usable on files written before that pruning existed.
 fn auditValueIndexBackward(r: *ReadTxn, vi_ref: Ref, keyrow_ref: Ref, prop_col: Ref, live_col: Ref) VerifyError!void {
     const Ctx = struct {
         r: *ReadTxn,
@@ -714,6 +881,99 @@ fn auditValueIndexBackward(r: *ReadTxn, vi_ref: Ref, keyrow_ref: Ref, prop_col: 
         }
     };
     Index.forEachEntry(r, vi_ref, Ctx{ .r = r, .keyrow_ref = keyrow_ref, .prop_col = prop_col, .live_col = live_col }, Ctx.onEntry) catch return error.ValueIndexStaleEntry;
+}
+
+// Forward direction of the backlink invariant: every live row's outbound
+// link/link_set target must carry that row's okey in the target's backlink set.
+// Any structural failure while walking is itself a divergence.
+fn auditBacklinksForward(r: *ReadTxn, cv: catalog.CatalogView, p: usize, kind: catalog.PropKind) VerifyError!void {
+    const Ctx = struct {
+        r: *ReadTxn,
+        bl: Ref,
+        prop_col: Ref,
+        live_col: Ref,
+        kind: catalog.PropKind,
+        fn checkOne(self: @This(), target: u64, source_okey: u64) anyerror!void {
+            const inner = (try Index.get(self.r, self.bl, target)) orelse return error.BacklinkMissingEntry;
+            if ((try Index.get(self.r, inner, source_okey)) == null) return error.BacklinkMissingEntry;
+        }
+        fn onEntry(self: @This(), okey: u64, row: u64) anyerror!void {
+            if ((try Column.get(self.r, self.live_col, row)) == 0) return; // defensive: skip dead
+            const raw = try Column.get(self.r, self.prop_col, row);
+            if (self.kind == .link) {
+                if (raw == 0) return; // null link
+                try self.checkOne(raw - 1, okey);
+                return;
+            }
+            // link_set: every member of the row's set must backlink to this row.
+            const Walk = struct {
+                r: *ReadTxn,
+                bl: Ref,
+                okey: u64,
+                fn onKey(m: @This(), target: u64) anyerror!void {
+                    const inner = (try Index.get(m.r, m.bl, target)) orelse return error.BacklinkMissingEntry;
+                    if ((try Index.get(m.r, inner, m.okey)) == null) return error.BacklinkMissingEntry;
+                }
+            };
+            try Index.forEachKey(self.r, raw, Walk{ .r = self.r, .bl = self.bl, .okey = okey }, Walk.onKey);
+        }
+    };
+    Index.forEachEntry(r, cv.keyrow_index_ref, Ctx{
+        .r = r,
+        .bl = cv.backlinkRef(p),
+        .prop_col = cv.propColRef(p),
+        .live_col = cv.live_col_ref,
+        .kind = kind,
+    }, Ctx.onEntry) catch return error.BacklinkMissingEntry;
+}
+
+// Backward direction of the backlink invariant: every backlink entry's source
+// must be a live row whose link column actually points at the entry's target.
+// Empty inner sets are tolerated defensively (maintenance prunes them now).
+fn auditBacklinksBackward(r: *ReadTxn, cv: catalog.CatalogView, p: usize, kind: catalog.PropKind) VerifyError!void {
+    const Ctx = struct {
+        r: *ReadTxn,
+        keyrow: Ref,
+        prop_col: Ref,
+        live_col: Ref,
+        kind: catalog.PropKind,
+        fn onEntry(self: @This(), target: u64, inner_root: u64) anyerror!void {
+            if ((try Index.count(self.r, inner_root)) == 0) return;
+            const Inner = struct {
+                r: *ReadTxn,
+                keyrow: Ref,
+                prop_col: Ref,
+                live_col: Ref,
+                kind: catalog.PropKind,
+                target: u64,
+                fn onKey(inner: @This(), src_okey: u64) anyerror!void {
+                    const row = (try Index.get(inner.r, inner.keyrow, src_okey)) orelse return error.BacklinkStaleEntry;
+                    if ((try Column.get(inner.r, inner.live_col, row)) == 0) return error.BacklinkStaleEntry;
+                    const raw = try Column.get(inner.r, inner.prop_col, row);
+                    if (inner.kind == .link) {
+                        if (raw == 0 or raw - 1 != inner.target) return error.BacklinkStaleEntry;
+                    } else {
+                        if ((try Index.get(inner.r, raw, inner.target)) == null) return error.BacklinkStaleEntry;
+                    }
+                }
+            };
+            try Index.forEachKey(self.r, inner_root, Inner{
+                .r = self.r,
+                .keyrow = self.keyrow,
+                .prop_col = self.prop_col,
+                .live_col = self.live_col,
+                .kind = self.kind,
+                .target = target,
+            }, Inner.onKey);
+        }
+    };
+    Index.forEachEntry(r, cv.backlinkRef(p), Ctx{
+        .r = r,
+        .keyrow = cv.keyrow_index_ref,
+        .prop_col = cv.propColRef(p),
+        .live_col = cv.live_col_ref,
+        .kind = kind,
+    }, Ctx.onEntry) catch return error.BacklinkStaleEntry;
 }
 
 // ---------------------------------------------------------------------------
@@ -761,6 +1021,34 @@ test "recovery follows header active_slot pointer, not max version" {
     }
 }
 
+test "falling back past a corrupt primary slot is surfaced in metrics" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "fallback.airdb");
+    defer testing.allocator.free(path);
+    {
+        var db = try Db.create(testing.allocator, path);
+        defer db.deinit();
+        var w = try db.beginWrite();
+        const a = try w.alloc(8);
+        @memcpy(a.bytes, "VERSION2");
+        w.setRoot(a.ref);
+        _ = try w.commit();
+        try testing.expect(!db.metrics().recovered_fallback); // clean session
+        // Corrupt the PRIMARY (active) slot's checksum region on disk.
+        const primary_off: usize = if (db.store.header.active_slot == 0) slot_a_off else slot_b_off;
+        db.store.map[primary_off + 4] ^= 0xFF;
+        try db.store.syncer.flush(db.store.file);
+    }
+    {
+        var db = try Db.open(testing.allocator, path);
+        defer db.deinit();
+        // Recovery used the other slot (the previous version) and says so.
+        try testing.expect(db.metrics().recovered_fallback);
+        try testing.expectEqual(@as(u64, 1), db.active_version);
+    }
+}
+
 test "commit then reopen sees the committed root" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -785,6 +1073,31 @@ test "commit then reopen sees the committed root" {
         const bytes = try r.deref(root_ref, 8);
         try testing.expectEqualStrings("HELLOAID", bytes);
     }
+}
+
+test "ending a read transaction twice does not release another reader's pin" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "doubleend.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    {
+        var w = try db.beginWrite();
+        const a = try w.alloc(8);
+        @memcpy(a.bytes, "PINDATA_");
+        w.setRoot(a.ref);
+        _ = try w.commit();
+    }
+    var r1 = try db.beginRead();
+    var r2 = try db.beginRead(); // same version, pin count 2
+    const v = r1.version;
+    r1.end();
+    r1.end(); // must be a no-op, not a second decrement
+    try testing.expectEqual(@as(u32, 1), db.pins.get(v).?); // r2 still pinned
+    try testing.expectEqual(v, db.horizon());
+    r2.end();
+    try testing.expectEqual(db.active_version, db.horizon());
 }
 
 test "version horizon tracks the oldest live reader" {
@@ -1035,6 +1348,77 @@ test "verifyIntegrity detects a corrupted value index" {
     try testing.expectError(error.ValueIndexStaleEntry, db.verifyIntegrity());
 }
 
+test "verifyIntegrity passes on a clean link graph after churn" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "vi_bl_clean.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    const links = @import("links.zig");
+
+    {
+        var w = try db.beginWrite();
+        var dir = try typedir.createTypes(&w, &.{
+            &.{ .{ .kind = .int }, .{ .kind = .blob } }, // 0: target type
+            &.{ .{ .kind = .int }, .{ .kind = .link, .link_target = 0 }, .{ .kind = .link_set, .link_target = 0 } }, // 1: source
+        }, &.{ false, false });
+        const a = try typedir.insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .bytes = "A" } });
+        dir = a.dir;
+        const b = try typedir.insert(&w, dir, 0, &.{ .{ .int = 2 }, .{ .bytes = "B" } });
+        dir = b.dir;
+        dir = (try typedir.insert(&w, dir, 1, &.{ .{ .int = 1 }, .{ .link = a.row }, .{ .link_set = &.{ a.row, b.row } } })).dir;
+        dir = (try typedir.insert(&w, dir, 1, &.{ .{ .int = 2 }, .{ .link = b.row }, .{ .link_set = &.{} } })).dir;
+        // Churn: move source 1's to-one link, drop one set member.
+        dir = try typedir.setLink(&w, dir, 1, 1, 1, b.row);
+        const src_cat = try typedir.catalogRef(&w, dir, 1);
+        const new_cat = try links.linkSetRemove(&w, src_cat, 1, 2, a.row);
+        dir = try typedir.setCatalogRef(&w, dir, 1, new_cat);
+        w.setRoot(dir);
+        _ = try w.commit();
+    }
+    try db.verifyIntegrity(); // forward + backward backlink audit finds no divergence
+}
+
+test "verifyIntegrity detects a corrupted backlink index" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "vi_bl_corrupt.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var target_okey: u64 = undefined;
+
+    {
+        var w = try db.beginWrite();
+        var dir = try typedir.createTypes(&w, &.{
+            &.{ .{ .kind = .int }, .{ .kind = .link, .link_target = 0 } },
+        }, &.{false});
+        const a = try typedir.insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .link = null } });
+        dir = a.dir;
+        target_okey = a.row;
+        dir = (try typedir.insert(&w, dir, 0, &.{ .{ .int = 2 }, .{ .link = target_okey } })).dir;
+        w.setRoot(dir);
+        _ = try w.commit();
+    }
+    try db.verifyIntegrity(); // clean before corruption
+
+    // White-box corruption: drop the target's backlink entry while the source's
+    // link column still points at it. Forward audit must flag the divergence.
+    {
+        var w = try db.beginWrite();
+        const dir = db.active_root;
+        const cat = try typedir.catalogRef(&w, dir, 0);
+        const cv = try catalog.loadCatalog(&w, cat);
+        const new_bl = try Index.remove(&w, cv.backlinkRef(1), target_okey);
+        const new_cat = try catalog.setBacklinkRef(&w, cat, 1, new_bl);
+        const new_dir = try typedir.setCatalogRef(&w, dir, 0, new_cat);
+        w.setRoot(new_dir);
+        _ = try w.commit();
+    }
+    try testing.expectError(error.BacklinkMissingEntry, db.verifyIntegrity());
+}
+
 test "verifyIntegrity passes on a non-indexed type" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1056,6 +1440,29 @@ test "verifyIntegrity passes on a non-indexed type" {
     }
 
     try db.verifyIntegrity(); // no indexed prop -> audit must not false-positive
+}
+
+test "the 65th attach is refused rather than reading with invisible pins" {
+    // A Db without a participant slot cannot advertise its reader pins, so
+    // concurrent writers would reclaim under its snapshots. open/create now
+    // refuse the attach outright.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "slots64.airdb");
+    defer testing.allocator.free(path);
+
+    var instances: [64]Db = undefined;
+    var opened: usize = 0;
+    defer {
+        var i: usize = 0;
+        while (i < opened) : (i += 1) instances[i].deinit();
+    }
+    instances[0] = try Db.create(testing.allocator, path);
+    opened = 1;
+    while (opened < 64) : (opened += 1) {
+        instances[opened] = try Db.open(testing.allocator, path);
+    }
+    try testing.expectError(error.TooManyAttachments, Db.open(testing.allocator, path));
 }
 
 test "two Db instances on one file share a coordination attach count" {
@@ -1259,6 +1666,7 @@ test "metrics report mapped length, versions, and reclaimable bytes" {
     try testing.expect(m.free_extent_count >= 1);
     try testing.expect(m.reclaimable_bytes >= 8);
     try testing.expectEqual(db.active_version, m.oldest_pinned_version); // no readers
+    try testing.expect(!m.poisoned);
 }
 
 test "version->root ring records committed versions" {
@@ -1342,6 +1750,103 @@ test "ring wraps after capacity" {
     try testing.expectEqual(@as(?u64, null), db.versionRoot(2));
 }
 
+test "a failed refresh leaves version and free list untouched" {
+    // Regression: refreshToLatest must be all-or-nothing. If the published
+    // free-list node cannot be decoded, the instance keeps its old version AND
+    // its old free list; previously it advanced with an empty list, which the
+    // next commit would persist, durably dropping every reclaimable extent.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "refresh_atomic.airdb");
+    defer testing.allocator.free(path);
+
+    var a = try Db.create(testing.allocator, path);
+    defer a.deinit();
+    {
+        var w = try a.beginWrite();
+        const x = try w.alloc(8);
+        @memcpy(x.bytes, "VERSION2");
+        w.setRoot(x.ref);
+        _ = try w.commit();
+    }
+
+    var b = try Db.open(testing.allocator, path);
+    defer b.deinit();
+    const b_version = b.active_version;
+    const b_fl_len = b.freeListLenForTest();
+
+    // a commits a version with a non-empty free list, then its node is
+    // corrupted in the shared mapping so b's refresh decode must fail.
+    {
+        var w = try a.beginWrite();
+        const old_root = a.active_root;
+        const x = try w.alloc(8);
+        @memcpy(x.bytes, "VERSION3");
+        try w.free(old_root, 8);
+        w.setRoot(x.ref);
+        _ = try w.commit();
+    }
+    try testing.expect(a.free_list_node_ref != 0);
+    const node_off: usize = @intCast(a.free_list_node_ref);
+    // An absurd extent count makes the node length exceed the mapping.
+    std.mem.writeInt(u32, a.store.map[node_off..][0..4], 0xFFFF_FFFF, .little);
+
+    try testing.expectError(error.BadRef, b.beginRead());
+    try testing.expectEqual(b_version, b.active_version);
+    try testing.expectEqual(b_fl_len, b.freeListLenForTest());
+}
+
+test "a retried commit's ring entry wins over the aborted duplicate" {
+    // A commit that fails its data barrier leaves its (version, root) ring entry
+    // behind; the retry reuses the same version number and appends a second
+    // entry. versionRoot must return the retry's root (the committed one), not
+    // the aborted duplicate, or beginReadAt would expose never-committed data.
+    const FailingSyncer = @import("syncer.zig").FailingSyncer;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "ringdup.airdb");
+    defer testing.allocator.free(path);
+
+    // Flush sequence: create=2 flushes, first commit=2, so the second commit's
+    // data barrier is flush #5.
+    var fsync = FailingSyncer{ .fail_on = 5 };
+    var db = try Db.createWith(testing.allocator, path, fsync.any());
+    defer db.deinit();
+    db.setRetainVersions(std.math.maxInt(u64));
+
+    {
+        var w = try db.beginWrite();
+        const a = try w.alloc(8);
+        @memcpy(a.bytes, "BASELINE");
+        w.setRoot(a.ref);
+        _ = try w.commit();
+    }
+    const v_target = db.active_version + 1;
+
+    // Aborted attempt at v_target: the ring entry lands, the flush fails.
+    {
+        var w = try db.beginWrite();
+        const a = try w.alloc(8);
+        @memcpy(a.bytes, "ABORTED!");
+        w.setRoot(a.ref);
+        try testing.expectError(error.Durability, w.commit());
+    }
+
+    // Retry commits v_target for real with different data.
+    {
+        var w = try db.beginWrite();
+        const a = try w.alloc(8);
+        @memcpy(a.bytes, "REALDATA");
+        w.setRoot(a.ref);
+        try testing.expectEqual(v_target, try w.commit());
+    }
+
+    // The past-version read must resolve to the committed root.
+    var r = try db.beginReadAt(v_target);
+    defer r.end();
+    try testing.expectEqualStrings("REALDATA", try r.deref(r.root(), 8));
+}
+
 test "beginReadAt opens a past version within the retention window" {
     const objects = @import("objects.zig");
     var tmp = testing.tmpDir(.{});
@@ -1399,6 +1904,73 @@ test "beginReadAt opens a past version within the retention window" {
     }
     // A future version is unavailable.
     try testing.expectError(error.VersionUnavailable, db.beginReadAt(vc + 5));
+}
+
+test "the retention window is shared across instances and survives reopen" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "retain_shared.airdb");
+    defer testing.allocator.free(path);
+    {
+        var a = try Db.create(testing.allocator, path);
+        defer a.deinit();
+        var b = try Db.open(testing.allocator, path);
+        defer b.deinit();
+        // A raises the floor; B sees it immediately through the shared mapping.
+        a.setRetainVersions(100);
+        try testing.expectEqual(@as(u64, 100), b.retainVersions());
+        // Make the header page durable via a commit.
+        var w = try a.beginWrite();
+        const x = try w.alloc(8);
+        @memcpy(x.bytes, "RETAINED");
+        w.setRoot(x.ref);
+        _ = try w.commit();
+    }
+    {
+        var db = try Db.open(testing.allocator, path);
+        defer db.deinit();
+        try testing.expectEqual(@as(u64, 100), db.retainVersions());
+    }
+}
+
+test "a writer honors a retention floor raised by another instance" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "retain_writer.airdb");
+    defer testing.allocator.free(path);
+    var a = try Db.create(testing.allocator, path);
+    defer a.deinit();
+    var b = try Db.open(testing.allocator, path);
+    defer b.deinit();
+    // Instance a (the "reader" side) demands full retention; b never called
+    // setRetainVersions and would previously reuse freed space immediately.
+    a.setRetainVersions(std.math.maxInt(u64));
+
+    // b commits a node, then frees it and commits again: with the shared floor
+    // the freed extent must NOT be reused by b's next allocation.
+    {
+        var w = try b.beginWrite();
+        const x = try w.alloc(8);
+        @memcpy(x.bytes, "AAAAAAAA");
+        w.setRoot(x.ref);
+        _ = try w.commit();
+    }
+    const old_root = b.active_root;
+    {
+        var w = try b.beginWrite();
+        const y = try w.alloc(8);
+        @memcpy(y.bytes, "BBBBBBBB");
+        try w.free(old_root, 8);
+        w.setRoot(y.ref);
+        _ = try w.commit();
+    }
+    {
+        var w = try b.beginWrite();
+        const z = try w.alloc(8);
+        // Without the shared window this allocation reused old_root.
+        try testing.expect(z.ref != old_root);
+        w.deinit();
+    }
 }
 
 test "beginReadAt rejects a version aged out of the retention window" {
@@ -1505,6 +2077,202 @@ fn churnNetZero(path: []const u8, live: u64, iters: u64, auto: bool) !struct { n
     };
 }
 
+test "a failed commit-point flush poisons the instance until reopen" {
+    // The flipped header pointer sits in the mapped page before the failed
+    // barrier, so its on-disk fate is indeterminate; further writes from this
+    // instance could scribble the maybe-published version. Reopen resolves.
+    const FailingSyncer = @import("syncer.zig").FailingSyncer;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "poison.airdb");
+    defer testing.allocator.free(path);
+
+    // create = 2 flushes; the first commit's data barrier is #3 and its
+    // HEADER flush (the commit point) is #4.
+    var fsync = FailingSyncer{ .fail_on = 4 };
+    {
+        var db = try Db.createWith(testing.allocator, path, fsync.any());
+        defer db.deinit();
+        {
+            var w = try db.beginWrite();
+            errdefer w.deinit();
+            const a = try w.alloc(8);
+            @memcpy(a.bytes, "POISON!!");
+            w.setRoot(a.ref);
+            try testing.expectError(error.Durability, w.commit());
+        }
+        try testing.expectError(error.CommitIndeterminate, db.beginWrite());
+        try testing.expect(db.metrics().poisoned);
+    }
+    // Reopen resolves the header and writes flow again.
+    var db = try Db.open(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    const a = try w.alloc(8);
+    @memcpy(a.bytes, "RESOLVED");
+    w.setRoot(a.ref);
+    _ = try w.commit();
+}
+
+test "a failed commit inside maybeCompactStep neither crashes nor wedges the write lock" {
+    // Regression for the commit error contract: maybeCompactStep holds
+    // `errdefer w.deinit()` across commit. Commit used to deinit the txn's
+    // lists itself on error, so the errdefer double-freed them (heap
+    // corruption); and non-durability commit errors leaked the cross-process
+    // write lock. Commit now concludes uniformly and deinit is a no-op after.
+    const FailingSyncer = @import("syncer.zig").FailingSyncer;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "compactfail.airdb");
+    defer testing.allocator.free(path);
+
+    // Flushes: create = 2, type commit = 2, churn commit = 2 -> the compact
+    // step's data barrier is flush #7.
+    var fsync = FailingSyncer{ .fail_on = 7 };
+    var db = try Db.createWith(testing.allocator, path, fsync.any());
+    defer db.deinit();
+    const tid: u16 = 0;
+    {
+        var w = try db.beginWrite();
+        const dir = try typedir.createTypes(&w, &.{&.{ .{ .kind = .int }, .{ .kind = .int } }}, &.{false});
+        w.setRoot(dir);
+        _ = try w.commit();
+    }
+    {
+        var w = try db.beginWrite();
+        var dir = db.active_root;
+        var pk: u64 = 0;
+        while (pk < 10) : (pk += 1) dir = (try typedir.insert(&w, dir, tid, &.{ .{ .int = pk }, .{ .int = pk } })).dir;
+        var out: [2]catalog.Value = undefined;
+        pk = 0;
+        while (pk < 8) : (pk += 1) {
+            const ver = (try typedir.get(&w, dir, tid, pk, &out)).?;
+            dir = switch (try typedir.delete(&w, dir, tid, pk, ver)) {
+                .ok => |d| d,
+                else => unreachable,
+            };
+        }
+        w.setRoot(dir);
+        _ = try w.commit();
+    }
+
+    // The compaction step's commit fails its data barrier.
+    try testing.expectError(error.Durability, db.maybeCompactStep(tid, 100));
+
+    // The write lock must be free and the data intact.
+    var w = try db.beginWriteTry();
+    w.deinit();
+    var r = try db.beginRead();
+    defer r.end();
+    try testing.expectEqual(@as(u64, 2), try typedir.liveCount(&r, r.root(), tid));
+}
+
+test "the compaction cursor never resumes across types" {
+    // Regression: the cursor was keyed only on (live_count, next_row), which
+    // two different types can share. Resuming type A's high-water cursor while
+    // stepping type B left B's tail unexamined and the final truncate would
+    // have dropped live rows. The cursor now also pins the exact catalog ref.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "cursor_types.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+
+    // Two identically shaped types with identical churn: both end with
+    // live=4, next_row=12 and dead tails.
+    {
+        var w = try db.beginWrite();
+        const dir = try typedir.createTypes(&w, &.{
+            &.{ .{ .kind = .int }, .{ .kind = .int } },
+            &.{ .{ .kind = .int }, .{ .kind = .int } },
+        }, &.{ false, false });
+        w.setRoot(dir);
+        _ = try w.commit();
+    }
+    {
+        var w = try db.beginWrite();
+        var dir = db.active_root;
+        var t: u16 = 0;
+        while (t < 2) : (t += 1) {
+            var pk: u64 = 0;
+            while (pk < 12) : (pk += 1) dir = (try typedir.insert(&w, dir, t, &.{ .{ .int = pk }, .{ .int = pk } })).dir;
+            var out: [2]catalog.Value = undefined;
+            pk = 0;
+            while (pk < 8) : (pk += 1) {
+                const ver = (try typedir.get(&w, dir, t, pk, &out)).?;
+                dir = switch (try typedir.delete(&w, dir, t, pk, ver)) {
+                    .ok => |d| d,
+                    else => unreachable,
+                };
+            }
+            w.setRoot(dir);
+        }
+        _ = try w.commit();
+    }
+
+    // Partial step on type 0 persists a cursor; type 1 must NOT resume it.
+    _ = try db.maybeCompactStep(0, 1);
+    while (true) {
+        const res = try db.maybeCompactStep(1, 2);
+        if (!res.ran or res.done) break;
+    }
+    while (true) {
+        const res = try db.maybeCompactStep(0, 2);
+        if (!res.ran or res.done) break;
+    }
+
+    // Every surviving row of both types is intact and both are fully packed.
+    var r = try db.beginRead();
+    defer r.end();
+    var t: u16 = 0;
+    while (t < 2) : (t += 1) {
+        try testing.expectEqual(@as(u64, 4), try typedir.liveCount(&r, r.root(), t));
+        var out: [2]catalog.Value = undefined;
+        var pk: u64 = 8;
+        while (pk < 12) : (pk += 1) {
+            try testing.expect((try typedir.get(&r, r.root(), t, pk, &out)) != null);
+        }
+        const cat = try typedir.catalogRef(&r, r.root(), t);
+        try testing.expectEqual(@as(u64, 4), (try catalog.loadCatalog(&r, cat)).next_row);
+    }
+}
+
+test "a corrupt persisted free-list extent fails open instead of poisoning reuse" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "flcorrupt.airdb");
+    defer testing.allocator.free(path);
+    var node_ref: Ref = 0;
+    {
+        var db = try Db.create(testing.allocator, path);
+        defer db.deinit();
+        {
+            var w = try db.beginWrite();
+            const a = try w.alloc(8);
+            @memcpy(a.bytes, "AAAAAAAA");
+            w.setRoot(a.ref);
+            _ = try w.commit();
+        }
+        const old_root = db.active_root;
+        {
+            var w = try db.beginWrite();
+            const b = try w.alloc(8);
+            @memcpy(b.bytes, "BBBBBBBB");
+            try w.free(old_root, 8);
+            w.setRoot(b.ref);
+            _ = try w.commit();
+        }
+        node_ref = db.free_list_node_ref;
+        try testing.expect(node_ref != 0);
+        // Corrupt the first extent's offset into something misaligned.
+        const off: usize = @intCast(node_ref);
+        std.mem.writeInt(u64, db.store.map[off + 12 ..][0..8], 12345, .little); // % 8 != 0
+        try db.store.syncer.flush(db.store.file);
+    }
+    try testing.expectError(error.Corrupt, Db.open(testing.allocator, path));
+}
+
 test "maybeCompactStep bounds dead rows under churn" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1555,4 +2323,86 @@ test "maybeCompactStep is a no-op when nothing to compact" {
     const cat = try typedir.catalogRef(&r, r.root(), tid);
     try testing.expectEqual(@as(u64, 3), try compaction.liveCount(&r, cat));
     try testing.expectEqual(@as(u64, 3), (try catalog.loadCatalog(&r, cat)).next_row);
+}
+
+test "a free list spanning multiple chunks survives commit and reopen" {
+    // Regression: the free list was persisted as ONE node whose size grew
+    // with the extent count; once heavy churn pushed it past the 16 MiB
+    // section cap, the commit-path allocation failed with error.AllocTooLarge
+    // and the database could no longer commit at all. The list is now a chain
+    // of bounded chunks; a list overflowing one chunk must persist, reload,
+    // and verify.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "flchain.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    errdefer db.deinit();
+
+    const n_extents = FreeList.chunk_extent_cap + 500;
+    const refs = try testing.allocator.alloc(u64, n_extents);
+    defer testing.allocator.free(refs);
+    {
+        var w = try db.beginWrite();
+        for (refs) |*r| r.* = (try w.alloc(8)).ref;
+        const root = try w.alloc(8);
+        @memcpy(root.bytes, "CHUNKED!");
+        w.setRoot(root.ref);
+        _ = try w.commit();
+    }
+    {
+        var w = try db.beginWrite();
+        for (refs) |r| try w.free(r, 8);
+        const root = try w.alloc(8);
+        @memcpy(root.bytes, "CHUNKED2");
+        w.setRoot(root.ref);
+        _ = try w.commit();
+    }
+    try testing.expect(db.freeListLenForTest() >= n_extents);
+    db.deinit();
+
+    var db2 = try Db.open(testing.allocator, path);
+    defer db2.deinit();
+    try testing.expect(db2.freeListLenForTest() >= n_extents);
+    try db2.verifyIntegrity();
+}
+
+test "a free-list chain whose next ref points up-chain is rejected as corrupt" {
+    // Regression: a forged or bit-rotted next_ref forming a cycle re-decoded
+    // the same chunk's extents on every hop -- an out-of-memory death, not an
+    // error, long before the hop guard tripped. Legitimate chains have
+    // strictly decreasing refs (chunks are written back-to-front), so a
+    // self-referencing head must fail the open cheaply with error.Corrupt.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "flcycle.airdb");
+    defer testing.allocator.free(path);
+    var node_ref: u64 = 0;
+    {
+        var db = try Db.create(testing.allocator, path);
+        defer db.deinit();
+        {
+            var w = try db.beginWrite();
+            const a = try w.alloc(8);
+            @memcpy(a.bytes, "CYCLBASE");
+            w.setRoot(a.ref);
+            _ = try w.commit();
+        }
+        const old_root = db.active_root;
+        {
+            var w = try db.beginWrite();
+            const b = try w.alloc(8);
+            @memcpy(b.bytes, "CYCLNEXT");
+            try w.free(old_root, 8);
+            w.setRoot(b.ref);
+            _ = try w.commit();
+        }
+        node_ref = db.free_list_node_ref;
+        try testing.expect(node_ref != 0);
+        // Point the head chunk's next_ref at itself.
+        const off: usize = @intCast(node_ref);
+        std.mem.writeInt(u64, db.store.map[off + 4 ..][0..8], node_ref, .little);
+        try db.store.syncer.flush(db.store.file);
+    }
+    try testing.expectError(error.Corrupt, Db.open(testing.allocator, path));
 }

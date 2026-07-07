@@ -32,9 +32,45 @@ pub const WriteTxn = struct {
     /// arena.top at transaction start. A freed ref >= this was bump-allocated during this
     /// transaction and is txn-private; a ref below it belongs to a committed version.
     txn_start_top: u64,
+    /// Pin/liveness part of the reclaim horizon, computed lazily on the first
+    /// pool allocation and reused for the rest of the transaction. Computing
+    /// it per allocation costs syscalls (pid liveness + incarnation checks per
+    /// participant slot) on the hottest path in the engine. Caching THIS part
+    /// is safe: every reusable extent has freed_version <= active_version, a
+    /// latest reader pins >= the version it observed published (and beginRead
+    /// re-validates after publishing its pin), and point-in-time readers are
+    /// admitted only inside the shared retention window. The retention window
+    /// itself is deliberately NOT cached -- see reclaimHorizon.
+    cached_horizon: ?u64 = null,
+    /// Set once the transaction has been concluded (committed, commit-failed,
+    /// or aborted). Makes deinit a no-op afterwards, so callers may hold an
+    /// `errdefer w.deinit()` across `commit()` without double-freeing the
+    /// bookkeeping lists or double-unlocking the cross-process write lock.
+    done: bool = false,
 
     pub fn deref(self: *WriteTxn, ref: Ref, len: usize) ![]const u8 {
         return self.db.arena.deref(ref, len);
+    }
+
+    fn reclaimHorizon(self: *WriteTxn) u64 {
+        const h = self.cached_horizon orelse blk: {
+            // Horizon-gated reuse is only safe when no reader in ANY live
+            // process pins a version below the extent's freeing version.
+            // globalHorizon = min of live processes' min-pinned versions,
+            // clamped to this writer's active_version. Without a participant
+            // slot this process cannot advertise its readers, so it stays
+            // bump-only (Db.open/create refuse slotless attaches, so this is
+            // pure defense).
+            const gh: u64 = if (self.db.participant_slot == null) 0 else self.db.coord.globalHorizon(self.db.active_version);
+            self.cached_horizon = gh;
+            break :blk gh;
+        };
+        // Clamp by the retention window ON EVERY ALLOCATION (a single atomic
+        // load from the shared header page). Another process may raise the
+        // floor mid-transaction and immediately admit a point-in-time reader
+        // under it; a cached window would let this writer keep reusing space
+        // that reader's snapshot references.
+        return @min(h, self.db.active_version -| self.db.retainVersions());
     }
 
     pub fn alloc(self: *WriteTxn, size: usize) !Allocation {
@@ -43,16 +79,8 @@ pub const WriteTxn = struct {
         //    reusing it is always safe and keeps single-transaction bulk writes space-bounded).
         //    Exact-size match: no carving, so fixed-size node churn never fragments the pool.
         if (self.db.arena.allocFromPool(&self.txn_reuse, size, std.math.maxInt(u64))) |a| return a;
-        // 2. Reuse a committed-free node, horizon-gated: only safe when no reader in ANY live
-        //    process pins a version below its freeing-version. globalHorizon = min of live
-        //    processes' min-pinned versions, clamped to this writer's active_version. Without a
-        //    participant slot this process cannot advertise its readers, so it stays bump-only.
-        const h: u64 = if (self.db.participant_slot == null) 0 else self.db.coord.globalHorizon(self.db.active_version);
-        // Clamp by the retention window: withhold space freed within the most recent
-        // `retain_versions` versions. With retain_versions == 0, eff == h (h is already
-        // <= active_version), so behavior is unchanged.
-        const eff = @min(h, self.db.active_version -| self.db.retain_versions);
-        if (self.db.arena.allocFromPool(&self.work_freelist, size, eff)) |a| return a;
+        // 2. Reuse a committed-free node, gated by the per-transaction reclaim horizon.
+        if (self.db.arena.allocFromPool(&self.work_freelist, size, self.reclaimHorizon())) |a| return a;
         // 3. Bump-allocate, growing the file if the arena is full.
         return self.db.bumpGrowing(size);
     }
@@ -86,6 +114,21 @@ pub const WriteTxn = struct {
     }
 
     pub fn deinit(self: *WriteTxn) void {
+        if (self.done) return; // already committed, commit-failed, or aborted
+        self.conclude();
+    }
+
+    // Shared conclusion for abort, commit failure, and (minus the rollback)
+    // the moment before a successful commit publishes. Rolls the bump pointer
+    // back: no committed version references any ref >= txn_start_top (they
+    // were allocated by this uncommitted transaction only), so the rollback is
+    // safe and prevents aborted/failed bytes from being folded into the next
+    // commit's logical_size as permanently unreclaimable garbage. Extents this
+    // txn reused from the committed pool stay recorded in db.free_list
+    // (untouched during the txn), so they remain free as before.
+    fn conclude(self: *WriteTxn) void {
+        self.done = true;
+        self.db.arena.top = @intCast(self.txn_start_top);
         self.in_flight_frees.deinit(self.db.store.allocator);
         self.work_freelist.deinit();
         self.txn_reuse.deinit();
@@ -116,10 +159,11 @@ pub const WriteTxn = struct {
     /// so transferring ownership to db.free_list before returning is safe and
     /// cannot double-free.
     pub fn commit(self: *WriteTxn) !u64 {
-        // Free in_flight_frees, work_freelist, and txn_reuse on every error path; explicit deinits cover success.
-        errdefer self.in_flight_frees.deinit(self.db.store.allocator);
-        errdefer self.work_freelist.deinit();
-        errdefer self.txn_reuse.deinit();
+        // EVERY error exit -- allocation failure, disk-full growth, and both
+        // durability-barrier failures -- concludes the transaction uniformly:
+        // lists freed, uncommitted bump bytes rolled back, write lock
+        // released, and `done` set so a caller's deferred deinit is a no-op.
+        errdefer self.conclude();
         const db = self.db;
         const prev_active_slot = db.store.header.active_slot;
         const prev_logical_size = db.store.header.logical_size;
@@ -145,13 +189,27 @@ pub const WriteTxn = struct {
         for (self.in_flight_frees.items) |e| {
             try new_fl.add(e);
         }
-        // 3. Reclaim the OLD free-list node so its space re-enters the free pool.
-        if (db.free_list_node_ref != 0) {
-            try new_fl.add(.{
-                .offset = db.free_list_node_ref,
-                .len = @intCast(db.free_list_node_len),
-                .freed_version = self.new_version,
-            });
+        // 3. Reclaim the OLD free-list chain so its space re-enters the free
+        //    pool. Every chunk is walked: reclaiming only the head would leak
+        //    the tail chunks on each commit.
+        {
+            var cref = db.free_list_node_ref;
+            var hops: usize = 0;
+            while (cref != 0) : (hops += 1) {
+                if (hops >= FreeList.max_chunks) return error.Corrupt;
+                const hdr = try self.deref(cref, FreeList.chunk_header_bytes);
+                const cnt = std.mem.readInt(u32, hdr[0..4], .little);
+                const next = std.mem.readInt(u64, hdr[4..12], .little);
+                // Legitimate chains strictly decrease (written back-to-front);
+                // anything else is corruption and must not feed the free list.
+                if (next != 0 and next >= cref) return error.Corrupt;
+                try new_fl.add(.{
+                    .offset = cref,
+                    .len = @intCast(FreeList.chunkByteLen(cnt)),
+                    .freed_version = self.new_version,
+                });
+                cref = next;
+            }
         }
         // 3b. Reclaim any leftover transaction-private nodes that were freed but not reused
         //     within this transaction. They are committed-but-unreferenced space; tag them
@@ -161,20 +219,36 @@ pub const WriteTxn = struct {
         }
         db.fl_rebuild_ns += @intCast(Io.Clock.now(.awake, rebuild_io).nanoseconds - rebuild_start);
 
-        // 4. Encode the new free list onto the arena via a BUMP allocation (never
-        //    reuse, to avoid recursion: the free-list node must not reference itself).
-        //    Use bumpGrowing so the file is extended if the arena is full.
-        // Measurement only: time the free-list byteLen + bump alloc + encode that
-        // every commit pays. No behavior change; counters live on the Db.
+        // 4. Encode the new free list onto the arena via BUMP allocations
+        //    (never reuse, to avoid recursion: the chunks must not reference
+        //    themselves), growing the file if the arena is full. The list is
+        //    persisted as a chain of bounded chunks -- a single node's size
+        //    grows with the extent count, and past the section cap its
+        //    allocation failed the commit outright with error.AllocTooLarge.
+        //    Chunks are written back-to-front so each knows its successor.
         const enc_io = std.Io.Threaded.global_single_threaded.io();
         const enc_start = Io.Clock.now(.awake, enc_io).nanoseconds;
-        const node_len = new_fl.byteLen();
-        const node = try db.bumpGrowing(node_len);
-        const written = new_fl.encode(node.bytes);
+        const items = new_fl.extents.items;
+        const nchunks = @max(1, (items.len + FreeList.chunk_extent_cap - 1) / FreeList.chunk_extent_cap);
+        var head_ref: u64 = 0;
+        var head_len: usize = 0;
+        {
+            var ci = nchunks;
+            while (ci > 0) {
+                ci -= 1;
+                const lo = ci * FreeList.chunk_extent_cap;
+                const hi = @min(lo + FreeList.chunk_extent_cap, items.len);
+                const chunk_len = FreeList.chunkByteLen(hi - lo);
+                const node = try db.bumpGrowing(chunk_len);
+                const written = FreeList.encodeChunk(items[lo..hi], head_ref, node.bytes);
+                std.debug.assert(written == chunk_len);
+                head_ref = node.ref;
+                head_len = chunk_len;
+            }
+        }
         db.fl_encode_ns += @intCast(Io.Clock.now(.awake, enc_io).nanoseconds - enc_start);
-        db.fl_extents_encoded += new_fl.extents.items.len;
+        db.fl_extents_encoded += items.len;
         db.commit_count += 1;
-        std.debug.assert(written == node_len);
 
         // --- Two-slot atomic durable commit ---
 
@@ -187,7 +261,7 @@ pub const WriteTxn = struct {
         const new_slot = Slot{
             .version = self.new_version,
             .root_ref = self.new_root,
-            .free_list_ref = node.ref,
+            .free_list_ref = head_ref,
             .logical_size = @intCast(db.arena.top),
         };
         new_slot.encode(db.store.map[inactive_off..][0..Slot.size]);
@@ -198,19 +272,17 @@ pub const WriteTxn = struct {
         // the entry is harmless: its version was never published (active_slot not flipped),
         // so versionRoot's `version > active_version` guard ignores it. The ring is bounded
         // and self-overwriting, so we never revert it.
-        const head = std.mem.readInt(u32, db.store.map[ring_head_off..][0..4], .little);
-        const idx = head % ring_capacity;
-        const e = ring_off + @as(usize, idx) * 16;
+        const head = std.mem.readInt(u64, db.store.map[ring_head_off..][0..8], .little);
+        const idx: usize = @intCast(head % ring_capacity);
+        const e = ring_off + idx * 16;
         std.mem.writeInt(u64, db.store.map[e..][0..8], self.new_version, .little);
         std.mem.writeInt(u64, db.store.map[e + 8 ..][0..8], self.new_root, .little);
-        std.mem.writeInt(u32, db.store.map[ring_head_off..][0..4], head + 1, .little);
+        std.mem.writeInt(u64, db.store.map[ring_head_off..][0..8], head + 1, .little);
 
         // Step 3: flush new data + inactive slot to durable storage.
-        // Failure here: old active slot is still valid; no in-memory state changed.
-        db.store.syncer.flush(db.store.file) catch {
-            self.db.coord.unlock();
-            return error.Durability;
-        };
+        // Failure here: old active slot is still valid; no in-memory state
+        // changed. Cleanup (including the unlock) is the errdefer's job.
+        db.store.syncer.flush(db.store.file) catch return error.Durability;
 
         // Step 4: flip the header commit pointer and flush (commit point).
         db.store.header.active_slot = inactive_idx;
@@ -220,10 +292,15 @@ pub const WriteTxn = struct {
             // Revert every in-memory header change so the old version stays live.
             db.store.header.active_slot = prev_active_slot;
             db.store.header.logical_size = prev_logical_size;
-            // Restore the mmap bytes to match the reverted header so subsequent
-            // persistHeader calls (from the next commit attempt) write the right value.
+            // Restore the mmap bytes to match the reverted header so a future
+            // open reads the right value. Cleanup (unlock etc.) is the
+            // errdefer's job. The flipped pointer was in the mapped page before
+            // the failed barrier, so async writeback may have persisted it
+            // anyway: this commit's on-disk fate is INDETERMINATE. Poison the
+            // instance -- further writes could scribble the maybe-published
+            // version's nodes; a reopen resolves which side won.
             db.store.persistHeader();
-            self.db.coord.unlock();
+            db.poisoned = true;
             return error.Durability;
         };
 
@@ -235,8 +312,9 @@ pub const WriteTxn = struct {
         // because we are on the success return path (return self.new_version below).
         db.free_list.deinit();
         db.free_list = new_fl; // ownership transferred; do not call new_fl.deinit()
-        db.free_list_node_ref = node.ref;
-        db.free_list_node_len = node_len;
+        db.free_list_node_ref = head_ref;
+        db.free_list_node_len = head_len;
+        self.done = true; // a later deinit must not roll back the committed state
         self.in_flight_frees.deinit(self.db.store.allocator);
         self.work_freelist.deinit();
         self.txn_reuse.deinit();
@@ -299,6 +377,90 @@ fn churnLogicalSize(path: []const u8, retain: u64, n: u64) !u64 {
         }
     }
     return db.logicalSize();
+}
+
+test "steady-state batched inserts keep the free list bounded" {
+    // Regression for the free-pool death spiral: every insert rewrites the
+    // catalog node, and if those nodes are not freed (or if carving/coalescing
+    // shreds the node-size classes), the committed free list grows by hundreds
+    // of unusable extents per batch and commit cost explodes at scale. With
+    // catalog recycling and exact-class reuse the list must stay tiny.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "steadystate.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    {
+        var w = try db.beginWrite();
+        const cat = try catalog.create(&w, 2);
+        w.setRoot(cat);
+        _ = try w.commit();
+    }
+    const batches: usize = 10;
+    const inserts_per_batch: usize = 500;
+    var pk: u64 = 0;
+    var batch: usize = 0;
+    while (batch < batches) : (batch += 1) {
+        var w = try db.beginWrite();
+        var cat = w.new_root;
+        var i: usize = 0;
+        while (i < inserts_per_batch) : (i += 1) {
+            cat = (try objects.insert(&w, cat, &.{ pk, pk })).cat;
+            pk += 1;
+        }
+        w.setRoot(cat);
+        _ = try w.commit();
+    }
+    // The committed list legitimately tracks the copy-on-write working set (the
+    // committed nodes the last batch touched), which grows with tree depth and
+    // plateaus. The failure mode this guards against is unusable extents
+    // accumulating at roughly one per insert PER BATCH (the fragmentation
+    // death spiral): after `batches` rounds that lands near
+    // inserts_per_batch * batches, while the healthy working set stays under
+    // one batch's width. Deriving the bound from the loop constant keeps the
+    // assertion honest if someone retunes the batch size.
+    try testing.expect(db.freeListLenForTest() < inserts_per_batch);
+}
+
+test "an abandoned transaction's bump allocations are rolled back" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "abortspace.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+
+    // Commit a baseline so logical size is stable.
+    {
+        var w = try db.beginWrite();
+        const a = try w.alloc(8);
+        @memcpy(a.bytes, "BASELINE");
+        w.setRoot(a.ref);
+        _ = try w.commit();
+    }
+    const size_before = db.logicalSize();
+
+    // Abort a transaction that bump-allocated a lot.
+    {
+        var w = try db.beginWrite();
+        var i: usize = 0;
+        while (i < 200) : (i += 1) _ = try w.alloc(4096);
+        w.deinit(); // abort
+    }
+    try testing.expectEqual(size_before, db.logicalSize());
+
+    // The next commit must not durably absorb the aborted region either.
+    {
+        var w = try db.beginWrite();
+        const a = try w.alloc(8);
+        @memcpy(a.bytes, "AFTERAB_");
+        w.setRoot(a.ref);
+        _ = try w.commit();
+    }
+    // One 8-byte node plus the free-list node: logical size grows by well under
+    // the ~800 KiB the aborted transaction touched.
+    try testing.expect(db.logicalSize() - size_before < 4096);
 }
 
 test "retention window withholds recently freed space from reuse" {

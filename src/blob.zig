@@ -44,6 +44,25 @@ fn indexNodeSize(chunk_count: usize) usize {
     return idx_refs_off + 8 * chunk_count;
 }
 
+const ChunkedHeader = struct { total_len: usize, chunk_count: u32, node_size: usize };
+
+/// Read and VALIDATE a chunked-blob index header. These fields come straight
+/// from the mapped file: an unvalidated chunk_count feeds lengths to txn.free
+/// (poisoning the free list with garbage extents -- corruption that spreads
+/// after commit), underflows `total_len - start`, and on 32-bit hosts can
+/// overflow indexNodeSize into a too-short deref. Sizes are computed in u64.
+fn chunkedHeader(txn: anytype, ref: Ref) !ChunkedHeader {
+    const hdr = try txn.deref(ref, idx_refs_off);
+    if (hdr[0] != tag_chunked) return error.Corrupt;
+    const total_len = std.mem.readInt(u64, hdr[idx_total_off..][0..8], .little);
+    const chunk_count = std.mem.readInt(u32, hdr[idx_count_off..][0..4], .little);
+    const expected: u64 = (total_len + chunk_size - 1) / chunk_size;
+    if (chunk_count == 0 or chunk_count != expected) return error.Corrupt;
+    const node_size: u64 = @as(u64, idx_refs_off) + 8 * @as(u64, chunk_count);
+    if (node_size > section_size) return error.Corrupt;
+    return .{ .total_len = @intCast(total_len), .chunk_count = chunk_count, .node_size = @intCast(node_size) };
+}
+
 /// Write `bytes` into the blob heap and return its Ref.
 /// Returns the null ref (0) when `bytes` is empty -- no node is allocated.
 /// Small blobs become a single inline node; blobs over `inline_max` are split
@@ -92,8 +111,7 @@ pub fn size(txn: anytype, ref: Ref) !usize {
         const node = try txn.deref(ref, inline_bytes_off);
         return std.mem.readInt(u32, node[inline_len_off..][0..4], .little);
     }
-    const node = try txn.deref(ref, idx_refs_off);
-    return @intCast(std.mem.readInt(u64, node[idx_total_off..][0..8], .little));
+    return (try chunkedHeader(txn, ref)).total_len;
 }
 
 /// Zero-copy slice into an inline blob node. Null ref -> empty slice.
@@ -103,7 +121,8 @@ pub fn size(txn: anytype, ref: Ref) !usize {
 pub fn get(txn: anytype, ref: Ref) ![]const u8 {
     if (ref == 0) return &.{};
     const tag = (try txn.deref(ref, 1))[0];
-    if (tag != tag_inline) return error.BlobChunked;
+    if (tag == tag_chunked) return error.BlobChunked;
+    if (tag != tag_inline) return error.Corrupt;
     const hdr = try txn.deref(ref, inline_bytes_off);
     const len = std.mem.readInt(u32, hdr[inline_len_off..][0..4], .little);
     const node = try txn.deref(ref, inline_bytes_off + @as(usize, len));
@@ -126,17 +145,15 @@ pub fn readInto(txn: anytype, ref: Ref, out: []u8) !void {
         return;
     }
 
-    const total_len = out.len;
-    const hdr = try txn.deref(ref, idx_refs_off);
-    const chunk_count = std.mem.readInt(u32, hdr[idx_count_off..][0..4], .little);
-    const node_size = indexNodeSize(chunk_count);
+    const h = try chunkedHeader(txn, ref);
+    if (h.total_len != out.len) return error.Corrupt;
     var i: usize = 0;
-    while (i < chunk_count) : (i += 1) {
+    while (i < h.chunk_count) : (i += 1) {
         const start = i * chunk_size;
-        const clen = @min(chunk_size, total_len - start);
+        const clen = @min(chunk_size, h.total_len - start);
         // Re-deref the index node each iteration so the read is independent of any
         // prior chunk deref slices.
-        const node = try txn.deref(ref, node_size);
+        const node = try txn.deref(ref, h.node_size);
         const chunk_ref = std.mem.readInt(u64, node[idx_refs_off + 8 * i ..][0..8], .little);
         const chunk = try txn.deref(chunk_ref, clen);
         @memcpy(out[start .. start + clen], chunk);
@@ -177,21 +194,21 @@ pub fn free(txn: *WriteTxn, ref: Ref) !void {
         return;
     }
 
-    const hdr = try txn.deref(ref, idx_refs_off);
-    const total_len: usize = @intCast(std.mem.readInt(u64, hdr[idx_total_off..][0..8], .little));
-    const chunk_count = std.mem.readInt(u32, hdr[idx_count_off..][0..4], .little);
-    const node_size = indexNodeSize(chunk_count);
+    const h = try chunkedHeader(txn, ref);
     var i: usize = 0;
-    while (i < chunk_count) : (i += 1) {
+    while (i < h.chunk_count) : (i += 1) {
         const start = i * chunk_size;
-        const clen = @min(chunk_size, total_len - start);
+        const clen = @min(chunk_size, h.total_len - start);
         // Read the chunk ref from the still-intact index node, then free the chunk.
         // free() only updates the free list; it does not touch the index node's bytes.
-        const node = try txn.deref(ref, node_size);
+        const node = try txn.deref(ref, h.node_size);
         const chunk_ref = std.mem.readInt(u64, node[idx_refs_off + 8 * i ..][0..8], .little);
+        // Bounds-validate the chunk ref before handing its extent to the free
+        // list: a corrupt ref would poison the pool with live/garbage space.
+        _ = try txn.deref(chunk_ref, clen);
         try txn.free(chunk_ref, clen);
     }
-    try txn.free(ref, node_size);
+    try txn.free(ref, h.node_size);
 }
 
 // ---------------------------------------------------------------------------
@@ -296,6 +313,40 @@ test "chunked blob over the inline cap round-trips" {
     }
 
     w.deinit();
+}
+
+test "a corrupt chunked header is an error, not a panic or a poisoned free list" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try blobTmpPath(testing.allocator, &tmp, "blob_corrupt.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    defer w.deinit();
+
+    const n = inline_max + 1; // 2 chunks
+    const src = try testing.allocator.alloc(u8, n);
+    defer testing.allocator.free(src);
+    @memset(src, 0xAB);
+    const ref = try put(&w, src);
+
+    const off: usize = @intCast(ref);
+    // (a) chunk_count inconsistent with total_len: previously underflowed
+    // `total_len - start` (panic) and fed garbage extents to the free list.
+    std.mem.writeInt(u32, db.store.map[off + idx_count_off ..][0..4], 1000, .little);
+    try testing.expectError(error.Corrupt, size(&w, ref));
+    var out_buf: [16]u8 = undefined;
+    try testing.expectError(error.Corrupt, readInto(&w, ref, out_buf[0..]));
+    const frees_before = w.in_flight_frees.items.len + w.txn_reuse.extents.items.len;
+    try testing.expectError(error.Corrupt, free(&w, ref));
+    try testing.expectEqual(frees_before, w.in_flight_frees.items.len + w.txn_reuse.extents.items.len);
+
+    // (b) an out-of-range tag byte is Corrupt everywhere.
+    db.store.map[off] = 7;
+    try testing.expectError(error.Corrupt, get(&w, ref));
+    try testing.expectError(error.Corrupt, size(&w, ref));
+    try testing.expectError(error.Corrupt, free(&w, ref));
 }
 
 test "free of a chunked blob" {

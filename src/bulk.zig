@@ -36,8 +36,11 @@ const ColChild = struct { ref: u64, count: u64 };
 // Deref a column node, sizing the read by its kind byte (leaf vs inner).
 fn derefColNode(txn: *WriteTxn, ref: Ref) ![]const u8 {
     const kb = try txn.deref(ref, 1);
-    if (kb[0] == cnode.kind_leaf) return txn.deref(ref, cnode.leaf_node_size);
-    return txn.deref(ref, cnode.inner_node_size);
+    return switch (kb[0]) {
+        cnode.kind_leaf => txn.deref(ref, cnode.leaf_node_size),
+        cnode.kind_inner => txn.deref(ref, cnode.inner_node_size),
+        else => error.Corrupt,
+    };
 }
 
 // Pack `values` into leaves filled to LEAF_CAP in row order. Returns the leaf
@@ -111,15 +114,40 @@ pub fn bulkColumn(txn: *WriteTxn, values: []const u64) !Ref {
 }
 
 // An index B+tree node together with the low key (smallest key in its subtree)
-// its parent records for it. Used as the per-level work item by the bottom-up
-// index builders below.
-const SpineChild = struct { ref: u64, low: u64 };
+// and its subtree entry count, both of which its parent records for it. Used as
+// the per-level work item by the bottom-up index builders below.
+const SpineChild = struct { ref: u64, low: u64, count: u64 };
 
 // Deref an index node, sizing the read by its kind byte (leaf vs inner).
 fn derefIdxNode(txn: *WriteTxn, ref: Ref) ![]const u8 {
     const kb = try txn.deref(ref, 1);
-    if (kb[0] == inode.kind_leaf) return txn.deref(ref, inode.leaf_node_size);
-    return txn.deref(ref, inode.inner_node_size);
+    return switch (kb[0]) {
+        inode.kind_leaf => txn.deref(ref, inode.leaf_node_size),
+        inode.kind_inner => txn.deref(ref, inode.inner_node_size),
+        else => error.Corrupt,
+    };
+}
+
+// When the BLIND rightmost leaf of the index is empty (removals emptied it),
+// return its parent-recorded low key; null otherwise (non-empty leaf, or an
+// empty ROOT leaf, which has no recorded low). The recorded low propagates
+// identically up every level of the rightmost path, so it is the single value
+// an appended run's first key must clear (see the qualification in bulkAppend).
+fn emptyRightmostLow(txn: *WriteTxn, root: Ref) !?u64 {
+    var cur: Ref = root;
+    var recorded_low: ?u64 = null;
+    var hops: usize = 0;
+    while (true) : (hops += 1) {
+        if (hops >= Index.max_depth) return error.Corrupt;
+        const nb = try derefIdxNode(txn, cur);
+        if (nb[0] == inode.kind_leaf) {
+            if ((try inode.parseLeaf(nb)).count != 0) return null;
+            return recorded_low; // null when the empty leaf IS the root
+        }
+        const iv = try inode.parseInner(nb);
+        recorded_low = iv.lowKey(iv.child_count - 1);
+        cur = iv.childRef(iv.child_count - 1);
+    }
 }
 
 // Pack strictly-ascending (keys, vals) into leaves filled to LEAF_CAP in key
@@ -139,15 +167,15 @@ fn packIndexLeaves(
         const end = @min(i + cap, keys.len);
         const a = try txn.alloc(inode.leaf_node_size);
         _ = inode.encodeLeaf(a.bytes, keys[i..end], vals[i..end]);
-        try out.append(al, .{ .ref = a.ref, .low = keys[i] });
+        try out.append(al, .{ .ref = a.ref, .low = keys[i], .count = @intCast(end - i) });
         i = end;
     }
     return out;
 }
 
 // Build one inner level over `children`, packed in runs of FANOUT. An index
-// inner node stores (child_ref, low_key); a parent's low key is the low key of
-// its first child, so each emitted node's low == children[run_start].low.
+// inner node stores (child_ref, low_key, subtree_count); a parent's low key is
+// the low key of its first child and its count is the sum of its run.
 fn stackIndexInner(
     txn: *WriteTxn,
     children: []const SpineChild,
@@ -158,18 +186,22 @@ fn stackIndexInner(
     const fan: usize = inode.FANOUT;
     var refs: [inode.FANOUT]u64 = undefined;
     var lows: [inode.FANOUT]u64 = undefined;
+    var counts: [inode.FANOUT]u64 = undefined;
     var j: usize = 0;
     while (j < children.len) {
         const end = @min(j + fan, children.len);
+        var total: u64 = 0;
         var k: usize = j;
         while (k < end) : (k += 1) {
             refs[k - j] = children[k].ref;
             lows[k - j] = children[k].low;
+            counts[k - j] = children[k].count;
+            total += children[k].count;
         }
         const cnt = end - j;
         const a = try txn.alloc(inode.inner_node_size);
-        _ = inode.encodeInner(a.bytes, refs[0..cnt], lows[0..cnt]);
-        try out.append(al, .{ .ref = a.ref, .low = children[j].low });
+        _ = inode.encodeInner(a.bytes, refs[0..cnt], lows[0..cnt], counts[0..cnt]);
+        try out.append(al, .{ .ref = a.ref, .low = children[j].low, .count = total });
         j = end;
     }
     return out;
@@ -224,7 +256,9 @@ pub fn indexAppendRun(txn: *WriteTxn, root: Ref, keys: []const u64, vals: []cons
     defer path_ridx.deinit(al);
     var cur: Ref = root;
     var leaf_ref: Ref = root;
-    while (true) {
+    var hops: usize = 0;
+    while (true) : (hops += 1) {
+        if (hops >= Index.max_depth) return error.Corrupt; // ref cycle guard
         const nb = try derefIdxNode(txn, cur);
         if (nb[0] == inode.kind_leaf) {
             leaf_ref = cur;
@@ -283,7 +317,7 @@ pub fn indexAppendRun(txn: *WriteTxn, root: Ref, keys: []const u64, vals: []cons
         defer full.deinit(al);
         var j: usize = 0;
         while (j < ri) : (j += 1) {
-            try full.append(al, .{ .ref = iv.childRef(j), .low = iv.lowKey(j) });
+            try full.append(al, .{ .ref = iv.childRef(j), .low = iv.lowKey(j), .count = iv.subtreeCount(j) });
         }
         for (level.items) |c| try full.append(al, c);
         const next = try stackIndexInner(txn, full.items, al);
@@ -301,6 +335,16 @@ pub fn indexAppendRun(txn: *WriteTxn, root: Ref, keys: []const u64, vals: []cons
     }
 
     const result = level.items[0].ref;
+
+    // 5. Free the replaced right-edge nodes: the old rightmost leaf and every
+    //    inner node on the old rightmost path were rebuilt above and are no
+    //    longer referenced by the new tree. Committed nodes route to deferred
+    //    (MVCC-safe) reclaim; txn-private ones become immediately reusable.
+    //    These frees are fallible, so they run BEFORE the manual level.deinit:
+    //    the errdefer must never fire on an already-deinitialized list.
+    try txn.free(leaf_ref, inode.leaf_node_size);
+    for (path_refs.items) |old_ref| try txn.free(old_ref, inode.inner_node_size);
+
     level.deinit(al);
     return result;
 }
@@ -324,7 +368,9 @@ pub fn columnAppendRun(txn: *WriteTxn, root: Ref, values: []const u64) !Ref {
     defer path_ridx.deinit(al);
     var cur: Ref = root;
     var leaf_ref: Ref = root;
-    while (true) {
+    var hops: usize = 0;
+    while (true) : (hops += 1) {
+        if (hops >= Column.max_depth) return error.Corrupt; // ref cycle guard
         const nb = try derefColNode(txn, cur);
         if (nb[0] == cnode.kind_leaf) {
             leaf_ref = cur;
@@ -392,6 +438,13 @@ pub fn columnAppendRun(txn: *WriteTxn, root: Ref, values: []const u64) !Ref {
     }
 
     const result = level.items[0].ref;
+
+    // 5. Free the replaced right-edge nodes (old rightmost leaf + old spine),
+    //    exactly as indexAppendRun does: they are unreferenced by the new tree.
+    //    Frees run before the manual deinit so the errdefer never double-frees.
+    try txn.free(leaf_ref, cnode.leaf_node_size);
+    for (path_refs.items) |old_ref| try txn.free(old_ref, cnode.inner_node_size);
+
     level.deinit(al);
     return result;
 }
@@ -449,31 +502,17 @@ pub fn bulkImport(
     rows: []const []const u64,
     opts: struct { presorted: bool = false },
 ) !Ref {
-    const v = try catalog.loadCatalog(txn, cat);
-    if (v.next_row != 0) return error.TypeNotEmpty;
-    const prop_count = v.prop_count;
-    const old_next_key = v.next_key;
+    var s = try catalog.CatalogSnapshot.load(txn, cat);
+    if (s.next_row != 0) return error.TypeNotEmpty;
+    const prop_count = s.prop_count;
+    const old_next_key = s.next_key;
 
-    // Capture every per-property field into locals before any allocation can
-    // grow/remap the file and invalidate the CatalogView bytes slice. Reject a
-    // link-bearing type here, before a single node is written.
-    var kinds: [max_prop_count]PropKind = undefined;
-    var elems: [max_prop_count]ElemKind = undefined;
-    var backlinks: [max_prop_count]Ref = undefined;
-    var targets: [max_prop_count]u16 = undefined;
-    var rules: [max_prop_count]DeletionRule = undefined;
-    var idxf: [max_prop_count]bool = undefined;
+    // Reject a link-bearing type here, before a single node is written.
     {
         var j: usize = 0;
         while (j < prop_count) : (j += 1) {
-            const k = v.kind(j);
+            const k = s.props[j].kind;
             if (k == .link or k == .link_set) return error.UnsupportedForBulk;
-            kinds[j] = k;
-            elems[j] = v.elemKind(j);
-            backlinks[j] = v.backlinkRef(j);
-            targets[j] = v.linkTarget(j);
-            rules[j] = v.delRule(j);
-            idxf[j] = v.indexed(j);
         }
     }
 
@@ -512,15 +551,29 @@ pub fn bulkImport(
 
     // --- All validation passed; build the tree roots bottom-up. ---
 
+    // The type is empty, but its creation pre-allocated empty columns and
+    // indexes that the bulk-built roots replace; free them so the import
+    // leaves no orphan nodes behind.
+    {
+        var p: usize = 0;
+        while (p < prop_count) : (p += 1) {
+            try Column.freeTree(txn, s.props[p].col);
+            if (s.props[p].indexed) try Index.freeTree(txn, s.props[p].value_index);
+        }
+    }
+    try Column.freeTree(txn, s.version_col_ref);
+    try Column.freeTree(txn, s.live_col_ref);
+    try Index.freeTree(txn, s.pk_index_ref);
+    try Index.freeTree(txn, s.keyrow_index_ref);
+
     // Property columns: gather each property's values in sorted-row order.
-    var prop_col_refs: [max_prop_count]Ref = undefined;
     {
         const col_vals = try al.alloc(u64, n);
         defer al.free(col_vals);
         var p: usize = 0;
         while (p < prop_count) : (p += 1) {
             for (perm, 0..) |src, r| col_vals[r] = rows[src][p];
-            prop_col_refs[p] = try bulkColumn(txn, col_vals[0..n]);
+            s.props[p].col = try bulkColumn(txn, col_vals[0..n]);
         }
     }
 
@@ -530,9 +583,9 @@ pub fn bulkImport(
     const stamps = try al.alloc(u64, n);
     defer al.free(stamps);
     @memset(stamps, txn.new_version);
-    const version_col_ref = try bulkColumn(txn, stamps[0..n]);
+    s.version_col_ref = try bulkColumn(txn, stamps[0..n]);
     @memset(stamps, 1);
-    const live_col_ref = try bulkColumn(txn, stamps[0..n]);
+    s.live_col_ref = try bulkColumn(txn, stamps[0..n]);
 
     // pk index (pk -> okey) and key->row index (okey -> physical row). okeys are
     // assigned in sorted-pk order from the type's current next_key, so
@@ -548,39 +601,22 @@ pub fn bulkImport(
         okeys[r] = old_next_key + @as(u64, @intCast(r));
         phys_rows[r] = @intCast(r);
     }
-    const pk_index_ref = try bulkIndex(txn, pks[0..n], okeys[0..n]);
-    const keyrow_index_ref = try bulkIndex(txn, okeys[0..n], phys_rows[0..n]);
+    s.pk_index_ref = try bulkIndex(txn, pks[0..n], okeys[0..n]);
+    s.keyrow_index_ref = try bulkIndex(txn, okeys[0..n], phys_rows[0..n]);
 
     // Value indexes: for each indexed property, group its okeys by value.
-    var value_index_refs: [max_prop_count]Ref = undefined;
     {
         var p: usize = 0;
         while (p < prop_count) : (p += 1) {
-            value_index_refs[p] = if (idxf[p])
-                try buildPropValueIndex(txn, rows, perm, p, old_next_key, al)
-            else
-                0;
+            if (s.props[p].indexed) {
+                s.props[p].value_index = try buildPropValueIndex(txn, rows, perm, p, old_next_key, al);
+            }
         }
     }
 
-    return catalog.writeCatalog(
-        txn,
-        prop_count,
-        @intCast(n), // next_row
-        keyrow_index_ref,
-        old_next_key + @as(u64, @intCast(n)), // next_key
-        pk_index_ref,
-        version_col_ref,
-        live_col_ref,
-        prop_col_refs[0..prop_count],
-        kinds[0..prop_count],
-        elems[0..prop_count],
-        backlinks[0..prop_count],
-        targets[0..prop_count],
-        rules[0..prop_count],
-        value_index_refs[0..prop_count],
-        idxf[0..prop_count],
-    );
+    s.next_row = @intCast(n);
+    s.next_key = old_next_key + @as(u64, @intCast(n));
+    return s.replace(txn);
 }
 
 // Build the value index for indexed property `p`: emit (value -> {okey -> 1})
@@ -648,8 +684,8 @@ fn buildPropValueIndex(
 // node is allocated, so a NotAppendable return leaves the catalog and all trees
 // untouched. The CALLER commits.
 pub fn bulkAppend(txn: *WriteTxn, cat: Ref, rows: []const []const u64) !Ref {
-    const v = try catalog.loadCatalog(txn, cat);
-    const prop_count = v.prop_count;
+    var s = try catalog.CatalogSnapshot.load(txn, cat);
+    const prop_count = s.prop_count;
 
     // Validate row widths first: a single malformed row aborts before any work.
     for (rows) |row| {
@@ -657,38 +693,16 @@ pub fn bulkAppend(txn: *WriteTxn, cat: Ref, rows: []const []const u64) !Ref {
     }
     if (rows.len == 0) return cat;
 
-    // Capture every catalog field into locals before any allocation can grow the
-    // file and invalidate the CatalogView bytes slice. While here, qualify the
-    // schema: reject an indexed or link-bearing property -- both keep secondary
-    // structures that a pure right-edge append cannot maintain.
-    const old_next_row = v.next_row;
-    const old_next_key = v.next_key;
-    const old_keyrow = v.keyrow_index_ref;
-    const old_pk_index = v.pk_index_ref;
-    const old_version_col = v.version_col_ref;
-    const old_live_col = v.live_col_ref;
-    var prop_refs: [max_prop_count]Ref = undefined;
-    var kinds: [max_prop_count]PropKind = undefined;
-    var elems: [max_prop_count]ElemKind = undefined;
-    var backlinks: [max_prop_count]Ref = undefined;
-    var targets: [max_prop_count]u16 = undefined;
-    var rules: [max_prop_count]DeletionRule = undefined;
-    var vidx: [max_prop_count]Ref = undefined;
-    var idxf: [max_prop_count]bool = undefined;
+    // Qualify the schema: reject an indexed or link-bearing property -- both
+    // keep secondary structures that a pure right-edge append cannot maintain.
+    const old_next_row = s.next_row;
+    const old_next_key = s.next_key;
     {
         var j: usize = 0;
         while (j < prop_count) : (j += 1) {
-            const k = v.kind(j);
+            const k = s.props[j].kind;
             if (k == .link or k == .link_set) return error.NotAppendable;
-            if (v.indexed(j)) return error.NotAppendable;
-            prop_refs[j] = v.propColRef(j);
-            kinds[j] = k;
-            elems[j] = v.elemKind(j);
-            backlinks[j] = v.backlinkRef(j);
-            targets[j] = v.linkTarget(j);
-            rules[j] = v.delRule(j);
-            vidx[j] = v.valueIndexRef(j);
-            idxf[j] = v.indexed(j);
+            if (s.props[j].indexed) return error.NotAppendable;
         }
     }
 
@@ -706,8 +720,20 @@ pub fn bulkAppend(txn: *WriteTxn, cat: Ref, rows: []const []const u64) !Ref {
 
     // The smallest batch pk (rows[0][0], since ascending) must clear the current
     // max pk in the type. An empty type (no max) admits any ascending batch.
-    if (try Index.maxKey(txn, old_pk_index)) |max_pk| {
+    if (try Index.maxKey(txn, s.pk_index_ref)) |max_pk| {
         if (rows[0][0] <= max_pk) return error.NotAppendable;
+    }
+
+    // If the BLIND rightmost pk-index leaf is empty (removals never merge
+    // leaves), its RECORDED LOW may exceed every surviving key -- a pk-history
+    // gap. indexAppendRun rebuilds exactly that leaf and derives the new
+    // parent low from the batch's first key; a batch below the recorded low
+    // would break the ascending-lows invariant and make the appended rows
+    // unreachable. Such a batch must take the row-by-row fallback. (The
+    // keyrow index is immune: new okeys are allocated above every okey -- and
+    // therefore every stale low -- the tree has ever held.)
+    if (try emptyRightmostLow(txn, s.pk_index_ref)) |stale_low| {
+        if (rows[0][0] < stale_low) return error.NotAppendable;
     }
 
     // --- Qualified. Nothing has been written yet; build the right-edge runs. ---
@@ -729,14 +755,13 @@ pub fn bulkAppend(txn: *WriteTxn, cat: Ref, rows: []const []const u64) !Ref {
     }
 
     // Property columns: append each property's values in batch order.
-    var new_prop_refs: [max_prop_count]Ref = undefined;
     {
         const col_vals = try al.alloc(u64, n);
         defer al.free(col_vals);
         var p: usize = 0;
         while (p < prop_count) : (p += 1) {
             for (rows, 0..) |row, j| col_vals[j] = row[p];
-            new_prop_refs[p] = try columnAppendRun(txn, prop_refs[p], col_vals[0..n]);
+            s.props[p].col = try columnAppendRun(txn, s.props[p].col, col_vals[0..n]);
         }
     }
 
@@ -744,34 +769,19 @@ pub fn bulkAppend(txn: *WriteTxn, cat: Ref, rows: []const []const u64) !Ref {
     const stamps = try al.alloc(u64, n);
     defer al.free(stamps);
     @memset(stamps, txn.new_version);
-    const new_version_col = try columnAppendRun(txn, old_version_col, stamps[0..n]);
+    s.version_col_ref = try columnAppendRun(txn, s.version_col_ref, stamps[0..n]);
     @memset(stamps, 1);
-    const new_live_col = try columnAppendRun(txn, old_live_col, stamps[0..n]);
+    s.live_col_ref = try columnAppendRun(txn, s.live_col_ref, stamps[0..n]);
 
     // pk index (pk -> okey) and key->row index (okey -> physical row). Both runs
     // land on the right edge: batch pks are ascending and above the current max,
     // and okeys are consecutive from next_key (thus above every existing okey).
-    const new_pk_index = try indexAppendRun(txn, old_pk_index, pks[0..n], okeys[0..n]);
-    const new_keyrow = try indexAppendRun(txn, old_keyrow, okeys[0..n], phys_rows[0..n]);
+    s.pk_index_ref = try indexAppendRun(txn, s.pk_index_ref, pks[0..n], okeys[0..n]);
+    s.keyrow_index_ref = try indexAppendRun(txn, s.keyrow_index_ref, okeys[0..n], phys_rows[0..n]);
 
-    return catalog.writeCatalog(
-        txn,
-        prop_count,
-        old_next_row + @as(u64, @intCast(n)), // next_row
-        new_keyrow,
-        old_next_key + @as(u64, @intCast(n)), // next_key
-        new_pk_index,
-        new_version_col,
-        new_live_col,
-        new_prop_refs[0..prop_count],
-        kinds[0..prop_count],
-        elems[0..prop_count],
-        backlinks[0..prop_count],
-        targets[0..prop_count],
-        rules[0..prop_count],
-        vidx[0..prop_count],
-        idxf[0..prop_count],
-    );
+    s.next_row = old_next_row + @as(u64, @intCast(n));
+    s.next_key = old_next_key + @as(u64, @intCast(n));
+    return s.replace(txn);
 }
 
 // Try the right-edge fast path; on NotAppendable, fall back to row-by-row
@@ -785,8 +795,21 @@ pub fn bulkAppendOrInsert(txn: *WriteTxn, cat: Ref, rows: []const []const u64) !
 
 // Insert every row one at a time, threading the catalog ref. A DuplicateKey from
 // objects.insert propagates to the caller. Empty rows return cat unchanged.
+//
+// Link-bearing schemas are rejected outright: objects.insert writes raw column
+// values without backlink maintenance (that is insertTyped's job), so silently
+// accepting them here would corrupt the link graph -- the same reason
+// bulkImport refuses them.
 fn fallbackInsert(txn: *WriteTxn, cat: Ref, rows: []const []const u64) !Ref {
     if (rows.len == 0) return cat;
+    {
+        const v = try catalog.loadCatalog(txn, cat);
+        var j: usize = 0;
+        while (j < v.prop_count) : (j += 1) {
+            const k = v.kind(j);
+            if (k == .link or k == .link_set) return error.UnsupportedForBulk;
+        }
+    }
     var c = cat;
     for (rows) |row| {
         c = (try objects.insert(txn, c, row)).cat;
@@ -807,6 +830,127 @@ fn bulkTmpPath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const dlen = try tmp.dir.realPath(testing.io, &path_buf);
     return std.fs.path.join(allocator, &.{ path_buf[0..dlen], name });
+}
+
+test "bulk append is refused when the batch does not clear the true max pk" {
+    // Regression: deleting the upper pk range empties the pk index's rightmost
+    // leaf. A maxKey that followed only the rightmost path then reported the
+    // type EMPTY, so bulkAppend admitted a batch below the surviving keys --
+    // duplicate pks and broken leaf ordering. The batch must be NotAppendable
+    // (and the fallback must handle it correctly instead).
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try bulkTmpPath(testing.allocator, &tmp, "bulkappend_maxpk.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    defer w.deinit();
+
+    var cat = try catalog.create(&w, 2);
+    var pk: u64 = 0;
+    while (pk <= 64) : (pk += 1) cat = (try objects.insert(&w, cat, &.{ pk, pk })).cat; // pk index splits
+    var out: [2]u64 = undefined;
+    pk = 32;
+    while (pk <= 64) : (pk += 1) {
+        const ver = (try objects.getByPk(&w, cat, pk, &out)).?;
+        cat = (try objects.delete(&w, cat, pk, ver)).ok;
+    }
+    // pks 0..31 survive; a batch starting at 10 must NOT take the fast path.
+    const rows = [_][]const u64{ &.{ 10, 1 }, &.{ 11, 2 } };
+    try testing.expectError(error.NotAppendable, bulkAppend(&w, cat, &rows));
+    // The orchestrator falls back to row-by-row, which detects the duplicate.
+    try testing.expectError(error.DuplicateKey, bulkAppendOrInsert(&w, cat, &rows));
+    // A batch that truly clears the surviving max qualifies.
+    const ok_rows = [_][]const u64{ &.{ 100, 1 }, &.{ 101, 2 } };
+    cat = try bulkAppend(&w, cat, &ok_rows);
+    try testing.expect((try objects.getByPk(&w, cat, 100, &out)) != null);
+    try testing.expect((try objects.getByPk(&w, cat, 31, &out)) != null);
+}
+
+test "bulk append into a pk-history gap takes the fallback" {
+    // Regression: with pks 0..31 and 40..104 inserted then 40..104 deleted,
+    // the rightmost pk-index leaves are EMPTY but keep recorded lows (40, 72).
+    // A batch of {33, 34} clears the surviving max (31) but sits BELOW the
+    // stale low; the old fast path rebuilt the low-72 leaf with low 33 and the
+    // appended rows became unreachable. Such a batch must fall back; a batch
+    // clearing the stale low may still take the fast path.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try bulkTmpPath(testing.allocator, &tmp, "bulkappend_gap.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    defer w.deinit();
+
+    var cat = try catalog.create(&w, 2);
+    var pk: u64 = 0;
+    while (pk <= 31) : (pk += 1) cat = (try objects.insert(&w, cat, &.{ pk, pk })).cat;
+    pk = 40;
+    while (pk <= 104) : (pk += 1) cat = (try objects.insert(&w, cat, &.{ pk, pk })).cat;
+    var out: [2]u64 = undefined;
+    pk = 40;
+    while (pk <= 104) : (pk += 1) {
+        const ver = (try objects.getByPk(&w, cat, pk, &out)).?;
+        cat = (try objects.delete(&w, cat, pk, ver)).ok;
+    }
+
+    // Below the stale low: NotAppendable; the orchestrator's fallback must
+    // leave every row reachable.
+    const gap_rows = [_][]const u64{ &.{ 33, 1 }, &.{ 34, 2 } };
+    try testing.expectError(error.NotAppendable, bulkAppend(&w, cat, &gap_rows));
+    cat = try bulkAppendOrInsert(&w, cat, &gap_rows);
+    try testing.expect((try objects.getByPk(&w, cat, 33, &out)) != null);
+    try testing.expect((try objects.getByPk(&w, cat, 34, &out)) != null);
+
+    // Every surviving pk still resolves (routing lows intact).
+    pk = 0;
+    while (pk <= 31) : (pk += 1) try testing.expect((try objects.getByPk(&w, cat, pk, &out)) != null);
+}
+
+test "bulk append fallback refuses link-bearing schemas" {
+    // objects.insert writes raw columns without backlink maintenance, so the
+    // row-by-row fallback must reject link/link_set types like bulkImport does
+    // instead of silently corrupting the graph.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try bulkTmpPath(testing.allocator, &tmp, "bulkappend_links.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    defer w.deinit();
+    const cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
+    const rows = [_][]const u64{&.{ 1, 0 }};
+    try testing.expectError(error.UnsupportedForBulk, bulkAppendOrInsert(&w, cat, &rows));
+}
+
+test "bulk append frees the replaced right-edge nodes" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try bulkTmpPath(testing.allocator, &tmp, "bulkappend_free.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+
+    // Commit a populated type so the old right edge is committed nodes.
+    {
+        var w = try db.beginWrite();
+        var cat = try catalog.create(&w, 2);
+        var pk: u64 = 0;
+        while (pk < 200) : (pk += 1) cat = (try objects.insert(&w, cat, &.{ pk, pk })).cat;
+        w.setRoot(cat);
+        _ = try w.commit();
+    }
+
+    // A qualifying append must record the replaced committed spine as
+    // in-flight frees (deferred, MVCC-safe reclaim) instead of leaking it.
+    var w = try db.beginWrite();
+    defer w.deinit();
+    const rows = [_][]const u64{ &.{ 1000, 1 }, &.{ 1001, 2 } };
+    _ = try bulkAppend(&w, w.new_root, &rows);
+    try testing.expect(w.in_flight_frees.items.len > 0);
 }
 
 fn checkColumnSize(w: *WriteTxn, n: usize) !void {

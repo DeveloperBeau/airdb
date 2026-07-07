@@ -12,6 +12,7 @@ const kind_inner = node.kind_inner;
 const hdr = node.hdr;
 const leaf_node_size = node.leaf_node_size;
 const inner_node_size = node.inner_node_size;
+const inner_stride = node.inner_stride;
 const encodeLeaf = node.encodeLeaf;
 const parseLeaf = node.parseLeaf;
 const LeafView = node.LeafView;
@@ -33,26 +34,32 @@ fn childIndexForKey(v: InnerView, k: u64) usize {
     return best;
 }
 
+// A legal tree over 2^64 keys with fanout 64 is at most ~11 levels deep, so any
+// walk deeper than this is following a corrupt ref cycle. Every recursive walker
+// carries a depth and fails with error.Corrupt instead of overflowing the stack.
+pub const max_depth: usize = 16;
+
 fn derefNode(txn: anytype, ref: Ref) ![]const u8 {
     const kind_bytes = try txn.deref(ref, 1);
-    const kind = kind_bytes[0];
-    if (kind == kind_leaf) {
-        return txn.deref(ref, leaf_node_size);
-    } else {
-        return txn.deref(ref, inner_node_size);
-    }
+    return switch (kind_bytes[0]) {
+        kind_leaf => txn.deref(ref, leaf_node_size),
+        kind_inner => txn.deref(ref, inner_node_size),
+        else => error.Corrupt,
+    };
 }
 
-// Test-only helper: build an inner node from a slice of (ref, low) pairs.
-pub fn makeInnerForTest(txn: *WriteTxn, children: []const struct { ref: u64, low: u64 }) !Ref {
+// Test-only helper: build an inner node from a slice of (ref, low, count) triples.
+pub fn makeInnerForTest(txn: *WriteTxn, children: []const struct { ref: u64, low: u64, count: u64 }) !Ref {
     var refs: [FANOUT]u64 = undefined;
     var lows: [FANOUT]u64 = undefined;
+    var counts: [FANOUT]u64 = undefined;
     for (children, 0..) |c, i| {
         refs[i] = c.ref;
         lows[i] = c.low;
+        counts[i] = c.count;
     }
     const a = try txn.alloc(inner_node_size);
-    _ = encodeInner(a.bytes, refs[0..children.len], lows[0..children.len]);
+    _ = encodeInner(a.bytes, refs[0..children.len], lows[0..children.len], counts[0..children.len]);
     return a.ref;
 }
 
@@ -98,6 +105,11 @@ fn nodeKind(txn: anytype, ref: Ref) !u8 {
 
 /// Look up key in the tree rooted at root. Returns the associated value or null.
 pub fn get(txn: anytype, root: Ref, key: u64) !?u64 {
+    return getAt(txn, root, key, 0);
+}
+
+fn getAt(txn: anytype, root: Ref, key: u64, depth: usize) !?u64 {
+    if (depth >= max_depth) return error.Corrupt;
     const bytes = try derefNode(txn, root);
     if (bytes[0] == kind_leaf) {
         const v = try parseLeaf(bytes);
@@ -109,46 +121,69 @@ pub fn get(txn: anytype, root: Ref, key: u64) !?u64 {
     const v = try parseInner(bytes);
     const ci = childIndexForKey(v, key);
     const child_ref: Ref = v.childRef(ci);
-    return get(txn, child_ref, key);
+    return getAt(txn, child_ref, key, depth + 1);
 }
 
 /// Return the largest key in the tree rooted at root, or null if the tree is
-/// empty. Descends the rightmost root-to-leaf path; read-only, O(height).
+/// empty. Read-only, O(height). Descends the LAST NON-EMPTY child at each
+/// level: removals never merge or drop leaves, so the rightmost leaf can be
+/// empty while the tree still holds keys -- blindly following the rightmost
+/// path would report a non-empty tree as empty, and bulkAppend would then
+/// admit a batch whose keys do not clear the true maximum, corrupting the pk
+/// index with duplicates and broken ordering.
 pub fn maxKey(txn: anytype, root: Ref) !?u64 {
     var cur: Ref = root;
-    while (true) {
+    var depth: usize = 0;
+    while (depth < max_depth) : (depth += 1) {
         const bytes = try derefNode(txn, cur);
         if (bytes[0] == kind_leaf) {
             const v = try parseLeaf(bytes);
-            if (v.count == 0) return null;
+            if (v.count == 0) return null; // only the empty root reaches here
             return v.key(v.count - 1);
         }
         const v = try parseInner(bytes);
-        cur = v.childRef(v.child_count - 1);
+        var i: usize = v.child_count;
+        cur = blk: {
+            while (i > 0) {
+                i -= 1;
+                if (v.subtreeCount(i) > 0) break :blk v.childRef(i);
+            }
+            return null; // every subtree is empty
+        };
     }
+    return error.Corrupt;
 }
 
 // ---------------------------------------------------------------------------
 // B+tree insert with leaf/inner split and height growth (Task 4)
 // ---------------------------------------------------------------------------
 
-const Split = struct { ref: Ref, low: u64 };
-const InsertResult = struct { ref: Ref, split: ?Split };
+// A split's right sibling and an insert's resulting node both carry their
+// subtree entry count so the parent can maintain the per-child counts that
+// make Index.count a single-node read.
+const Split = struct { ref: Ref, low: u64, count: u64 };
+const InsertResult = struct { ref: Ref, count: u64, split: ?Split };
 
 /// Descend the leftmost spine to the leftmost leaf and return its first key.
 fn minKey(txn: anytype, ref: Ref) !u64 {
-    const bytes = try derefNode(txn, ref);
-    if (bytes[0] == kind_leaf) {
-        const v = try parseLeaf(bytes);
-        return v.key(0);
+    var cur: Ref = ref;
+    var depth: usize = 0;
+    while (depth < max_depth) : (depth += 1) {
+        const bytes = try derefNode(txn, cur);
+        if (bytes[0] == kind_leaf) {
+            const v = try parseLeaf(bytes);
+            return v.key(0);
+        }
+        const v = try parseInner(bytes);
+        cur = v.childRef(0);
     }
-    const v = try parseInner(bytes);
-    return minKey(txn, v.childRef(0));
+    return error.Corrupt;
 }
 
 /// Recursive insert. Returns the (possibly new) node ref and an optional right
 /// sibling produced by a midpoint split.
-fn insertInto(txn: *WriteTxn, node_ref: Ref, key: u64, val: u64) !InsertResult {
+fn insertInto(txn: *WriteTxn, node_ref: Ref, key: u64, val: u64, depth: usize) !InsertResult {
+    if (depth >= max_depth) return error.Corrupt;
     const node_bytes = try txn.deref(node_ref, 1);
     const kind = node_bytes[0];
 
@@ -162,7 +197,7 @@ fn insertInto(txn: *WriteTxn, node_ref: Ref, key: u64, val: u64) !InsertResult {
         if (i < v.count and v.key(i) == key) {
             const a = try txn.writableCopy(node_ref, leaf_node_size);
             std.mem.writeInt(u64, a.bytes[hdr + i * 16 + 8 ..][0..8], val, .little);
-            return InsertResult{ .ref = a.ref, .split = null };
+            return InsertResult{ .ref = a.ref, .count = v.count, .split = null };
         }
 
         // Not full: shift and insert.
@@ -177,7 +212,7 @@ fn insertInto(txn: *WriteTxn, node_ref: Ref, key: u64, val: u64) !InsertResult {
             std.mem.writeInt(u64, a.bytes[hdr + i * 16 ..][0..8], key, .little);
             std.mem.writeInt(u64, a.bytes[hdr + i * 16 + 8 ..][0..8], val, .little);
             std.mem.writeInt(u16, a.bytes[1..3], v.count + 1, .little);
-            return InsertResult{ .ref = a.ref, .split = null };
+            return InsertResult{ .ref = a.ref, .count = @as(u64, v.count) + 1, .split = null };
         }
 
         // Full: build LEAF_CAP+1 sorted pairs, split at midpoint.
@@ -207,40 +242,50 @@ fn insertInto(txn: *WriteTxn, node_ref: Ref, key: u64, val: u64) !InsertResult {
         }
         const right_a = try txn.alloc(leaf_node_size);
         _ = encodeLeaf(right_a.bytes, keys_buf[m_leaf..total_leaf], vals_buf[m_leaf..total_leaf]);
-        return InsertResult{ .ref = left_a.ref, .split = Split{ .ref = right_a.ref, .low = keys_buf[m_leaf] } };
+        return InsertResult{
+            .ref = left_a.ref,
+            .count = m_leaf,
+            .split = Split{ .ref = right_a.ref, .low = keys_buf[m_leaf], .count = total_leaf - m_leaf },
+        };
     }
 
     // ---- INNER --------------------------------------------------------------
     const inner_bytes = try txn.deref(node_ref, inner_node_size);
     const v = try parseInner(inner_bytes);
     const ci = childIndexForKey(v, key);
-    const r = try insertInto(txn, v.childRef(ci), key, val);
+    const old_total = v.totalCount();
+    const old_child_count = v.subtreeCount(ci);
+    const r = try insertInto(txn, v.childRef(ci), key, val, depth + 1);
 
-    // No split in child: just update the child ref.
+    // No split in child: update the child's ref and subtree count.
     if (r.split == null) {
         const new_inner = try txn.writableCopy(node_ref, inner_node_size);
-        std.mem.writeInt(u64, new_inner.bytes[hdr + ci * 16 ..][0..8], r.ref, .little);
-        return InsertResult{ .ref = new_inner.ref, .split = null };
+        std.mem.writeInt(u64, new_inner.bytes[hdr + ci * inner_stride ..][0..8], r.ref, .little);
+        std.mem.writeInt(u64, new_inner.bytes[hdr + ci * inner_stride + 16 ..][0..8], r.count, .little);
+        return InsertResult{ .ref = new_inner.ref, .count = old_total - old_child_count + r.count, .split = null };
     }
 
     const split = r.split.?;
+    const new_total = old_total - old_child_count + r.count + split.count;
 
     // Child split but this inner node is not full: shift and insert at ci+1.
     if (v.child_count < FANOUT) {
         const new_inner = try txn.writableCopy(node_ref, inner_node_size);
-        // Update child ci's ref (low_key unchanged: left half keeps same minimum).
-        std.mem.writeInt(u64, new_inner.bytes[hdr + ci * 16 ..][0..8], r.ref, .little);
+        // Update child ci's ref+count (low_key unchanged: left half keeps same minimum).
+        std.mem.writeInt(u64, new_inner.bytes[hdr + ci * inner_stride ..][0..8], r.ref, .little);
+        std.mem.writeInt(u64, new_inner.bytes[hdr + ci * inner_stride + 16 ..][0..8], r.count, .little);
         // Shift slots [ci+1, child_count) right by one.
         var j: usize = v.child_count;
         while (j > ci + 1) : (j -= 1) {
-            const src = hdr + (j - 1) * 16;
-            const dst = hdr + j * 16;
-            @memcpy(new_inner.bytes[dst..][0..16], new_inner.bytes[src..][0..16]);
+            const src = hdr + (j - 1) * inner_stride;
+            const dst = hdr + j * inner_stride;
+            @memcpy(new_inner.bytes[dst..][0..inner_stride], new_inner.bytes[src..][0..inner_stride]);
         }
-        std.mem.writeInt(u64, new_inner.bytes[hdr + (ci + 1) * 16 ..][0..8], split.ref, .little);
-        std.mem.writeInt(u64, new_inner.bytes[hdr + (ci + 1) * 16 + 8 ..][0..8], split.low, .little);
+        std.mem.writeInt(u64, new_inner.bytes[hdr + (ci + 1) * inner_stride ..][0..8], split.ref, .little);
+        std.mem.writeInt(u64, new_inner.bytes[hdr + (ci + 1) * inner_stride + 8 ..][0..8], split.low, .little);
+        std.mem.writeInt(u64, new_inner.bytes[hdr + (ci + 1) * inner_stride + 16 ..][0..8], split.count, .little);
         std.mem.writeInt(u16, new_inner.bytes[1..3], v.child_count + 1, .little);
-        return InsertResult{ .ref = new_inner.ref, .split = null };
+        return InsertResult{ .ref = new_inner.ref, .count = new_total, .split = null };
     }
 
     // Child split AND this inner node is full: build FANOUT+1 entries, split at midpoint.
@@ -248,52 +293,71 @@ fn insertInto(txn: *WriteTxn, node_ref: Ref, key: u64, val: u64) !InsertResult {
     const total_inner: usize = @as(usize, FANOUT) + 1;
     var refs_buf: [FANOUT + 1]u64 = undefined;
     var lows_buf: [FANOUT + 1]u64 = undefined;
+    var counts_buf: [FANOUT + 1]u64 = undefined;
     var j: usize = 0;
     while (j < v.child_count) : (j += 1) {
         refs_buf[j] = v.childRef(j);
         lows_buf[j] = v.lowKey(j);
+        counts_buf[j] = v.subtreeCount(j);
     }
-    // Update ci's ref to the left half returned by the child split.
+    // Update ci's ref/count to the left half returned by the child split.
     refs_buf[ci] = r.ref;
+    counts_buf[ci] = r.count;
     // Insert new right sibling immediately after ci.
     j = v.child_count; // = FANOUT
     while (j > ci + 1) : (j -= 1) {
         refs_buf[j] = refs_buf[j - 1];
         lows_buf[j] = lows_buf[j - 1];
+        counts_buf[j] = counts_buf[j - 1];
     }
     refs_buf[ci + 1] = split.ref;
     lows_buf[ci + 1] = split.low;
+    counts_buf[ci + 1] = split.count;
 
     const m_inner: usize = total_inner / 2;
     const left_a = try txn.writableCopy(node_ref, inner_node_size);
     std.mem.writeInt(u16, left_a.bytes[1..3], @intCast(m_inner), .little);
+    var left_count: u64 = 0;
     j = 0;
     while (j < m_inner) : (j += 1) {
-        std.mem.writeInt(u64, left_a.bytes[hdr + j * 16 ..][0..8], refs_buf[j], .little);
-        std.mem.writeInt(u64, left_a.bytes[hdr + j * 16 + 8 ..][0..8], lows_buf[j], .little);
+        std.mem.writeInt(u64, left_a.bytes[hdr + j * inner_stride ..][0..8], refs_buf[j], .little);
+        std.mem.writeInt(u64, left_a.bytes[hdr + j * inner_stride + 8 ..][0..8], lows_buf[j], .little);
+        std.mem.writeInt(u64, left_a.bytes[hdr + j * inner_stride + 16 ..][0..8], counts_buf[j], .little);
+        left_count += counts_buf[j];
     }
+    var right_count: u64 = 0;
+    j = m_inner;
+    while (j < total_inner) : (j += 1) right_count += counts_buf[j];
     const right_a = try txn.alloc(inner_node_size);
-    _ = encodeInner(right_a.bytes, refs_buf[m_inner..total_inner], lows_buf[m_inner..total_inner]);
-    return InsertResult{ .ref = left_a.ref, .split = Split{ .ref = right_a.ref, .low = lows_buf[m_inner] } };
+    _ = encodeInner(right_a.bytes, refs_buf[m_inner..total_inner], lows_buf[m_inner..total_inner], counts_buf[m_inner..total_inner]);
+    return InsertResult{
+        .ref = left_a.ref,
+        .count = left_count,
+        .split = Split{ .ref = right_a.ref, .low = lows_buf[m_inner], .count = right_count },
+    };
 }
 
 /// Insert or update key->val in the tree rooted at root.
 /// Returns the (possibly new) root Ref. Grows the tree height on root split.
 pub fn insert(txn: *WriteTxn, root: Ref, key: u64, val: u64) !Ref {
-    const r = try insertInto(txn, root, key, val);
+    const r = try insertInto(txn, root, key, val, 0);
     if (r.split == null) return r.ref;
     // Root was split: build a new two-child inner root.
     const left_min = try minKey(txn, r.ref);
     const new_root = try txn.alloc(inner_node_size);
     const root_refs = [_]u64{ r.ref, r.split.?.ref };
     const root_lows = [_]u64{ left_min, r.split.?.low };
-    _ = encodeInner(new_root.bytes, &root_refs, &root_lows);
+    const root_counts = [_]u64{ r.count, r.split.?.count };
+    _ = encodeInner(new_root.bytes, &root_refs, &root_lows, &root_counts);
     return new_root.ref;
 }
 
-/// Recursive remove. Returns the (possibly new) node ref.
+const RemoveResult = struct { ref: Ref, count: u64 };
+
+/// Recursive remove. Returns the (possibly new) node ref and its subtree count.
 /// Returns node_ref unchanged when the key is absent (no COW on the path).
-fn removeInto(txn: *WriteTxn, node_ref: Ref, key: u64) !Ref {
+fn removeInto(txn: *WriteTxn, node_ref: Ref, key: u64, depth: usize) !RemoveResult {
+    if (depth >= max_depth) return error.Corrupt;
     const kind = (try txn.deref(node_ref, 1))[0];
 
     // ---- LEAF ---------------------------------------------------------------
@@ -301,7 +365,7 @@ fn removeInto(txn: *WriteTxn, node_ref: Ref, key: u64) !Ref {
         const leaf_bytes = try txn.deref(node_ref, leaf_node_size);
         const v = try parseLeaf(leaf_bytes);
         const i = v.lowerBound(key);
-        if (i >= v.count or v.key(i) != key) return node_ref; // no-op
+        if (i >= v.count or v.key(i) != key) return .{ .ref = node_ref, .count = v.count }; // no-op
         const a = try txn.writableCopy(node_ref, leaf_node_size);
         // Shift slots (i+1 .. count) left by one, overwriting slot i.
         var j: usize = i;
@@ -311,7 +375,7 @@ fn removeInto(txn: *WriteTxn, node_ref: Ref, key: u64) !Ref {
             @memcpy(a.bytes[dst..][0..16], a.bytes[src..][0..16]);
         }
         std.mem.writeInt(u16, a.bytes[1..3], v.count - 1, .little);
-        return a.ref;
+        return .{ .ref = a.ref, .count = @as(u64, v.count) - 1 };
     }
 
     // ---- INNER --------------------------------------------------------------
@@ -319,36 +383,56 @@ fn removeInto(txn: *WriteTxn, node_ref: Ref, key: u64) !Ref {
     const v = try parseInner(inner_bytes);
     const ci = childIndexForKey(v, key);
     const old_child_ref: Ref = v.childRef(ci);
-    const new_child = try removeInto(txn, old_child_ref, key);
+    // Capture BEFORE writableCopy: it frees node_ref into the reuse pool, so
+    // v's bytes must not be read after it (the node can be reallocated).
+    const old_total = v.totalCount();
+    const old_child_count = v.subtreeCount(ci);
+    const r = try removeInto(txn, old_child_ref, key, depth + 1);
     // No change in the subtree: skip COW on this inner node too.
-    if (new_child == old_child_ref) return node_ref;
+    if (r.ref == old_child_ref) return .{ .ref = node_ref, .count = old_total };
     const new_inner = try txn.writableCopy(node_ref, inner_node_size);
-    std.mem.writeInt(u64, new_inner.bytes[hdr + ci * 16 ..][0..8], new_child, .little);
-    return new_inner.ref;
+    std.mem.writeInt(u64, new_inner.bytes[hdr + ci * inner_stride ..][0..8], r.ref, .little);
+    std.mem.writeInt(u64, new_inner.bytes[hdr + ci * inner_stride + 16 ..][0..8], r.count, .little);
+    return .{ .ref = new_inner.ref, .count = old_total - old_child_count + r.count };
 }
 
 /// Remove key from the tree rooted at root.
 /// Returns the (possibly new) root Ref. No-op if key is absent.
 pub fn remove(txn: *WriteTxn, root: Ref, key: u64) !Ref {
-    return removeInto(txn, root, key);
+    return (try removeInto(txn, root, key, 0)).ref;
 }
 
-/// Return the number of keys in the tree rooted at root.
+/// Recursively free every node of the tree rooted at node_ref so the space
+/// becomes reclaimable. Only the NODES are freed; for trees whose leaf values
+/// are refs to other structures (e.g. value-index inner sets) the caller owns
+/// those separately.
+pub fn freeTree(txn: *WriteTxn, node_ref: Ref) !void {
+    return freeTreeAt(txn, node_ref, 0);
+}
+
+fn freeTreeAt(txn: *WriteTxn, node_ref: Ref, depth: usize) !void {
+    if (depth >= max_depth) return error.Corrupt;
+    const bytes = try derefNode(txn, node_ref);
+    if (bytes[0] == kind_leaf) {
+        try txn.free(node_ref, leaf_node_size);
+        return;
+    }
+    const v = try parseInner(bytes);
+    var i: usize = 0;
+    while (i < v.child_count) : (i += 1) try freeTreeAt(txn, v.childRef(i), depth + 1);
+    try txn.free(node_ref, inner_node_size);
+}
+
+/// Return the number of keys in the tree rooted at root. A single-node read:
+/// leaves know their own count and inner nodes store per-child subtree counts.
 pub fn count(txn: anytype, root: Ref) !u64 {
     const bytes = try derefNode(txn, root);
     if (bytes[0] == kind_leaf) {
         const v = try parseLeaf(bytes);
         return v.count;
     }
-    // Inner node: sum counts over all children.
     const v = try parseInner(bytes);
-    var total: u64 = 0;
-    var i: usize = 0;
-    while (i < v.child_count) : (i += 1) {
-        const child_ref: Ref = v.childRef(i);
-        total += try count(txn, child_ref);
-    }
-    return total;
+    return v.totalCount();
 }
 
 // Visit every key in ascending order, calling onKey(ctx, key) for each.
@@ -359,6 +443,17 @@ pub fn forEachKey(
     ctx: anytype,
     comptime onKey: fn (@TypeOf(ctx), u64) anyerror!void,
 ) !void {
+    return forEachKeyAt(txn, root, ctx, onKey, 0);
+}
+
+fn forEachKeyAt(
+    txn: anytype,
+    root: Ref,
+    ctx: anytype,
+    comptime onKey: fn (@TypeOf(ctx), u64) anyerror!void,
+    depth: usize,
+) !void {
+    if (depth >= max_depth) return error.Corrupt;
     const bytes = try derefNode(txn, root);
     if (bytes[0] == kind_leaf) {
         const leaf = try parseLeaf(bytes);
@@ -370,7 +465,7 @@ pub fn forEachKey(
     var i: usize = 0;
     while (i < inner.child_count) : (i += 1) {
         const child_ref: Ref = inner.childRef(i);
-        try forEachKey(txn, child_ref, ctx, onKey);
+        try forEachKeyAt(txn, child_ref, ctx, onKey, depth + 1);
     }
 }
 
@@ -383,6 +478,17 @@ pub fn forEachEntry(
     ctx: anytype,
     comptime onEntry: fn (@TypeOf(ctx), u64, u64) anyerror!void,
 ) !void {
+    return forEachEntryAt(txn, root, ctx, onEntry, 0);
+}
+
+fn forEachEntryAt(
+    txn: anytype,
+    root: Ref,
+    ctx: anytype,
+    comptime onEntry: fn (@TypeOf(ctx), u64, u64) anyerror!void,
+    depth: usize,
+) !void {
+    if (depth >= max_depth) return error.Corrupt;
     const bytes = try derefNode(txn, root);
     if (bytes[0] == kind_leaf) {
         const leaf = try parseLeaf(bytes);
@@ -394,7 +500,7 @@ pub fn forEachEntry(
     var i: usize = 0;
     while (i < inner.child_count) : (i += 1) {
         const child_ref: Ref = inner.childRef(i);
-        try forEachEntry(txn, child_ref, ctx, onEntry);
+        try forEachEntryAt(txn, child_ref, ctx, onEntry, depth + 1);
     }
 }
 
@@ -411,7 +517,20 @@ pub fn forEachEntryInRange(
     ctx: anytype,
     comptime onEntry: fn (@TypeOf(ctx), u64, u64) anyerror!void,
 ) !void {
+    return forEachEntryInRangeAt(txn, root, lo, hi, ctx, onEntry, 0);
+}
+
+fn forEachEntryInRangeAt(
+    txn: anytype,
+    root: Ref,
+    lo: u64,
+    hi: u64,
+    ctx: anytype,
+    comptime onEntry: fn (@TypeOf(ctx), u64, u64) anyerror!void,
+    depth: usize,
+) !void {
     if (root == 0 or lo > hi) return;
+    if (depth >= max_depth) return error.Corrupt;
     const bytes = try derefNode(txn, root);
     if (bytes[0] == kind_leaf) {
         const leaf = try parseLeaf(bytes);
@@ -428,7 +547,7 @@ pub fn forEachEntryInRange(
     while (i < inner.child_count) : (i += 1) {
         if (inner.lowKey(i) > hi) return;
         const child_ref: Ref = inner.childRef(i);
-        try forEachEntryInRange(txn, child_ref, lo, hi, ctx, onEntry);
+        try forEachEntryInRangeAt(txn, child_ref, lo, hi, ctx, onEntry, depth + 1);
     }
 }
 
@@ -442,6 +561,38 @@ fn idxTmpPath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const 
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const dlen = try tmp.dir.realPath(testing.io, &path_buf);
     return std.fs.path.join(allocator, &.{ path_buf[0..dlen], name });
+}
+
+test "a ref cycle or unknown kind byte fails with error.Corrupt" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try idxTmpPath(testing.allocator, &tmp, "idx_cycle.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    defer w.deinit();
+
+    // An inner node whose only child is itself: every walk must hit the depth
+    // cap and error out rather than overflow the stack. (count is exempt: it is
+    // a single-node read of the stored subtree counts and never descends.)
+    const a = try w.alloc(inner_node_size);
+    _ = encodeInner(a.bytes, &.{a.ref}, &.{0}, &.{1});
+    try testing.expectError(error.Corrupt, get(&w, a.ref, 5));
+    try testing.expectError(error.Corrupt, maxKey(&w, a.ref));
+    try testing.expectError(error.Corrupt, insert(&w, a.ref, 1, 1));
+    try testing.expectError(error.Corrupt, remove(&w, a.ref, 1));
+    const NopSink = struct {
+        fn onKey(_: @This(), _: u64) !void {}
+    };
+    try testing.expectError(error.Corrupt, forEachKey(&w, a.ref, NopSink{}, NopSink.onKey));
+
+    // A node with an out-of-range kind byte is rejected outright.
+    const b = try w.alloc(leaf_node_size);
+    _ = encodeLeaf(b.bytes, &.{}, &.{});
+    // Rewrite the kind byte through the arena (b.bytes is mutable).
+    b.bytes[0] = 7;
+    try testing.expectError(error.Corrupt, get(&w, b.ref, 1));
 }
 
 test "get and count traverse an inner node over two leaves" {
@@ -458,7 +609,7 @@ test "get and count traverse an inner node over two leaves" {
     var b = try create(&w);
     b = try insert(&w, b, 5, 55);
     b = try insert(&w, b, 7, 77);
-    const inner = try makeInnerForTest(&w, &.{ .{ .ref = a, .low = 1 }, .{ .ref = b, .low = 5 } });
+    const inner = try makeInnerForTest(&w, &.{ .{ .ref = a, .low = 1, .count = 2 }, .{ .ref = b, .low = 5, .count = 2 } });
     try testing.expectEqual(@as(u64, 4), try count(&w, inner));
     try testing.expectEqual(@as(?u64, 11), try get(&w, inner, 1));
     try testing.expectEqual(@as(?u64, 55), try get(&w, inner, 5));
@@ -567,6 +718,79 @@ test "a committed index version stays intact for a pinned reader while a later c
     try testing.expect((try get(&r2, r2.root(), 500)) == null);
     try testing.expectEqual(@as(?u64, 1235 * 10), try get(&r2, r2.root(), 1235)); // untouched key
     r2.end();
+}
+
+test "maxKey survives an emptied rightmost leaf" {
+    // Removals never merge or drop leaves, so deleting the upper key range
+    // leaves an EMPTY rightmost leaf. maxKey must keep descending into the
+    // last non-empty subtree instead of reporting the tree empty -- bulkAppend
+    // uses maxKey to qualify batches, and a false "empty" admits keys below
+    // the true maximum.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try idxTmpPath(testing.allocator, &tmp, "idx_maxkey.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    defer w.deinit();
+
+    var root = try create(&w);
+    var k: u64 = 0;
+    while (k <= 64) : (k += 1) root = try insert(&w, root, k, k); // forces a leaf split
+    try testing.expectEqual(@as(?u64, 64), try maxKey(&w, root));
+    // Empty the rightmost leaf by removing the upper half.
+    k = 32;
+    while (k <= 64) : (k += 1) root = try remove(&w, root, k);
+    try testing.expectEqual(@as(?u64, 31), try maxKey(&w, root));
+    // Fully emptied tree reports null.
+    k = 0;
+    while (k < 32) : (k += 1) root = try remove(&w, root, k);
+    try testing.expectEqual(@as(?u64, null), try maxKey(&w, root));
+}
+
+test "stored subtree counts match a full iteration under churn" {
+    // count() reads per-child subtree counts from a single node. Verify the
+    // stored counts stay exact through scattered inserts (with splits and
+    // height growth), upserts (which must NOT bump counts), and removes.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try idxTmpPath(testing.allocator, &tmp, "idx_counts.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    defer w.deinit();
+
+    var root = try create(&w);
+    const N: u64 = 5000;
+    var i: u64 = 0;
+    while (i < N) : (i += 1) {
+        const k = (i *% 2654435761) % 1_000_003;
+        root = try insert(&w, root, k, k);
+    }
+    // Upserts: rewrite existing keys; counts must not change.
+    i = 0;
+    while (i < 500) : (i += 1) {
+        const k = (i *% 2654435761) % 1_000_003;
+        root = try insert(&w, root, k, k + 1);
+    }
+    // Remove every 3rd inserted key.
+    i = 0;
+    while (i < N) : (i += 3) {
+        const k = (i *% 2654435761) % 1_000_003;
+        root = try remove(&w, root, k);
+    }
+
+    const Tally = struct {
+        n: *u64,
+        fn onKey(self: @This(), _: u64) !void {
+            self.n.* += 1;
+        }
+    };
+    var walked: u64 = 0;
+    try forEachKey(&w, root, Tally{ .n = &walked }, Tally.onKey);
+    try testing.expectEqual(walked, try count(&w, root));
 }
 
 test "forEachKey visits all keys in ascending order" {

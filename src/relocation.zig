@@ -11,73 +11,26 @@ const max_prop_count: usize = 256;
 // slot), updating the key->row index so the key and all links stay valid. Does
 // not shrink columns. Returns the new catalog ref.
 pub fn relocateRow(txn: *WriteTxn, cat: Ref, okey: u64, new_row: u64) !Ref {
-    const v = try catalog.loadCatalog(txn, cat);
-    const old_row = (try Index.get(txn, v.keyrow_index_ref, okey)) orelse return cat;
+    var s = try catalog.CatalogSnapshot.load(txn, cat);
+    const old_row = (try Index.get(txn, s.keyrow_index_ref, okey)) orelse return cat;
     if (old_row == new_row) return cat;
     // Bijection / safety guards.
-    std.debug.assert((try Column.get(txn, v.live_col_ref, old_row)) == 1);
-    std.debug.assert((try Column.get(txn, v.live_col_ref, new_row)) == 0);
+    std.debug.assert((try Column.get(txn, s.live_col_ref, old_row)) == 1);
+    std.debug.assert((try Column.get(txn, s.live_col_ref, new_row)) == 0);
 
-    // Capture all view-backed values into locals before the first Column.set,
-    // since growing the file can invalidate the bytes backing CatalogView.
-    const pc = v.prop_count;
-    const next_row = v.next_row;
-    const next_key = v.next_key;
-    const idx_ref = v.pk_index_ref;
-    var keyrow = v.keyrow_index_ref;
-    var ver_ref = v.version_col_ref;
-    var live_ref = v.live_col_ref;
-    var prop_refs: [max_prop_count]Ref = undefined;
-    var kinds: [max_prop_count]catalog.PropKind = undefined;
-    var elems: [max_prop_count]catalog.ElemKind = undefined;
-    var bl: [max_prop_count]Ref = undefined;
-    var targets: [max_prop_count]u16 = undefined;
-    var rules: [max_prop_count]catalog.DeletionRule = undefined;
-    var vidx: [max_prop_count]Ref = undefined;
-    var idxf: [max_prop_count]bool = undefined;
-    {
-        var j: usize = 0;
-        while (j < pc) : (j += 1) {
-            prop_refs[j] = v.propColRef(j);
-            kinds[j] = v.kind(j);
-            elems[j] = v.elemKind(j);
-            bl[j] = v.backlinkRef(j);
-            targets[j] = v.linkTarget(j);
-            rules[j] = v.delRule(j);
-            vidx[j] = v.valueIndexRef(j);
-            idxf[j] = v.indexed(j);
-        }
-    }
     // Copy each property cell + the version cell from old_row to new_row.
     var i: usize = 0;
-    while (i < pc) : (i += 1) {
-        const cell = try Column.get(txn, prop_refs[i], old_row);
-        prop_refs[i] = try Column.set(txn, prop_refs[i], new_row, cell);
+    while (i < s.prop_count) : (i += 1) {
+        const cell = try Column.get(txn, s.props[i].col, old_row);
+        s.props[i].col = try Column.set(txn, s.props[i].col, new_row, cell);
     }
-    const oldver = try Column.get(txn, ver_ref, old_row);
-    ver_ref = try Column.set(txn, ver_ref, new_row, oldver);
-    live_ref = try Column.set(txn, live_ref, new_row, 1);
-    live_ref = try Column.set(txn, live_ref, old_row, 0);
-    keyrow = try Index.insert(txn, keyrow, okey, new_row);
+    const oldver = try Column.get(txn, s.version_col_ref, old_row);
+    s.version_col_ref = try Column.set(txn, s.version_col_ref, new_row, oldver);
+    s.live_col_ref = try Column.set(txn, s.live_col_ref, new_row, 1);
+    s.live_col_ref = try Column.set(txn, s.live_col_ref, old_row, 0);
+    s.keyrow_index_ref = try Index.insert(txn, s.keyrow_index_ref, okey, new_row);
 
-    return catalog.writeCatalog(
-        txn,
-        pc,
-        next_row,
-        keyrow,
-        next_key,
-        idx_ref,
-        ver_ref,
-        live_ref,
-        prop_refs[0..pc],
-        kinds[0..pc],
-        elems[0..pc],
-        bl[0..pc],
-        targets[0..pc],
-        rules[0..pc],
-        vidx[0..pc],
-        idxf[0..pc],
-    );
+    return s.replace(txn);
 }
 
 // ---------------------------------------------------------------------------
@@ -139,6 +92,60 @@ test "relocateRow moves a row and keeps key, pk, and value" {
     // c now lives in b's old slot.
     try testing.expectEqual(@as(?u64, b_row), try catalog.okeyToRow(&w, cat, c_okey));
     w.deinit();
+}
+
+test "setLink after relocating the SOURCE keeps the backlink graph exact" {
+    // Regression: setLink/linkSetAdd/linkSetRemove recorded the source's
+    // PHYSICAL ROW as the backlink source, while every consumer treats sources
+    // as stable okeys. Once a source row was relocated the two diverged:
+    // removals missed, stale entries inflated counts, and nullify could clear
+    // an unrelated object's link. Backlink sources must be okeys.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "reloc3.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    defer w.deinit();
+
+    var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
+
+    // Throwaway opens a dead slot; then two targets and the source.
+    const dead = try objects.insert(&w, cat, &.{ 99, 0 });
+    cat = dead.cat;
+    const t1 = try objects.insert(&w, cat, &.{ 1, 0 });
+    cat = t1.cat;
+    const t2 = try objects.insert(&w, cat, &.{ 2, 0 });
+    cat = t2.cat;
+    const src = try objects.insert(&w, cat, &.{ 3, 0 });
+    cat = src.cat;
+
+    // Free the throwaway's physical slot and relocate the SOURCE into it, so
+    // the source's row and okey diverge.
+    const dead_row = (try catalog.okeyToRow(&w, cat, dead.row)).?;
+    var out: [2]u64 = undefined;
+    const dv = (try objects.getByPk(&w, cat, 99, &out)).?;
+    cat = (try objects.delete(&w, cat, 99, dv)).ok;
+    cat = try relocateRow(&w, cat, src.row, dead_row);
+    try testing.expect((try catalog.okeyToRow(&w, cat, src.row)).? != src.row);
+
+    // Link src -> t1, then move it to t2: counts must track exactly.
+    cat = try links.setLink(&w, cat, 3, 1, t1.row);
+    try testing.expectEqual(@as(u64, 1), try links.backlinkCount(&w, cat, 1, t1.row));
+    cat = try links.setLink(&w, cat, 3, 1, t2.row);
+    try testing.expectEqual(@as(u64, 0), try links.backlinkCount(&w, cat, 1, t1.row));
+    try testing.expectEqual(@as(u64, 1), try links.backlinkCount(&w, cat, 1, t2.row));
+
+    // Deleting t2 must nullify the relocated source's link (backlink resolves
+    // through the okey), leaving t1 and the source's other data untouched.
+    const t2v = (try objects.getByPk(&w, cat, 2, &out)).?;
+    cat = switch (try objects.deleteAndNullify(&w, cat, 2, t2v)) {
+        .ok => |c| c,
+        else => unreachable,
+    };
+    try testing.expectEqual(@as(?u64, null), try links.getLink(&w, cat, 3, 1));
+    try testing.expect((try objects.getByPk(&w, cat, 1, &out)) != null);
 }
 
 test "a same-type link to a relocated object still resolves" {

@@ -26,8 +26,11 @@ pub const AIRDB_E_CONFLICT: i64 = -4;
 pub const AIRDB_E_DUPLICATE: i64 = -5;
 pub const AIRDB_E_NOT_EMPTY: i64 = -6;
 pub const AIRDB_E_UNSUPPORTED: i64 = -7;
+/// A commit-point flush failed: the commit's on-disk fate is indeterminate and
+/// the handle refuses further writes. Close and reopen the database to resolve.
+pub const AIRDB_E_INDETERMINATE: i64 = -8;
 
-const MAX_PROPS: usize = 256;
+const MAX_PROPS: usize = catalog.max_prop_count;
 
 const Database = struct {
     db: Db,
@@ -35,6 +38,12 @@ const Database = struct {
 };
 
 const alloc = std.heap.c_allocator;
+
+// Distinguish a retryable commit failure from an indeterminate one (the
+// commit-point flush failed and the instance is poisoned until reopen).
+fn commitErrCode(self: *Database) i64 {
+    return if (self.db.poisoned) AIRDB_E_INDETERMINATE else AIRDB_E_GENERIC;
+}
 
 // Open the database at `path`, creating it with an int-property object type of
 // `prop_count` properties (property 0 is the primary key) if it does not exist.
@@ -45,6 +54,10 @@ export fn airdb_open(path_ptr: [*:0]const u8, prop_count: u16) ?*Database {
     // The storage layer requires an absolute path. Reject anything else here so
     // a relative path returns a clean error instead of aborting the host.
     if (!std.fs.path.isAbsolute(path)) return null;
+    // A C ABI must not trust its arguments: prop_count 0 trips an internal
+    // assert (abort in safe builds), and > 256 would overflow fixed-size
+    // per-property buffers in release builds. Reject both cleanly.
+    if (prop_count == 0 or prop_count > MAX_PROPS) return null;
     const self = alloc.create(Database) catch return null;
 
     if (Db.open(alloc, path)) |opened| {
@@ -64,7 +77,15 @@ export fn airdb_open(path_ptr: [*:0]const u8, prop_count: u16) ?*Database {
         r.end();
         self.prop_count = pc;
         return self;
-    } else |_| {
+    } else |open_err| {
+        // Create only when the file genuinely does not exist. Any other open
+        // failure (corruption, resources, permissions) must NOT fall through to
+        // create: FileStore.create truncates, which would destroy a database
+        // that may still be recoverable.
+        if (open_err != error.FileNotFound) {
+            alloc.destroy(self);
+            return null;
+        }
         self.db = Db.create(alloc, path) catch {
             alloc.destroy(self);
             return null;
@@ -109,13 +130,13 @@ export fn airdb_prop_count(handle: ?*Database) i64 {
 export fn airdb_insert(handle: ?*Database, vals: [*]const u64, len: usize) i64 {
     const self = handle orelse return AIRDB_E_GENERIC;
     if (len != self.prop_count) return AIRDB_E_BAD_ARGS;
-    var w = self.db.beginWrite() catch return AIRDB_E_GENERIC;
+    var w = self.db.beginWrite() catch return commitErrCode(self);
     const r = objects.insert(&w, w.new_root, vals[0..len]) catch |e| {
         w.deinit();
         return if (e == error.DuplicateKey) AIRDB_E_DUPLICATE else AIRDB_E_GENERIC;
     };
     w.setRoot(r.cat);
-    _ = w.commit() catch return AIRDB_E_GENERIC;
+    _ = w.commit() catch return commitErrCode(self);
     return @intCast(r.row);
 }
 
@@ -146,7 +167,7 @@ export fn airdb_update(handle: ?*Database, vals: [*]const u64, len: usize) i64 {
     const self = handle orelse return AIRDB_E_GENERIC;
     if (len != self.prop_count) return AIRDB_E_BAD_ARGS;
     const pk = vals[0];
-    var w = self.db.beginWrite() catch return AIRDB_E_GENERIC;
+    var w = self.db.beginWrite() catch return commitErrCode(self);
     var cur: [MAX_PROPS]u64 = undefined;
     const ver = objects.getByPk(&w, w.new_root, pk, cur[0..len]) catch {
         w.deinit();
@@ -163,7 +184,7 @@ export fn airdb_update(handle: ?*Database, vals: [*]const u64, len: usize) i64 {
     switch (res) {
         .ok => |ok| {
             w.setRoot(ok.cat);
-            _ = w.commit() catch return AIRDB_E_GENERIC;
+            _ = w.commit() catch return commitErrCode(self);
             return AIRDB_OK;
         },
         .conflict => {
@@ -180,7 +201,7 @@ export fn airdb_update(handle: ?*Database, vals: [*]const u64, len: usize) i64 {
 // Delete the row with primary key `pk`. Returns AIRDB_OK or an error code.
 export fn airdb_delete(handle: ?*Database, pk: u64) i64 {
     const self = handle orelse return AIRDB_E_GENERIC;
-    var w = self.db.beginWrite() catch return AIRDB_E_GENERIC;
+    var w = self.db.beginWrite() catch return commitErrCode(self);
     var cur: [MAX_PROPS]u64 = undefined;
     const ver = objects.getByPk(&w, w.new_root, pk, cur[0..self.prop_count]) catch {
         w.deinit();
@@ -197,7 +218,7 @@ export fn airdb_delete(handle: ?*Database, pk: u64) i64 {
     switch (res) {
         .ok => |new_cat| {
             w.setRoot(new_cat);
-            _ = w.commit() catch return AIRDB_E_GENERIC;
+            _ = w.commit() catch return commitErrCode(self);
             return AIRDB_OK;
         },
         .conflict => {
@@ -223,6 +244,7 @@ export fn airdb_delete(handle: ?*Database, pk: u64) i64 {
 export fn airdb_bulk_insert(handle: ?*Database, rows_flat: [*]const u64, row_count: usize, prop_count: usize) i64 {
     const self = handle orelse return AIRDB_E_GENERIC;
     if (prop_count != self.prop_count) return AIRDB_E_BAD_ARGS;
+    if (row_count > std.math.maxInt(i64)) return AIRDB_E_BAD_ARGS; // return value is i64
 
     // Build a []const []const u64 view over the flat buffer: each row slice
     // points at its prop_count-wide window. Freed regardless of outcome.
@@ -232,7 +254,7 @@ export fn airdb_bulk_insert(handle: ?*Database, rows_flat: [*]const u64, row_cou
         row.* = rows_flat[i * prop_count ..][0..prop_count];
     }
 
-    var w = self.db.beginWrite() catch return AIRDB_E_GENERIC;
+    var w = self.db.beginWrite() catch return commitErrCode(self);
     const newcat = bulk.bulkImport(&w, w.new_root, rows_slices, .{}) catch |e| {
         w.deinit(); // releases the write lock; nothing was made durable
         return switch (e) {
@@ -246,7 +268,7 @@ export fn airdb_bulk_insert(handle: ?*Database, rows_flat: [*]const u64, row_cou
     w.setRoot(newcat);
     // commit releases the lock on BOTH its success and its own error paths, so
     // do not unlock again here.
-    _ = w.commit() catch return AIRDB_E_GENERIC;
+    _ = w.commit() catch return commitErrCode(self);
     return @intCast(row_count);
 }
 
@@ -264,6 +286,7 @@ export fn airdb_bulk_insert(handle: ?*Database, rows_flat: [*]const u64, row_cou
 export fn airdb_bulk_append(handle: ?*Database, rows_flat: [*]const u64, row_count: usize, prop_count: usize) i64 {
     const self = handle orelse return AIRDB_E_GENERIC;
     if (prop_count != self.prop_count) return AIRDB_E_BAD_ARGS;
+    if (row_count > std.math.maxInt(i64)) return AIRDB_E_BAD_ARGS; // return value is i64
 
     // Build a []const []const u64 view over the flat buffer: each row slice
     // points at its prop_count-wide window. Freed regardless of outcome.
@@ -273,7 +296,7 @@ export fn airdb_bulk_append(handle: ?*Database, rows_flat: [*]const u64, row_cou
         row.* = rows_flat[i * prop_count ..][0..prop_count];
     }
 
-    var w = self.db.beginWrite() catch return AIRDB_E_GENERIC;
+    var w = self.db.beginWrite() catch return commitErrCode(self);
     const newcat = bulk.bulkAppendOrInsert(&w, w.new_root, rows_slices) catch |e| {
         w.deinit(); // releases the write lock; nothing was made durable
         return switch (e) {
@@ -285,7 +308,7 @@ export fn airdb_bulk_append(handle: ?*Database, rows_flat: [*]const u64, row_cou
     w.setRoot(newcat);
     // commit releases the lock on BOTH its success and its own error paths, so
     // do not unlock again here.
-    _ = w.commit() catch return AIRDB_E_GENERIC;
+    _ = w.commit() catch return commitErrCode(self);
     return @intCast(row_count);
 }
 
@@ -303,15 +326,21 @@ export fn airdb_bulk_append(handle: ?*Database, rows_flat: [*]const u64, row_cou
 //
 // The write lock is acquired in airdb_begin and released exactly once: by
 // airdb_commit (via WriteTxn.commit, which unlocks on both its success and its
-// own error/revert paths) or by airdb_abort (via WriteTxn.deinit). Operation
-// errors leave the txn open and the catalog ref unadvanced, so a failed op
-// never corrupts the batch -- the caller chooses to continue or abort.
+// own error/revert paths) or by airdb_abort (via WriteTxn.deinit).
+//
+// BENIGN op results (duplicate, not-found, conflict) are decided before any
+// mutation and leave the txn fully usable. A STRUCTURAL op failure (generic
+// error mid-mutation) is different: the op may have freed tree nodes that the
+// unadvanced catalog ref still references, so committing afterwards would hand
+// live nodes to the free list. Such a failure poisons the txn -- only
+// airdb_abort is accepted; airdb_commit refuses and aborts instead.
 // ---------------------------------------------------------------------------
 
 const Txn = struct {
     dbh: *Database,
     w: WriteTxn,
     cat: Ref, // current catalog ref, threaded across operations
+    poisoned: bool = false, // structural op failure: commit must not proceed
 };
 
 // Begin an explicit write transaction. Acquires the write lock. Returns null on
@@ -326,6 +355,7 @@ export fn airdb_begin(handle: ?*Database) ?*Txn {
         return null;
     };
     t.cat = t.w.new_root;
+    t.poisoned = false;
     return t;
 }
 
@@ -343,9 +373,12 @@ export fn airdb_abort(txn: ?*Txn) void {
 // advanced, so the batch remains consistent.
 export fn airdb_txn_insert(txn: ?*Txn, vals: [*]const u64, len: usize) i64 {
     const t = txn orelse return AIRDB_E_GENERIC;
+    if (t.poisoned) return AIRDB_E_GENERIC;
     if (len != t.dbh.prop_count) return AIRDB_E_BAD_ARGS;
     const r = objects.insert(&t.w, t.cat, vals[0..len]) catch |e| {
-        return if (e == error.DuplicateKey) AIRDB_E_DUPLICATE else AIRDB_E_GENERIC;
+        if (e == error.DuplicateKey) return AIRDB_E_DUPLICATE; // pre-mutation check: txn stays usable
+        t.poisoned = true; // mid-mutation failure: the batch may reference freed nodes
+        return AIRDB_E_GENERIC;
     };
     t.cat = r.cat; // thread the new catalog ref; do NOT commit
     return @intCast(r.row);
@@ -356,12 +389,16 @@ export fn airdb_txn_insert(txn: ?*Txn, vals: [*]const u64, len: usize) i64 {
 // the txn stays open and the catalog ref is not advanced.
 export fn airdb_txn_update(txn: ?*Txn, vals: [*]const u64, len: usize) i64 {
     const t = txn orelse return AIRDB_E_GENERIC;
+    if (t.poisoned) return AIRDB_E_GENERIC;
     if (len != t.dbh.prop_count) return AIRDB_E_BAD_ARGS;
     const pk = vals[0];
     var cur: [MAX_PROPS]u64 = undefined;
     const ver = objects.getByPk(&t.w, t.cat, pk, cur[0..len]) catch return AIRDB_E_GENERIC;
     if (ver == null) return AIRDB_E_NOT_FOUND;
-    const res = objects.update(&t.w, t.cat, pk, vals[0..len], ver.?) catch return AIRDB_E_GENERIC;
+    const res = objects.update(&t.w, t.cat, pk, vals[0..len], ver.?) catch {
+        t.poisoned = true; // mid-mutation failure
+        return AIRDB_E_GENERIC;
+    };
     switch (res) {
         .ok => |ok| {
             t.cat = ok.cat;
@@ -377,10 +414,14 @@ export fn airdb_txn_update(txn: ?*Txn, vals: [*]const u64, len: usize) i64 {
 // the txn stays open and the catalog ref is not advanced.
 export fn airdb_txn_delete(txn: ?*Txn, pk: u64) i64 {
     const t = txn orelse return AIRDB_E_GENERIC;
+    if (t.poisoned) return AIRDB_E_GENERIC;
     var cur: [MAX_PROPS]u64 = undefined;
     const ver = objects.getByPk(&t.w, t.cat, pk, cur[0..t.dbh.prop_count]) catch return AIRDB_E_GENERIC;
     if (ver == null) return AIRDB_E_NOT_FOUND;
-    const res = objects.delete(&t.w, t.cat, pk, ver.?) catch return AIRDB_E_GENERIC;
+    const res = objects.delete(&t.w, t.cat, pk, ver.?) catch {
+        t.poisoned = true; // mid-mutation failure
+        return AIRDB_E_GENERIC;
+    };
     switch (res) {
         .ok => |new_cat| {
             t.cat = new_cat;
@@ -399,12 +440,21 @@ export fn airdb_txn_delete(txn: ?*Txn, pk: u64) i64 {
 // AIRDB_E_GENERIC).
 export fn airdb_commit(txn: ?*Txn) i64 {
     const t = txn orelse return AIRDB_E_GENERIC;
+    if (t.poisoned) {
+        // A structural op failure may have freed nodes the batch's tree still
+        // references; committing would hand live nodes to the durable free
+        // list. Abort on the caller's behalf.
+        t.w.deinit();
+        alloc.destroy(t);
+        return AIRDB_E_GENERIC;
+    }
     t.w.setRoot(t.cat);
     _ = t.w.commit() catch {
         // commit already released the lock per WriteTxn.commit's contract; just
         // free the handle. Do NOT double-unlock.
+        const code = commitErrCode(t.dbh);
         alloc.destroy(t);
-        return AIRDB_E_GENERIC;
+        return code;
     };
     alloc.destroy(t);
     return AIRDB_OK;
@@ -480,6 +530,53 @@ test "ffi: null handle is safe" {
 
 test "ffi: relative path is rejected without aborting" {
     try testing.expect(airdb_open("relative/path.airdb", 2) == null);
+}
+
+test "ffi: hostile prop_count is rejected without aborting" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try ffiTmpPathZ(testing.allocator, &tmp, "badpc.airdb");
+    defer testing.allocator.free(path);
+    // 0 used to trip an internal assert (host abort); >256 overflowed
+    // fixed-size per-property buffers in release builds.
+    try testing.expect(airdb_open(path.ptr, 0) == null);
+    try testing.expect(airdb_open(path.ptr, 300) == null);
+}
+
+test "ffi: open of a corrupt database returns null and never truncates the file" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try ffiTmpPathZ(testing.allocator, &tmp, "corrupt_open.airdb");
+    defer testing.allocator.free(path);
+
+    // Create a real database with one row, then close it.
+    {
+        const h = airdb_open(path.ptr, 2) orelse return error.OpenFailed;
+        try testing.expect(airdb_insert(h, &[_]u64{ 1, 42 }, 2) >= 0);
+        airdb_close(h);
+    }
+
+    // Corrupt the magic so Db.open fails with something other than FileNotFound.
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var len_before: u64 = 0;
+    {
+        var f = try std.Io.Dir.openFileAbsolute(io, path, .{ .mode = .read_write });
+        defer f.close(io);
+        len_before = try f.length(io);
+        try f.writePositionalAll(io, &[_]u8{ 0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF }, 0);
+        try f.sync(io);
+    }
+
+    // Open must fail cleanly -- and must NOT truncate/recreate the file.
+    try testing.expect(airdb_open(path.ptr, 2) == null);
+
+    var f = try std.Io.Dir.openFileAbsolute(io, path, .{ .mode = .read_only });
+    defer f.close(io);
+    try testing.expectEqual(len_before, try f.length(io));
+    var magic: [8]u8 = undefined;
+    _ = try f.readPositionalAll(io, &magic, 0);
+    // The corrupted magic is still there: nothing rewrote the header.
+    try testing.expectEqualSlices(u8, &[_]u8{ 0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF }, &magic);
 }
 
 test "ffi txn: begin then abort releases the write lock" {
@@ -776,4 +873,42 @@ test "airdb_bulk_append wrong prop_count returns AIRDB_E_BAD_ARGS" {
     // Nothing was written and the lock is free.
     try testing.expectEqual(@as(i64, 0), airdb_count(h));
     try testing.expect(airdb_insert(h, &[_]u64{ 1, 10 }, 2) >= 0);
+}
+
+test "ffi txn: a poisoned txn refuses commit and releases the lock" {
+    // Regression: a structural op failure mid-batch can free tree nodes the
+    // unadvanced catalog ref still references; committing such a txn handed
+    // live nodes to the durable free list. Commit must abort instead.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try ffiTmpPathZ(testing.allocator, &tmp, "poisontxn.airdb");
+    defer testing.allocator.free(path);
+    const h = airdb_open(path.ptr, 2) orelse return error.OpenFailed;
+    defer airdb_close(h);
+
+    const t = airdb_begin(h) orelse return error.BeginFailed;
+    try testing.expect(airdb_txn_insert(t, &[_]u64{ 1, 10 }, 2) >= 0);
+    t.poisoned = true; // simulate a structural op failure
+    try testing.expectEqual(AIRDB_E_GENERIC, airdb_commit(t));
+    // Nothing became durable and the write lock was released.
+    try testing.expectEqual(@as(i64, 0), airdb_count(h));
+    const t2 = airdb_begin(h) orelse return error.BeginFailed;
+    airdb_abort(t2);
+}
+
+test "ffi: a poisoned handle reports AIRDB_E_INDETERMINATE, not generic failure" {
+    // Regression: only the failing commit itself returned -8; every later
+    // write on the poisoned handle collapsed to AIRDB_E_GENERIC, so a caller
+    // who missed the one -8 could never learn the handle needs a reopen.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try ffiTmpPathZ(testing.allocator, &tmp, "poisonedh.airdb");
+    defer testing.allocator.free(path);
+    const h = airdb_open(path.ptr, 2) orelse return error.OpenFailed;
+    defer airdb_close(h);
+
+    h.db.poisoned = true; // simulate a failed commit-point flush
+    try testing.expectEqual(AIRDB_E_INDETERMINATE, airdb_insert(h, &[_]u64{ 1, 10 }, 2));
+    try testing.expectEqual(AIRDB_E_INDETERMINATE, airdb_update(h, &[_]u64{ 1, 11 }, 2));
+    try testing.expectEqual(AIRDB_E_INDETERMINATE, airdb_delete(h, 1));
 }

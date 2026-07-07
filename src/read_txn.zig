@@ -7,6 +7,10 @@ pub const ReadTxn = struct {
     db: *Db,
     root_ref: Ref,
     version: u64,
+    /// Set by end(). A second end() must be a no-op: decrementing the pin count
+    /// again would release another reader's pin at the same version and expose
+    /// it to premature space reuse.
+    ended: bool = false,
 
     pub fn root(self: ReadTxn) Ref {
         return self.root_ref;
@@ -17,6 +21,8 @@ pub const ReadTxn = struct {
     }
 
     pub fn end(self: *ReadTxn) void {
+        if (self.ended) return;
+        self.ended = true;
         if (self.db.pins.getPtr(self.version)) |ptr| {
             if (ptr.* > 0) ptr.* -= 1;
             if (ptr.* == 0) _ = self.db.pins.remove(self.version);

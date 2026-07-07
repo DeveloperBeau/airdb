@@ -31,6 +31,12 @@ pub fn create(txn: *WriteTxn) !Ref {
     return a.ref;
 }
 
+// A legal tree with fanout 64 covering 2^64 rows is at most ~11 levels deep, so
+// any walk deeper than this is following a corrupt ref cycle. Every recursive
+// walker carries a depth and fails with error.Corrupt instead of overflowing
+// the stack.
+pub const max_depth: usize = 16;
+
 /// Deref a node by first reading its kind byte, then dereffing the full node.
 fn derefNode(txn: anytype, ref: Ref) ![]const u8 {
     const kind_buf = try txn.deref(ref, 1);
@@ -60,6 +66,11 @@ pub fn len(txn: anytype, root: Ref) !u64 {
 
 /// Return the value at index. Returns error.IndexOutOfBounds if out of range.
 pub fn get(txn: anytype, root: Ref, index: u64) !u64 {
+    return getAt(txn, root, index, 0);
+}
+
+fn getAt(txn: anytype, root: Ref, index: u64, depth: usize) !u64 {
+    if (depth >= max_depth) return error.Corrupt;
     const bytes = try derefNode(txn, root);
     if (bytes[0] == kind_leaf) {
         const count = std.mem.readInt(u16, bytes[1..3], .little);
@@ -73,7 +84,7 @@ pub fn get(txn: anytype, root: Ref, index: u64) !u64 {
         var i: u16 = 0;
         while (i < view.child_count) : (i += 1) {
             const cc = view.childCount(i);
-            if (idx < cc) return get(txn, view.childRef(i), idx);
+            if (idx < cc) return getAt(txn, view.childRef(i), idx, depth + 1);
             idx -= cc;
         }
         return error.IndexOutOfBounds;
@@ -82,7 +93,8 @@ pub fn get(txn: anytype, root: Ref, index: u64) !u64 {
 
 const AppendResult = struct { ref: Ref, count: u64, split: ?Ref, split_count: u64 };
 
-fn appendInto(txn: *WriteTxn, node_ref: Ref, value: u64) !AppendResult {
+fn appendInto(txn: *WriteTxn, node_ref: Ref, value: u64, depth: usize) !AppendResult {
+    if (depth >= max_depth) return error.Corrupt;
     const bytes = try derefNode(txn, node_ref);
     if (bytes[0] == kind_leaf) {
         const count = std.mem.readInt(u16, bytes[1..3], .little);
@@ -110,7 +122,7 @@ fn appendInto(txn: *WriteTxn, node_ref: Ref, value: u64) !AppendResult {
             while (i < child_count) : (i += 1) old_total += view.childCount(i);
         }
         const old_last_count = view.childCount(last_idx);
-        const r = try appendInto(txn, last_ref, value);
+        const r = try appendInto(txn, last_ref, value, depth + 1);
         // COW the inner node and update the last child entry.
         const a = try txn.writableCopy(node_ref, inner_node_size);
         const last_off: usize = inner_header + last_idx * 16;
@@ -139,7 +151,7 @@ fn appendInto(txn: *WriteTxn, node_ref: Ref, value: u64) !AppendResult {
 /// Append value to the column. Returns the new root Ref (copy-on-write).
 /// Grows the tree through leaf splits and height increases as needed.
 pub fn append(txn: *WriteTxn, root: Ref, value: u64) !Ref {
-    const r = try appendInto(txn, root, value);
+    const r = try appendInto(txn, root, value, 0);
     if (r.split == null) return r.ref;
     // Split propagated to the root: grow height by one.
     const a = try txn.alloc(inner_node_size);
@@ -151,7 +163,8 @@ pub fn append(txn: *WriteTxn, root: Ref, value: u64) !Ref {
 /// Recursive copy-on-write set: copies only the nodes on the path from root to
 /// the target leaf. Sibling subtrees are shared by reference, so the old root
 /// remains a valid, unchanged snapshot after the call returns.
-fn setInto(txn: *WriteTxn, node_ref: Ref, index: u64, value: u64) !Ref {
+fn setInto(txn: *WriteTxn, node_ref: Ref, index: u64, value: u64, depth: usize) !Ref {
+    if (depth >= max_depth) return error.Corrupt;
     const bytes = try derefNode(txn, node_ref);
     if (bytes[0] == kind_leaf) {
         const count = std.mem.readInt(u16, bytes[1..3], .little);
@@ -181,7 +194,7 @@ fn setInto(txn: *WriteTxn, node_ref: Ref, index: u64, value: u64) !Ref {
         if (!found) return error.IndexOutOfBounds;
         // Capture the child ref before the recursive call (bytes may alias mmap).
         const child_ref = view.childRef(target_i);
-        const new_child = try setInto(txn, child_ref, local_index, value);
+        const new_child = try setInto(txn, child_ref, local_index, value, depth + 1);
         // COW this inner node and patch only the updated child's ref (count unchanged).
         const a = try txn.writableCopy(node_ref, inner_node_size);
         const off: usize = inner_header + @as(usize, target_i) * 16;
@@ -193,12 +206,17 @@ fn setInto(txn: *WriteTxn, node_ref: Ref, index: u64, value: u64) !Ref {
 /// Overwrite the value at index. Returns the new root Ref (copy-on-write).
 /// Returns error.IndexOutOfBounds if out of range. Works on trees of any depth.
 pub fn set(txn: *WriteTxn, root: Ref, index: u64, value: u64) !Ref {
-    return setInto(txn, root, index, value);
+    return setInto(txn, root, index, value, 0);
 }
 
 /// Recursively free every node in the subtree rooted at node_ref. Leaves and inner
 /// nodes are freed at their respective on-disk sizes so the space becomes reclaimable.
-fn freeTree(txn: *WriteTxn, node_ref: Ref) !void {
+pub fn freeTree(txn: *WriteTxn, node_ref: Ref) !void {
+    return freeTreeAt(txn, node_ref, 0);
+}
+
+fn freeTreeAt(txn: *WriteTxn, node_ref: Ref, depth: usize) !void {
+    if (depth >= max_depth) return error.Corrupt;
     const bytes = try derefNode(txn, node_ref);
     if (bytes[0] == kind_leaf) {
         try txn.free(node_ref, leaf_node_size);
@@ -207,7 +225,7 @@ fn freeTree(txn: *WriteTxn, node_ref: Ref) !void {
         var i: u16 = 0;
         // Capture child refs before freeing: parsing reads from the mmap, which we do
         // not mutate here, so the view stays valid for the duration of the loop.
-        while (i < view.child_count) : (i += 1) try freeTree(txn, view.childRef(i));
+        while (i < view.child_count) : (i += 1) try freeTreeAt(txn, view.childRef(i), depth + 1);
         try txn.free(node_ref, inner_node_size);
     }
 }
@@ -272,6 +290,25 @@ test "parseLeaf rejects a buffer too small for its declared count" {
     buf[0] = 0; // kind = leaf
     std.mem.writeInt(u16, buf[1..3], 100, .little); // claims 100 values
     try testing.expectError(error.Corrupt, parseLeaf(buf[0..16]));
+}
+
+test "a column ref cycle fails with error.Corrupt" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try colTmpPath(testing.allocator, &tmp, "col_cycle.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    defer w.deinit();
+
+    // Inner node whose only child is itself with a nonzero claimed count:
+    // get/set/append must hit the depth cap, not overflow the stack.
+    const a = try w.alloc(inner_node_size);
+    _ = encodeInner(a.bytes, &.{a.ref}, &.{10});
+    try testing.expectError(error.Corrupt, get(&w, a.ref, 0));
+    try testing.expectError(error.Corrupt, set(&w, a.ref, 0, 1));
+    try testing.expectError(error.Corrupt, append(&w, a.ref, 1));
 }
 
 test "single-leaf column: create, append, get, len, set" {

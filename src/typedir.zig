@@ -292,9 +292,11 @@ pub fn deleteNullifyX(txn: *WriteTxn, dir: Ref, type_id: u16, pk: u64, expected_
     var buf: [256]u64 = undefined;
     const ver = (try Objects.getByPk(txn, cat0, pk, buf[0..pc])) orelse return .not_found;
     if (ver != expected_version) return .{ .conflict = .{ .current_version = ver } };
-    const okey = (try catalog.pkToOkey(txn, cat0, pk)).?;
+    const okey = (try catalog.pkToOkey(txn, cat0, pk)) orelse return .not_found;
 
     // BLOCK check (top-level only): refuse if any block-rule link points at it.
+    // The object's own self-link does not block: this delete clears that link
+    // anyway, and counting it made self-linked rows permanently undeletable.
     const tc = try typeCount(txn, dir);
     var s: u16 = 0;
     while (s < tc) : (s += 1) {
@@ -304,7 +306,12 @@ pub fn deleteNullifyX(txn: *WriteTxn, dir: Ref, type_id: u16, pk: u64, expected_
         while (p < sv.prop_count) : (p += 1) {
             const k = sv.kind(p);
             if ((k == .link or k == .link_set) and sv.linkTarget(p) == type_id and sv.delRule(p) == .block) {
-                if ((try links.backlinkCount(txn, s_cat, p, okey)) > 0) return .blocked;
+                const cnt = try links.backlinkCount(txn, s_cat, p, okey);
+                if (cnt > 1) return .blocked;
+                if (cnt == 1) {
+                    const self_only = s == type_id and (try links.backlinkContains(txn, s_cat, p, okey, okey));
+                    if (!self_only) return .blocked;
+                }
             }
         }
     }
@@ -331,14 +338,32 @@ fn deleteWorker(txn: *WriteTxn, dir: Ref, type_id: u16, okey: u64, visited: *std
     if ((try Objects.getByObjectKey(txn, cat_t0, okey, rbuf[0..pc])) == null) return cur; // already gone
     const pk = rbuf[0];
 
-    // 1) Cascade: delete children reached by this object's cascade-rule props.
+    // Snapshot the cascade-relevant schema BEFORE any mutation. Catalog nodes
+    // are freed the moment they are rewritten, so a CatalogView into cat_t0
+    // must not be read after a recursive delete has rewritten this type's
+    // catalog -- the node's bytes may already belong to a new allocation.
+    var kinds: [256]catalog.PropKind = undefined;
+    var elems: [256]catalog.ElemKind = undefined;
+    var rules: [256]catalog.DeletionRule = undefined;
+    var targets: [256]u16 = undefined;
     {
         const sv = try catalog.loadCatalog(txn, cat_t0);
         var p: usize = 0;
-        while (p < sv.prop_count) : (p += 1) {
-            const k = sv.kind(p);
-            if ((k != .link and k != .link_set) or sv.delRule(p) != .cascade) continue;
-            const child_type = sv.linkTarget(p);
+        while (p < pc) : (p += 1) {
+            kinds[p] = sv.kind(p);
+            elems[p] = sv.elemKind(p);
+            rules[p] = sv.delRule(p);
+            targets[p] = sv.linkTarget(p);
+        }
+    }
+
+    // 1) Cascade: delete children reached by this object's cascade-rule props.
+    {
+        var p: usize = 0;
+        while (p < pc) : (p += 1) {
+            const k = kinds[p];
+            if ((k != .link and k != .link_set) or rules[p] != .cascade) continue;
+            const child_type = targets[p];
             if (k == .link) {
                 if (try links.getLink(txn, try catalogRef(txn, cur, type_id), pk, p)) |child| {
                     cur = try deleteWorker(txn, cur, child_type, child, visited);
@@ -368,13 +393,21 @@ fn deleteWorker(txn: *WriteTxn, dir: Ref, type_id: u16, okey: u64, visited: *std
         const cleaned = try links.cleanOutboundInCatalog(txn, t_cat, okey);
         cur = try setCatalogRef(txn, cur, type_id, cleaned);
     }
-    // 4) Tombstone (re-read current version, which matches in this txn).
+    // 4) Tombstone (re-read current version, which matches in this txn), then
+    //    reclaim the row's blob/collection storage from the raws just re-read.
+    //    The re-read (not the step-0 rbuf) matters: step 2 may have nullified
+    //    this row's own to-one link columns. Reclaiming only on .ok mirrors
+    //    deleteTyped; without it every directory-path delete -- including
+    //    every cascade-deleted child -- leaked its blobs and collection trees.
     {
         const t_cat = try catalogRef(txn, cur, type_id);
         const cur_ver = (try Objects.getByObjectKey(txn, t_cat, okey, rbuf[0..pc])) orelse return cur;
         const dres = try Objects.delete(txn, t_cat, pk, cur_ver);
         switch (dres) {
-            .ok => |new_cat| cur = try setCatalogRef(txn, cur, type_id, new_cat),
+            .ok => |new_cat| {
+                cur = try setCatalogRef(txn, cur, type_id, new_cat);
+                try Objects.freeRowStorage(txn, kinds[0..pc], elems[0..pc], rbuf[0..pc]);
+            },
             else => {},
         }
     }
@@ -393,7 +426,11 @@ pub fn insertEmbedded(txn: *WriteTxn, dir: Ref, owner_type: u16, owner_pk: u64, 
     var cur = dir;
     const child_type = (try catalog.loadCatalog(txn, try catalogRef(txn, cur, owner_type))).linkTarget(prop);
 
-    // Replace: delete any existing owned child first.
+    // Replace: delete any existing owned child first. A refused delete must
+    // SURFACE, not be swallowed: silently linking the new child while the old
+    // one survives breaks the single-owner invariant and leaks an ownerless
+    // object. (.blocked is reachable when another type block-links the child;
+    // conflict/not_found are impossible for a version read in this txn.)
     if (try getLink(txn, cur, owner_type, owner_pk, prop)) |old_okey| {
         const child_cat = try catalogRef(txn, cur, child_type);
         const pc = (try catalog.loadCatalog(txn, child_cat)).prop_count;
@@ -403,7 +440,7 @@ pub fn insertEmbedded(txn: *WriteTxn, dir: Ref, owner_type: u16, owner_pk: u64, 
             const dres = try deleteNullifyX(txn, cur, child_type, old_pk, old_ver);
             switch (dres) {
                 .ok => |d| cur = d,
-                else => {},
+                else => return error.Blocked,
             }
         }
     }
@@ -427,7 +464,9 @@ pub fn clearEmbedded(txn: *WriteTxn, dir: Ref, owner_type: u16, owner_pk: u64, p
     const dres = try deleteNullifyX(txn, dir, child_type, child_pk, child_ver);
     return switch (dres) {
         .ok => |d| d,
-        else => dir,
+        // A refused clear must surface: returning the unchanged dir read as
+        // success while the child and its link silently survived.
+        else => error.Blocked,
     };
 }
 
@@ -984,6 +1023,48 @@ test "directory delete works after relocating the target" {
 
 const relocation = @import("relocation.zig");
 
+test "a self-linked object is deletable across transactions" {
+    // Two regressions in one shape: (a) a block-rule self-link counted itself
+    // and refused the delete forever; (b) the nullify version bump stamped the
+    // row being deleted, so the follow-up tombstone's version check failed
+    // forever. Both must not block a self-linked delete.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tdTmpPath(testing.allocator, &tmp, "selflink.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+
+    // Commit a row that links to ITSELF via a block-rule property.
+    {
+        var w = try db.beginWrite();
+        var dir = try createWithDefs(&w, &.{
+            &.{ .{ .kind = .int }, .{ .kind = .link, .link_target = 0, .del_rule = .block } },
+        });
+        const a = try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .link = null } });
+        dir = a.dir;
+        dir = try setLink(&w, dir, 0, 1, 1, a.row);
+        w.setRoot(dir);
+        _ = try w.commit();
+    }
+    // Deleting it in a LATER transaction must succeed: the self-link neither
+    // blocks nor invalidates the version the caller read.
+    {
+        var w = try db.beginWrite();
+        var out: [2]Value = undefined;
+        const ver = (try get(&w, w.new_root, 0, 1, &out)).?;
+        const res = try deleteNullifyX(&w, w.new_root, 0, 1, ver);
+        try testing.expect(res == .ok);
+        w.setRoot(res.ok);
+        _ = try w.commit();
+    }
+    var r = try db.beginRead();
+    defer r.end();
+    try testing.expectEqual(@as(u64, 0), try liveCount(&r, r.root(), 0));
+    // A FOREIGN block-rule source must still block, self-exemption or not.
+    // (covered by the existing "block prevents deleting a referenced object")
+}
+
 test "cascade is cycle-safe" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1010,4 +1091,181 @@ test "cascade is cycle-safe" {
     dir = da.ok;
     try testing.expectEqual(@as(u64, 0), try liveCount(&w, dir, 0)); // both gone
     w.deinit();
+}
+
+test "a directory delete of a self-referencing link_set row frees its set root exactly once" {
+    // Directory-path variant of the objects-layer regression: deleteWorker now
+    // reclaims the row's collection storage, so the inbound nullify must not
+    // COW (and thereby free) the dying row's own set root first.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tdTmpPath(testing.allocator, &tmp, "selfset_dir.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+
+    {
+        var w = try db.beginWrite();
+        var dir = try createWithDefs(&w, &.{
+            &.{ .{ .kind = .int }, .{ .kind = .link_set, .link_target = 0 } },
+        });
+        const ins = try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .link_set = &.{} } });
+        dir = ins.dir;
+        dir = try linkSetAdd(&w, dir, 0, 1, 1, ins.row); // set contains own okey
+        w.setRoot(dir);
+        _ = try w.commit();
+    }
+    var w = try db.beginWrite();
+    defer w.deinit();
+    var out: [2]Value = undefined;
+    const ver = (try get(&w, w.new_root, 0, 1, &out)).?;
+    const res = try deleteNullifyX(&w, w.new_root, 0, 1, ver);
+    try testing.expect(res == .ok);
+    var seen = std.AutoHashMap(u64, void).init(testing.allocator);
+    defer seen.deinit();
+    for (w.txn_reuse.extents.items) |e| {
+        const gop = try seen.getOrPut(e.offset);
+        try testing.expect(!gop.found_existing); // duplicate free
+    }
+    for (w.in_flight_frees.items) |e| {
+        const gop = try seen.getOrPut(e.offset);
+        try testing.expect(!gop.found_existing);
+    }
+}
+
+test "a directory delete frees the row's collection storage" {
+    // Regression: deleteWorker tombstoned via the raw delete and never freed
+    // the row's collection trees -- every directory-path delete leaked them
+    // permanently. The captured roots must show up among the freed extents.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tdTmpPath(testing.allocator, &tmp, "dircoll.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+
+    {
+        var w = try db.beginWrite();
+        var dir = try createWithDefs(&w, &.{
+            &.{ .{ .kind = .int }, .{ .kind = .set, .elem = .int }, .{ .kind = .list, .elem = .int } },
+        });
+        dir = (try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .set_int = &.{ 1, 2, 3 } }, .{ .list_int = &.{ 7, 8, 9 } } })).dir;
+        w.setRoot(dir);
+        _ = try w.commit();
+    }
+    var w = try db.beginWrite();
+    defer w.deinit();
+    var raw: [3]u64 = undefined;
+    _ = (try Objects.getByPk(&w, try catalogRef(&w, w.new_root, 0), 1, &raw)).?;
+    var out: [3]Value = undefined;
+    const ver = (try get(&w, w.new_root, 0, 1, &out)).?;
+    const res = try deleteNullifyX(&w, w.new_root, 0, 1, ver);
+    try testing.expect(res == .ok);
+    var freed_set = false;
+    var freed_list = false;
+    for (w.in_flight_frees.items) |e| {
+        if (e.offset == raw[1]) freed_set = true;
+        if (e.offset == raw[2]) freed_list = true;
+    }
+    for (w.txn_reuse.extents.items) |e| {
+        if (e.offset == raw[1]) freed_set = true;
+        if (e.offset == raw[2]) freed_list = true;
+    }
+    try testing.expect(freed_set);
+    try testing.expect(freed_list);
+}
+
+test "a cascade delete frees the child's collection storage" {
+    // Regression: cascade-deleted children go through deleteWorker, which
+    // leaked their collection trees; the child's set root must be freed.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tdTmpPath(testing.allocator, &tmp, "casccoll.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+
+    {
+        var w = try db.beginWrite();
+        var dir = try createWithDefs(&w, &.{
+            &.{ .{ .kind = .int }, .{ .kind = .link, .link_target = 1, .del_rule = .cascade } }, // 0: owner
+            &.{ .{ .kind = .int }, .{ .kind = .set, .elem = .int } }, // 1: child
+        });
+        const child = try insert(&w, dir, 1, &.{ .{ .int = 100 }, .{ .set_int = &.{ 1, 2, 3 } } });
+        dir = child.dir;
+        dir = (try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .link = child.row } })).dir;
+        w.setRoot(dir);
+        _ = try w.commit();
+    }
+    var w = try db.beginWrite();
+    defer w.deinit();
+    var raw: [2]u64 = undefined;
+    _ = (try Objects.getByPk(&w, try catalogRef(&w, w.new_root, 1), 100, &raw)).?;
+    var out: [2]Value = undefined;
+    const ver = (try get(&w, w.new_root, 0, 1, &out)).?;
+    const res = try deleteNullifyX(&w, w.new_root, 0, 1, ver);
+    try testing.expect(res == .ok);
+    try testing.expectEqual(@as(u64, 0), try liveCount(&w, res.ok, 1)); // child cascaded
+    var freed_child_set = false;
+    for (w.in_flight_frees.items) |e| {
+        if (e.offset == raw[1]) freed_child_set = true;
+    }
+    for (w.txn_reuse.extents.items) |e| {
+        if (e.offset == raw[1]) freed_child_set = true;
+    }
+    try testing.expect(freed_child_set);
+}
+
+const embedded_block_schema = [_][]const catalog.PropDef{
+    &.{ .{ .kind = .int }, .{ .kind = .link, .link_target = 1, .del_rule = .cascade } }, // 0: owner
+    &.{ .{ .kind = .int }, .{ .kind = .blob } }, // 1: embedded child
+    &.{ .{ .kind = .int }, .{ .kind = .link, .link_target = 1, .del_rule = .block } }, // 2: blocker
+};
+
+test "replacing an embedded child surfaces a blocked delete" {
+    // Regression: the refused delete of the old child was swallowed and the
+    // new child linked anyway -- two live children, one of them ownerless,
+    // breaking the single-owner invariant.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tdTmpPath(testing.allocator, &tmp, "embblock1.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    defer w.deinit();
+    var dir = try createTypes(&w, &embedded_block_schema, &.{ false, true, false });
+
+    dir = (try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .link = null } })).dir;
+    dir = try insertEmbedded(&w, dir, 0, 1, 1, &.{ .{ .int = 100 }, .{ .bytes = "old" } });
+    const child_okey = (try getLink(&w, dir, 0, 1, 1)).?;
+    dir = (try insert(&w, dir, 2, &.{ .{ .int = 5 }, .{ .link = child_okey } })).dir;
+
+    try testing.expectError(error.Blocked, insertEmbedded(&w, dir, 0, 1, 1, &.{ .{ .int = 200 }, .{ .bytes = "new" } }));
+    // Old child intact and still owned.
+    try testing.expectEqual(@as(?u64, child_okey), try getLink(&w, dir, 0, 1, 1));
+    try testing.expectEqual(@as(u64, 1), try liveCount(&w, dir, 1));
+}
+
+test "clearing an embedded child surfaces a blocked delete" {
+    // Regression: a refused clear returned the unchanged directory, reading as
+    // success while the child and its owning link silently survived.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tdTmpPath(testing.allocator, &tmp, "embblock2.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    defer w.deinit();
+    var dir = try createTypes(&w, &embedded_block_schema, &.{ false, true, false });
+
+    dir = (try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .link = null } })).dir;
+    dir = try insertEmbedded(&w, dir, 0, 1, 1, &.{ .{ .int = 100 }, .{ .bytes = "note" } });
+    const child_okey = (try getLink(&w, dir, 0, 1, 1)).?;
+    dir = (try insert(&w, dir, 2, &.{ .{ .int = 5 }, .{ .link = child_okey } })).dir;
+
+    try testing.expectError(error.Blocked, clearEmbedded(&w, dir, 0, 1, 1));
+    try testing.expectEqual(@as(?u64, child_okey), try getLink(&w, dir, 0, 1, 1));
+    try testing.expectEqual(@as(u64, 1), try liveCount(&w, dir, 1));
 }

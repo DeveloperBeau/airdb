@@ -26,7 +26,9 @@ const RealSyncer = @import("syncer.zig").RealSyncer;
 // Public constants
 // ---------------------------------------------------------------------------
 
-pub const airdb_magic: u64 = 0x6169726462_0001;
+// _0002: the free list is persisted as a chain of bounded chunks
+// ([count u32][next_ref u64][extents...]), not a single unbounded node.
+pub const airdb_magic: u64 = 0x6169726462_0002;
 pub const default_page_size: u32 = 4096;
 
 // ---------------------------------------------------------------------------

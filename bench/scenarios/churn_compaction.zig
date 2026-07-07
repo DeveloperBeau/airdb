@@ -143,7 +143,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
             var w = try db.beginWrite();
             cat = db.active_root;
             const t0 = nowNs(io);
-            const res = try compaction.compactStep(&w, cat, compact_budget);
+            const res = try compaction.compactStep(&w, cat, 0, compact_budget);
             const dt: u64 = @intCast(nowNs(io) - t0);
             cat = res.cat;
             w.setRoot(cat);

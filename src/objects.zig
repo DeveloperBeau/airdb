@@ -4,6 +4,7 @@ const Db = @import("db.zig").Db;
 const Ref = @import("ref.zig").Ref;
 const Column = @import("column.zig");
 const Index = @import("index.zig");
+const bindex = @import("bindex.zig");
 const blob = @import("blob.zig");
 const catalog = @import("catalog.zig");
 const collections = @import("collections.zig");
@@ -31,7 +32,8 @@ const writeCatalog = catalog.writeCatalog;
 // ---------------------------------------------------------------------------
 
 // Add `okey` to the value-index inner set for `value`, returning the new index ref.
-fn viAdd(txn: *WriteTxn, vi_ref: Ref, value: u64, okey: u64) !Ref {
+// Pub: the migration backfill reuses it to index pre-migration rows.
+pub fn viAdd(txn: *WriteTxn, vi_ref: Ref, value: u64, okey: u64) !Ref {
     const existing = try Index.get(txn, vi_ref, value);
     var set_root = existing orelse try Index.create(txn);
     set_root = try Index.insert(txn, set_root, okey, 1);
@@ -39,10 +41,18 @@ fn viAdd(txn: *WriteTxn, vi_ref: Ref, value: u64, okey: u64) !Ref {
 }
 
 // Remove `okey` from the value-index inner set for `value`. No-op if absent.
+// When the inner set empties, its outer entry is removed and the set's nodes
+// freed: high-churn workloads would otherwise accumulate one empty set per
+// distinct value ever indexed, reclaimable only by a full file copy.
 fn viRemove(txn: *WriteTxn, vi_ref: Ref, value: u64, okey: u64) !Ref {
     const existing = try Index.get(txn, vi_ref, value);
     const set_root = existing orelse return vi_ref;
     const new_set = try Index.remove(txn, set_root, okey);
+    if ((try Index.count(txn, new_set)) == 0) {
+        const new_vi = try Index.remove(txn, vi_ref, value);
+        try Index.freeTree(txn, new_set);
+        return new_vi;
+    }
     return try Index.insert(txn, vi_ref, value, new_set);
 }
 
@@ -64,83 +74,38 @@ fn removeValueIndex(txn: *WriteTxn, cat: Ref, p: usize, value: u64, okey: u64) !
 // values.len must equal the prop_count stored in the catalog.
 // Returns error.DuplicateKey if values[0] (the primary key) already exists.
 pub fn insert(txn: *WriteTxn, cat: Ref, values: []const u64) !struct { cat: Ref, row: u64 } {
-    const v = try loadCatalog(txn, cat);
-    std.debug.assert(values.len == v.prop_count);
-
-    // Capture all refs from the view into locals before any mutation so the
-    // bytes slice backing CatalogView cannot be invalidated by file growth.
-    const old_keyrow = v.keyrow_index_ref;
-    const old_next_key = v.next_key;
-    const old_pk_index_ref = v.pk_index_ref;
-    const old_version_col_ref = v.version_col_ref;
-    const old_live_col_ref = v.live_col_ref;
-    var old_prop_refs: [max_prop_count]Ref = undefined;
-    var old_kinds: [max_prop_count]PropKind = undefined;
-    var old_elems: [max_prop_count]ElemKind = undefined;
-    var old_backlinks: [max_prop_count]Ref = undefined;
-    var old_targets: [max_prop_count]u16 = undefined;
-    var old_rules: [max_prop_count]catalog.DeletionRule = undefined;
-    var old_vidx: [max_prop_count]Ref = undefined;
-    var old_idxf: [max_prop_count]bool = undefined;
-    {
-        var j: usize = 0;
-        while (j < v.prop_count) : (j += 1) {
-            old_prop_refs[j] = v.propColRef(j);
-            old_kinds[j] = v.kind(j);
-            old_elems[j] = v.elemKind(j);
-            old_backlinks[j] = v.backlinkRef(j);
-            old_targets[j] = v.linkTarget(j);
-            old_rules[j] = v.delRule(j);
-            old_vidx[j] = v.valueIndexRef(j);
-            old_idxf[j] = v.indexed(j);
-        }
-    }
-    const prop_count = v.prop_count;
-    const row = v.next_row;
-    const okey = old_next_key;
+    var s = try catalog.CatalogSnapshot.load(txn, cat);
+    std.debug.assert(values.len == s.prop_count);
+    const prop_count = s.prop_count;
+    const row = s.next_row;
+    const okey = s.next_key;
 
     const pk = values[0];
-    if ((try Index.get(txn, old_pk_index_ref, pk)) != null) return error.DuplicateKey;
+    if ((try Index.get(txn, s.pk_index_ref, pk)) != null) return error.DuplicateKey;
 
     // COW-append to each property column.
-    var new_prop_refs: [max_prop_count]Ref = undefined;
     {
         var i: usize = 0;
         while (i < prop_count) : (i += 1) {
-            new_prop_refs[i] = try Column.append(txn, old_prop_refs[i], values[i]);
+            s.props[i].col = try Column.append(txn, s.props[i].col, values[i]);
         }
     }
-    const new_version_col = try Column.append(txn, old_version_col_ref, txn.new_version);
-    const new_live_col = try Column.append(txn, old_live_col_ref, 1);
+    s.version_col_ref = try Column.append(txn, s.version_col_ref, txn.new_version);
+    s.live_col_ref = try Column.append(txn, s.live_col_ref, 1);
     // pk index maps pk -> okey; keyrow index maps okey -> physical row.
-    const new_index = try Index.insert(txn, old_pk_index_ref, pk, okey);
-    const new_keyrow = try Index.insert(txn, old_keyrow, okey, row);
+    s.pk_index_ref = try Index.insert(txn, s.pk_index_ref, pk, okey);
+    s.keyrow_index_ref = try Index.insert(txn, s.keyrow_index_ref, okey, row);
+    s.next_row = row + 1;
+    s.next_key = okey + 1;
 
-    const new_cat = try writeCatalog(
-        txn,
-        prop_count,
-        row + 1,
-        new_keyrow,
-        old_next_key + 1,
-        new_index,
-        new_version_col,
-        new_live_col,
-        new_prop_refs[0..prop_count],
-        old_kinds[0..prop_count],
-        old_elems[0..prop_count],
-        old_backlinks[0..prop_count],
-        old_targets[0..prop_count],
-        old_rules[0..prop_count],
-        old_vidx[0..prop_count],
-        old_idxf[0..prop_count],
-    );
+    const new_cat = try s.replace(txn);
     // Maintain the value index for each indexed property: add this row's okey to
     // the inner set at its stored value, in the same transaction as the row.
     var cat_out = new_cat;
     {
         var p: usize = 0;
         while (p < prop_count) : (p += 1) {
-            if (old_idxf[p]) cat_out = try addValueIndex(txn, cat_out, p, values[p], okey);
+            if (s.props[p].indexed) cat_out = try addValueIndex(txn, cat_out, p, values[p], okey);
         }
     }
     return .{ .cat = cat_out, .row = okey };
@@ -160,41 +125,16 @@ pub const DeleteResult = union(enum) {
 };
 
 pub fn update(txn: *WriteTxn, cat: Ref, pk: u64, values: []const u64, expected_version: u64) !UpdateResult {
-    const v = try loadCatalog(txn, cat);
-    std.debug.assert(values.len == v.prop_count);
+    var s = try catalog.CatalogSnapshot.load(txn, cat);
+    std.debug.assert(values.len == s.prop_count);
     std.debug.assert(values[0] == pk); // pk is identity, must not change
-    const okey = (try Index.get(txn, v.pk_index_ref, pk)) orelse return .not_found;
-    const row = (try catalog.okeyToRow(txn, cat, okey)).?;
-    const cur = try Column.get(txn, v.version_col_ref, row);
+    const okey = (try Index.get(txn, s.pk_index_ref, pk)) orelse return .not_found;
+    // The pk index resolved but the key->row index did not: treat the divergence
+    // as absent rather than crashing on corrupt data.
+    const row = (try Index.get(txn, s.keyrow_index_ref, okey)) orelse return .not_found;
+    const cur = try Column.get(txn, s.version_col_ref, row);
     if (cur != expected_version) return .{ .conflict = .{ .current_version = cur } };
-
-    // Capture refs into locals before mutating (avoid relying on the catalog deref slice).
-    const pc = v.prop_count;
-    const idx_ref = v.pk_index_ref;
-    const live_ref = v.live_col_ref;
-    const next_row = v.next_row;
-    var prop_refs: [256]Ref = undefined;
-    var kinds: [256]PropKind = undefined;
-    var elems_buf: [max_prop_count]ElemKind = undefined;
-    var bl_buf: [max_prop_count]Ref = undefined;
-    var targets_buf: [max_prop_count]u16 = undefined;
-    var rules_buf: [max_prop_count]catalog.DeletionRule = undefined;
-    var vidx_buf: [max_prop_count]Ref = undefined;
-    var idxf_buf: [max_prop_count]bool = undefined;
-    {
-        var j: usize = 0;
-        while (j < pc) : (j += 1) {
-            prop_refs[j] = v.propColRef(j);
-            kinds[j] = v.kind(j);
-            elems_buf[j] = v.elemKind(j);
-            bl_buf[j] = v.backlinkRef(j);
-            targets_buf[j] = v.linkTarget(j);
-            rules_buf[j] = v.delRule(j);
-            vidx_buf[j] = v.valueIndexRef(j);
-            idxf_buf[j] = v.indexed(j);
-        }
-    }
-    var ver_ref = v.version_col_ref;
+    const pc = s.prop_count;
 
     // Snapshot the current value of each indexed property before overwriting the
     // column, so the value index can move the okey from its old to its new value.
@@ -202,21 +142,27 @@ pub fn update(txn: *WriteTxn, cat: Ref, pk: u64, values: []const u64, expected_v
     {
         var j: usize = 0;
         while (j < pc) : (j += 1) {
-            if (idxf_buf[j]) old_vals[j] = try Column.get(txn, prop_refs[j], row);
+            if (s.props[j].indexed) old_vals[j] = try Column.get(txn, s.props[j].col, row);
         }
     }
 
+    // Copy-on-write only the columns whose value actually changed: an O(height)
+    // read is strictly cheaper than an O(height) path copy, so a one-field
+    // update on a wide type no longer rewrites every property column.
     var i: usize = 0;
-    while (i < pc) : (i += 1) prop_refs[i] = try Column.set(txn, prop_refs[i], row, values[i]);
-    ver_ref = try Column.set(txn, ver_ref, row, txn.new_version);
+    while (i < pc) : (i += 1) {
+        const cur_val = try Column.get(txn, s.props[i].col, row);
+        if (cur_val != values[i]) s.props[i].col = try Column.set(txn, s.props[i].col, row, values[i]);
+    }
+    s.version_col_ref = try Column.set(txn, s.version_col_ref, row, txn.new_version);
 
-    const new_cat = try writeCatalog(txn, pc, next_row, v.keyrow_index_ref, v.next_key, idx_ref, ver_ref, live_ref, prop_refs[0..pc], kinds[0..pc], elems_buf[0..pc], bl_buf[0..pc], targets_buf[0..pc], rules_buf[0..pc], vidx_buf[0..pc], idxf_buf[0..pc]);
+    const new_cat = try s.replace(txn);
     // Re-point the value index for any indexed property whose value changed.
     var cat_out = new_cat;
     {
         var p: usize = 0;
         while (p < pc) : (p += 1) {
-            if (idxf_buf[p] and old_vals[p] != values[p]) {
+            if (s.props[p].indexed and old_vals[p] != values[p]) {
                 cat_out = try removeValueIndex(txn, cat_out, p, old_vals[p], okey);
                 cat_out = try addValueIndex(txn, cat_out, p, values[p], okey);
             }
@@ -226,68 +172,40 @@ pub fn update(txn: *WriteTxn, cat: Ref, pk: u64, values: []const u64, expected_v
 }
 
 pub fn delete(txn: *WriteTxn, cat: Ref, pk: u64, expected_version: u64) !DeleteResult {
-    const v = try loadCatalog(txn, cat);
-    const okey = (try Index.get(txn, v.pk_index_ref, pk)) orelse return .not_found;
-    const row = (try catalog.okeyToRow(txn, cat, okey)).?;
-    const cur = try Column.get(txn, v.version_col_ref, row);
+    var s = try catalog.CatalogSnapshot.load(txn, cat);
+    const okey = (try Index.get(txn, s.pk_index_ref, pk)) orelse return .not_found;
+    const row = (try Index.get(txn, s.keyrow_index_ref, okey)) orelse return .not_found;
+    const cur = try Column.get(txn, s.version_col_ref, row);
     if (cur != expected_version) return .{ .conflict = .{ .current_version = cur } };
-
-    // Capture refs into locals before mutating.
-    const pc = v.prop_count;
-    const next_row = v.next_row;
-    var prop_refs: [256]Ref = undefined;
-    var kinds: [256]PropKind = undefined;
-    var elems_buf: [max_prop_count]ElemKind = undefined;
-    var bl_buf: [max_prop_count]Ref = undefined;
-    var targets_buf: [max_prop_count]u16 = undefined;
-    var rules_buf: [max_prop_count]catalog.DeletionRule = undefined;
-    var vidx_buf: [max_prop_count]Ref = undefined;
-    var idxf_buf: [max_prop_count]bool = undefined;
-    {
-        var j: usize = 0;
-        while (j < pc) : (j += 1) {
-            prop_refs[j] = v.propColRef(j);
-            kinds[j] = v.kind(j);
-            elems_buf[j] = v.elemKind(j);
-            bl_buf[j] = v.backlinkRef(j);
-            targets_buf[j] = v.linkTarget(j);
-            rules_buf[j] = v.delRule(j);
-            vidx_buf[j] = v.valueIndexRef(j);
-            idxf_buf[j] = v.indexed(j);
-        }
-    }
-    var live_ref = v.live_col_ref;
-    var ver_ref = v.version_col_ref;
-    var idx_ref = v.pk_index_ref;
-    var keyrow_ref = v.keyrow_index_ref;
+    const pc = s.prop_count;
 
     // Read the value of each indexed property while the row is still readable,
     // so its okey can be dropped from the value index. Property columns are not
-    // mutated by delete, so prop_refs still address the row's current values.
+    // mutated by delete, so the snapshot's cols still address the current values.
     var old_vals: [max_prop_count]u64 = undefined;
     {
         var j: usize = 0;
         while (j < pc) : (j += 1) {
-            if (idxf_buf[j]) old_vals[j] = try Column.get(txn, prop_refs[j], row);
+            if (s.props[j].indexed) old_vals[j] = try Column.get(txn, s.props[j].col, row);
         }
     }
 
-    live_ref = try Column.set(txn, live_ref, row, 0); // tombstone
-    ver_ref = try Column.set(txn, ver_ref, row, txn.new_version); // bump version stamp
-    idx_ref = try Index.remove(txn, idx_ref, pk); // remove pk from the index
+    s.live_col_ref = try Column.set(txn, s.live_col_ref, row, 0); // tombstone
+    s.version_col_ref = try Column.set(txn, s.version_col_ref, row, txn.new_version); // bump version stamp
+    s.pk_index_ref = try Index.remove(txn, s.pk_index_ref, pk); // remove pk from the index
     // Drop the object key from the key->row index. Copy-on-write keeps the old
     // index version intact for any reader pinned to the prior snapshot, so this
     // is MVCC-safe; it prevents a stale key from aliasing a row a later
     // relocation reuses.
-    keyrow_ref = try Index.remove(txn, keyrow_ref, okey);
+    s.keyrow_index_ref = try Index.remove(txn, s.keyrow_index_ref, okey);
 
-    const new_cat = try writeCatalog(txn, pc, next_row, keyrow_ref, v.next_key, idx_ref, ver_ref, live_ref, prop_refs[0..pc], kinds[0..pc], elems_buf[0..pc], bl_buf[0..pc], targets_buf[0..pc], rules_buf[0..pc], vidx_buf[0..pc], idxf_buf[0..pc]);
+    const new_cat = try s.replace(txn);
     // Drop this row's okey from the value index for every indexed property.
     var cat_out = new_cat;
     {
         var p: usize = 0;
         while (p < pc) : (p += 1) {
-            if (idxf_buf[p]) cat_out = try removeValueIndex(txn, cat_out, p, old_vals[p], okey);
+            if (s.props[p].indexed) cat_out = try removeValueIndex(txn, cat_out, p, old_vals[p], okey);
         }
     }
     return .{ .ok = cat_out };
@@ -448,7 +366,7 @@ pub fn getTypedByOkey(txn: anytype, cat: Ref, okey: u64, out: []Value) !?u64 {
 pub fn deleteAndNullify(txn: *WriteTxn, cat: Ref, pk: u64, expected_version: u64) !DeleteResult {
     const v = try loadCatalog(txn, cat);
     const okey = (try Index.get(txn, v.pk_index_ref, pk)) orelse return .not_found;
-    const row = (try catalog.okeyToRow(txn, cat, okey)).?;
+    const row = (try catalog.okeyToRow(txn, cat, okey)) orelse return .not_found;
     const cur_ver = try Column.get(txn, v.version_col_ref, row);
     if (cur_ver != expected_version) return .{ .conflict = .{ .current_version = cur_ver } };
     const fixed = try links.fixBacklinksForDelete(txn, cat, okey);
@@ -481,7 +399,10 @@ pub fn updateTyped(
     // Step 2: version check BEFORE freeing or allocating any blob.
     if (current_version != expected_version)
         return .{ .conflict = .{ .current_version = current_version } };
-    // Step 3: apply path -- free old blobs and allocate new ones.
+    // Step 3: apply path -- free old blobs and allocate new ones. Collection
+    // properties are CARRIED THROUGH unchanged (mutate them via their own
+    // APIs): updating any row of a collection-bearing type must not require
+    // the caller to re-supply roots, and must never crash.
     var new_raw: [max_prop_count]u64 = undefined;
     var i: usize = 0;
     while (i < pc) : (i += 1) {
@@ -491,12 +412,71 @@ pub fn updateTyped(
                 try blob.free(txn, cur_raw[i]);
                 break :blk try blob.put(txn, values[i].bytes);
             },
-            .list, .set, .dict, .link_set => unreachable, // collection update not yet implemented
+            .list, .set, .dict, .link_set => cur_raw[i],
             .link => if (values[i].link) |k| k + 1 else 0,
         };
     }
     // Step 4: delegate to the core update; it will re-check the version (match).
-    return try update(txn, cat, pk, new_raw[0..pc], expected_version);
+    const result = try update(txn, cat, pk, new_raw[0..pc], expected_version);
+    // Step 5: maintain backlinks for any changed to-one link, mirroring
+    // setLink. Skipping this left the old target's backlink set naming this
+    // source forever and the new target's set missing it -- corrupting
+    // nullify/cascade/block enforcement. The backlink source is the okey.
+    switch (result) {
+        .ok => |ok| {
+            var cat_out = ok.cat;
+            var changed = false;
+            var p: usize = 0;
+            while (p < pc) : (p += 1) {
+                if (kinds[p] != .link or cur_raw[p] == new_raw[p]) continue;
+                // The row was just updated successfully, so its pk must
+                // resolve; anything else is index divergence, and bailing
+                // mid-loop would leave the backlinks half-moved.
+                const okey = (try catalog.pkToOkey(txn, cat_out, pk)) orelse return error.Corrupt;
+                if (cur_raw[p] != 0) cat_out = try links.removeBacklink(txn, cat_out, p, cur_raw[p] - 1, okey);
+                if (new_raw[p] != 0) cat_out = try links.addBacklink(txn, cat_out, p, new_raw[p] - 1, okey);
+                changed = true;
+            }
+            if (changed) return .{ .ok = .{ .cat = cat_out, .version = ok.version } };
+            return result;
+        },
+        else => return result,
+    }
+}
+
+// Free the blob and collection storage held in a deleted row's columns.
+// `raw` holds the row's column values captured before the tombstone (the
+// tombstone leaves the physical columns intact, so a pre-delete read stays
+// accurate). Shared by deleteTyped and the directory-level delete
+// (typedir.deleteWorker); before that sharing, every row deleted through the
+// directory path -- including every cascade-deleted child -- leaked its blobs
+// and list/set/dict trees permanently. A raw of 0 (no storage, e.g. a row
+// written with caller-supplied raws or a dead-row migration backfill) frees
+// nothing rather than erroring mid-delete.
+pub fn freeRowStorage(txn: *WriteTxn, kinds: []const PropKind, elems: []const ElemKind, raw: []const u64) !void {
+    var i: usize = 0;
+    while (i < kinds.len) : (i += 1) {
+        if (raw[i] == 0) continue;
+        switch (kinds[i]) {
+            .blob => try blob.free(txn, raw[i]),
+            .list => {
+                if (elems[i] == .blob) {
+                    // Elements are blob refs: free each before the tree.
+                    const n = try Column.len(txn, raw[i]);
+                    var e: u64 = 0;
+                    while (e < n) : (e += 1) try blob.free(txn, try Column.get(txn, raw[i], e));
+                }
+                try Column.freeTree(txn, raw[i]);
+            },
+            .set => switch (elems[i]) {
+                .int => try Index.freeTree(txn, raw[i]),
+                .blob => try bindex.freeTree(txn, raw[i]),
+            },
+            .dict => try bindex.freeTree(txn, raw[i]),
+            .link_set => try Index.freeTree(txn, raw[i]),
+            .int, .link => {},
+        }
+    }
 }
 
 // deleteTyped is MVCC-safe: blobs are freed only on the apply path, never on
@@ -510,11 +490,15 @@ pub fn deleteTyped(
     const v = try loadCatalog(txn, cat);
     const pc = v.prop_count;
     std.debug.assert(pc <= max_prop_count);
-    // Capture kinds before any mutation.
+    // Capture kinds/elems before any mutation.
     var kinds: [max_prop_count]PropKind = undefined;
+    var elems: [max_prop_count]ElemKind = undefined;
     {
         var j: usize = 0;
-        while (j < pc) : (j += 1) kinds[j] = v.kind(j);
+        while (j < pc) : (j += 1) {
+            kinds[j] = v.kind(j);
+            elems[j] = v.elemKind(j);
+        }
     }
     // Step 1: read the current row.
     var cur_raw: [max_prop_count]u64 = undefined;
@@ -522,13 +506,19 @@ pub fn deleteTyped(
     // Step 2: version check BEFORE freeing any blob.
     if (current_version != expected_version)
         return .{ .conflict = .{ .current_version = current_version } };
-    // Step 3: apply path -- free all blob props.
-    var i: usize = 0;
-    while (i < pc) : (i += 1) {
-        if (kinds[i] == .blob) try blob.free(txn, cur_raw[i]);
+    // Step 3: delegate to the graph-safe delete (nullifies inbound links).
+    const result = try deleteAndNullify(txn, cat, pk, expected_version);
+    // Step 4: on the apply path, free the row's blob and collection storage.
+    // This runs AFTER deleteAndNullify because the outbound backlink cleanup
+    // reads the link_set roots; the tombstoned row's columns still hold the
+    // roots, so cur_raw stays accurate. Without this every deleted row leaked
+    // its blobs and list/set/dict trees (and their element/key blobs)
+    // permanently. MVCC-safe: a conflict or not_found result frees nothing.
+    switch (result) {
+        .ok => try freeRowStorage(txn, kinds[0..pc], elems[0..pc], cur_raw[0..pc]),
+        else => {},
     }
-    // Step 4: delegate to the graph-safe delete (nullifies inbound links).
-    return try deleteAndNullify(txn, cat, pk, expected_version);
+    return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -637,6 +627,40 @@ test "update applies on a matching version" {
         try testing.expectEqual(@as(u64, 77), out[1]);
         r.end();
     }
+}
+
+test "update copies only the columns whose value changed" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "obj4_diff.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var cat = try create(&w, 3);
+    cat = (try insert(&w, cat, &.{ 1, 10, 20 })).cat;
+
+    const before = try loadCatalog(&w, cat);
+    const col0 = before.propColRef(0);
+    const col1 = before.propColRef(1);
+    const col2 = before.propColRef(2);
+
+    var out: [3]u64 = undefined;
+    const ver = (try getByPk(&w, cat, 1, &out)).?;
+    const res = try update(&w, cat, 1, &.{ 1, 99, 20 }, ver);
+    try testing.expect(res == .ok);
+    cat = res.ok.cat;
+
+    const after = try loadCatalog(&w, cat);
+    // Unchanged columns keep their exact roots (no copy-on-write happened).
+    try testing.expectEqual(col0, after.propColRef(0));
+    try testing.expectEqual(col2, after.propColRef(2));
+    // The changed column was rewritten.
+    try testing.expect(after.propColRef(1) != col1);
+    _ = (try getByPk(&w, cat, 1, &out)).?;
+    try testing.expectEqual(@as(u64, 99), out[1]);
+    try testing.expectEqual(@as(u64, 20), out[2]);
+    w.deinit();
 }
 
 test "update conflicts on a stale version" {
@@ -1126,6 +1150,164 @@ test "value index tracks deletes" {
     w.deinit();
 }
 
+test "updateTyped carries collection properties through unchanged" {
+    // Regression: updating any row of a collection-bearing type hit
+    // `unreachable` (panic in Debug, UB in release). Collections are now
+    // carried through; mutate them via their own APIs.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "utyped_coll.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    defer w.deinit();
+    var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .int }, .{ .kind = .list, .elem = .int } });
+    cat = (try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .int = 10 }, .{ .list_int = &.{ 7, 8, 9 } } })).cat;
+
+    var out: [3]Value = undefined;
+    const ver = (try getTyped(&w, cat, 1, &out)).?;
+    const res = try updateTyped(&w, cat, 1, &.{ .{ .int = 1 }, .{ .int = 20 }, out[2] }, ver);
+    try testing.expect(res == .ok);
+    cat = res.ok.cat;
+
+    _ = (try getTyped(&w, cat, 1, &out)).?;
+    try testing.expectEqual(@as(u64, 20), out[1].int);
+    try testing.expectEqual(@as(?u64, 3), try collections.listLen(&w, cat, 1, 2));
+    try testing.expectEqual(@as(u64, 8), try collections.listGetInt(&w, cat, 1, 2, 1));
+}
+
+test "deleteTyped frees the row's collection storage" {
+    // Regression: deleted rows leaked their list/set/dict trees (and element
+    // and key blobs) permanently -- unreclaimable except by a full file copy.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "del_coll_free.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+
+    // Commit a row carrying every collection kind so its trees are committed.
+    {
+        var w = try db.beginWrite();
+        var cat = try catalog.createDefs(&w, &.{
+            .{ .kind = .int },
+            .{ .kind = .list, .elem = .blob },
+            .{ .kind = .set, .elem = .int },
+            .{ .kind = .dict },
+        });
+        cat = (try insertTyped(&w, cat, &.{
+            .{ .int = 1 },
+            .{ .list_blob = &.{ "alpha", "beta" } },
+            .{ .set_int = &.{ 1, 2, 3 } },
+            .{ .dict_int = &.{ .{ .key = "k1", .val = 10 }, .{ .key = "k2", .val = 20 } } },
+        })).cat;
+        w.setRoot(cat);
+        _ = try w.commit();
+    }
+    // Deleting the row must record the collection trees as in-flight frees.
+    var w = try db.beginWrite();
+    defer w.deinit();
+    var out: [4]Value = undefined;
+    const ver = (try getTyped(&w, w.new_root, 1, &out)).?;
+    const before = w.in_flight_frees.items.len;
+    const res = try deleteTyped(&w, w.new_root, 1, ver);
+    try testing.expect(res == .ok);
+    // list tree + 2 element blobs + set tree + dict tree + 2 key blobs, plus
+    // the COW frees of the delete itself: well above the tombstone-only count.
+    try testing.expect(w.in_flight_frees.items.len >= before + 7);
+}
+
+test "updateTyped moves backlinks when a link value changes" {
+    // Regression: updateTyped encoded the new link into the column but never
+    // touched the backlink index, leaving the old target's set naming this
+    // source forever and the new target's set missing it.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "utyped_link.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    defer w.deinit();
+    var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
+    const a = try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .link = null } });
+    cat = a.cat;
+    const b = try insertTyped(&w, cat, &.{ .{ .int = 2 }, .{ .link = null } });
+    cat = b.cat;
+    const c = try insertTyped(&w, cat, &.{ .{ .int = 3 }, .{ .link = a.row } });
+    cat = c.cat;
+
+    var out: [2]Value = undefined;
+    const ver = (try getTyped(&w, cat, 3, &out)).?;
+    const res = try updateTyped(&w, cat, 3, &.{ .{ .int = 3 }, .{ .link = b.row } }, ver);
+    try testing.expect(res == .ok);
+    cat = res.ok.cat;
+
+    const links_mod = @import("links.zig");
+    try testing.expectEqual(@as(u64, 0), try links_mod.backlinkCount(&w, cat, 1, a.row));
+    try testing.expectEqual(@as(u64, 1), try links_mod.backlinkCount(&w, cat, 1, b.row));
+    // Deleting the NEW target nullifies the source's link.
+    var raw: [2]u64 = undefined;
+    const bv = (try getByPk(&w, cat, 2, &raw)).?;
+    cat = switch (try deleteAndNullify(&w, cat, 2, bv)) {
+        .ok => |x| x,
+        else => unreachable,
+    };
+    try testing.expectEqual(@as(?u64, null), try links_mod.getLink(&w, cat, 3, 1));
+}
+
+test "a multi-leaf value-index set is pruned and freed when emptied" {
+    // The single-leaf prune case is covered elsewhere; this drives the inner
+    // set past one leaf (>64 members) so freeTree's inner-node recursion runs.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "vidx_prune_big.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    defer w.deinit();
+    var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .int, .indexed = true } });
+    const n: u64 = 80;
+    var pk: u64 = 1;
+    while (pk <= n) : (pk += 1) cat = (try insert(&w, cat, &.{ pk, 7 })).cat;
+    var out: [2]u64 = undefined;
+    pk = 1;
+    while (pk <= n) : (pk += 1) {
+        const ver = (try getByPk(&w, cat, pk, &out)).?;
+        cat = (try delete(&w, cat, pk, ver)).ok;
+    }
+    const v = try loadCatalog(&w, cat);
+    try testing.expectEqual(@as(?u64, null), try Index.get(&w, v.valueIndexRef(1), 7));
+    try testing.expectEqual(@as(u64, 0), try Index.count(&w, v.valueIndexRef(1)));
+}
+
+test "an emptied value-index set is pruned from the outer index" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "vidx_prune.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+    var w = try db.beginWrite();
+    defer w.deinit();
+    var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .int, .indexed = true } });
+    cat = (try insert(&w, cat, &.{ 1, 10 })).cat;
+    cat = (try insert(&w, cat, &.{ 2, 10 })).cat;
+    // Delete both rows carrying value 10: the 10 entry must disappear entirely,
+    // not linger as an empty set.
+    var out: [2]u64 = undefined;
+    var pk: u64 = 1;
+    while (pk <= 2) : (pk += 1) {
+        const ver = (try getByPk(&w, cat, pk, &out)).?;
+        cat = (try delete(&w, cat, pk, ver)).ok;
+    }
+    const v = try loadCatalog(&w, cat);
+    try testing.expectEqual(@as(?u64, null), try Index.get(&w, v.valueIndexRef(1), 10));
+    try testing.expectEqual(@as(u64, 0), try Index.count(&w, v.valueIndexRef(1)));
+}
+
 test "non-indexed prop has no index" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1176,4 +1358,48 @@ test "reinserting a primary key after delete yields a new object key" {
     try testing.expect((try getByPk(&w, cat, 100, &out)) != null);
     try testing.expectEqual(@as(u64, 70), out[1]);
     w.deinit();
+}
+
+test "deleteTyped frees a self-referencing link_set root exactly once" {
+    // Regression: deleting a row whose link_set contained its own okey freed
+    // the set root twice. The inbound nullify removed okey from the row's own
+    // set -- a COW whose Index.remove freed the old root -- and the delete's
+    // storage reclamation then freed the same root again from the captured
+    // column raw, handing one extent to two future allocations. The nullify
+    // now leaves a self-sourced set untouched; no freed offset may repeat.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "selfset.airdb");
+    defer testing.allocator.free(path);
+    var db = try Db.create(testing.allocator, path);
+    defer db.deinit();
+
+    {
+        var w = try db.beginWrite();
+        var cat = try catalog.createDefs(&w, &.{
+            .{ .kind = .int },
+            .{ .kind = .link_set },
+        });
+        const ins = try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .link_set = &.{} } });
+        cat = ins.cat;
+        cat = try links.linkSetAdd(&w, cat, 1, 1, ins.row); // set contains own okey
+        w.setRoot(cat);
+        _ = try w.commit();
+    }
+    var w = try db.beginWrite();
+    defer w.deinit();
+    var out: [2]Value = undefined;
+    const ver = (try getTyped(&w, w.new_root, 1, &out)).?;
+    const res = try deleteTyped(&w, w.new_root, 1, ver);
+    try testing.expect(res == .ok);
+    var seen = std.AutoHashMap(u64, void).init(testing.allocator);
+    defer seen.deinit();
+    for (w.txn_reuse.extents.items) |e| {
+        const gop = try seen.getOrPut(e.offset);
+        try testing.expect(!gop.found_existing); // duplicate free
+    }
+    for (w.in_flight_frees.items) |e| {
+        const gop = try seen.getOrPut(e.offset);
+        try testing.expect(!gop.found_existing);
+    }
 }
