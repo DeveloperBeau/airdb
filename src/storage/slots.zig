@@ -1,13 +1,19 @@
 const std = @import("std");
 const Reference = @import("reference.zig").Reference;
 
+/// One of the two commit slots in the header page: the durable record of a
+/// committed version -- its version number, root ref, persisted free-list
+/// head, and logical file size -- protected by a CRC32.
 pub const Slot = struct {
     version: u64,
     rootRef: Reference,
     freeListRef: Reference,
     logicalSize: u64,
+    /// Encoded slot size in bytes: four u64 fields plus the CRC32.
     pub const size: usize = 36;
 
+    /// Encode the slot into `buffer` (at least `size` bytes), stamping a
+    /// CRC32 over the fields.
     pub fn encode(self: Slot, buffer: []u8) void {
         std.debug.assert(buffer.len >= size);
         std.mem.writeInt(u64, buffer[0..8], self.version, .little);
@@ -17,6 +23,8 @@ pub const Slot = struct {
         std.mem.writeInt(u32, buffer[32..36], std.hash.Crc32.hash(buffer[0..32]), .little);
     }
 
+    /// Decode a slot from `buffer`, verifying its CRC32; error.BadChecksum
+    /// when the stored checksum does not match the fields.
     pub fn decode(buffer: []const u8) error{BadChecksum}!Slot {
         std.debug.assert(buffer.len >= size);
         const stored = std.mem.readInt(u32, buffer[32..36], .little);

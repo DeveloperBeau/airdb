@@ -15,16 +15,23 @@ const maxPropertyCount = catalog.maxPropertyCount;
 const Pair = compactionCopy.Pair;
 const collectKeyRowPairs = compactionCopy.collectKeyRowPairs;
 
-// Cross-database row/value deep-copying lives in compactionCopy.zig;
-// re-exported here for the whole-file compaction callers below.
+/// Deep-copy one type's live rows into a fresh catalog in another database
+/// (re-exported from compactionCopy.zig for the whole-file compaction
+/// callers below).
 pub const copyTypeRows = compactionCopy.copyTypeRows;
+/// Rebuild a copied type's backlink indexes from its copied forward links
+/// (re-exported from compactionCopy.zig).
 pub const rebuildBacklinks = compactionCopy.rebuildBacklinks;
 
+/// Number of live rows in the type, counted from the key->row index (a
+/// single-node count read).
 pub fn liveCount(transaction: anytype, catalogRef: Reference) !u64 {
     const view = try catalog.loadCatalog(transaction, catalogRef);
     return Index.count(transaction, view.keyrowIndexRef);
 }
 
+/// True when more than half the type's physical rows are dead -- the packing
+/// trigger. Single-node reads, O(1).
 pub fn shouldCompact(transaction: anytype, catalogRef: Reference) !bool {
     const view = try catalog.loadCatalog(transaction, catalogRef);
     const nextRow = view.nextRow;
@@ -33,9 +40,10 @@ pub fn shouldCompact(transaction: anytype, catalogRef: Reference) !bool {
     return (nextRow - live) * 2 > nextRow; // more than half the rows are dead
 }
 
-// Rebuild the type's columns to contain only live rows, packed densely, and
-// remap the key->row index. Object keys, primaryKey index, and backlink indexes are
-// preserved (keyed by object key). Returns the new catalog ref.
+/// Rebuild the type's columns to contain only live rows, packed densely, and
+/// remap the key->row index. Object keys, primaryKey index, and backlink
+/// indexes are preserved (keyed by object key). Returns the new catalog ref.
+/// O(live rows x properties) column writes in one transaction.
 pub fn compactType(transaction: *WriteTransaction, catalogRef: Reference) !Reference {
     var snapshot = try catalog.CatalogSnapshot.load(transaction, catalogRef);
     const propertyCount = snapshot.propertyCount;
@@ -112,16 +120,16 @@ fn truncatePacked(transaction: *WriteTransaction, catalogRef: Reference, newLen:
     return snapshot.replace(transaction);
 }
 
-// Two-pointer packing cursor for one in-flight compaction run. liveCount and
-// nextRow pin the run to a specific catalog shape: if either changes between
-// steps (churn inserted/deleted/relocated rows), the stored cursor is stale and
-// must be discarded. holeLo scans upward through [0, liveCount) seeking dead
-// relocation targets; highHi scans downward from nextRow toward liveCount
-// seeking live rows that must move down. Both advance monotonically across
-// steps so no slot is ever revisited (relocateRow is not idempotent).
-//
-// The struct itself lives on the Database (the cursor persists across the write
-// transactions of one packing run), so its definition is in database.zig.
+/// Two-pointer packing cursor for one in-flight compaction run. liveCount and
+/// nextRow pin the run to a specific catalog shape: if either changes between
+/// steps (churn inserted/deleted/relocated rows), the stored cursor is stale and
+/// must be discarded. holeLo scans upward through [0, liveCount) seeking dead
+/// relocation targets; highHi scans downward from nextRow toward liveCount
+/// seeking live rows that must move down. Both advance monotonically across
+/// steps so no slot is ever revisited (relocateRow is not idempotent).
+///
+/// The struct itself lives on the Database (the cursor persists across the write
+/// transactions of one packing run), so its definition is in database.zig.
 pub const CompactCursor = @import("../database.zig").CompactCursor;
 
 // Map a physical row to its stable object key. There is no reverse key->row
@@ -162,31 +170,31 @@ fn advanceHighCursor(transaction: *WriteTransaction, catalogRef: Reference, live
     while (cursor.highHi > liveRowCount and (try Column.get(transaction, view.liveColRef, cursor.highHi - 1)) == 0) : (cursor.highHi -= 1) {}
 }
 
-// Incrementally pack a type toward dense storage, doing at most `budget`
-// relocations per call, using a budget-proportional two-pointer tail scan
-// instead of a full index walk.
-//
-// `holeLo` advances upward through [0, liveCount) to find dead slots
-// (relocation targets); `highHi` advances downward from nextRow toward
-// liveCount to find live rows at physical index >= liveCount (rows that must
-// move down). Each paired (hole, high row) is relocated via relocateRow, up to
-// `budget` times; both cursors then step past the consumed slots. The cursor is
-// persisted on the Database so the next call resumes where this one stopped.
-//
-// Reset rule (data-loss-critical): the cursor is only resumed when the freshly
-// loaded liveCount AND nextRow match the stored ones. Any mismatch -- or no
-// stored cursor -- restarts the scan from holeLo=0, highHi=nextRow. This
-// guarantees a stale cursor (from churn between steps) can never be trusted.
-//
-// Truncation guard (the no-data-loss line): the dead tail [liveCount, nextRow)
-// is truncated, and `done` reported, ONLY when `highHi <= liveCount` -- i.e.
-// the downward cursor has examined the ENTIRE range above liveCount and every
-// live row it found was relocated (relocating a high row flips it dead, then the
-// cursor steps past it). This is equivalent in safety to the old
-// "all collected high rows moved" guard: both certify that no live row remains
-// in [liveCount, nextRow) before the truncate. A debug-only bounded scan
-// asserts exactly that immediately before truncating. Returns the updated
-// catalog ref, the rows moved this call, and whether packing finished.
+/// Incrementally pack a type toward dense storage, doing at most `budget`
+/// relocations per call, using a budget-proportional two-pointer tail scan
+/// instead of a full index walk.
+///
+/// `holeLo` advances upward through [0, liveCount) to find dead slots
+/// (relocation targets); `highHi` advances downward from nextRow toward
+/// liveCount to find live rows at physical index >= liveCount (rows that must
+/// move down). Each paired (hole, high row) is relocated via relocateRow, up to
+/// `budget` times; both cursors then step past the consumed slots. The cursor is
+/// persisted on the Database so the next call resumes where this one stopped.
+///
+/// Reset rule (data-loss-critical): the cursor is only resumed when the freshly
+/// loaded liveCount AND nextRow match the stored ones. Any mismatch -- or no
+/// stored cursor -- restarts the scan from holeLo=0, highHi=nextRow. This
+/// guarantees a stale cursor (from churn between steps) can never be trusted.
+///
+/// Truncation guard (the no-data-loss line): the dead tail [liveCount, nextRow)
+/// is truncated, and `done` reported, ONLY when `highHi <= liveCount` -- i.e.
+/// the downward cursor has examined the ENTIRE range above liveCount and every
+/// live row it found was relocated (relocating a high row flips it dead, then the
+/// cursor steps past it). This is equivalent in safety to the old
+/// "all collected high rows moved" guard: both certify that no live row remains
+/// in [liveCount, nextRow) before the truncate. A debug-only bounded scan
+/// asserts exactly that immediately before truncating. Returns the updated
+/// catalog ref, the rows moved this call, and whether packing finished.
 pub fn compactStep(transaction: *WriteTransaction, catalogRef: Reference, typeId: u16, budget: usize) !struct { catalogRef: Reference, moved: usize, done: bool } {
     var currentCatalog = catalogRef;
     const liveRows = try liveCount(transaction, currentCatalog);
@@ -247,6 +255,8 @@ pub fn compactStep(transaction: *WriteTransaction, catalogRef: Reference, typeId
 // Full-file compaction with a verify-before-swap equivalence gate.
 // ---------------------------------------------------------------------------
 
+/// Verification failure: the compacted copy did not match the source, so the
+/// swap was refused.
 pub const CompactionError = error{CompactionMismatch};
 
 // Order-independent 64-bit mix of a primary key, folded with XOR so the running
@@ -370,10 +380,12 @@ fn verifyEquivalent(allocator: std.mem.Allocator, source: anytype, srcDir: Refer
     }
 }
 
-// Copy a database's live data into a brand-new file (an on-disk shrink),
-// preserving object keys, primary keys, links, and backlinks. Before the new
-// file is published (committed) it is verified equivalent to the source; on any
-// mismatch the destination is discarded uncommitted and the error propagates.
+/// Copy a database's live data into a brand-new file (an on-disk shrink),
+/// preserving object keys, primary keys, links, and backlinks. Before the new
+/// file is published (committed) it is verified equivalent to the source; on
+/// any mismatch the destination is discarded uncommitted and the error
+/// propagates. Heavy I/O: opens both databases and reads every live row twice
+/// (copy, then verify).
 pub fn compactToNewFile(allocator: std.mem.Allocator, srcPath: []const u8, dstPath: []const u8) !void {
     var sourceDatabase = try @import("../database.zig").Database.open(allocator, srcPath);
     defer sourceDatabase.deinit();
@@ -436,23 +448,24 @@ pub fn compactToNewFile(allocator: std.mem.Allocator, srcPath: []const u8, dstPa
 
 const Io = std.Io;
 
-// Compact a database file in place, crash-safely.
-//
-// The live data is first compacted into a sibling temp file "<path>.compacting"
-// (written, verified equivalent, committed, and fsync'd by compactToNewFile),
-// then the temp data file is atomically renamed over the original. The rename is
-// the single publish point: a crash BEFORE it leaves the original `path`
-// completely untouched (the orphan `.compacting` temp is simply overwritten on
-// the next run); a crash AFTER it leaves the new compacted file in place, and
-// the coord is recreated on the next Database.open.
-//
-// After the rename the stale coordination files are removed so the next open
-// recreates "<path>.coord" fresh: the old coord describes the pre-compaction
-// data file, and the temp's coord is orphaned once its data file is renamed away.
-//
-// `path` must be ABSOLUTE. The caller must close ALL handles to the database
-// (and end any read/write transactions) before calling this -- there must be no
-// other open Database on `path` while it is replaced.
+/// Compact a database file in place, crash-safely. Heavy I/O: a full copy,
+/// verify, fsync, and rename.
+///
+/// The live data is first compacted into a sibling temp file "<path>.compacting"
+/// (written, verified equivalent, committed, and fsync'd by compactToNewFile),
+/// then the temp data file is atomically renamed over the original. The rename is
+/// the single publish point: a crash BEFORE it leaves the original `path`
+/// completely untouched (the orphan `.compacting` temp is simply overwritten on
+/// the next run); a crash AFTER it leaves the new compacted file in place, and
+/// the coord is recreated on the next Database.open.
+///
+/// After the rename the stale coordination files are removed so the next open
+/// recreates "<path>.coord" fresh: the old coord describes the pre-compaction
+/// data file, and the temp's coord is orphaned once its data file is renamed away.
+///
+/// `path` must be ABSOLUTE. The caller must close ALL handles to the database
+/// (and end any read/write transactions) before calling this -- there must be no
+/// other open Database on `path` while it is replaced.
 pub fn compactInPlace(allocator: std.mem.Allocator, path: []const u8) !void {
     // Build "<path>.compacting" temp path.
     const tmp = try std.fmt.allocPrint(allocator, "{s}.compacting", .{path});

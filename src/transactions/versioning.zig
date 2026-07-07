@@ -1,11 +1,11 @@
-// versioning.zig -- commit-slot selection, version adoption, reader pins, and
-// the shared retention window for a Database.
-//
-// These free functions implement the version/pin machinery behind database.zig's
-// public surface: which commit slot is authoritative after a crash, when an
-// instance may adopt a newer published version, how reader pins are advertised
-// to other processes, and how far back point-in-time reads may reach. database.zig
-// keeps thin public delegates for the caller-facing pieces.
+//! Commit-slot selection, version adoption, reader pins, and
+//! the shared retention window for a Database.
+//!
+//! These free functions implement the version/pin machinery behind database.zig's
+//! public surface: which commit slot is authoritative after a crash, when an
+//! instance may adopt a newer published version, how reader pins are advertised
+//! to other processes, and how far back point-in-time reads may reach. database.zig
+//! keeps thin public delegates for the caller-facing pieces.
 
 const std = @import("std");
 const testing = std.testing;

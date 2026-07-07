@@ -1,12 +1,18 @@
 const std = @import("std");
 
+/// Kind byte of a generic storage node: leaf values, inner refs, or raw bytes.
 pub const NodeKind = enum(u8) { leafValues, innerRefs, rawBytes };
 
+/// The header every generic storage node starts with: a kind byte plus a
+/// little-endian element count.
 pub const NodeHeader = struct {
     kind: NodeKind,
     elementCount: u32,
-    pub const size: usize = 5; // [kind:u8][elementCount:u32 LE]
+    /// Encoded header size: [kind:u8][elementCount:u32 LE].
+    pub const size: usize = 5;
 
+    /// Encode the header into the first `size` bytes of `buffer` (the caller
+    /// supplies at least `size` bytes).
     pub fn encode(buffer: []u8, header: NodeHeader) EncodeResult {
         // Caller must provide >= size bytes. Under ReleaseSafe (this project's build mode) this assert is a safe trap, not UB.
         std.debug.assert(buffer.len >= size);
@@ -14,17 +20,22 @@ pub const NodeHeader = struct {
         std.mem.writeInt(u32, buffer[1..5], header.elementCount, .little);
         return .{ .headerLen = size };
     }
+    /// The encoded header length, with a helper to size the full node.
     pub const EncodeResult = struct {
         headerLen: usize,
+        /// Total node length: the header plus a `payloadLen`-byte payload.
         pub fn totalLenWithPayload(self: EncodeResult, payloadLen: usize) usize {
             return self.headerLen + payloadLen;
         }
     };
 };
 
+/// A parsed node: its header plus the payload slice that follows it.
 pub const NodeView = struct {
     header: NodeHeader,
     payload: []const u8,
+    /// Validate and split `bytes` into header and payload; error.Corrupt on a
+    /// short buffer or an out-of-range kind byte.
     pub fn parse(bytes: []const u8) error{Corrupt}!NodeView {
         if (bytes.len < NodeHeader.size) return error.Corrupt;
         const rawKind = bytes[0];

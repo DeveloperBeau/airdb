@@ -1,10 +1,10 @@
-// compactionCopy.zig -- deep-copying live rows and values between databases.
-//
-// This is the per-value/per-row copy machinery behind full-file compaction
-// (compaction.compactToNewFile): copying a single property value across
-// databases (including blobs, lists, sets, dicts, and link sets), copying all
-// live rows of one type into a fresh destination catalog, and rebuilding the
-// destination's backlink indexes from its copied forward links.
+//! Deep-copying of live rows and values between databases.
+//!
+//! This is the per-value/per-row copy machinery behind full-file compaction
+//! (compaction.compactToNewFile): copying a single property value across
+//! databases (including blobs, lists, sets, dicts, and link sets), copying all
+//! live rows of one type into a fresh destination catalog, and rebuilding the
+//! destination's backlink indexes from its copied forward links.
 
 const std = @import("std");
 const WriteTransaction = @import("../database.zig").WriteTransaction;

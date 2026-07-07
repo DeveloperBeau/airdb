@@ -1,38 +1,41 @@
-// coordination.zig -- coordination file for multi-process attach/detach and latest-version signal.
-//
-// Layout (4096-byte mmap'd file):
-//   [0..8]   magic        u64 LE  (coordMagic)
-//   [8..12]  attachCount u32     (atomic, 4-aligned)
-//   [12..16] reserved     (zero)
-//   [16..24] latestVersion   u64     (atomic, 8-aligned)
-//   [24..64] reserved     (zero)
-//   [64..1088] participant slots  64 x 16 bytes each
-//              slot layout: [pid u32 @+0][startToken u32 @+4][minPinned u64 @+8]
-//              pid==0 means slot is free; minPinned==sentinelMax means "pins
-//              nothing". startToken is the (truncated) process start time of
-//              the claimer: a recycled pid alone cannot keep a dead reader's
-//              slot alive, the incarnation must match too.
-//
-// Zig 0.16 notes (same adaptations as fileStore.zig):
-//   - File I/O via std.Io.File and std.Io.Dir.*Absolute(io, path, .{})
-//   - mmap PROT flags: .{ .READ = true, .WRITE = true }
-//   - mmap flags:      .{ .TYPE = .SHARED }
-//   - mmap return:     []align(std.heap.page_size_min) u8
-//   - File.length(io), File.setLength(io, n), File.close(io)
+//! Coordination file for multi-process attach/detach and latest-version signal.
+//!
+//! Layout (4096-byte mmap'd file):
+//!   [0..8]   magic        u64 LE  (coordMagic)
+//!   [8..12]  attachCount u32     (atomic, 4-aligned)
+//!   [12..16] reserved     (zero)
+//!   [16..24] latestVersion   u64     (atomic, 8-aligned)
+//!   [24..64] reserved     (zero)
+//!   [64..1088] participant slots  64 x 16 bytes each
+//!              slot layout: [pid u32 @+0][startToken u32 @+4][minPinned u64 @+8]
+//!              pid==0 means slot is free; minPinned==sentinelMax means "pins
+//!              nothing". startToken is the (truncated) process start time of
+//!              the claimer: a recycled pid alone cannot keep a dead reader's
+//!              slot alive, the incarnation must match too.
+//!
+//! Zig 0.16 notes (same adaptations as fileStore.zig):
+//!   - File I/O via std.Io.File and std.Io.Dir.*Absolute(io, path, .{})
+//!   - mmap PROT flags: .{ .READ = true, .WRITE = true }
+//!   - mmap flags:      .{ .TYPE = .SHARED }
+//!   - mmap return:     []align(std.heap.page_size_min) u8
+//!   - File.length(io), File.setLength(io, n), File.close(io)
 
 const std = @import("std");
 const platform = @import("../platform.zig");
 
+/// The blocking Io instance used for all coord-file operations.
 pub fn coordIo() std.Io {
     return std.Io.Threaded.global_single_threaded.io();
 }
 
+/// Magic stamped at offset 0 once a coord file is fully initialized.
 pub const coordMagic: u64 = 0x6169726462_4300;
 const coordSize: usize = 4096;
 const offMagic: usize = 0; // u64
 const offAttach: usize = 8; // u32 atomic, 4-aligned
 const offLatest: usize = 16; // u64 atomic, 8-aligned
 
+/// "Pins nothing" sentinel for a participant slot's minPinned field.
 pub const sentinelMax: u64 = std.math.maxInt(u64);
 const participantSlots: usize = 64;
 const participantsOff: usize = 64;
@@ -48,6 +51,10 @@ fn pidAlive(pid: u32) bool {
     return platform.processAlive(pid);
 }
 
+/// The mmap'd coordination page shared by every process attached to one
+/// database: attach count, latest committed version, the cross-process write
+/// lock, and 64 participant slots publishing reader pins for the reclaim
+/// horizon.
 pub const Coordination = struct {
     file: std.Io.File,
     section: platform.Section,
@@ -101,6 +108,7 @@ pub const Coordination = struct {
         return Coordination{ .file = file, .section = section, .map = map };
     }
 
+    /// Unmap the coord page and close the file.
     pub fn deinit(self: *Coordination) void {
         self.section.unmap();
         self.file.close(coordIo());
@@ -220,18 +228,16 @@ pub const Coordination = struct {
         @atomicStore(u64, self.slotMinPtr(slotIndex), version, .seq_cst);
     }
 
+    /// Test-only: the raw minPinned published by slot `slotIndex`.
     pub fn slotMinPinnedForTest(self: *Coordination, slotIndex: usize) u64 {
         return @atomicLoad(u64, self.slotMinPtr(slotIndex), .acquire);
     }
 
+    /// Test-only: the raw pid recorded in slot `slotIndex` (0 when free).
     pub fn slotPidForTest(self: *Coordination, slotIndex: usize) u32 {
         return @atomicLoad(u32, self.slotPidPtr(slotIndex), .seq_cst);
     }
 
-    /// Compute the global reclaim horizon: the minimum minPinned across all
-    /// live participant slots. Slots whose process no longer exists are
-    /// reclaimed (pid zeroed) in the same pass. Returns `fallback` if no
-    /// live slot publishes a pinned version below it.
     // Free a dead or recycled slot, but ONLY if it still holds the exact
     // (pid, token) word the caller sampled. The liveness verdict spans
     // syscalls, and in that window the dead owner's slot can be released and
@@ -249,6 +255,11 @@ pub const Coordination = struct {
         _ = @cmpxchgStrong(u64, self.slotClaimPtr(slotIndex), sampledWord, 0, .seq_cst, .seq_cst);
     }
 
+    /// Compute the global reclaim horizon: the minimum minPinned across all
+    /// live participant slots, or `fallback` if no live slot publishes a
+    /// pinned version below it. Slots whose process no longer exists are
+    /// reclaimed in the same pass. O(slots), with a pid-liveness (and
+    /// possibly incarnation) syscall per occupied slot.
     pub fn globalHorizon(self: *Coordination, fallback: u64) u64 {
         var minV: u64 = fallback;
         var slotIndex: usize = 0;

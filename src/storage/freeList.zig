@@ -1,5 +1,8 @@
 const std = @import("std");
 
+/// One reclaimable byte range: its arena offset, its (8-byte-rounded) length,
+/// and the version whose commit freed it -- reusable only once no reader pins
+/// a version at or below freedVersion.
 pub const FreeExtent = struct { offset: u64, len: u64, freedVersion: u64 };
 const extentBytes: usize = 24;
 
@@ -13,6 +16,9 @@ fn round8(size: u64) u64 {
     return (size + 7) & ~@as(u64, 7);
 }
 
+/// The in-memory pool of reclaimable extents, bucketed by exact 8-byte size
+/// class so the copy-on-write allocation path reuses space with an O(1)
+/// bucket probe instead of a scan.
 pub const FreeList = struct {
     allocator: std.mem.Allocator,
     extents: std.ArrayList(FreeExtent),
@@ -28,6 +34,7 @@ pub const FreeList = struct {
     /// copy-on-write node write.
     bySize: std.AutoHashMap(u64, std.ArrayList(usize)),
 
+    /// An empty free list whose bookkeeping lives in `allocator`.
     pub fn init(allocator: std.mem.Allocator) FreeList {
         return .{
             .allocator = allocator,
@@ -37,6 +44,7 @@ pub const FreeList = struct {
         };
     }
 
+    /// Release the extent list, back-pointers, and size-class buckets.
     pub fn deinit(self: *FreeList) void {
         var iterator = self.bySize.valueIterator();
         while (iterator.next()) |list| list.deinit(self.allocator);
@@ -81,6 +89,8 @@ pub const FreeList = struct {
         while (iterator.next()) |list| list.clearRetainingCapacity();
     }
 
+    /// Record `extent` as reclaimable, rounding its length up to the 8-byte
+    /// size class; a zero-length extent is ignored. Amortized O(1).
     pub fn add(self: *FreeList, extent: FreeExtent) !void {
         if (extent.len == 0) return;
         const rounded = FreeExtent{ .offset = extent.offset, .len = round8(extent.len), .freedVersion = extent.freedVersion };
@@ -91,13 +101,15 @@ pub const FreeList = struct {
         try self.bucketAdd(rounded.len, self.extents.items.len - 1);
     }
 
-    // The persisted free list is a CHAIN of bounded chunks, not one node: a
-    // single node's size grows with the extent count, and once heavy churn
-    // pushed the list past the 16 MiB section cap the commit-path allocation
-    // died with error.AllocTooLarge -- an unrecoverable commit failure.
-    //
-    // Chunk layout: [count u32 LE][nextRef u64 LE] then
-    // count * ([offset u64][length u64][freedVersion u64]) LE.
+    /// Byte size of a persisted chunk's [count u32 LE][nextRef u64 LE] header.
+    ///
+    /// The persisted free list is a CHAIN of bounded chunks, not one node: a
+    /// single node's size grows with the extent count, and once heavy churn
+    /// pushed the list past the 16 MiB section cap the commit-path allocation
+    /// died with error.AllocTooLarge -- an unrecoverable commit failure.
+    ///
+    /// Chunk layout: [count u32 LE][nextRef u64 LE] then
+    /// count * ([offset u64][length u64][freedVersion u64]) LE.
     pub const chunkHeaderBytes: usize = 12;
     /// Extents per chunk: 12 + 65_536 * 24 bytes keeps every chunk allocation
     /// near 1.5 MiB, far below the section size.
@@ -105,10 +117,13 @@ pub const FreeList = struct {
     /// Chain-walk bound (cycle guard); supports ~68 billion extents.
     pub const maxChunks: usize = 1 << 20;
 
+    /// Encoded byte length of a chunk holding `count` extents.
     pub fn chunkByteLen(count: usize) usize {
         return chunkHeaderBytes + count * extentBytes;
     }
 
+    /// Encode `extents` plus the next chunk's ref into `buffer` as one chunk;
+    /// returns the encoded byte length. O(extents).
     pub fn encodeChunk(extents: []const FreeExtent, nextRef: u64, buffer: []u8) usize {
         std.debug.assert(buffer.len >= chunkByteLen(extents.len));
         std.mem.writeInt(u32, buffer[0..4], @intCast(extents.len), .little);

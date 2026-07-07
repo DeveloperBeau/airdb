@@ -1,19 +1,19 @@
-// fileStore.zig -- header, mmap, and injectable Syncing for airdb.
-//
-// Zig 0.16 adaptations from the task spec:
-//   - std.fs.File           -> std.Io.File  (std.fs.File removed in 0.16)
-//   - std.fs.createFileAbsolute/openFileAbsolute
-//                           -> std.Io.Dir.createFileAbsolute/openFileAbsolute(io, ...)
-//   - File.setEndPos(n)     -> File.setLength(io, n)
-//   - File.getEndPos()      -> File.length(io) -> u64
-//   - File.sync()           -> File.sync(io)
-//   - File.close()          -> File.close(io)
-//   - mmap alignment        -> []align(std.heap.page_size_min) u8
-//   - mmap flags            -> .{ .TYPE = .SHARED } (not .SHARED = true)
-//   - page-size constant    -> std.heap.page_size_min (compile-time lower bound)
-//   - Dir.realpathAlloc     -> Dir.realPath(io, buffer) with stack buffer
-//   - Io instance           -> std.Io.Threaded.global_single_threaded.io()
-//       (always initialized; works in both test and production contexts)
+//! Header, mmap, and injectable Syncing for airdb.
+//!
+//! Zig 0.16 API adaptations used throughout:
+//!   - std.fs.File           -> std.Io.File  (std.fs.File removed in 0.16)
+//!   - std.fs.createFileAbsolute/openFileAbsolute
+//!                           -> std.Io.Dir.createFileAbsolute/openFileAbsolute(io, ...)
+//!   - File.setEndPos(n)     -> File.setLength(io, n)
+//!   - File.getEndPos()      -> File.length(io) -> u64
+//!   - File.sync()           -> File.sync(io)
+//!   - File.close()          -> File.close(io)
+//!   - mmap alignment        -> []align(std.heap.page_size_min) u8
+//!   - mmap flags            -> .{ .TYPE = .SHARED } (not .SHARED = true)
+//!   - page-size constant    -> std.heap.page_size_min (compile-time lower bound)
+//!   - Dir.realpathAlloc     -> Dir.realPath(io, buffer) with stack buffer
+//!   - Io instance           -> std.Io.Threaded.global_single_threaded.io()
+//!       (always initialized; works in both test and production contexts)
 
 const std = @import("std");
 const testing = std.testing;
@@ -26,17 +26,22 @@ const FileSyncer = @import("syncer.zig").FileSyncer;
 // Public constants
 // ---------------------------------------------------------------------------
 
-// _0002: the free list is persisted as a chain of bounded chunks
-// ([count u32][nextRef u64][extents...]), not a single unbounded node.
+/// File magic doubling as the format version ("airdb" + _NNNN).
+/// _0002: the free list is persisted as a chain of bounded chunks
+/// ([count u32][nextRef u64][extents...]), not a single unbounded node.
 pub const airdbMagic: u64 = 0x6169726462_0002;
+/// Size of the header page; the header and both commit slots live in it.
 pub const defaultPageSize: u32 = 4096;
 
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
 
+/// On-disk byte-order marker recorded in the header (only .little is accepted).
 pub const Endianness = enum(u8) { little = 1, big = 2 };
 
+/// The decoded fixed file header: magic, page size, endianness, the active
+/// commit slot, and the logical (in-use) file size.
 pub const Header = struct {
     magic: u64,
     pageSize: u32,
@@ -49,6 +54,8 @@ pub const Header = struct {
 // FileStore
 // ---------------------------------------------------------------------------
 
+/// The mapped database file: owns the file handle, the append-only section
+/// mappings, the parsed header, and the injected durability barrier.
 pub const FileStore = struct {
     allocator: std.mem.Allocator, // reserved for future allocations (buffer pool, catalog pages)
     file: Io.File,
@@ -204,6 +211,10 @@ pub const FileStore = struct {
         std.mem.writeInt(u32, self.map[offset.checksum..][0..4], crc, .little);
     }
 
+    /// Parse and validate the header from the mapping: a wrong magic or
+    /// endianness is a hard error, while the CRC32 verdict is only recorded
+    /// in headerChecksumOk (never a failure) so database recovery can decide
+    /// whether to trust activeSlot.
     pub fn readHeader(self: *FileStore) !void {
         if (self.map.len < defaultPageSize) return error.Corrupt;
 
@@ -283,8 +294,9 @@ pub const FileStore = struct {
         return self.sections.items;
     }
 
-    /// Re-encode header fields into the mmap'd page (does not flush).
-    // Writes the in-memory header into the mmap'd buffer. Durability requires a subsequent Syncing.flush.
+    /// Re-encode the in-memory header into the mmap'd page and mark the
+    /// checksum valid. Does not flush: durability requires a subsequent
+    /// Syncing.flush.
     pub fn persistHeader(self: *FileStore) void {
         self.writeHeader();
         self.headerChecksumOk = true;
