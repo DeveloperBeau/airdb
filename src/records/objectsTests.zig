@@ -13,7 +13,7 @@ const loadCatalog = catalog.loadCatalog;
 const insert = rows.insert;
 const update = rows.update;
 const delete = rows.delete;
-const getByPk = rows.getByPk;
+const getByPrimaryKey = rows.getByPrimaryKey;
 const getByObjectKey = rows.getByObjectKey;
 const insertTyped = objects.insertTyped;
 const getTyped = objects.getTyped;
@@ -68,7 +68,7 @@ test "insert rejects a duplicate primary key" {
     w.deinit();
 }
 
-test "getByPk reads property values and the row version" {
+test "getByPrimaryKey reads property values and the row version" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "obj3.airdb");
@@ -81,12 +81,12 @@ test "getByPk reads property values and the row version" {
     catalogRef = (try insert(&w, catalogRef, &.{ 200, 8, 0 })).catalogRef;
 
     var out: [3]u64 = undefined;
-    const ver = try getByPk(&w, catalogRef, 200, &out);
+    const ver = try getByPrimaryKey(&w, catalogRef, 200, &out);
     try testing.expect(ver != null);
     try testing.expectEqual(@as(u64, 200), out[0]);
     try testing.expectEqual(@as(u64, 8), out[1]);
     try testing.expectEqual(@as(u64, 0), out[2]);
-    try testing.expectEqual(@as(?u64, null), try getByPk(&w, catalogRef, 999, &out));
+    try testing.expectEqual(@as(?u64, null), try getByPrimaryKey(&w, catalogRef, 999, &out));
     w.deinit();
 }
 
@@ -109,7 +109,7 @@ test "update applies on a matching version" {
     {
         var r = try database.beginRead();
         var out: [3]u64 = undefined;
-        fetched_version = (try getByPk(&r, r.root(), 100, &out)).?;
+        fetched_version = (try getByPrimaryKey(&r, r.root(), 100, &out)).?;
         r.end();
     }
     {
@@ -123,7 +123,7 @@ test "update applies on a matching version" {
     {
         var r = try database.beginRead();
         var out: [3]u64 = undefined;
-        _ = try getByPk(&r, r.root(), 100, &out);
+        _ = try getByPrimaryKey(&r, r.root(), 100, &out);
         try testing.expectEqual(@as(u64, 77), out[1]);
         r.end();
     }
@@ -146,7 +146,7 @@ test "update copies only the columns whose value changed" {
     const col2 = before.propColRef(2);
 
     var out: [3]u64 = undefined;
-    const ver = (try getByPk(&w, catalogRef, 1, &out)).?;
+    const ver = (try getByPrimaryKey(&w, catalogRef, 1, &out)).?;
     const res = try update(&w, catalogRef, 1, &.{ 1, 99, 20 }, ver);
     try testing.expect(res == .ok);
     catalogRef = res.ok.catalogRef;
@@ -157,7 +157,7 @@ test "update copies only the columns whose value changed" {
     try testing.expectEqual(col2, after.propColRef(2));
     // The changed column was rewritten.
     try testing.expect(after.propColRef(1) != col1);
-    _ = (try getByPk(&w, catalogRef, 1, &out)).?;
+    _ = (try getByPrimaryKey(&w, catalogRef, 1, &out)).?;
     try testing.expectEqual(@as(u64, 99), out[1]);
     try testing.expectEqual(@as(u64, 20), out[2]);
     w.deinit();
@@ -182,7 +182,7 @@ test "update conflicts on a stale version" {
     {
         var r = try database.beginRead();
         var out: [3]u64 = undefined;
-        fetched_version = (try getByPk(&r, r.root(), 100, &out)).?;
+        fetched_version = (try getByPrimaryKey(&r, r.root(), 100, &out)).?;
         r.end();
     }
     {
@@ -208,7 +208,7 @@ test "delete conflicts on a stale version" {
     catalogRef = (try insert(&w, catalogRef, &.{ 100, 7, 1 })).catalogRef;
     catalogRef = (try insert(&w, catalogRef, &.{ 200, 8, 0 })).catalogRef;
     var out: [3]u64 = undefined;
-    const v100 = (try getByPk(&w, catalogRef, 100, &out)).?;
+    const v100 = (try getByPrimaryKey(&w, catalogRef, 100, &out)).?;
     const stale = try delete(&w, catalogRef, 100, v100 + 1);
     try testing.expect(stale == .conflict);
     w.deinit();
@@ -226,11 +226,11 @@ test "delete tombstones a row" {
     catalogRef = (try insert(&w, catalogRef, &.{ 100, 7, 1 })).catalogRef;
     catalogRef = (try insert(&w, catalogRef, &.{ 200, 8, 0 })).catalogRef;
     var out: [3]u64 = undefined;
-    const v100 = (try getByPk(&w, catalogRef, 100, &out)).?;
+    const v100 = (try getByPrimaryKey(&w, catalogRef, 100, &out)).?;
     const ok = try delete(&w, catalogRef, 100, v100);
     try testing.expect(ok == .ok);
     catalogRef = ok.ok;
-    try testing.expectEqual(@as(?u64, null), try getByPk(&w, catalogRef, 100, &out));
+    try testing.expectEqual(@as(?u64, null), try getByPrimaryKey(&w, catalogRef, 100, &out));
     try testing.expectEqual(@as(u64, 1), try liveCount(&w, catalogRef));
     w.deinit();
 }
@@ -247,9 +247,9 @@ test "a deleted primary key can be reinserted" {
     catalogRef = (try insert(&w, catalogRef, &.{ 100, 7, 1 })).catalogRef;
     catalogRef = (try insert(&w, catalogRef, &.{ 200, 8, 0 })).catalogRef;
     var out: [3]u64 = undefined;
-    const v100 = (try getByPk(&w, catalogRef, 100, &out)).?;
+    const v100 = (try getByPrimaryKey(&w, catalogRef, 100, &out)).?;
     catalogRef = (try delete(&w, catalogRef, 100, v100)).ok;
-    // pk 100 can be reinserted after deletion
+    // primaryKey 100 can be reinserted after deletion
     catalogRef = (try insert(&w, catalogRef, &.{ 100, 70, 1 })).catalogRef;
     try testing.expectEqual(@as(u64, 2), try liveCount(&w, catalogRef));
     w.deinit();
@@ -264,7 +264,7 @@ test "objects persist across commit and reopen" {
         var database = try Database.create(testing.allocator, path);
         defer database.deinit();
         var w = try database.beginWrite();
-        var catalogRef = try create(&w, 2); // pk + one value
+        var catalogRef = try create(&w, 2); // primaryKey + one value
         var i: u64 = 0;
         while (i < 1000) : (i += 1) catalogRef = (try insert(&w, catalogRef, &.{ i, i * 2 })).catalogRef;
         w.setRoot(catalogRef);
@@ -276,10 +276,10 @@ test "objects persist across commit and reopen" {
         var r = try database.beginRead();
         try testing.expectEqual(@as(u64, 1000), try liveCount(&r, r.root()));
         var out: [2]u64 = undefined;
-        _ = (try getByPk(&r, r.root(), 777, &out)).?;
+        _ = (try getByPrimaryKey(&r, r.root(), 777, &out)).?;
         try testing.expectEqual(@as(u64, 777), out[0]);
         try testing.expectEqual(@as(u64, 1554), out[1]);
-        try testing.expectEqual(@as(?u64, null), try getByPk(&r, r.root(), 5000, &out));
+        try testing.expectEqual(@as(?u64, null), try getByPrimaryKey(&r, r.root(), 5000, &out));
         r.end();
     }
 }
@@ -289,7 +289,7 @@ test "100k objects with updates and deletes match a reference map after reopen" 
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "obj7.airdb");
     defer testing.allocator.free(path);
-    var ref = std.AutoHashMap(u64, u64).init(testing.allocator); // pk -> prop1 value, live only
+    var ref = std.AutoHashMap(u64, u64).init(testing.allocator); // primaryKey -> prop1 value, live only
     defer ref.deinit();
     const N: u64 = 100_000;
     {
@@ -300,26 +300,26 @@ test "100k objects with updates and deletes match a reference map after reopen" 
         var out: [2]u64 = undefined;
         var i: u64 = 0;
         while (i < N) : (i += 1) {
-            const pk = (i *% 2654435761) % 5_000_011;
-            if ((try getByPk(&w, catalogRef, pk, &out)) != null) continue; // skip hash collision (dup pk)
-            catalogRef = (try insert(&w, catalogRef, &.{ pk, i })).catalogRef;
-            try ref.put(pk, i);
+            const primaryKey = (i *% 2654435761) % 5_000_011;
+            if ((try getByPrimaryKey(&w, catalogRef, primaryKey, &out)) != null) continue; // skip hash collision (dup primaryKey)
+            catalogRef = (try insert(&w, catalogRef, &.{ primaryKey, i })).catalogRef;
+            try ref.put(primaryKey, i);
         }
         // Snapshot the live keys, then update every 5th and delete every 7th.
         var keys = std.ArrayList(u64).empty;
         defer keys.deinit(testing.allocator);
         var kit = ref.keyIterator();
         while (kit.next()) |k| try keys.append(testing.allocator, k.*);
-        for (keys.items, 0..) |pk, idx| {
-            const ver = (try getByPk(&w, catalogRef, pk, &out)).?;
+        for (keys.items, 0..) |primaryKey, idx| {
+            const ver = (try getByPrimaryKey(&w, catalogRef, primaryKey, &out)).?;
             if (idx % 5 == 0) {
-                const res = try update(&w, catalogRef, pk, &.{ pk, out[1] +% 1 }, ver);
+                const res = try update(&w, catalogRef, primaryKey, &.{ primaryKey, out[1] +% 1 }, ver);
                 catalogRef = res.ok.catalogRef;
-                try ref.put(pk, out[1] +% 1);
+                try ref.put(primaryKey, out[1] +% 1);
             } else if (idx % 7 == 0) {
-                const res = try delete(&w, catalogRef, pk, ver);
+                const res = try delete(&w, catalogRef, primaryKey, ver);
                 catalogRef = res.ok;
-                _ = ref.remove(pk);
+                _ = ref.remove(primaryKey);
             }
         }
         w.setRoot(catalogRef);
@@ -333,7 +333,7 @@ test "100k objects with updates and deletes match a reference map after reopen" 
         var out: [2]u64 = undefined;
         var it = ref.iterator();
         while (it.next()) |e| {
-            const ver = try getByPk(&r, r.root(), e.key_ptr.*, &out);
+            const ver = try getByPrimaryKey(&r, r.root(), e.key_ptr.*, &out);
             try testing.expect(ver != null);
             try testing.expectEqual(e.value_ptr.*, out[1]);
         }
@@ -491,7 +491,7 @@ test "a large blob property decodes to a ref and materializes; small stays inlin
 test "getByObjectKey reads a row by its stable object key" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const path = try objTmpPath(testing.allocator, &tmp, "okey.airdb");
+    const path = try objTmpPath(testing.allocator, &tmp, "objectKey.airdb");
     defer testing.allocator.free(path);
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
@@ -517,7 +517,7 @@ test "getByObjectKey reads a row by its stable object key" {
 test "getByObjectKey resolves through the key-to-row index" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const path = try objTmpPath(testing.allocator, &tmp, "okey_index.airdb");
+    const path = try objTmpPath(testing.allocator, &tmp, "objectKeyIndex.airdb");
     defer testing.allocator.free(path);
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
@@ -541,7 +541,7 @@ test "getByObjectKey resolves through the key-to-row index" {
 
 // Collect, in ascending order, the object keys held in the value index's inner
 // set for (catalogRef, prop, value). Empty/absent yields an empty list.
-fn collectIndexOkeys(
+fn collectIndexObjectKeys(
     transaction: anytype,
     catalogRef: Reference,
     prop: usize,
@@ -562,7 +562,7 @@ fn collectIndexOkeys(
     try Index.forEachKey(transaction, inner, Sink{ .list = out, .alloc = allocator }, Sink.onKey);
 }
 
-fn expectIndexOkeys(
+fn expectIndexObjectKeys(
     transaction: anytype,
     catalogRef: Reference,
     prop: usize,
@@ -571,7 +571,7 @@ fn expectIndexOkeys(
 ) !void {
     var got = std.ArrayList(u64).empty;
     defer got.deinit(testing.allocator);
-    try collectIndexOkeys(transaction, catalogRef, prop, value, &got, testing.allocator);
+    try collectIndexObjectKeys(transaction, catalogRef, prop, value, &got, testing.allocator);
     try testing.expectEqualSlices(u64, expected, got.items);
 }
 
@@ -592,9 +592,9 @@ test "value index tracks inserts" {
     catalogRef = o2.catalogRef;
     const o3 = try insert(&w, catalogRef, &.{ 4, 30 });
     catalogRef = o3.catalogRef;
-    try expectIndexOkeys(&w, catalogRef, 1, 10, &.{ o0.row, o2.row });
-    try expectIndexOkeys(&w, catalogRef, 1, 20, &.{o1.row});
-    try expectIndexOkeys(&w, catalogRef, 1, 30, &.{o3.row});
+    try expectIndexObjectKeys(&w, catalogRef, 1, 10, &.{ o0.row, o2.row });
+    try expectIndexObjectKeys(&w, catalogRef, 1, 20, &.{o1.row});
+    try expectIndexObjectKeys(&w, catalogRef, 1, 30, &.{o3.row});
     w.deinit();
 }
 
@@ -615,13 +615,13 @@ test "value index tracks updates" {
     catalogRef = o2.catalogRef;
     // Move o1's indexed prop from 20 to 10.
     var out: [2]u64 = undefined;
-    const ver = (try getByPk(&w, catalogRef, 2, &out)).?;
+    const ver = (try getByPrimaryKey(&w, catalogRef, 2, &out)).?;
     const res = try update(&w, catalogRef, 2, &.{ 2, 10 }, ver);
     try testing.expect(res == .ok);
     catalogRef = res.ok.catalogRef;
-    try expectIndexOkeys(&w, catalogRef, 1, 10, &.{ o0.row, o1.row, o2.row });
+    try expectIndexObjectKeys(&w, catalogRef, 1, 10, &.{ o0.row, o1.row, o2.row });
     // The 20 entry is now empty.
-    try expectIndexOkeys(&w, catalogRef, 1, 20, &.{});
+    try expectIndexObjectKeys(&w, catalogRef, 1, 20, &.{});
     w.deinit();
 }
 
@@ -640,13 +640,13 @@ test "value index tracks deletes" {
     catalogRef = o1.catalogRef;
     const o2 = try insert(&w, catalogRef, &.{ 3, 10 });
     catalogRef = o2.catalogRef;
-    try expectIndexOkeys(&w, catalogRef, 1, 10, &.{ o0.row, o2.row });
+    try expectIndexObjectKeys(&w, catalogRef, 1, 10, &.{ o0.row, o2.row });
     // Delete o0 (value 10); only o2 should remain under 10.
     var out: [2]u64 = undefined;
-    const ver = (try getByPk(&w, catalogRef, 1, &out)).?;
+    const ver = (try getByPrimaryKey(&w, catalogRef, 1, &out)).?;
     catalogRef = (try delete(&w, catalogRef, 1, ver)).ok;
-    try expectIndexOkeys(&w, catalogRef, 1, 10, &.{o2.row});
-    try expectIndexOkeys(&w, catalogRef, 1, 20, &.{o1.row});
+    try expectIndexObjectKeys(&w, catalogRef, 1, 10, &.{o2.row});
+    try expectIndexObjectKeys(&w, catalogRef, 1, 20, &.{o1.row});
     w.deinit();
 }
 
@@ -749,7 +749,7 @@ test "updateTyped moves backlinks when a link value changes" {
     try testing.expectEqual(@as(u64, 1), try links_mod.backlinkCount(&w, catalogRef, 1, b.row));
     // Deleting the NEW target nullifies the source's link.
     var raw: [2]u64 = undefined;
-    const bv = (try getByPk(&w, catalogRef, 2, &raw)).?;
+    const bv = (try getByPrimaryKey(&w, catalogRef, 2, &raw)).?;
     catalogRef = switch (try deleteAndNullify(&w, catalogRef, 2, bv)) {
         .ok => |x| x,
         else => unreachable,
@@ -770,13 +770,13 @@ test "a multi-leaf value-index set is pruned and freed when emptied" {
     defer w.deinit();
     var catalogRef = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .int, .indexed = true } });
     const n: u64 = 80;
-    var pk: u64 = 1;
-    while (pk <= n) : (pk += 1) catalogRef = (try insert(&w, catalogRef, &.{ pk, 7 })).catalogRef;
+    var primaryKey: u64 = 1;
+    while (primaryKey <= n) : (primaryKey += 1) catalogRef = (try insert(&w, catalogRef, &.{ primaryKey, 7 })).catalogRef;
     var out: [2]u64 = undefined;
-    pk = 1;
-    while (pk <= n) : (pk += 1) {
-        const ver = (try getByPk(&w, catalogRef, pk, &out)).?;
-        catalogRef = (try delete(&w, catalogRef, pk, ver)).ok;
+    primaryKey = 1;
+    while (primaryKey <= n) : (primaryKey += 1) {
+        const ver = (try getByPrimaryKey(&w, catalogRef, primaryKey, &out)).?;
+        catalogRef = (try delete(&w, catalogRef, primaryKey, ver)).ok;
     }
     const v = try loadCatalog(&w, catalogRef);
     try testing.expectEqual(@as(?u64, null), try Index.get(&w, v.valueIndexRef(1), 7));
@@ -798,10 +798,10 @@ test "an emptied value-index set is pruned from the outer index" {
     // Delete both rows carrying value 10: the 10 entry must disappear entirely,
     // not linger as an empty set.
     var out: [2]u64 = undefined;
-    var pk: u64 = 1;
-    while (pk <= 2) : (pk += 1) {
-        const ver = (try getByPk(&w, catalogRef, pk, &out)).?;
-        catalogRef = (try delete(&w, catalogRef, pk, ver)).ok;
+    var primaryKey: u64 = 1;
+    while (primaryKey <= 2) : (primaryKey += 1) {
+        const ver = (try getByPrimaryKey(&w, catalogRef, primaryKey, &out)).?;
+        catalogRef = (try delete(&w, catalogRef, primaryKey, ver)).ok;
     }
     const v = try loadCatalog(&w, catalogRef);
     try testing.expectEqual(@as(?u64, null), try Index.get(&w, v.valueIndexRef(1), 10));
@@ -820,9 +820,9 @@ test "non-indexed prop has no index" {
     const r0 = try insert(&w, catalogRef, &.{ 1, 100 });
     catalogRef = r0.catalogRef;
     var out: [2]u64 = undefined;
-    const ver = (try getByPk(&w, catalogRef, 1, &out)).?;
+    const ver = (try getByPrimaryKey(&w, catalogRef, 1, &out)).?;
     catalogRef = (try update(&w, catalogRef, 1, &.{ 1, 200 }, ver)).ok.catalogRef;
-    const ver2 = (try getByPk(&w, catalogRef, 1, &out)).?;
+    const ver2 = (try getByPrimaryKey(&w, catalogRef, 1, &out)).?;
     catalogRef = (try delete(&w, catalogRef, 1, ver2)).ok;
     const v = try loadCatalog(&w, catalogRef);
     var i: usize = 0;
@@ -841,28 +841,28 @@ test "reinserting a primary key after delete yields a new object key" {
     var catalogRef = try create(&w, 2);
     const first = try insert(&w, catalogRef, &.{ 100, 7 });
     catalogRef = first.catalogRef;
-    const okey_a = first.row;
+    const objectKeyA = first.row;
     var out: [2]u64 = undefined;
-    const v = (try getByPk(&w, catalogRef, 100, &out)).?;
+    const v = (try getByPrimaryKey(&w, catalogRef, 100, &out)).?;
     catalogRef = (try delete(&w, catalogRef, 100, v)).ok;
     const second = try insert(&w, catalogRef, &.{ 100, 70 });
     catalogRef = second.catalogRef;
-    const okey_b = second.row;
-    try testing.expect(okey_a != okey_b);
+    const objectKeyB = second.row;
+    try testing.expect(objectKeyA != objectKeyB);
     // The old object key is tombstoned and resolves to null.
-    try testing.expectEqual(@as(?u64, null), try getByObjectKey(&w, catalogRef, okey_a, &out));
+    try testing.expectEqual(@as(?u64, null), try getByObjectKey(&w, catalogRef, objectKeyA, &out));
     // The new object key returns the new row.
-    try testing.expect((try getByObjectKey(&w, catalogRef, okey_b, &out)) != null);
+    try testing.expect((try getByObjectKey(&w, catalogRef, objectKeyB, &out)) != null);
     try testing.expectEqual(@as(u64, 70), out[1]);
-    // Lookup by pk returns the new values.
-    try testing.expect((try getByPk(&w, catalogRef, 100, &out)) != null);
+    // Lookup by primaryKey returns the new values.
+    try testing.expect((try getByPrimaryKey(&w, catalogRef, 100, &out)) != null);
     try testing.expectEqual(@as(u64, 70), out[1]);
     w.deinit();
 }
 
 test "deleteTyped frees a self-referencing link_set root exactly once" {
-    // Regression: deleting a row whose link_set contained its own okey freed
-    // the set root twice. The inbound nullify removed okey from the row's own
+    // Regression: deleting a row whose link_set contained its own objectKey freed
+    // the set root twice. The inbound nullify removed objectKey from the row's own
     // set -- a COW whose Index.remove freed the old root -- and the delete's
     // storage reclamation then freed the same root again from the captured
     // column raw, handing one extent to two future allocations. The nullify
@@ -882,7 +882,7 @@ test "deleteTyped frees a self-referencing link_set root exactly once" {
         });
         const ins = try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .link_set = &.{} } });
         catalogRef = ins.catalogRef;
-        catalogRef = try links.linkSetAdd(&w, catalogRef, 1, 1, ins.row); // set contains own okey
+        catalogRef = try links.linkSetAdd(&w, catalogRef, 1, 1, ins.row); // set contains own objectKey
         w.setRoot(catalogRef);
         _ = try w.commit();
     }

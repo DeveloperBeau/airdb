@@ -1,6 +1,6 @@
 // bulk_append -- append a contiguous, right-edge batch to a POPULATED type two
 // ways and contrast the cost. Both databases are seeded identically with a base
-// of N/2 rows; then the same N/2-row contiguous batch (pks above the current
+// of N/2 rows; then the same N/2-row contiguous batch (primaryKeys above the current
 // max, monotonic) is added. Path A drives the right-edge bulkAppendOrInsert fast
 // path in a single write transaction; Path B inserts the identical batch one row
 // at a time in batched commits (the realistic baseline). We report the load-time
@@ -39,7 +39,7 @@ fn nowNs(io: Io) i96 {
     return Io.Clock.now(.awake, io).nanoseconds;
 }
 
-// Seed a fresh two-int type with `base` rows (pks 0..base-1, value = pk) using
+// Seed a fresh two-int type with `base` rows (primaryKeys 0..base-1, value = primaryKey) using
 // bulkImport in one transaction, so both databases start from an identical,
 // already-populated base. Returns nothing; the committed catalog is the root.
 fn seedBase(database: *airdb.Database, base_rows: []const []const u64) !void {
@@ -83,8 +83,8 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     const batch = try alloc.alloc([]const u64, m);
     defer alloc.free(batch);
     for (batch_storage, batch, 0..) |*cells, *row, i| {
-        const pk: u64 = @intCast(base + i);
-        cells.* = .{ pk, pk };
+        const primaryKey: u64 = @intCast(base + i);
+        cells.* = .{ primaryKey, primaryKey };
         row.* = &cells.*;
     }
 
@@ -126,8 +126,8 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         var catalogRef: Reference = databaseB.active_root; // reload the committed catalog ref
         var j: usize = 0;
         while (j < this_batch) : (j += 1) {
-            const pk: u64 = base + inserted + j;
-            const r = try rows.insert(&w, catalogRef, &.{ pk, pk });
+            const primaryKey: u64 = base + inserted + j;
+            const r = try rows.insert(&w, catalogRef, &.{ primaryKey, primaryKey });
             catalogRef = r.catalogRef;
         }
         w.setRoot(catalogRef);
@@ -153,7 +153,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         }
         try seedBase(&databaseC, &small_rows);
 
-        // pks 100, 102, 101: above the max but NOT strictly ascending.
+        // primaryKeys 100, 102, 101: above the max but NOT strictly ascending.
         const scattered = [_][]const u64{ &.{ 100, 100 }, &.{ 102, 102 }, &.{ 101, 101 } };
         var w = try databaseC.beginWrite();
         if (bulk.bulkAppend(&w, w.new_root, &scattered)) |_| {

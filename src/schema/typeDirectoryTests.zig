@@ -218,7 +218,7 @@ test "multi-type directory carries links and collections via createWithDefs" {
     defer database.deinit();
     var w = try database.beginWrite();
     const PD = catalog.PropDef;
-    // type 0: scalar (int pk, blob name); type 1: int pk + a to-one link + a to-many link_set
+    // type 0: scalar (int primaryKey, blob name); type 1: int primaryKey + a to-one link + a to-many link_set
     const schema = [_][]const PD{
         &.{ .{ .kind = .int }, .{ .kind = .blob } },
         &.{ .{ .kind = .int }, .{ .kind = .link }, .{ .kind = .link_set } },
@@ -265,12 +265,12 @@ test "a cross-type link resolves to the target type's object" {
 
     const ains = try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .bytes = "Ada" } });
     dir = ains.dir;
-    const author_okey = ains.row;
-    dir = (try insert(&w, dir, 1, &.{ .{ .int = 1 }, .{ .link = author_okey } })).dir;
+    const authorObjectKey = ains.row;
+    dir = (try insert(&w, dir, 1, &.{ .{ .int = 1 }, .{ .link = authorObjectKey } })).dir;
 
     const r = (try resolveLink(&w, dir, 1, 1, 1)).?;
     try testing.expectEqual(@as(u16, 0), r.target_type);
-    try testing.expectEqual(author_okey, r.okey);
+    try testing.expectEqual(authorObjectKey, r.objectKey);
 
     var out: [2]Value = undefined;
     _ = (try getLinked(&w, dir, 1, 1, 1, &out)).?;
@@ -295,11 +295,11 @@ test "deleting a target nullifies inbound links from another type" {
 
     const ains = try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .bytes = "Ada" } });
     dir = ains.dir;
-    const author_okey = ains.row;
-    dir = (try insert(&w, dir, 1, &.{ .{ .int = 1 }, .{ .link = author_okey } })).dir;
-    dir = (try insert(&w, dir, 1, &.{ .{ .int = 2 }, .{ .link = author_okey } })).dir;
+    const authorObjectKey = ains.row;
+    dir = (try insert(&w, dir, 1, &.{ .{ .int = 1 }, .{ .link = authorObjectKey } })).dir;
+    dir = (try insert(&w, dir, 1, &.{ .{ .int = 2 }, .{ .link = authorObjectKey } })).dir;
 
-    try testing.expectEqual(@as(u64, 2), try backlinkCount(&w, dir, 1, 1, author_okey));
+    try testing.expectEqual(@as(u64, 2), try backlinkCount(&w, dir, 1, 1, authorObjectKey));
 
     var abuf: [2]Value = undefined;
     const author_ver = (try get(&w, dir, 0, 1, &abuf)).?;
@@ -308,7 +308,7 @@ test "deleting a target nullifies inbound links from another type" {
 
     try testing.expectEqual(@as(?u64, null), try getLink(&w, dir, 1, 1, 1));
     try testing.expectEqual(@as(?u64, null), try getLink(&w, dir, 1, 2, 1));
-    try testing.expectEqual(@as(u64, 0), try backlinkCount(&w, dir, 1, 1, author_okey));
+    try testing.expectEqual(@as(u64, 0), try backlinkCount(&w, dir, 1, 1, authorObjectKey));
     w.deinit();
 }
 
@@ -322,7 +322,7 @@ test "cross-type links persist across reopen" {
         &.{ .{ .kind = .int }, .{ .kind = .blob } }, // 0: Author
         &.{ .{ .kind = .int }, .{ .kind = .link, .link_target = 0 } }, // 1: Book.author -> Author
     };
-    var author_okey: u64 = undefined;
+    var authorObjectKey: u64 = undefined;
     {
         var database = try Database.create(testing.allocator, path);
         defer database.deinit();
@@ -330,10 +330,10 @@ test "cross-type links persist across reopen" {
         var dir = try createWithDefs(&w, &schema);
         const ains = try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .bytes = "Ada" } });
         dir = ains.dir;
-        author_okey = ains.row;
+        authorObjectKey = ains.row;
         var i: u64 = 1;
         while (i <= 20) : (i += 1) {
-            dir = (try insert(&w, dir, 1, &.{ .{ .int = i }, .{ .link = author_okey } })).dir;
+            dir = (try insert(&w, dir, 1, &.{ .{ .int = i }, .{ .link = authorObjectKey } })).dir;
         }
         w.setRoot(dir);
         _ = try w.commit();
@@ -342,10 +342,10 @@ test "cross-type links persist across reopen" {
         var database = try Database.open(testing.allocator, path);
         defer database.deinit();
         var r = try database.beginRead();
-        try testing.expectEqual(@as(u64, 20), try backlinkCount(&r, r.root(), 1, 1, author_okey));
+        try testing.expectEqual(@as(u64, 20), try backlinkCount(&r, r.root(), 1, 1, authorObjectKey));
         const res = (try resolveLink(&r, r.root(), 1, 7, 1)).?;
         try testing.expectEqual(@as(u16, 0), res.target_type);
-        try testing.expectEqual(author_okey, res.okey);
+        try testing.expectEqual(authorObjectKey, res.objectKey);
         var out: [2]Value = undefined;
         _ = (try getLinked(&r, r.root(), 1, 13, 1, &out)).?;
         try testing.expectEqualStrings("Ada", out[1].bytes);
@@ -553,24 +553,24 @@ test "directory delete works after relocating the target" {
     // A throwaway author opens a dead slot for the real author to move into.
     const throwaway = try insert(&w, dir, 0, &.{ .{ .int = 99 }, .{ .bytes = "tmp" } });
     dir = throwaway.dir;
-    const throwaway_okey = throwaway.row;
+    const throwawayObjectKey = throwaway.row;
 
     const author = try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .bytes = "Ada" } });
     dir = author.dir;
-    const author_okey = author.row;
+    const authorObjectKey = author.row;
 
-    // A book links the real author by its stable okey.
-    dir = (try insert(&w, dir, 1, &.{ .{ .int = 1 }, .{ .link = author_okey } })).dir;
-    try testing.expectEqual(@as(?u64, author_okey), try getLink(&w, dir, 1, 1, 1));
+    // A book links the real author by its stable objectKey.
+    dir = (try insert(&w, dir, 1, &.{ .{ .int = 1 }, .{ .link = authorObjectKey } })).dir;
+    try testing.expectEqual(@as(?u64, authorObjectKey), try getLink(&w, dir, 1, 1, 1));
 
     // Free the throwaway's physical slot, then relocate the author into it.
     const authorCatalog = try catalogRef(&w, dir, 0);
-    const dead_row = (try catalog.okeyToRow(&w, authorCatalog, throwaway_okey)).?;
+    const dead_row = (try catalog.objectKeyToRow(&w, authorCatalog, throwawayObjectKey)).?;
     var vbuf: [2]Value = undefined;
     const tv = (try get(&w, dir, 0, 99, &vbuf)).?;
     const dthrow = try delete(&w, dir, 0, 99, tv);
     dir = dthrow.ok;
-    const relocated = try relocation.relocateRow(&w, try catalogRef(&w, dir, 0), author_okey, dead_row);
+    const relocated = try relocation.relocateRow(&w, try catalogRef(&w, dir, 0), authorObjectKey, dead_row);
     dir = try setCatalogRef(&w, dir, 0, relocated);
 
     // Deleting the author must nullify the book's link, proving the delete used
@@ -673,7 +673,7 @@ test "a directory delete of a self-referencing link_set row frees its set root e
         });
         const ins = try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .link_set = &.{} } });
         dir = ins.dir;
-        dir = try linkSetAdd(&w, dir, 0, 1, 1, ins.row); // set contains own okey
+        dir = try linkSetAdd(&w, dir, 0, 1, 1, ins.row); // set contains own objectKey
         w.setRoot(dir);
         _ = try w.commit();
     }
@@ -718,7 +718,7 @@ test "a directory delete frees the row's collection storage" {
     var w = try database.beginWrite();
     defer w.deinit();
     var raw: [3]u64 = undefined;
-    _ = (try rows.getByPk(&w, try catalogRef(&w, w.new_root, 0), 1, &raw)).?;
+    _ = (try rows.getByPrimaryKey(&w, try catalogRef(&w, w.new_root, 0), 1, &raw)).?;
     var out: [3]Value = undefined;
     const ver = (try get(&w, w.new_root, 0, 1, &out)).?;
     const res = try deleteNullifyX(&w, w.new_root, 0, 1, ver);
@@ -762,7 +762,7 @@ test "a cascade delete frees the child's collection storage" {
     var w = try database.beginWrite();
     defer w.deinit();
     var raw: [2]u64 = undefined;
-    _ = (try rows.getByPk(&w, try catalogRef(&w, w.new_root, 1), 100, &raw)).?;
+    _ = (try rows.getByPrimaryKey(&w, try catalogRef(&w, w.new_root, 1), 100, &raw)).?;
     var out: [2]Value = undefined;
     const ver = (try get(&w, w.new_root, 0, 1, &out)).?;
     const res = try deleteNullifyX(&w, w.new_root, 0, 1, ver);
@@ -800,12 +800,12 @@ test "replacing an embedded child surfaces a blocked delete" {
 
     dir = (try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .link = null } })).dir;
     dir = try insertEmbedded(&w, dir, 0, 1, 1, &.{ .{ .int = 100 }, .{ .bytes = "old" } });
-    const child_okey = (try getLink(&w, dir, 0, 1, 1)).?;
-    dir = (try insert(&w, dir, 2, &.{ .{ .int = 5 }, .{ .link = child_okey } })).dir;
+    const childObjectKey = (try getLink(&w, dir, 0, 1, 1)).?;
+    dir = (try insert(&w, dir, 2, &.{ .{ .int = 5 }, .{ .link = childObjectKey } })).dir;
 
     try testing.expectError(error.Blocked, insertEmbedded(&w, dir, 0, 1, 1, &.{ .{ .int = 200 }, .{ .bytes = "new" } }));
     // Old child intact and still owned.
-    try testing.expectEqual(@as(?u64, child_okey), try getLink(&w, dir, 0, 1, 1));
+    try testing.expectEqual(@as(?u64, childObjectKey), try getLink(&w, dir, 0, 1, 1));
     try testing.expectEqual(@as(u64, 1), try liveCount(&w, dir, 1));
 }
 
@@ -824,10 +824,10 @@ test "clearing an embedded child surfaces a blocked delete" {
 
     dir = (try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .link = null } })).dir;
     dir = try insertEmbedded(&w, dir, 0, 1, 1, &.{ .{ .int = 100 }, .{ .bytes = "note" } });
-    const child_okey = (try getLink(&w, dir, 0, 1, 1)).?;
-    dir = (try insert(&w, dir, 2, &.{ .{ .int = 5 }, .{ .link = child_okey } })).dir;
+    const childObjectKey = (try getLink(&w, dir, 0, 1, 1)).?;
+    dir = (try insert(&w, dir, 2, &.{ .{ .int = 5 }, .{ .link = childObjectKey } })).dir;
 
     try testing.expectError(error.Blocked, clearEmbedded(&w, dir, 0, 1, 1));
-    try testing.expectEqual(@as(?u64, child_okey), try getLink(&w, dir, 0, 1, 1));
+    try testing.expectEqual(@as(?u64, childObjectKey), try getLink(&w, dir, 0, 1, 1));
     try testing.expectEqual(@as(u64, 1), try liveCount(&w, dir, 1));
 }

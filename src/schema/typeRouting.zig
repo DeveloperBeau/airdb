@@ -37,16 +37,16 @@ pub fn insert(transaction: *WriteTransaction, dir: Reference, type_id: u16, valu
     return .{ .dir = new_dir, .row = r.row };
 }
 
-/// Read the object with primary key `pk` from `type_id` into `out`, returning
+/// Read the object with primary key `primaryKey` from `type_id` into `out`, returning
 /// its version or null when absent.
-pub fn get(transaction: anytype, dir: Reference, type_id: u16, pk: u64, out: []Value) !?u64 {
-    return Objects.getTyped(transaction, try typedir.catalogRef(transaction, dir, type_id), pk, out);
+pub fn get(transaction: anytype, dir: Reference, type_id: u16, primaryKey: u64, out: []Value) !?u64 {
+    return Objects.getTyped(transaction, try typedir.catalogRef(transaction, dir, type_id), primaryKey, out);
 }
 
-/// Update the object with primary key `pk` when `expected_version` matches.
-pub fn update(transaction: *WriteTransaction, dir: Reference, type_id: u16, pk: u64, values: []const Value, expected_version: u64) !UpdateResult {
+/// Update the object with primary key `primaryKey` when `expected_version` matches.
+pub fn update(transaction: *WriteTransaction, dir: Reference, type_id: u16, primaryKey: u64, values: []const Value, expected_version: u64) !UpdateResult {
     const catalogRef = try typedir.catalogRef(transaction, dir, type_id);
-    const r = try Objects.updateTyped(transaction, catalogRef, pk, values, expected_version);
+    const r = try Objects.updateTyped(transaction, catalogRef, primaryKey, values, expected_version);
     return switch (r) {
         .ok => |o| .{ .ok = .{ .dir = try setCatalogRef(transaction, dir, type_id, o.catalogRef), .version = o.version } },
         .conflict => |c| .{ .conflict = c },
@@ -54,10 +54,10 @@ pub fn update(transaction: *WriteTransaction, dir: Reference, type_id: u16, pk: 
     };
 }
 
-/// Delete the object with primary key `pk` when `expected_version` matches.
-pub fn delete(transaction: *WriteTransaction, dir: Reference, type_id: u16, pk: u64, expected_version: u64) !DeleteResult {
+/// Delete the object with primary key `primaryKey` when `expected_version` matches.
+pub fn delete(transaction: *WriteTransaction, dir: Reference, type_id: u16, primaryKey: u64, expected_version: u64) !DeleteResult {
     const catalogRef = try typedir.catalogRef(transaction, dir, type_id);
-    const r = try Objects.deleteTyped(transaction, catalogRef, pk, expected_version);
+    const r = try Objects.deleteTyped(transaction, catalogRef, primaryKey, expected_version);
     return switch (r) {
         .ok => |c| .{ .ok = try setCatalogRef(transaction, dir, type_id, c) },
         .conflict => |c| .{ .conflict = c },
@@ -72,15 +72,15 @@ pub fn liveCount(transaction: anytype, dir: Reference, type_id: u16) !u64 {
 
 // --- link / to-many routing (mutators COW the directory) ---
 
-/// The to-one link target (object key) of `pk`'s property `prop`, or null.
-pub fn getLink(transaction: anytype, dir: Reference, type_id: u16, pk: u64, prop: usize) !?u64 {
-    return links.getLink(transaction, try typedir.catalogRef(transaction, dir, type_id), pk, prop);
+/// The to-one link target (object key) of `primaryKey`'s property `prop`, or null.
+pub fn getLink(transaction: anytype, dir: Reference, type_id: u16, primaryKey: u64, prop: usize) !?u64 {
+    return links.getLink(transaction, try typedir.catalogRef(transaction, dir, type_id), primaryKey, prop);
 }
 
-/// Set (or clear, with null) the to-one link of `pk`'s property `prop`.
-pub fn setLink(transaction: *WriteTransaction, dir: Reference, type_id: u16, pk: u64, prop: usize, target: ?u64) !Reference {
+/// Set (or clear, with null) the to-one link of `primaryKey`'s property `prop`.
+pub fn setLink(transaction: *WriteTransaction, dir: Reference, type_id: u16, primaryKey: u64, prop: usize, target: ?u64) !Reference {
     const catalogRef = try typedir.catalogRef(transaction, dir, type_id);
-    const newCatalog = try links.setLink(transaction, catalogRef, pk, prop, target);
+    const newCatalog = try links.setLink(transaction, catalogRef, primaryKey, prop, target);
     return try setCatalogRef(transaction, dir, type_id, newCatalog);
 }
 
@@ -89,71 +89,71 @@ pub fn backlinkCount(transaction: anytype, dir: Reference, type_id: u16, prop: u
     return links.backlinkCount(transaction, try typedir.catalogRef(transaction, dir, type_id), prop, target);
 }
 
-/// Add `target` to `pk`'s link-set property `prop`.
-pub fn linkSetAdd(transaction: *WriteTransaction, dir: Reference, type_id: u16, pk: u64, prop: usize, target: u64) !Reference {
+/// Add `target` to `primaryKey`'s link-set property `prop`.
+pub fn linkSetAdd(transaction: *WriteTransaction, dir: Reference, type_id: u16, primaryKey: u64, prop: usize, target: u64) !Reference {
     const catalogRef = try typedir.catalogRef(transaction, dir, type_id);
-    const newCatalog = try links.linkSetAdd(transaction, catalogRef, pk, prop, target);
+    const newCatalog = try links.linkSetAdd(transaction, catalogRef, primaryKey, prop, target);
     return try setCatalogRef(transaction, dir, type_id, newCatalog);
 }
 
-/// Remove `target` from `pk`'s link-set property `prop`.
-pub fn linkSetRemove(transaction: *WriteTransaction, dir: Reference, type_id: u16, pk: u64, prop: usize, target: u64) !Reference {
+/// Remove `target` from `primaryKey`'s link-set property `prop`.
+pub fn linkSetRemove(transaction: *WriteTransaction, dir: Reference, type_id: u16, primaryKey: u64, prop: usize, target: u64) !Reference {
     const catalogRef = try typedir.catalogRef(transaction, dir, type_id);
-    const newCatalog = try links.linkSetRemove(transaction, catalogRef, pk, prop, target);
+    const newCatalog = try links.linkSetRemove(transaction, catalogRef, primaryKey, prop, target);
     return try setCatalogRef(transaction, dir, type_id, newCatalog);
 }
 
-/// Whether `pk`'s link-set property `prop` contains `target`.
-pub fn linkSetContains(transaction: anytype, dir: Reference, type_id: u16, pk: u64, prop: usize, target: u64) !bool {
-    return links.linkSetContains(transaction, try typedir.catalogRef(transaction, dir, type_id), pk, prop, target);
+/// Whether `primaryKey`'s link-set property `prop` contains `target`.
+pub fn linkSetContains(transaction: anytype, dir: Reference, type_id: u16, primaryKey: u64, prop: usize, target: u64) !bool {
+    return links.linkSetContains(transaction, try typedir.catalogRef(transaction, dir, type_id), primaryKey, prop, target);
 }
 
 // ---------------------------------------------------------------------------
 // Cross-type link resolution and delete-nullify
 // ---------------------------------------------------------------------------
 
-/// Resolve `pk`'s to-one link `prop` to its target type and object key, or
+/// Resolve `primaryKey`'s to-one link `prop` to its target type and object key, or
 /// null when the link is unset.
-pub fn resolveLink(transaction: anytype, dir: Reference, src_type: u16, pk: u64, prop: usize) !?struct { target_type: u16, okey: u64 } {
+pub fn resolveLink(transaction: anytype, dir: Reference, src_type: u16, primaryKey: u64, prop: usize) !?struct { target_type: u16, objectKey: u64 } {
     const sourceCatalog = try typedir.catalogRef(transaction, dir, src_type);
-    const okey = (try links.getLink(transaction, sourceCatalog, pk, prop)) orelse return null;
+    const objectKey = (try links.getLink(transaction, sourceCatalog, primaryKey, prop)) orelse return null;
     const target_type = (try catalog.loadCatalog(transaction, sourceCatalog)).linkTarget(prop);
-    return .{ .target_type = target_type, .okey = okey };
+    return .{ .target_type = target_type, .objectKey = objectKey };
 }
 
 /// Materialize the linked object into `out` (sized to the TARGET type's prop_count).
 /// Returns the target row version, or null if the link is unset or the target is gone.
-pub fn getLinked(transaction: anytype, dir: Reference, src_type: u16, pk: u64, prop: usize, out: []Value) !?u64 {
-    const r = (try resolveLink(transaction, dir, src_type, pk, prop)) orelse return null;
+pub fn getLinked(transaction: anytype, dir: Reference, src_type: u16, primaryKey: u64, prop: usize, out: []Value) !?u64 {
+    const r = (try resolveLink(transaction, dir, src_type, primaryKey, prop)) orelse return null;
     const targetCatalog = try typedir.catalogRef(transaction, dir, r.target_type);
-    return Objects.getTypedByOkey(transaction, targetCatalog, r.okey, out);
+    return Objects.getTypedByObjectKey(transaction, targetCatalog, r.objectKey, out);
 }
 
 /// Delete an object, enforcing per-property deletion rules across the directory:
 /// block (refuse while a block-rule link points at it), cascade (delete owned
 /// children first), nullify (clear dangling inbound links). Cascade is recursive
 /// and cycle-safe.
-pub fn deleteNullifyX(transaction: *WriteTransaction, dir: Reference, type_id: u16, pk: u64, expected_version: u64) !DeleteResult {
+pub fn deleteNullifyX(transaction: *WriteTransaction, dir: Reference, type_id: u16, primaryKey: u64, expected_version: u64) !DeleteResult {
     const catalog0 = try typedir.catalogRef(transaction, dir, type_id);
     const pc = (try catalog.loadCatalog(transaction, catalog0)).prop_count;
     var buf: [256]u64 = undefined;
-    const ver = (try rows.getByPk(transaction, catalog0, pk, buf[0..pc])) orelse return .not_found;
+    const ver = (try rows.getByPrimaryKey(transaction, catalog0, primaryKey, buf[0..pc])) orelse return .not_found;
     if (ver != expected_version) return .{ .conflict = .{ .current_version = ver } };
-    const okey = (try catalog.pkToOkey(transaction, catalog0, pk)) orelse return .not_found;
+    const objectKey = (try catalog.primaryKeyToObjectKey(transaction, catalog0, primaryKey)) orelse return .not_found;
 
-    if (try isBlocked(transaction, dir, type_id, okey)) return .blocked;
+    if (try isBlocked(transaction, dir, type_id, objectKey)) return .blocked;
 
     var visited = std.AutoHashMap(u64, void).init(transaction.database.store.allocator);
     defer visited.deinit();
-    const new_dir = try deleteWorker(transaction, dir, type_id, okey, &visited);
+    const new_dir = try deleteWorker(transaction, dir, type_id, objectKey, &visited);
     return .{ .ok = new_dir };
 }
 
 // BLOCK check (top-level only): whether any block-rule link in the directory
-// points at `okey` of `type_id`. The object's own self-link does not block:
+// points at `objectKey` of `type_id`. The object's own self-link does not block:
 // the delete clears that link anyway, and counting it made self-linked rows
 // permanently undeletable.
-fn isBlocked(transaction: *WriteTransaction, dir: Reference, type_id: u16, okey: u64) !bool {
+fn isBlocked(transaction: *WriteTransaction, dir: Reference, type_id: u16, objectKey: u64) !bool {
     const tc = try typeCount(transaction, dir);
     var s: u16 = 0;
     while (s < tc) : (s += 1) {
@@ -163,10 +163,10 @@ fn isBlocked(transaction: *WriteTransaction, dir: Reference, type_id: u16, okey:
         while (p < sv.prop_count) : (p += 1) {
             const k = sv.kind(p);
             if ((k == .link or k == .link_set) and sv.linkTarget(p) == type_id and sv.delRule(p) == .block) {
-                const cnt = try links.backlinkCount(transaction, sourceCatalog, p, okey);
+                const cnt = try links.backlinkCount(transaction, sourceCatalog, p, objectKey);
                 if (cnt > 1) return true;
                 if (cnt == 1) {
-                    const self_only = s == type_id and (try links.backlinkContains(transaction, sourceCatalog, p, okey, okey));
+                    const self_only = s == type_id and (try links.backlinkContains(transaction, sourceCatalog, p, objectKey, objectKey));
                     if (!self_only) return true;
                 }
             }
@@ -201,20 +201,20 @@ fn snapshotSchema(transaction: *WriteTransaction, catalogRef: Reference, prop_co
     return s;
 }
 
-/// Recursively delete object `okey` of `type_id`: cascade to owned children
+/// Recursively delete object `objectKey` of `type_id`: cascade to owned children
 /// first, then nullify inbound links to it, clean its outbound backlinks, and
 /// tombstone. Cycle/repeat-safe via `visited`. Inner deletes do not re-enforce
 /// block (a cascade never half-applies). Returns the new directory ref.
-fn deleteWorker(transaction: *WriteTransaction, dir: Reference, type_id: u16, okey: u64, visited: *std.AutoHashMap(u64, void)) !Reference {
-    const key = (@as(u64, type_id) << 48) | okey;
+fn deleteWorker(transaction: *WriteTransaction, dir: Reference, type_id: u16, objectKey: u64, visited: *std.AutoHashMap(u64, void)) !Reference {
+    const key = (@as(u64, type_id) << 48) | objectKey;
     if (visited.contains(key)) return dir;
     try visited.put(key, {});
 
     var rbuf: [256]u64 = undefined;
     const catalogBefore = try typedir.catalogRef(transaction, dir, type_id);
     const pc = (try catalog.loadCatalog(transaction, catalogBefore)).prop_count;
-    if ((try rows.getByObjectKey(transaction, catalogBefore, okey, rbuf[0..pc])) == null) return dir; // already gone
-    const pk = rbuf[0];
+    if ((try rows.getByObjectKey(transaction, catalogBefore, objectKey, rbuf[0..pc])) == null) return dir; // already gone
+    const primaryKey = rbuf[0];
     const schema = try snapshotSchema(transaction, catalogBefore, pc);
 
     // Phase 1) Cascade: delete children reached by this object's cascade-rule
@@ -228,40 +228,40 @@ fn deleteWorker(transaction: *WriteTransaction, dir: Reference, type_id: u16, ok
             if ((k != .link and k != .link_set) or schema.rules[p] != .cascade) continue;
             const child_type = schema.targets[p];
             if (k == .link) {
-                if (try links.getLink(transaction, try typedir.catalogRef(transaction, cur, type_id), pk, p)) |child| {
+                if (try links.getLink(transaction, try typedir.catalogRef(transaction, cur, type_id), primaryKey, p)) |child| {
                     cur = try deleteWorker(transaction, cur, child_type, child, visited);
                 }
             } else {
                 var members = std.ArrayList(u64).empty;
                 defer members.deinit(transaction.database.store.allocator);
-                try links.linkSetCollect(transaction, try typedir.catalogRef(transaction, cur, type_id), pk, p, &members, transaction.database.store.allocator);
+                try links.linkSetCollect(transaction, try typedir.catalogRef(transaction, cur, type_id), primaryKey, p, &members, transaction.database.store.allocator);
                 for (members.items) |child| cur = try deleteWorker(transaction, cur, child_type, child, visited);
             }
         }
     }
 
-    cur = try nullifyInbound(transaction, cur, type_id, okey);
-    cur = try cleanOutbound(transaction, cur, type_id, okey);
-    return tombstoneAndReclaim(transaction, cur, type_id, pk, okey, &schema);
+    cur = try nullifyInbound(transaction, cur, type_id, objectKey);
+    cur = try cleanOutbound(transaction, cur, type_id, objectKey);
+    return tombstoneAndReclaim(transaction, cur, type_id, primaryKey, objectKey, &schema);
 }
 
 // Phase 2) Nullify inbound links to this object across all types.
-fn nullifyInbound(transaction: *WriteTransaction, dir: Reference, type_id: u16, okey: u64) !Reference {
+fn nullifyInbound(transaction: *WriteTransaction, dir: Reference, type_id: u16, objectKey: u64) !Reference {
     var cur = dir;
     const n = try typeCount(transaction, cur);
     var s: u16 = 0;
     while (s < n) : (s += 1) {
         const sourceCatalog = try typedir.catalogRef(transaction, cur, s);
-        const new_s = try links.nullifyInboundInCatalog(transaction, sourceCatalog, okey, type_id, s == type_id);
+        const new_s = try links.nullifyInboundInCatalog(transaction, sourceCatalog, objectKey, type_id, s == type_id);
         cur = try setCatalogRef(transaction, cur, s, new_s);
     }
     return cur;
 }
 
 // Phase 3) Clean this object's own outbound backlink entries.
-fn cleanOutbound(transaction: *WriteTransaction, dir: Reference, type_id: u16, okey: u64) !Reference {
+fn cleanOutbound(transaction: *WriteTransaction, dir: Reference, type_id: u16, objectKey: u64) !Reference {
     const typeCatalog = try typedir.catalogRef(transaction, dir, type_id);
-    const cleaned = try links.cleanOutboundInCatalog(transaction, typeCatalog, okey);
+    const cleaned = try links.cleanOutboundInCatalog(transaction, typeCatalog, objectKey);
     return setCatalogRef(transaction, dir, type_id, cleaned);
 }
 
@@ -271,12 +271,12 @@ fn cleanOutbound(transaction: *WriteTransaction, dir: Reference, type_id: u16, o
 // nullified this row's own to-one link columns. Reclaiming only on .ok mirrors
 // deleteTyped; without it every directory-path delete -- including every
 // cascade-deleted child -- leaked its blobs and collection trees.
-fn tombstoneAndReclaim(transaction: *WriteTransaction, dir: Reference, type_id: u16, pk: u64, okey: u64, schema: *const SchemaSnapshot) !Reference {
+fn tombstoneAndReclaim(transaction: *WriteTransaction, dir: Reference, type_id: u16, primaryKey: u64, objectKey: u64, schema: *const SchemaSnapshot) !Reference {
     const pc = schema.prop_count;
     var rbuf: [256]u64 = undefined;
     const typeCatalog = try typedir.catalogRef(transaction, dir, type_id);
-    const cur_ver = (try rows.getByObjectKey(transaction, typeCatalog, okey, rbuf[0..pc])) orelse return dir;
-    const dres = try rows.delete(transaction, typeCatalog, pk, cur_ver);
+    const cur_ver = (try rows.getByObjectKey(transaction, typeCatalog, objectKey, rbuf[0..pc])) orelse return dir;
+    const dres = try rows.delete(transaction, typeCatalog, primaryKey, cur_ver);
     switch (dres) {
         .ok => |newCatalog| {
             const cur = try setCatalogRef(transaction, dir, type_id, newCatalog);

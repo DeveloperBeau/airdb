@@ -196,7 +196,7 @@ const typeRouting = @import("typeRouting.zig");
 // Create an embedded child for `owner`'s to-one link `prop` and link it in.
 // If the owner already has a child via `prop`, the old child is deleted first
 // (replace semantics). Returns the new directory ref.
-pub fn insertEmbedded(transaction: *WriteTransaction, dir: Reference, owner_type: u16, owner_pk: u64, prop: usize, child_values: []const Value) !Reference {
+pub fn insertEmbedded(transaction: *WriteTransaction, dir: Reference, owner_type: u16, ownerPrimaryKey: u64, prop: usize, child_values: []const Value) !Reference {
     var cur = dir;
     const child_type = (try catalog.loadCatalog(transaction, try catalogRef(transaction, cur, owner_type))).linkTarget(prop);
 
@@ -205,13 +205,13 @@ pub fn insertEmbedded(transaction: *WriteTransaction, dir: Reference, owner_type
     // one survives breaks the single-owner invariant and leaks an ownerless
     // object. (.blocked is reachable when another type block-links the child;
     // conflict/not_found are impossible for a version read in this transaction.)
-    if (try typeRouting.getLink(transaction, cur, owner_type, owner_pk, prop)) |old_okey| {
+    if (try typeRouting.getLink(transaction, cur, owner_type, ownerPrimaryKey, prop)) |oldObjectKey| {
         const childCatalog = try catalogRef(transaction, cur, child_type);
         const pc = (try catalog.loadCatalog(transaction, childCatalog)).prop_count;
         var buf: [256]u64 = undefined;
-        if (try rows.getByObjectKey(transaction, childCatalog, old_okey, buf[0..pc])) |old_ver| {
-            const old_pk = buf[0];
-            const dres = try typeRouting.deleteNullifyX(transaction, cur, child_type, old_pk, old_ver);
+        if (try rows.getByObjectKey(transaction, childCatalog, oldObjectKey, buf[0..pc])) |old_ver| {
+            const oldPrimaryKey = buf[0];
+            const dres = try typeRouting.deleteNullifyX(transaction, cur, child_type, oldPrimaryKey, old_ver);
             switch (dres) {
                 .ok => |d| cur = d,
                 else => return error.Blocked,
@@ -221,21 +221,21 @@ pub fn insertEmbedded(transaction: *WriteTransaction, dir: Reference, owner_type
 
     const ins = try typeRouting.insert(transaction, cur, child_type, child_values);
     cur = ins.dir;
-    return try typeRouting.setLink(transaction, cur, owner_type, owner_pk, prop, ins.row);
+    return try typeRouting.setLink(transaction, cur, owner_type, ownerPrimaryKey, prop, ins.row);
 }
 
 // Delete the embedded child owned by `owner` via to-one link `prop`. Deleting
 // the child cross-type-nullifies the owner's inbound link automatically.
 // Returns the new directory ref (unchanged if there is no child).
-pub fn clearEmbedded(transaction: *WriteTransaction, dir: Reference, owner_type: u16, owner_pk: u64, prop: usize) !Reference {
-    const child_okey = (try typeRouting.getLink(transaction, dir, owner_type, owner_pk, prop)) orelse return dir;
+pub fn clearEmbedded(transaction: *WriteTransaction, dir: Reference, owner_type: u16, ownerPrimaryKey: u64, prop: usize) !Reference {
+    const childObjectKey = (try typeRouting.getLink(transaction, dir, owner_type, ownerPrimaryKey, prop)) orelse return dir;
     const child_type = (try catalog.loadCatalog(transaction, try catalogRef(transaction, dir, owner_type))).linkTarget(prop);
     const childCatalog = try catalogRef(transaction, dir, child_type);
     const pc = (try catalog.loadCatalog(transaction, childCatalog)).prop_count;
     var buf: [256]u64 = undefined;
-    const child_ver = (try rows.getByObjectKey(transaction, childCatalog, child_okey, buf[0..pc])) orelse return dir;
-    const child_pk = buf[0];
-    const dres = try typeRouting.deleteNullifyX(transaction, dir, child_type, child_pk, child_ver);
+    const child_ver = (try rows.getByObjectKey(transaction, childCatalog, childObjectKey, buf[0..pc])) orelse return dir;
+    const childPrimaryKey = buf[0];
+    const dres = try typeRouting.deleteNullifyX(transaction, dir, child_type, childPrimaryKey, child_ver);
     return switch (dres) {
         .ok => |d| d,
         // A refused clear must surface: returning the unchanged dir read as

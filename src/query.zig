@@ -5,15 +5,15 @@ const index = @import("trees/index.zig");
 const Column = @import("trees/column.zig");
 const Reference = @import("storage/reference.zig").Reference;
 
-// Query engine over an object catalog. Operates on the stable object key (okey)
-// space: a scan walks the per-type key->row index, so each entry maps an okey to
+// Query engine over an object catalog. Operates on the stable object key (objectKey)
+// space: a scan walks the per-type key->row index, so each entry maps an objectKey to
 // the physical row that currently holds its data (rows can move via relocation).
 // Predicates compare the raw u64 stored in a property column, so they apply to
-// int properties and to link properties (which store target okey + 1). Blob and
+// int properties and to link properties (which store target objectKey + 1). Blob and
 // collection predicates are a later addition.
 //
-// Results are object keys (okeys); materialize them with
-// objects.getTypedByOkey. The fetch model is stale-snapshot: a query reads one
+// Results are object keys (objectKeys); materialize them with
+// objects.getTypedByObjectKey. The fetch model is stale-snapshot: a query reads one
 // committed snapshot and returns detached keys, never live cursors.
 
 const MAX_PROPS: usize = 256;
@@ -97,25 +97,25 @@ fn validateProps(s: *const Scan, preds: []const Predicate) !void {
     }
 }
 
-// (okey, physical row) pair, as surfaced by the key->row index.
-const Pair = struct { okey: u64, row: u64 };
+// (objectKey, physical row) pair, as surfaced by the key->row index.
+const Pair = struct { objectKey: u64, row: u64 };
 
 // ---------------------------------------------------------------------------
 // Query planner.
 //
 // The planner chooses an optional DRIVING predicate: a predicate whose property
 // is indexed and whose operator is index-friendly (eq, lt, le, gt, ge). When one
-// exists, the candidate okeys are gathered from that property's value index
+// exists, the candidate objectKeys are gathered from that property's value index
 // rather than from a full keyrow scan; the remaining predicates are then applied
 // to each candidate by the same rowLive/rowMatches logic the scan uses.
 //
 // Correctness: the value index is an exact mirror of the indexed property (kept
-// in sync on every mutation), so its inner sets contain exactly the okeys whose
-// value satisfies the driving predicate. Resolving each candidate okey through
+// in sync on every mutation), so its inner sets contain exactly the objectKeys whose
+// value satisfies the driving predicate. Resolving each candidate objectKey through
 // the keyrow index and re-applying ALL predicates (including the driving one,
 // which always passes) plus the live check reproduces, on the same committed
-// snapshot, the exact okey set the full scan would emit. Candidate pairs are
-// sorted by okey so the emitted order matches the ascending-okey scan order too.
+// snapshot, the exact objectKey set the full scan would emit. Candidate pairs are
+// sorted by objectKey so the emitted order matches the ascending-objectKey scan order too.
 // ---------------------------------------------------------------------------
 
 // Pick the index of the driving predicate, or null to fall back to a full scan.
@@ -153,8 +153,8 @@ fn rangeBounds(op: Op, value: u64) ?Bounds {
     };
 }
 
-// Appends okeys to a list; used to drain a value-index inner set (okey -> 1).
-const OkeyCollector = struct {
+// Appends objectKeys to a list; used to drain a value-index inner set (objectKey -> 1).
+const ObjectKeyCollector = struct {
     list: *std.ArrayList(u64),
     allocator: std.mem.Allocator,
     fn onKey(self: @This(), key: u64) !void {
@@ -172,9 +172,9 @@ const InnerRootCollector = struct {
     }
 };
 
-// Gather candidate (okey, row) pairs for a driving predicate from its value
-// index, resolving each okey to its current physical row via the keyrow index
-// (skipping any okey with no mapping). Pairs are returned sorted by okey.
+// Gather candidate (objectKey, row) pairs for a driving predicate from its value
+// index, resolving each objectKey to its current physical row via the keyrow index
+// (skipping any objectKey with no mapping). Pairs are returned sorted by objectKey.
 fn collectCandidatePairs(
     transaction: anytype,
     s: *const Scan,
@@ -183,13 +183,13 @@ fn collectCandidatePairs(
     allocator: std.mem.Allocator,
 ) !void {
     const vi = s.value_index_refs[driver.prop];
-    var okeys = std.ArrayList(u64).empty;
-    defer okeys.deinit(allocator);
+    var objectKeys = std.ArrayList(u64).empty;
+    defer objectKeys.deinit(allocator);
 
     if (driver.op == .eq) {
         if (try index.get(transaction, vi, driver.value)) |inner_root| {
             if (inner_root != 0) {
-                try index.forEachKey(transaction, inner_root, OkeyCollector{ .list = &okeys, .allocator = allocator }, OkeyCollector.onKey);
+                try index.forEachKey(transaction, inner_root, ObjectKeyCollector{ .list = &objectKeys, .allocator = allocator }, ObjectKeyCollector.onKey);
             }
         }
     } else {
@@ -199,22 +199,22 @@ fn collectCandidatePairs(
         try index.forEachEntryInRange(transaction, vi, bounds.lo, bounds.hi, InnerRootCollector{ .list = &inner_roots, .allocator = allocator }, InnerRootCollector.onEntry);
         for (inner_roots.items) |inner_root| {
             if (inner_root == 0) continue;
-            try index.forEachKey(transaction, inner_root, OkeyCollector{ .list = &okeys, .allocator = allocator }, OkeyCollector.onKey);
+            try index.forEachKey(transaction, inner_root, ObjectKeyCollector{ .list = &objectKeys, .allocator = allocator }, ObjectKeyCollector.onKey);
         }
     }
 
-    for (okeys.items) |okey| {
-        const row = (try index.get(transaction, s.keyrow_index_ref, okey)) orelse continue;
-        try pairs.append(allocator, .{ .okey = okey, .row = row });
+    for (objectKeys.items) |objectKey| {
+        const row = (try index.get(transaction, s.keyrow_index_ref, objectKey)) orelse continue;
+        try pairs.append(allocator, .{ .objectKey = objectKey, .row = row });
     }
     std.mem.sort(Pair, pairs.items, {}, struct {
         fn lt(_: void, a: Pair, b: Pair) bool {
-            return a.okey < b.okey;
+            return a.objectKey < b.objectKey;
         }
     }.lt);
 }
 
-// Run a query: stream every live matching (okey, row) into `onMatch(ctx, okey, row)`.
+// Run a query: stream every live matching (objectKey, row) into `onMatch(ctx, objectKey, row)`.
 // With a driving predicate the candidate set comes from that property's value
 // index (bounded by its selectivity, so a temporary pair buffer is fine); the
 // full-scan path streams the key->row index directly and evaluates each row
@@ -232,7 +232,7 @@ fn runQuery(
         defer pairs.deinit(allocator);
         try collectCandidatePairs(transaction, s, preds[di], &pairs, allocator);
         for (pairs.items) |pr| {
-            if (try evalRow(transaction, s, pr.row, preds)) try onMatch(ctx, pr.okey, pr.row);
+            if (try evalRow(transaction, s, pr.row, preds)) try onMatch(ctx, pr.objectKey, pr.row);
         }
         return;
     }
@@ -241,8 +241,8 @@ fn runQuery(
         s: *const Scan,
         preds: []const Predicate,
         inner: @TypeOf(ctx),
-        fn onEntry(self: @This(), okey: u64, row: u64) anyerror!void {
-            if (try evalRow(self.transaction, self.s, row, self.preds)) try onMatch(self.inner, okey, row);
+        fn onEntry(self: @This(), objectKey: u64, row: u64) anyerror!void {
+            if (try evalRow(self.transaction, self.s, row, self.preds)) try onMatch(self.inner, objectKey, row);
         }
     };
     try index.forEachEntry(transaction, s.keyrow_index_ref, Stream{ .transaction = transaction, .s = s, .preds = preds, .inner = ctx }, Stream.onEntry);
@@ -255,7 +255,7 @@ fn drivingPredicateIndex(transaction: anytype, catalogRef: Reference, preds: []c
     return pickDriving(&s, preds);
 }
 
-// Collect the okeys of every live row that satisfies ALL predicates (logical
+// Collect the objectKeys of every live row that satisfies ALL predicates (logical
 // AND). An empty predicate list matches every live row.
 pub fn where(
     transaction: anytype,
@@ -269,8 +269,8 @@ pub fn where(
     const Sink = struct {
         out: *std.ArrayList(u64),
         allocator: std.mem.Allocator,
-        fn onMatch(self: @This(), okey: u64, _: u64) anyerror!void {
-            try self.out.append(self.allocator, okey);
+        fn onMatch(self: @This(), objectKey: u64, _: u64) anyerror!void {
+            try self.out.append(self.allocator, objectKey);
         }
     };
     try runQuery(transaction, &s, preds, allocator, Sink{ .out = out, .allocator = allocator }, Sink.onMatch);
@@ -318,7 +318,7 @@ pub fn aggregateInt(transaction: anytype, catalogRef: Reference, prop: usize, pr
     return agg;
 }
 
-// Convenience: collect okeys whose property `prop` is in the inclusive range
+// Convenience: collect objectKeys whose property `prop` is in the inclusive range
 // [lo, hi]. Implemented as a scan with two predicates; an index-seek fast path
 // is a later optimization.
 pub fn rangeInclusive(
@@ -337,12 +337,12 @@ pub fn rangeInclusive(
     try where(transaction, catalogRef, &preds, out, allocator);
 }
 
-// Sort a slice of okeys in place by an int property, ascending. Reads each
+// Sort a slice of objectKeys in place by an int property, ascending. Reads each
 // row's value once into a temporary pair array, then sorts.
 pub fn sortByPropAsc(
     transaction: anytype,
     catalogRef: Reference,
-    okeys: []u64,
+    objectKeys: []u64,
     prop: usize,
     allocator: std.mem.Allocator,
 ) !void {
@@ -350,12 +350,12 @@ pub fn sortByPropAsc(
     if (prop >= v.prop_count) return error.BadProp;
     const col = v.propColRef(prop);
     const SortPair = struct { val: u64, key: u64 };
-    const pairs = try allocator.alloc(SortPair, okeys.len);
+    const pairs = try allocator.alloc(SortPair, objectKeys.len);
     defer allocator.free(pairs);
-    for (okeys, 0..) |k, i| {
-        // A caller-supplied okey that no longer resolves (stale or deleted) is
+    for (objectKeys, 0..) |k, i| {
+        // A caller-supplied objectKey that no longer resolves (stale or deleted) is
         // an input error, not a crash.
-        const row = (try catalog.okeyToRow(transaction, catalogRef, k)) orelse return error.NotFound;
+        const row = (try catalog.objectKeyToRow(transaction, catalogRef, k)) orelse return error.NotFound;
         pairs[i] = .{ .val = try Column.get(transaction, col, row), .key = k };
     }
     std.mem.sort(SortPair, pairs, {}, struct {
@@ -363,7 +363,7 @@ pub fn sortByPropAsc(
             return a.val < b.val;
         }
     }.lt);
-    for (pairs, 0..) |pr, i| okeys[i] = pr.key;
+    for (pairs, 0..) |pr, i| objectKeys[i] = pr.key;
 }
 
 // Tests of file-private invariants; the main suite lives in queryTests.zig.
@@ -383,13 +383,13 @@ fn qTmpPath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const u8
 // Every test builds two catalogs over identical data inserted in identical
 // order: one with prop 1 indexed (the planner drives off its value index) and
 // one with prop 1 NOT indexed (forced full scan). Because both catalogs assign
-// object keys from 0 in the same insertion order, a row's okey is the same in
-// both, so the sorted okey slices must be byte-for-byte equal. Any divergence
+// object keys from 0 in the same insertion order, a row's objectKey is the same in
+// both, so the sorted objectKey slices must be byte-for-byte equal. Any divergence
 // between the index path and the full scan is a defect.
 // ---------------------------------------------------------------------------
 
-// Build a 3-prop type: prop0 = pk, prop1 = value (indexed iff `idx`), prop2 =
-// secondary. Inserts n rows with pk=i, prop1=i%100, prop2=i.
+// Build a 3-prop type: prop0 = primaryKey, prop1 = value (indexed iff `idx`), prop2 =
+// secondary. Inserts n rows with primaryKey=i, prop1=i%100, prop2=i.
 fn seedPlannerCatalog(w: *@import("database.zig").WriteTransaction, idx: bool, n: u64) !Reference {
     const defs = [_]catalog.PropDef{
         .{ .kind = .int },

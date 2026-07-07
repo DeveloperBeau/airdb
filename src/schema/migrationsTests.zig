@@ -19,7 +19,7 @@ const propCount = catalog.propCount;
 
 const insert = @import("../records/rows.zig").insert;
 
-const getByPk = @import("../records/rows.zig").getByPk;
+const getByPrimaryKey = @import("../records/rows.zig").getByPrimaryKey;
 
 const getLink = @import("../records/links.zig").getLink;
 
@@ -37,7 +37,7 @@ test "addProperty backfills the default for existing rows" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    // start with pk + one value
+    // start with primaryKey + one value
     var catalogRef = try create(&w, 2);
     catalogRef = (try insert(&w, catalogRef, &.{ 1, 10 })).catalogRef;
     catalogRef = (try insert(&w, catalogRef, &.{ 2, 20 })).catalogRef;
@@ -45,7 +45,7 @@ test "addProperty backfills the default for existing rows" {
     catalogRef = try addProperty(&w, catalogRef, .{ .kind = .int }, 7);
     try testing.expectEqual(@as(PropCount, 3), try propCount(&w, catalogRef));
     var out: [3]u64 = undefined;
-    _ = (try getByPk(&w, catalogRef, 1, &out)).?;
+    _ = (try getByPrimaryKey(&w, catalogRef, 1, &out)).?;
     try testing.expectEqual(@as(u64, 10), out[1]);
     try testing.expectEqual(@as(u64, 7), out[2]); // backfilled
     w.deinit();
@@ -66,7 +66,7 @@ test "addProperty: new inserts supply the added property" {
     // new inserts provide all three
     catalogRef = (try insert(&w, catalogRef, &.{ 3, 30, 99 })).catalogRef;
     var out: [3]u64 = undefined;
-    _ = (try getByPk(&w, catalogRef, 3, &out)).?;
+    _ = (try getByPrimaryKey(&w, catalogRef, 3, &out)).?;
     try testing.expectEqual(@as(u64, 99), out[2]);
     w.deinit();
 }
@@ -83,12 +83,12 @@ test "removeProperty drops a property and shifts the rest" {
     catalogRef = (try insert(&w, catalogRef, &.{ 1, 10 })).catalogRef;
     catalogRef = try addProperty(&w, catalogRef, .{ .kind = .int }, 7);
     catalogRef = (try insert(&w, catalogRef, &.{ 3, 30, 99 })).catalogRef;
-    // remove the middle property (index 1); now pk + the added prop
+    // remove the middle property (index 1); now primaryKey + the added prop
     catalogRef = try removeProperty(&w, catalogRef, 1);
     try testing.expectEqual(@as(PropCount, 2), try propCount(&w, catalogRef));
     var out2: [2]u64 = undefined;
-    _ = (try getByPk(&w, catalogRef, 3, &out2)).?;
-    try testing.expectEqual(@as(u64, 3), out2[0]); // pk preserved
+    _ = (try getByPrimaryKey(&w, catalogRef, 3, &out2)).?;
+    try testing.expectEqual(@as(u64, 3), out2[0]); // primaryKey preserved
     try testing.expectEqual(@as(u64, 99), out2[1]); // the formerly-third prop shifted to index 1
     w.deinit();
 }
@@ -183,7 +183,7 @@ test "addProperty link type gets a backlink index" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    var catalogRef = try create(&w, 1); // just a pk
+    var catalogRef = try create(&w, 1); // just a primaryKey
     catalogRef = (try insert(&w, catalogRef, &.{1})).catalogRef;
     catalogRef = try addProperty(&w, catalogRef, .{ .kind = .link }, 0); // 0 == null link
     const v = try catalog.loadCatalog(&w, catalogRef);
@@ -221,8 +221,8 @@ test "addProperty copies a blob default per row instead of sharing one node" {
     // Every row reads the default bytes, but from its OWN node.
     var raw1: [3]u64 = undefined;
     var raw2: [3]u64 = undefined;
-    const v1 = (try getByPk(&w, w.new_root, 1, &raw1)).?;
-    const v2 = (try getByPk(&w, w.new_root, 2, &raw2)).?;
+    const v1 = (try getByPrimaryKey(&w, w.new_root, 1, &raw1)).?;
+    const v2 = (try getByPrimaryKey(&w, w.new_root, 2, &raw2)).?;
     try testing.expectEqualStrings("default-bytes", try blob.get(&w, raw1[2]));
     try testing.expectEqualStrings("default-bytes", try blob.get(&w, raw2[2]));
     try testing.expect(raw1[2] != raw2[2]);

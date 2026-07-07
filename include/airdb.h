@@ -50,9 +50,9 @@ int64_t airdb_prop_count(AirdbDatabase *database);
  * Returns the new object key, or a negative error code. */
 int64_t airdb_insert(AirdbDatabase *database, const uint64_t *vals, size_t len);
 
-/* Read the row with primary key `pk` into `out` (len must equal prop_count).
+/* Read the row with primary key `primaryKey` into `out` (len must equal prop_count).
  * Returns the row version (>= 1), or AIRDB_E_NOT_FOUND. */
-int64_t airdb_get(AirdbDatabase *database, uint64_t pk, uint64_t *out, size_t len);
+int64_t airdb_get(AirdbDatabase *database, uint64_t primaryKey, uint64_t *out, size_t len);
 
 /* Number of live rows, or a negative error code. */
 int64_t airdb_count(AirdbDatabase *database);
@@ -61,8 +61,8 @@ int64_t airdb_count(AirdbDatabase *database);
  * Returns AIRDB_OK or a negative error code. */
 int64_t airdb_update(AirdbDatabase *database, const uint64_t *vals, size_t len);
 
-/* Delete the row with primary key `pk`. Returns AIRDB_OK or an error code. */
-int64_t airdb_delete(AirdbDatabase *database, uint64_t pk);
+/* Delete the row with primary key `primaryKey`. Returns AIRDB_OK or an error code. */
+int64_t airdb_delete(AirdbDatabase *database, uint64_t primaryKey);
 
 /* Bulk-load `row_count` rows of `prop_count` values each from the flat,
  * row-major buffer (row i occupies rows_flat[i*prop_count..]; element 0 of
@@ -105,10 +105,10 @@ int64_t airdb_txn_insert(AirdbTxn *transaction, const uint64_t *vals, size_t len
  * code; on error the transaction stays open and the batch is unchanged. */
 int64_t airdb_txn_update(AirdbTxn *transaction, const uint64_t *vals, size_t len);
 
-/* Stage a delete of the row with primary key `pk`. Returns AIRDB_OK or an
+/* Stage a delete of the row with primary key `primaryKey`. Returns AIRDB_OK or an
  * error code; on error the transaction stays open and the batch is
  * unchanged. */
-int64_t airdb_txn_delete(AirdbTxn *transaction, uint64_t pk);
+int64_t airdb_txn_delete(AirdbTxn *transaction, uint64_t primaryKey);
 
 #ifdef __cplusplus
 }

@@ -6,14 +6,14 @@
 // link, and the cascade-delete worker recurses to arbitrary depth). We exploit
 // that with one directory carrying a single 4-type chain:
 //
-//   type 0  root        {int pk, link(cascade -> type 1)}   non-embedded
-//   type 1  child        {int pk, link(cascade -> type 2)}   embedded
-//   type 2  grandchild   {int pk, link(cascade -> type 3)}   embedded
-//   type 3  greatchild   {int pk, int value}                 embedded leaf
+//   type 0  root        {int primaryKey, link(cascade -> type 1)}   non-embedded
+//   type 1  child        {int primaryKey, link(cascade -> type 2)}   embedded
+//   type 2  grandchild   {int primaryKey, link(cascade -> type 3)}   embedded
+//   type 3  greatchild   {int primaryKey, int value}                 embedded leaf
 //
 // Depth d builds a root plus d embedded levels down the chain (depth 1 = one
 // embedded child; depth 2 = child + grandchild; depth 3 = + great-grandchild).
-// Every type owns an independent pk space, so each depth uses key = d*stride + i
+// Every type owns an independent primaryKey space, so each depth uses key = d*stride + i
 // across all its levels to keep rows disjoint across the three depth passes
 // while sharing one directory and one Database.
 //
@@ -47,7 +47,7 @@ const max_rows: usize = 50_000;
 // Root rows committed per write transaction.
 const batch_size: usize = 5_000;
 
-// Disjoint pk band per depth; larger than max_rows so depth passes never alias.
+// Disjoint primaryKey band per depth; larger than max_rows so depth passes never alias.
 const depth_stride: u64 = 1_000_000;
 
 // A 4-type chain: types 0..2 carry a cascade to-one link to the next type;
@@ -124,7 +124,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
                     const t0 = nowNs(io);
                     // Root row of type 0.
                     dir = (try typeRouting.insert(&w, dir, 0, &.{ .{ .int = key }, .{ .link = null } })).dir;
-                    // Embedded levels 1..d. Each shares `key` in its own pk space.
+                    // Embedded levels 1..d. Each shares `key` in its own primaryKey space.
                     var level: u16 = 0;
                     while (level < d) : (level += 1) {
                         const leaf = level + 1 == max_depth;

@@ -19,8 +19,8 @@ fn qTmpPath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const u8
     return std.fs.path.join(allocator, &.{ path_buf[0..path_len], name });
 }
 
-// Build a 3-prop type: prop0 = pk, prop1 = value (indexed iff `idx`), prop2 =
-// secondary. Inserts n rows with pk=i, prop1=i%100, prop2=i.
+// Build a 3-prop type: prop0 = primaryKey, prop1 = value (indexed iff `idx`), prop2 =
+// secondary. Inserts n rows with primaryKey=i, prop1=i%100, prop2=i.
 fn seedPlannerCatalog(w: *@import("database.zig").WriteTransaction, idx: bool, n: u64) !Reference {
     const defs = [_]catalog.PropDef{
         .{ .kind = .int },
@@ -33,7 +33,7 @@ fn seedPlannerCatalog(w: *@import("database.zig").WriteTransaction, idx: bool, n
     return catalogRef;
 }
 
-// Build a type with pk(int) + age(int) and insert (pk, age) rows.
+// Build a type with primaryKey(int) + age(int) and insert (primaryKey, age) rows.
 fn seed(w: anytype, pairs: []const [2]u64) !Reference {
     var catalogRef = try catalog.create(w, 2);
     for (pairs) |p| catalogRef = (try rows.insert(w, catalogRef, &.{ p[0], p[1] })).catalogRef;
@@ -54,7 +54,7 @@ test "where filters live rows by ANDed predicates" {
     defer r1.deinit(testing.allocator);
     try where(&w, catalogRef, &.{.{ .prop = 1, .op = .eq, .value = 30 }}, &r1, testing.allocator);
     try testing.expectEqual(@as(usize, 2), r1.items.len);
-    // age > 25 AND pk < 4  -> pk 2 (age30), pk3 (age40) ; pk4 excluded by pk<4
+    // age > 25 AND primaryKey < 4  -> primaryKey 2 (age30), primaryKey3 (age40) ; primaryKey4 excluded by primaryKey<4
     var r2 = std.ArrayList(u64).empty;
     defer r2.deinit(testing.allocator);
     try where(&w, catalogRef, &.{
@@ -62,9 +62,9 @@ test "where filters live rows by ANDed predicates" {
         .{ .prop = 0, .op = .lt, .value = 4 },
     }, &r2, testing.allocator);
     try testing.expectEqual(@as(usize, 2), r2.items.len);
-    // delete pk 2, re-query age==30 -> only pk4
+    // delete primaryKey 2, re-query age==30 -> only primaryKey4
     var out: [2]u64 = undefined;
-    const vv = (try rows.getByPk(&w, catalogRef, 2, &out)).?;
+    const vv = (try rows.getByPrimaryKey(&w, catalogRef, 2, &out)).?;
     catalogRef = (try rows.delete(&w, catalogRef, 2, vv)).ok;
     var r3 = std.ArrayList(u64).empty;
     defer r3.deinit(testing.allocator);
@@ -89,8 +89,8 @@ test "out-of-range property indices are rejected up front" {
     try testing.expectError(error.BadProp, where(&w, catalogRef, &bad, &hits, testing.allocator));
     try testing.expectError(error.BadProp, countWhere(&w, catalogRef, &bad, testing.allocator));
     try testing.expectError(error.BadProp, aggregateInt(&w, catalogRef, 9, &.{}, testing.allocator));
-    var okeys = [_]u64{};
-    try testing.expectError(error.BadProp, sortByPropAsc(&w, catalogRef, &okeys, 5, testing.allocator));
+    var objectKeys = [_]u64{};
+    try testing.expectError(error.BadProp, sortByPropAsc(&w, catalogRef, &objectKeys, 5, testing.allocator));
 }
 
 test "streamed full scan agrees with where on count and aggregate" {
@@ -105,15 +105,15 @@ test "streamed full scan agrees with where on count and aggregate" {
     var catalogRef = try seed(&w, &.{ .{ 1, 20 }, .{ 2, 30 }, .{ 3, 40 }, .{ 4, 30 }, .{ 5, 25 } });
     // Tombstone one matching row so the live filter is exercised mid-stream.
     var out: [2]u64 = undefined;
-    const ver = (try rows.getByPk(&w, catalogRef, 4, &out)).?;
+    const ver = (try rows.getByPrimaryKey(&w, catalogRef, 4, &out)).?;
     catalogRef = (try rows.delete(&w, catalogRef, 4, ver)).ok;
 
     const preds = [_]Predicate{.{ .prop = 1, .op = .ge, .value = 25 }};
-    var okeys = std.ArrayList(u64).empty;
-    defer okeys.deinit(testing.allocator);
-    try where(&w, catalogRef, &preds, &okeys, testing.allocator);
-    try testing.expectEqual(@as(usize, 3), okeys.items.len); // pks 2, 3, 5
-    try testing.expectEqual(@as(u64, okeys.items.len), try countWhere(&w, catalogRef, &preds, testing.allocator));
+    var objectKeys = std.ArrayList(u64).empty;
+    defer objectKeys.deinit(testing.allocator);
+    try where(&w, catalogRef, &preds, &objectKeys, testing.allocator);
+    try testing.expectEqual(@as(usize, 3), objectKeys.items.len); // primaryKeys 2, 3, 5
+    try testing.expectEqual(@as(u64, objectKeys.items.len), try countWhere(&w, catalogRef, &preds, testing.allocator));
     const agg = try aggregateInt(&w, catalogRef, 1, &preds, testing.allocator);
     try testing.expectEqual(@as(u64, 3), agg.count);
     try testing.expectEqual(@as(u64, 30 + 40 + 25), agg.sum);
@@ -154,10 +154,10 @@ test "rangeInclusive and sortByPropAsc" {
     const catalogRef = try seed(&w, &.{ .{ 5, 1 }, .{ 1, 1 }, .{ 9, 1 }, .{ 3, 1 }, .{ 7, 1 } });
     var rng = std.ArrayList(u64).empty;
     defer rng.deinit(testing.allocator);
-    // pk in [3,7]
+    // primaryKey in [3,7]
     try rangeInclusive(&w, catalogRef, 0, 3, 7, &rng, testing.allocator);
-    try testing.expectEqual(@as(usize, 3), rng.items.len); // pks 5,3,7
-    // sort the matching okeys by pk ascending, then verify the pk order is 3,5,7
+    try testing.expectEqual(@as(usize, 3), rng.items.len); // primaryKeys 5,3,7
+    // sort the matching objectKeys by primaryKey ascending, then verify the primaryKey order is 3,5,7
     try sortByPropAsc(&w, catalogRef, rng.items, 0, testing.allocator);
     var out: [2]u64 = undefined;
     _ = try rows.getByObjectKey(&w, catalogRef, rng.items[0], &out);
@@ -194,34 +194,34 @@ test "query returns stable object keys after relocation" {
     defer database.deinit();
     var w = try database.beginWrite();
 
-    // pk + age. Insert a throwaway first to open up a dead slot, then the target.
+    // primaryKey + age. Insert a throwaway first to open up a dead slot, then the target.
     var catalogRef = try catalog.create(&w, 2);
     const throwaway = try rows.insert(&w, catalogRef, &.{ 1, 99 });
     catalogRef = throwaway.catalogRef;
     const target = try rows.insert(&w, catalogRef, &.{ 2, 30 });
     catalogRef = target.catalogRef;
-    const target_okey = target.row;
+    const targetObjectKey = target.row;
 
     // Free the throwaway's physical slot.
-    const dead_row = (try catalog.okeyToRow(&w, catalogRef, throwaway.row)).?;
+    const dead_row = (try catalog.objectKeyToRow(&w, catalogRef, throwaway.row)).?;
     var vbuf: [2]u64 = undefined;
-    const tv = (try rows.getByPk(&w, catalogRef, 1, &vbuf)).?;
+    const tv = (try rows.getByPrimaryKey(&w, catalogRef, 1, &vbuf)).?;
     catalogRef = (try rows.delete(&w, catalogRef, 1, tv)).ok;
 
-    // Relocate the target into the freed slot; its okey is unchanged.
-    catalogRef = try relocation.relocateRow(&w, catalogRef, target_okey, dead_row);
+    // Relocate the target into the freed slot; its objectKey is unchanged.
+    catalogRef = try relocation.relocateRow(&w, catalogRef, targetObjectKey, dead_row);
 
-    // A query that matches the relocated row must return its stable okey, and
-    // that okey must resolve to the right values.
+    // A query that matches the relocated row must return its stable objectKey, and
+    // that objectKey must resolve to the right values.
     var hits = std.ArrayList(u64).empty;
     defer hits.deinit(testing.allocator);
     try where(&w, catalogRef, &.{.{ .prop = 1, .op = .eq, .value = 30 }}, &hits, testing.allocator);
     try testing.expectEqual(@as(usize, 1), hits.items.len);
-    try testing.expectEqual(target_okey, hits.items[0]);
+    try testing.expectEqual(targetObjectKey, hits.items[0]);
 
     var out: [2]u64 = undefined;
     try testing.expect((try rows.getByObjectKey(&w, catalogRef, hits.items[0], &out)) != null);
-    try testing.expectEqual(@as(u64, 2), out[0]); // pk
+    try testing.expectEqual(@as(u64, 2), out[0]); // primaryKey
     try testing.expectEqual(@as(u64, 30), out[1]); // age
     w.deinit();
 }
@@ -233,7 +233,7 @@ fn whereSorted(transaction: anytype, catalogRef: Reference, preds: []const Predi
     std.mem.sort(u64, out.items, {}, std.sort.asc(u64));
 }
 
-// Assert the index path (on indexedCatalog) yields the exact same sorted okey set as
+// Assert the index path (on indexedCatalog) yields the exact same sorted objectKey set as
 // the full scan (on scanCatalog) for the given predicates.
 fn expectSameWhere(transaction: anytype, indexedCatalog: Reference, scanCatalog: Reference, preds: []const Predicate) !void {
     var a = std.ArrayList(u64).empty;
@@ -416,14 +416,14 @@ test "index path equals full scan after deletes" {
     var w = try database.beginWrite();
     var indexedCatalog = try seedPlannerCatalog(&w, true, 2000);
     var scanCatalog = try seedPlannerCatalog(&w, false, 2000);
-    // Delete every 7th pk from both catalogs.
+    // Delete every 7th primaryKey from both catalogs.
     var out: [3]u64 = undefined;
-    var pk: u64 = 0;
-    while (pk < 2000) : (pk += 7) {
-        const vi = (try rows.getByPk(&w, indexedCatalog, pk, &out)).?;
-        indexedCatalog = (try rows.delete(&w, indexedCatalog, pk, vi)).ok;
-        const vs = (try rows.getByPk(&w, scanCatalog, pk, &out)).?;
-        scanCatalog = (try rows.delete(&w, scanCatalog, pk, vs)).ok;
+    var primaryKey: u64 = 0;
+    while (primaryKey < 2000) : (primaryKey += 7) {
+        const vi = (try rows.getByPrimaryKey(&w, indexedCatalog, primaryKey, &out)).?;
+        indexedCatalog = (try rows.delete(&w, indexedCatalog, primaryKey, vi)).ok;
+        const vs = (try rows.getByPrimaryKey(&w, scanCatalog, primaryKey, &out)).?;
+        scanCatalog = (try rows.delete(&w, scanCatalog, primaryKey, vs)).ok;
     }
     try expectSameWhere(&w, indexedCatalog, scanCatalog, &.{.{ .prop = 1, .op = .eq, .value = 42 }});
     try expectSameWhere(&w, indexedCatalog, scanCatalog, &.{ .{ .prop = 1, .op = .ge, .value = 40 }, .{ .prop = 1, .op = .le, .value = 45 } });

@@ -95,19 +95,19 @@ pub fn insertTyped(transaction: *WriteTransaction, catalogRef: Reference, values
 // storage; a blob larger than the inline cap (stored chunked) decodes to a
 // .blob_ref the caller materializes with blob.getAlloc.
 // Returns the row version, or null when the key is not found.
-pub fn getTyped(transaction: anytype, catalogRef: Reference, pk: u64, out: []Value) !?u64 {
+pub fn getTyped(transaction: anytype, catalogRef: Reference, primaryKey: u64, out: []Value) !?u64 {
     const v = try loadCatalog(transaction, catalogRef);
     const pc = v.prop_count;
     std.debug.assert(out.len == pc);
     std.debug.assert(pc <= max_prop_count);
-    // Capture kinds before the getByPk call may touch other catalog nodes.
+    // Capture kinds before the getByPrimaryKey call may touch other catalog nodes.
     var kinds: [max_prop_count]PropKind = undefined;
     {
         var j: usize = 0;
         while (j < pc) : (j += 1) kinds[j] = v.kind(j);
     }
     var raw: [max_prop_count]u64 = undefined;
-    const ver = (try rows.getByPk(transaction, catalogRef, pk, raw[0..pc])) orelse return null;
+    const ver = (try rows.getByPrimaryKey(transaction, catalogRef, primaryKey, raw[0..pc])) orelse return null;
     var i: usize = 0;
     while (i < pc) : (i += 1) {
         out[i] = switch (kinds[i]) {
@@ -123,8 +123,8 @@ pub fn getTyped(transaction: anytype, catalogRef: Reference, pk: u64, out: []Val
     return ver;
 }
 
-// getTypedByOkey decodes a row addressed by stable object key into Values.
-pub fn getTypedByOkey(transaction: anytype, catalogRef: Reference, okey: u64, out: []Value) !?u64 {
+// getTypedByObjectKey decodes a row addressed by stable object key into Values.
+pub fn getTypedByObjectKey(transaction: anytype, catalogRef: Reference, objectKey: u64, out: []Value) !?u64 {
     const v = try loadCatalog(transaction, catalogRef);
     const pc = v.prop_count;
     std.debug.assert(out.len == pc);
@@ -135,7 +135,7 @@ pub fn getTypedByOkey(transaction: anytype, catalogRef: Reference, okey: u64, ou
         while (j < pc) : (j += 1) kinds[j] = v.kind(j);
     }
     var raw: [max_prop_count]u64 = undefined;
-    const ver = (try rows.getByObjectKey(transaction, catalogRef, okey, raw[0..pc])) orelse return null;
+    const ver = (try rows.getByObjectKey(transaction, catalogRef, objectKey, raw[0..pc])) orelse return null;
     var i: usize = 0;
     while (i < pc) : (i += 1) {
         out[i] = switch (kinds[i]) {
@@ -153,14 +153,14 @@ pub fn getTypedByOkey(transaction: anytype, catalogRef: Reference, okey: u64, ou
 
 // Delete an object and keep the graph consistent: nullify inbound links and
 // clean the deleted object's outbound backlink entries.
-pub fn deleteAndNullify(transaction: *WriteTransaction, catalogRef: Reference, pk: u64, expected_version: u64) !DeleteResult {
+pub fn deleteAndNullify(transaction: *WriteTransaction, catalogRef: Reference, primaryKey: u64, expected_version: u64) !DeleteResult {
     const v = try loadCatalog(transaction, catalogRef);
-    const okey = (try Index.get(transaction, v.pk_index_ref, pk)) orelse return .not_found;
-    const row = (try catalog.okeyToRow(transaction, catalogRef, okey)) orelse return .not_found;
+    const objectKey = (try Index.get(transaction, v.primaryKeyIndexRef, primaryKey)) orelse return .not_found;
+    const row = (try catalog.objectKeyToRow(transaction, catalogRef, objectKey)) orelse return .not_found;
     const cur_ver = try Column.get(transaction, v.version_col_ref, row);
     if (cur_ver != expected_version) return .{ .conflict = .{ .current_version = cur_ver } };
-    const fixed = try links.fixBacklinksForDelete(transaction, catalogRef, okey);
-    return try rows.delete(transaction, fixed, pk, expected_version);
+    const fixed = try links.fixBacklinksForDelete(transaction, catalogRef, objectKey);
+    return try rows.delete(transaction, fixed, primaryKey, expected_version);
 }
 
 // updateTyped is MVCC-safe: it does NOT free any blob unless the version check
@@ -172,7 +172,7 @@ pub fn deleteAndNullify(transaction: *WriteTransaction, catalogRef: Reference, p
 pub fn updateTyped(
     transaction: *WriteTransaction,
     catalogRef: Reference,
-    pk: u64,
+    primaryKey: u64,
     values: []const Value,
     expected_version: u64,
 ) !UpdateResult {
@@ -188,7 +188,7 @@ pub fn updateTyped(
     }
     // Step 1: read the current row into cur_raw.
     var cur_raw: [max_prop_count]u64 = undefined;
-    const current_version = (try rows.getByPk(transaction, catalogRef, pk, cur_raw[0..pc])) orelse return .not_found;
+    const current_version = (try rows.getByPrimaryKey(transaction, catalogRef, primaryKey, cur_raw[0..pc])) orelse return .not_found;
     // Step 2: version check BEFORE freeing or allocating any blob.
     if (current_version != expected_version)
         return .{ .conflict = .{ .current_version = current_version } };
@@ -210,11 +210,11 @@ pub fn updateTyped(
         };
     }
     // Step 4: delegate to the core update; it will re-check the version (match).
-    const result = try rows.update(transaction, catalogRef, pk, new_raw[0..pc], expected_version);
+    const result = try rows.update(transaction, catalogRef, primaryKey, new_raw[0..pc], expected_version);
     // Step 5: maintain backlinks for any changed to-one link, mirroring
     // setLink. Skipping this left the old target's backlink set naming this
     // source forever and the new target's set missing it -- corrupting
-    // nullify/cascade/block enforcement. The backlink source is the okey.
+    // nullify/cascade/block enforcement. The backlink source is the objectKey.
     switch (result) {
         .ok => |ok| {
             var updatedCatalog = ok.catalogRef;
@@ -222,12 +222,12 @@ pub fn updateTyped(
             var p: usize = 0;
             while (p < pc) : (p += 1) {
                 if (kinds[p] != .link or cur_raw[p] == new_raw[p]) continue;
-                // The row was just updated successfully, so its pk must
+                // The row was just updated successfully, so its primaryKey must
                 // resolve; anything else is index divergence, and bailing
                 // mid-loop would leave the backlinks half-moved.
-                const okey = (try catalog.pkToOkey(transaction, updatedCatalog, pk)) orelse return error.Corrupt;
-                if (cur_raw[p] != 0) updatedCatalog = try links.removeBacklink(transaction, updatedCatalog, p, cur_raw[p] - 1, okey);
-                if (new_raw[p] != 0) updatedCatalog = try links.addBacklink(transaction, updatedCatalog, p, new_raw[p] - 1, okey);
+                const objectKey = (try catalog.primaryKeyToObjectKey(transaction, updatedCatalog, primaryKey)) orelse return error.Corrupt;
+                if (cur_raw[p] != 0) updatedCatalog = try links.removeBacklink(transaction, updatedCatalog, p, cur_raw[p] - 1, objectKey);
+                if (new_raw[p] != 0) updatedCatalog = try links.addBacklink(transaction, updatedCatalog, p, new_raw[p] - 1, objectKey);
                 changed = true;
             }
             if (changed) return .{ .ok = .{ .catalogRef = updatedCatalog, .version = ok.version } };
@@ -242,7 +242,7 @@ pub fn updateTyped(
 pub fn deleteTyped(
     transaction: *WriteTransaction,
     catalogRef: Reference,
-    pk: u64,
+    primaryKey: u64,
     expected_version: u64,
 ) !DeleteResult {
     const v = try loadCatalog(transaction, catalogRef);
@@ -260,12 +260,12 @@ pub fn deleteTyped(
     }
     // Step 1: read the current row.
     var cur_raw: [max_prop_count]u64 = undefined;
-    const current_version = (try rows.getByPk(transaction, catalogRef, pk, cur_raw[0..pc])) orelse return .not_found;
+    const current_version = (try rows.getByPrimaryKey(transaction, catalogRef, primaryKey, cur_raw[0..pc])) orelse return .not_found;
     // Step 2: version check BEFORE freeing any blob.
     if (current_version != expected_version)
         return .{ .conflict = .{ .current_version = current_version } };
     // Step 3: delegate to the graph-safe delete (nullifies inbound links).
-    const result = try deleteAndNullify(transaction, catalogRef, pk, expected_version);
+    const result = try deleteAndNullify(transaction, catalogRef, primaryKey, expected_version);
     // Step 4: on the apply path, free the row's blob and collection storage.
     // This runs AFTER deleteAndNullify because the outbound backlink cleanup
     // reads the link_set roots; the tombstoned row's columns still hold the

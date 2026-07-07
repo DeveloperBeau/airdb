@@ -44,7 +44,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     var database = try airdb.Database.create(alloc, path);
     errdefer database.deinit();
 
-    // Simple two-int type: {pk, value}. The first value is the primary key.
+    // Simple two-int type: {primaryKey, value}. The first value is the primary key.
     var catalogRef: Reference = blk: {
         var w = try database.beginWrite();
         const c = try catalog.create(&w, 2);
@@ -60,8 +60,8 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         catalogRef = database.active_root; // reload the committed catalog ref
         var j: usize = 0;
         while (j < this_batch) : (j += 1) {
-            const pk: u64 = inserted + j;
-            const r = try rows.insert(&w, catalogRef, &.{ pk, pk });
+            const primaryKey: u64 = inserted + j;
+            const r = try rows.insert(&w, catalogRef, &.{ primaryKey, primaryKey });
             catalogRef = r.catalogRef;
         }
         w.setRoot(catalogRef);
@@ -91,7 +91,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     var r = try reopened.beginRead();
     catalogRef = r.root();
     var out: [2]u64 = undefined;
-    _ = try rows.getByPk(&r, catalogRef, 0, &out);
+    _ = try rows.getByPrimaryKey(&r, catalogRef, 0, &out);
     const first_read_ns: u64 = @intCast(nowNs(io) - read_start);
     r.end();
 

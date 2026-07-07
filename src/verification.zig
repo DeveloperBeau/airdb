@@ -110,8 +110,8 @@ fn auditValueIndexes(database: *Database) VerifyError!void {
 }
 
 // Forward direction of the value-index invariant: walk the live rows (the
-// keyrow index maps okey->row for live rows only) and assert each row's indexed
-// value carries that okey in the value index's inner set. A live row that the
+// keyrow index maps objectKey->row for live rows only) and assert each row's indexed
+// value carries that objectKey in the value index's inner set. A live row that the
 // index does not cover is error.ValueIndexMissingEntry. Any structural failure
 // reading the index/columns of an established typed catalog is itself a
 // divergence and reported the same way.
@@ -121,20 +121,20 @@ fn auditValueIndexForward(r: *ReadTransaction, keyrow_ref: Reference, vi_ref: Re
         vi_ref: Reference,
         prop_col: Reference,
         live_col: Reference,
-        fn onEntry(self: @This(), okey: u64, row: u64) anyerror!void {
+        fn onEntry(self: @This(), objectKey: u64, row: u64) anyerror!void {
             if ((try Column.get(self.r, self.live_col, row)) == 0) return; // defensive: skip dead
             const value = try Column.get(self.r, self.prop_col, row);
             const inner = (try Index.get(self.r, self.vi_ref, value)) orelse return error.ValueIndexMissingEntry;
-            if ((try Index.get(self.r, inner, okey)) == null) return error.ValueIndexMissingEntry;
+            if ((try Index.get(self.r, inner, objectKey)) == null) return error.ValueIndexMissingEntry;
         }
     };
     Index.forEachEntry(r, keyrow_ref, Ctx{ .r = r, .vi_ref = vi_ref, .prop_col = prop_col, .live_col = live_col }, Ctx.onEntry) catch return error.ValueIndexMissingEntry;
 }
 
 // Backward direction of the value-index invariant: walk every (value, inner-set)
-// entry of the value index and, for each okey in a non-empty inner set, assert it
+// entry of the value index and, for each objectKey in a non-empty inner set, assert it
 // resolves through the keyrow index to a live row whose property value equals
-// that value. A stale/dangling okey or a value mismatch is
+// that value. A stale/dangling objectKey or a value mismatch is
 // error.ValueIndexStaleEntry. Empty inner sets are skipped defensively: current
 // maintenance removes an entry the moment its set empties, but tolerating one
 // keeps the audit usable on files written before that pruning existed.
@@ -152,8 +152,8 @@ fn auditValueIndexBackward(r: *ReadTransaction, vi_ref: Reference, keyrow_ref: R
                 prop_col: Reference,
                 live_col: Reference,
                 value: u64,
-                fn onKey(inner: @This(), okey: u64) anyerror!void {
-                    const row = (try Index.get(inner.r, inner.keyrow_ref, okey)) orelse return error.ValueIndexStaleEntry;
+                fn onKey(inner: @This(), objectKey: u64) anyerror!void {
+                    const row = (try Index.get(inner.r, inner.keyrow_ref, objectKey)) orelse return error.ValueIndexStaleEntry;
                     if ((try Column.get(inner.r, inner.live_col, row)) == 0) return error.ValueIndexStaleEntry;
                     if ((try Column.get(inner.r, inner.prop_col, row)) != inner.value) return error.ValueIndexStaleEntry;
                 }
@@ -165,7 +165,7 @@ fn auditValueIndexBackward(r: *ReadTransaction, vi_ref: Reference, keyrow_ref: R
 }
 
 // Forward direction of the backlink invariant: every live row's outbound
-// link/link_set target must carry that row's okey in the target's backlink set.
+// link/link_set target must carry that row's objectKey in the target's backlink set.
 // Any structural failure while walking is itself a divergence.
 fn auditBacklinksForward(r: *ReadTransaction, cv: catalog.CatalogView, p: usize, kind: catalog.PropKind) VerifyError!void {
     const Ctx = struct {
@@ -174,29 +174,29 @@ fn auditBacklinksForward(r: *ReadTransaction, cv: catalog.CatalogView, p: usize,
         prop_col: Reference,
         live_col: Reference,
         kind: catalog.PropKind,
-        fn checkOne(self: @This(), target: u64, source_okey: u64) anyerror!void {
+        fn checkOne(self: @This(), target: u64, sourceObjectKey: u64) anyerror!void {
             const inner = (try Index.get(self.r, self.bl, target)) orelse return error.BacklinkMissingEntry;
-            if ((try Index.get(self.r, inner, source_okey)) == null) return error.BacklinkMissingEntry;
+            if ((try Index.get(self.r, inner, sourceObjectKey)) == null) return error.BacklinkMissingEntry;
         }
-        fn onEntry(self: @This(), okey: u64, row: u64) anyerror!void {
+        fn onEntry(self: @This(), objectKey: u64, row: u64) anyerror!void {
             if ((try Column.get(self.r, self.live_col, row)) == 0) return; // defensive: skip dead
             const raw = try Column.get(self.r, self.prop_col, row);
             if (self.kind == .link) {
                 if (raw == 0) return; // null link
-                try self.checkOne(raw - 1, okey);
+                try self.checkOne(raw - 1, objectKey);
                 return;
             }
             // link_set: every member of the row's set must backlink to this row.
             const Walk = struct {
                 r: *ReadTransaction,
                 bl: Reference,
-                okey: u64,
+                objectKey: u64,
                 fn onKey(m: @This(), target: u64) anyerror!void {
                     const inner = (try Index.get(m.r, m.bl, target)) orelse return error.BacklinkMissingEntry;
-                    if ((try Index.get(m.r, inner, m.okey)) == null) return error.BacklinkMissingEntry;
+                    if ((try Index.get(m.r, inner, m.objectKey)) == null) return error.BacklinkMissingEntry;
                 }
             };
-            try Index.forEachKey(self.r, raw, Walk{ .r = self.r, .bl = self.bl, .okey = okey }, Walk.onKey);
+            try Index.forEachKey(self.r, raw, Walk{ .r = self.r, .bl = self.bl, .objectKey = objectKey }, Walk.onKey);
         }
     };
     Index.forEachEntry(r, cv.keyrow_index_ref, Ctx{
@@ -227,8 +227,8 @@ fn auditBacklinksBackward(r: *ReadTransaction, cv: catalog.CatalogView, p: usize
                 live_col: Reference,
                 kind: catalog.PropKind,
                 target: u64,
-                fn onKey(inner: @This(), src_okey: u64) anyerror!void {
-                    const row = (try Index.get(inner.r, inner.keyrow, src_okey)) orelse return error.BacklinkStaleEntry;
+                fn onKey(inner: @This(), sourceObjectKey: u64) anyerror!void {
+                    const row = (try Index.get(inner.r, inner.keyrow, sourceObjectKey)) orelse return error.BacklinkStaleEntry;
                     if ((try Column.get(inner.r, inner.live_col, row)) == 0) return error.BacklinkStaleEntry;
                     const raw = try Column.get(inner.r, inner.prop_col, row);
                     if (inner.kind == .link) {

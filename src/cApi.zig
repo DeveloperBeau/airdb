@@ -145,14 +145,14 @@ export fn airdb_insert(handle: ?*DatabaseHandle, vals: [*]const u64, len: usize)
     return @intCast(r.row);
 }
 
-// Read the row with primary key `pk` into `out` (len must equal prop_count).
+// Read the row with primary key `primaryKey` into `out` (len must equal prop_count).
 // Returns the row version (>= 1) on success, AIRDB_E_NOT_FOUND if absent.
-export fn airdb_get(handle: ?*DatabaseHandle, pk: u64, out: [*]u64, len: usize) i64 {
+export fn airdb_get(handle: ?*DatabaseHandle, primaryKey: u64, out: [*]u64, len: usize) i64 {
     const self = handle orelse return AIRDB_E_GENERIC;
     if (len != self.prop_count) return AIRDB_E_BAD_ARGS;
     var r = self.database.beginRead() catch return AIRDB_E_GENERIC;
     defer r.end();
-    const ver = rows.getByPk(&r, r.root(), pk, out[0..len]) catch return AIRDB_E_GENERIC;
+    const ver = rows.getByPrimaryKey(&r, r.root(), primaryKey, out[0..len]) catch return AIRDB_E_GENERIC;
     return if (ver) |v| @intCast(v) else AIRDB_E_NOT_FOUND;
 }
 
@@ -165,16 +165,16 @@ export fn airdb_count(handle: ?*DatabaseHandle) i64 {
     return @intCast(c);
 }
 
-// Update the row with primary key `pk` to `vals` (len must equal prop_count,
-// vals[0] must equal pk). Auto-reads the current version, so it always applies
+// Update the row with primary key `primaryKey` to `vals` (len must equal prop_count,
+// vals[0] must equal primaryKey). Auto-reads the current version, so it always applies
 // (no optimistic check at this layer). Returns AIRDB_OK or an error code.
 export fn airdb_update(handle: ?*DatabaseHandle, vals: [*]const u64, len: usize) i64 {
     const self = handle orelse return AIRDB_E_GENERIC;
     if (len != self.prop_count) return AIRDB_E_BAD_ARGS;
-    const pk = vals[0];
+    const primaryKey = vals[0];
     var w = self.database.beginWrite() catch return commitErrCode(self);
     var cur: [MAX_PROPS]u64 = undefined;
-    const ver = rows.getByPk(&w, w.new_root, pk, cur[0..len]) catch {
+    const ver = rows.getByPrimaryKey(&w, w.new_root, primaryKey, cur[0..len]) catch {
         w.deinit();
         return AIRDB_E_GENERIC;
     };
@@ -182,7 +182,7 @@ export fn airdb_update(handle: ?*DatabaseHandle, vals: [*]const u64, len: usize)
         w.deinit();
         return AIRDB_E_NOT_FOUND;
     }
-    const res = rows.update(&w, w.new_root, pk, vals[0..len], ver.?) catch {
+    const res = rows.update(&w, w.new_root, primaryKey, vals[0..len], ver.?) catch {
         w.deinit();
         return AIRDB_E_GENERIC;
     };
@@ -203,12 +203,12 @@ export fn airdb_update(handle: ?*DatabaseHandle, vals: [*]const u64, len: usize)
     }
 }
 
-// Delete the row with primary key `pk`. Returns AIRDB_OK or an error code.
-export fn airdb_delete(handle: ?*DatabaseHandle, pk: u64) i64 {
+// Delete the row with primary key `primaryKey`. Returns AIRDB_OK or an error code.
+export fn airdb_delete(handle: ?*DatabaseHandle, primaryKey: u64) i64 {
     const self = handle orelse return AIRDB_E_GENERIC;
     var w = self.database.beginWrite() catch return commitErrCode(self);
     var cur: [MAX_PROPS]u64 = undefined;
-    const ver = rows.getByPk(&w, w.new_root, pk, cur[0..self.prop_count]) catch {
+    const ver = rows.getByPrimaryKey(&w, w.new_root, primaryKey, cur[0..self.prop_count]) catch {
         w.deinit();
         return AIRDB_E_GENERIC;
     };
@@ -216,7 +216,7 @@ export fn airdb_delete(handle: ?*DatabaseHandle, pk: u64) i64 {
         w.deinit();
         return AIRDB_E_NOT_FOUND;
     }
-    const res = rows.delete(&w, w.new_root, pk, ver.?) catch {
+    const res = rows.delete(&w, w.new_root, primaryKey, ver.?) catch {
         w.deinit();
         return AIRDB_E_GENERIC;
     };
@@ -396,11 +396,11 @@ export fn airdb_txn_update(transaction: ?*Transaction, vals: [*]const u64, len: 
     const t = transaction orelse return AIRDB_E_GENERIC;
     if (t.poisoned) return AIRDB_E_GENERIC;
     if (len != t.databaseHandle.prop_count) return AIRDB_E_BAD_ARGS;
-    const pk = vals[0];
+    const primaryKey = vals[0];
     var cur: [MAX_PROPS]u64 = undefined;
-    const ver = rows.getByPk(&t.w, t.catalogRef, pk, cur[0..len]) catch return AIRDB_E_GENERIC;
+    const ver = rows.getByPrimaryKey(&t.w, t.catalogRef, primaryKey, cur[0..len]) catch return AIRDB_E_GENERIC;
     if (ver == null) return AIRDB_E_NOT_FOUND;
-    const res = rows.update(&t.w, t.catalogRef, pk, vals[0..len], ver.?) catch {
+    const res = rows.update(&t.w, t.catalogRef, primaryKey, vals[0..len], ver.?) catch {
         t.poisoned = true; // mid-mutation failure
         return AIRDB_E_GENERIC;
     };
@@ -417,13 +417,13 @@ export fn airdb_txn_update(transaction: ?*Transaction, vals: [*]const u64, len: 
 // Stage a delete in the open transaction (no commit). Mirrors airdb_delete
 // against the threaded catalog ref. Returns AIRDB_OK or an error code; on error
 // the transaction stays open and the catalog ref is not advanced.
-export fn airdb_txn_delete(transaction: ?*Transaction, pk: u64) i64 {
+export fn airdb_txn_delete(transaction: ?*Transaction, primaryKey: u64) i64 {
     const t = transaction orelse return AIRDB_E_GENERIC;
     if (t.poisoned) return AIRDB_E_GENERIC;
     var cur: [MAX_PROPS]u64 = undefined;
-    const ver = rows.getByPk(&t.w, t.catalogRef, pk, cur[0..t.databaseHandle.prop_count]) catch return AIRDB_E_GENERIC;
+    const ver = rows.getByPrimaryKey(&t.w, t.catalogRef, primaryKey, cur[0..t.databaseHandle.prop_count]) catch return AIRDB_E_GENERIC;
     if (ver == null) return AIRDB_E_NOT_FOUND;
-    const res = rows.delete(&t.w, t.catalogRef, pk, ver.?) catch {
+    const res = rows.delete(&t.w, t.catalogRef, primaryKey, ver.?) catch {
         t.poisoned = true; // mid-mutation failure
         return AIRDB_E_GENERIC;
     };
@@ -492,7 +492,7 @@ test "ffi: open, insert, get, count, update, delete, reopen" {
     try testing.expect(airdb_insert(h, &[_]u64{ 100, 7, 1 }, 3) >= 0);
     try testing.expect(airdb_insert(h, &[_]u64{ 200, 8, 0 }, 3) >= 0);
     try testing.expectEqual(@as(i64, 2), airdb_count(h));
-    // duplicate pk rejected
+    // duplicate primaryKey rejected
     try testing.expectEqual(AIRDB_E_DUPLICATE, airdb_insert(h, &[_]u64{ 100, 9, 9 }, 3));
     // bad arity
     try testing.expectEqual(AIRDB_E_BAD_ARGS, airdb_insert(h, &[_]u64{ 1, 2 }, 2));
@@ -688,7 +688,7 @@ test "ffi transaction: abort after a failed op releases the lock" {
 
     const transaction = airdb_begin(h) orelse return error.BeginFailed;
     try testing.expect(airdb_txn_insert(transaction, &[_]u64{ 1, 10 }, 2) >= 0);
-    // Duplicate pk fails but leaves the transaction open.
+    // Duplicate primaryKey fails but leaves the transaction open.
     try testing.expectEqual(AIRDB_E_DUPLICATE, airdb_txn_insert(transaction, &[_]u64{ 1, 11 }, 2));
     airdb_abort(transaction);
 
@@ -777,7 +777,7 @@ test "airdb_bulk_insert wrong prop_count returns AIRDB_E_BAD_ARGS" {
     try testing.expect(airdb_insert(h, &[_]u64{ 1, 10 }, 2) >= 0);
 }
 
-test "airdb_bulk_insert duplicate pk returns AIRDB_E_DUPLICATE, type still empty, lock released" {
+test "airdb_bulk_insert duplicate primaryKey returns AIRDB_E_DUPLICATE, type still empty, lock released" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try ffiTmpPathZ(testing.allocator, &tmp, "bulk_dup.airdb");
@@ -805,11 +805,11 @@ test "airdb_bulk_append appends a contiguous batch in one commit" {
         const h = airdb_open(path.ptr, 2) orelse return error.OpenFailed;
         defer airdb_close(h);
 
-        // Seed a populated type with pks 0,1,2.
+        // Seed a populated type with primaryKeys 0,1,2.
         const seed = [_]u64{ 0, 0, 1, 10, 2, 20 };
         try testing.expectEqual(@as(i64, 3), airdb_bulk_insert(h, &seed, 3, 2));
 
-        // Append a contiguous, strictly-ascending batch above the current max pk.
+        // Append a contiguous, strictly-ascending batch above the current max primaryKey.
         const batch = [_]u64{ 3, 30, 4, 40, 5, 50 };
         try testing.expectEqual(@as(i64, 3), airdb_bulk_append(h, &batch, 3, 2));
         try testing.expectEqual(@as(i64, 6), airdb_count(h));
@@ -839,12 +839,12 @@ test "airdb_bulk_append falls back for a scattered batch" {
     const h = airdb_open(path.ptr, 2) orelse return error.OpenFailed;
     defer airdb_close(h);
 
-    // Seed pks 0,1,2 (current max pk is 2).
+    // Seed primaryKeys 0,1,2 (current max primaryKey is 2).
     const seed = [_]u64{ 0, 0, 1, 10, 2, 20 };
     try testing.expectEqual(@as(i64, 3), airdb_bulk_insert(h, &seed, 3, 2));
 
     // A descending batch does not qualify for the right-edge fast path, but both
-    // pks are fresh, so the row-by-row fallback inserts them successfully.
+    // primaryKeys are fresh, so the row-by-row fallback inserts them successfully.
     const scattered = [_]u64{ 5, 50, 4, 40 };
     try testing.expectEqual(@as(i64, 2), airdb_bulk_append(h, &scattered, 2, 2));
     try testing.expectEqual(@as(i64, 5), airdb_count(h));
@@ -854,7 +854,7 @@ test "airdb_bulk_append falls back for a scattered batch" {
     try testing.expect(airdb_get(h, 5, &out, 2) >= 1);
     try testing.expectEqual(@as(u64, 50), out[1]);
 
-    // A non-qualifying batch carrying an existing pk surfaces the fallback's
+    // A non-qualifying batch carrying an existing primaryKey surfaces the fallback's
     // DuplicateKey as AIRDB_E_DUPLICATE; nothing is made durable.
     const dup = [_]u64{ 6, 60, 1, 11 };
     try testing.expectEqual(AIRDB_E_DUPLICATE, airdb_bulk_append(h, &dup, 2, 2));

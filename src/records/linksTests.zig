@@ -30,7 +30,7 @@ fn objTmpPath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const 
     return std.fs.path.join(allocator, &.{ path_buf[0..dlen], name });
 }
 
-test "link-set accessors return error.NotFound for an absent pk" {
+test "link-set accessors return error.NotFound for an absent primaryKey" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "link_notfound.airdb");
@@ -107,7 +107,7 @@ test "nullifying a source's link bumps its version" {
     defer testing.allocator.free(path);
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
-    var a_okey: u64 = undefined;
+    var objectKeyA: u64 = undefined;
 
     // Commit 1: target + linked source.
     {
@@ -115,7 +115,7 @@ test "nullifying a source's link bumps its version" {
         var catalogRef = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
         const a = try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .link = null } });
         catalogRef = a.catalogRef;
-        a_okey = a.row;
+        objectKeyA = a.row;
         const s = try insertTyped(&w, catalogRef, &.{ .{ .int = 2 }, .{ .link = a.row } });
         w.setRoot(s.catalogRef);
         _ = try w.commit();
@@ -132,7 +132,7 @@ test "nullifying a source's link bumps its version" {
     {
         var w = try database.beginWrite();
         var raw: [2]u64 = undefined;
-        const av = (try @import("rows.zig").getByPk(&w, w.new_root, 1, &raw)).?;
+        const av = (try @import("rows.zig").getByPrimaryKey(&w, w.new_root, 1, &raw)).?;
         const catalogRef = switch (try @import("objects.zig").deleteAndNullify(&w, w.new_root, 1, av)) {
             .ok => |x| x,
             else => unreachable,
@@ -146,7 +146,7 @@ test "nullifying a source's link bumps its version" {
     {
         var w = try database.beginWrite();
         defer w.deinit();
-        const res = try @import("objects.zig").updateTyped(&w, w.new_root, 2, &.{ .{ .int = 2 }, .{ .link = a_okey } }, stale);
+        const res = try @import("objects.zig").updateTyped(&w, w.new_root, 2, &.{ .{ .int = 2 }, .{ .link = objectKeyA } }, stale);
         try testing.expect(res == .conflict);
     }
 }
@@ -164,15 +164,15 @@ test "a multi-leaf backlink set is pruned and freed when emptied" {
     const target = try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .link = null } });
     catalogRef = target.catalogRef;
     // >64 sources so the backlink inner set splits past one leaf.
-    var pk: u64 = 2;
-    while (pk <= 82) : (pk += 1) {
-        const src = try insertTyped(&w, catalogRef, &.{ .{ .int = pk }, .{ .link = target.row } });
+    var primaryKey: u64 = 2;
+    while (primaryKey <= 82) : (primaryKey += 1) {
+        const src = try insertTyped(&w, catalogRef, &.{ .{ .int = primaryKey }, .{ .link = target.row } });
         catalogRef = src.catalogRef;
     }
     try testing.expectEqual(@as(u64, 81), try backlinkCount(&w, catalogRef, 1, target.row));
     // Clear every inbound link; the set (and its inner nodes) must be pruned.
-    pk = 2;
-    while (pk <= 82) : (pk += 1) catalogRef = try setLink(&w, catalogRef, pk, 1, null);
+    primaryKey = 2;
+    while (primaryKey <= 82) : (primaryKey += 1) catalogRef = try setLink(&w, catalogRef, primaryKey, 1, null);
     const v = try catalog.loadCatalog(&w, catalogRef);
     try testing.expectEqual(@as(?u64, null), try Index.get(&w, v.backlinkRef(1), target.row));
     try testing.expectEqual(@as(u64, 0), try backlinkCount(&w, catalogRef, 1, target.row));
@@ -227,7 +227,7 @@ test "nullifyInboundInCatalog clears only links whose target type matches the fi
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    // props: pk(int), prop1(link -> type 5), prop2(link -> type 9)
+    // props: primaryKey(int), prop1(link -> type 5), prop2(link -> type 9)
     var catalogRef = try catalog.createDefs(&w, &.{
         .{ .kind = .int },
         .{ .kind = .link, .link_target = 5 },
@@ -370,7 +370,7 @@ test "to-many link set: insert seeds members and backlinks" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    // props: pk(int), tags(link_set -> same type)
+    // props: primaryKey(int), tags(link_set -> same type)
     var catalogRef = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link_set } });
     const a = try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .link_set = &.{} } });
     catalogRef = a.catalogRef;
@@ -517,7 +517,7 @@ test "deleting a to-many linker cleans its backlinks" {
     const b = try insertTyped(&w, catalogRef, &.{ .{ .int = 2 }, .{ .link_set = &.{a.row} } });
     catalogRef = b.catalogRef;
     try testing.expectEqual(@as(u64, 1), try backlinkCount(&w, catalogRef, 1, a.row));
-    // Delete b (the linker): no lingering backlink on a's okey.
+    // Delete b (the linker): no lingering backlink on a's objectKey.
     var out: [2]Value = undefined;
     const vb = (try getTyped(&w, catalogRef, 2, &out)).?;
     catalogRef = (try deleteTyped(&w, catalogRef, 2, vb)).ok;

@@ -17,9 +17,9 @@ const links = @import("../records/links.zig");
 const bindex = @import("../trees/byteKeyIndex.zig");
 
 /// One key->row index entry: a stable object key and its physical row.
-pub const Pair = struct { okey: u64, row: u64 };
+pub const Pair = struct { objectKey: u64, row: u64 };
 
-/// Collect every (okey, row) entry of the key->row index rooted at
+/// Collect every (objectKey, row) entry of the key->row index rooted at
 /// `keyrow_ref` into a list the caller owns. O(live rows).
 pub fn collectKeyRowPairs(
     allocator: std.mem.Allocator,
@@ -32,7 +32,7 @@ pub fn collectKeyRowPairs(
         list: *std.ArrayList(Pair),
         a: std.mem.Allocator,
         fn onEntry(self: @This(), key: u64, val: u64) !void {
-            try self.list.append(self.a, .{ .okey = key, .row = val });
+            try self.list.append(self.a, .{ .objectKey = key, .row = val });
         }
     };
     try Index.forEachEntry(transaction, keyrow_ref, Collector{ .list = &pairs, .a = allocator }, Collector.onEntry);
@@ -99,13 +99,13 @@ fn copyBindex(src: anytype, dst: *WriteTransaction, src_root: u64) !u64 {
     return newr;
 }
 
-// Add okey under `value` in a value index (value -> {okey -> 1}), mirroring the
+// Add objectKey under `value` in a value index (value -> {objectKey -> 1}), mirroring the
 // shape the object layer's maintenance keeps. Local to the copy path, which
 // must rebuild value indexes in the destination database.
-fn viAddInto(dst: *WriteTransaction, vi_ref: Reference, value: u64, okey: u64) !Reference {
+fn viAddInto(dst: *WriteTransaction, vi_ref: Reference, value: u64, objectKey: u64) !Reference {
     const existing = try Index.get(dst, vi_ref, value);
     var set_root = existing orelse try Index.create(dst);
-    set_root = try Index.insert(dst, set_root, okey, 1);
+    set_root = try Index.insert(dst, set_root, objectKey, 1);
     return try Index.insert(dst, vi_ref, value, set_root);
 }
 
@@ -123,7 +123,7 @@ fn createDestinationStructures(dst: *WriteTransaction, s: *catalog.CatalogSnapsh
     s.version_col_ref = try Column.create(dst);
     s.live_col_ref = try Column.create(dst);
     s.keyrow_index_ref = try Index.create(dst);
-    s.pk_index_ref = try Index.create(dst);
+    s.primaryKeyIndexRef = try Index.create(dst);
 }
 
 /// Copy all live rows of `sourceCatalog` (in the source database) into a fresh catalog in the
@@ -147,7 +147,7 @@ pub fn copyTypeRows(src: anytype, sourceCatalog: Reference, dst: *WriteTransacti
     const s_live = s.live_col_ref;
     const s_keyrow = s.keyrow_index_ref;
 
-    // Collect live (okey, src_row) pairs, then re-point at fresh dst structures.
+    // Collect live (objectKey, src_row) pairs, then re-point at fresh dst structures.
     const alloc = dst.database.store.allocator;
     var pairs = try collectKeyRowPairs(alloc, src, s_keyrow);
     defer pairs.deinit(alloc);
@@ -166,15 +166,15 @@ pub fn copyTypeRows(src: anytype, sourceCatalog: Reference, dst: *WriteTransacti
             // empties every indexed query after a full-file compaction (the
             // planner trusts the flag) and fails the value-index audit.
             if (s.props[j].indexed) {
-                s.props[j].value_index = try viAddInto(dst, s.props[j].value_index, draw, pr.okey);
+                s.props[j].value_index = try viAddInto(dst, s.props[j].value_index, draw, pr.objectKey);
             }
         }
         const ver = try Column.get(src, s_ver, pr.row);
         s.version_col_ref = try Column.append(dst, s.version_col_ref, ver);
         s.live_col_ref = try Column.append(dst, s.live_col_ref, 1);
-        s.keyrow_index_ref = try Index.insert(dst, s.keyrow_index_ref, pr.okey, d_row);
-        const pk = try Column.get(src, s_prop[0], pr.row);
-        s.pk_index_ref = try Index.insert(dst, s.pk_index_ref, pk, pr.okey);
+        s.keyrow_index_ref = try Index.insert(dst, s.keyrow_index_ref, pr.objectKey, d_row);
+        const primaryKey = try Column.get(src, s_prop[0], pr.row);
+        s.primaryKeyIndexRef = try Index.insert(dst, s.primaryKeyIndexRef, primaryKey, pr.objectKey);
         d_row += 1;
     }
 
@@ -193,7 +193,7 @@ pub fn rebuildBacklinks(dst: *WriteTransaction, catalogRef: Reference) !Referenc
     while (p < pc) : (p += 1) {
         const k = (try catalog.loadCatalog(dst, cur)).kind(p);
         if (k != .link and k != .link_set) continue;
-        // collect (okey,row) of cur
+        // collect (objectKey,row) of cur
         var pairs = blk: {
             const vv = try catalog.loadCatalog(dst, cur);
             break :blk try collectKeyRowPairs(alloc, dst, vv.keyrow_index_ref);
@@ -204,9 +204,9 @@ pub fn rebuildBacklinks(dst: *WriteTransaction, catalogRef: Reference) !Referenc
             const col = vv.propColRef(p);
             const raw = try Column.get(dst, col, pr.row);
             if (k == .link) {
-                if (raw != 0) cur = try links.addBacklink(dst, cur, p, raw - 1, pr.okey);
+                if (raw != 0) cur = try links.addBacklink(dst, cur, p, raw - 1, pr.objectKey);
             } else {
-                // link_set: the column holds a set-root of target okeys
+                // link_set: the column holds a set-root of target objectKeys
                 var members = std.ArrayList(u64).empty;
                 defer members.deinit(alloc);
                 const M = struct {
@@ -217,7 +217,7 @@ pub fn rebuildBacklinks(dst: *WriteTransaction, catalogRef: Reference) !Referenc
                     }
                 };
                 try Index.forEachKey(dst, raw, M{ .list = &members, .a = alloc }, M.onKey);
-                for (members.items) |t| cur = try links.addBacklink(dst, cur, p, t, pr.okey);
+                for (members.items) |t| cur = try links.addBacklink(dst, cur, p, t, pr.objectKey);
             }
         }
     }

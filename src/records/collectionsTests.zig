@@ -38,7 +38,7 @@ fn objTmpPath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const 
     return std.fs.path.join(allocator, &.{ path_buf[0..dlen], name });
 }
 
-test "collection accessors return error.NotFound for an absent pk" {
+test "collection accessors return error.NotFound for an absent primaryKey" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "coll_notfound.airdb");

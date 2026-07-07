@@ -34,11 +34,11 @@ pub const Value = union(enum) {
     dict_int: []const DictEntry,
     coll_root: Reference, // read side: getTyped returns this for list/set/dict/link_set properties
     link: ?u64,
-    link_set: []const u64, // to-many: initial set of target okeys
+    link_set: []const u64, // to-many: initial set of target objectKeys
 };
 
 // Catalog node layout:
-// [prop_count u16][next_row u64][pk_index_ref u64][version_col_ref u64][live_col_ref u64]
+// [prop_count u16][next_row u64][primaryKeyIndexRef u64][version_col_ref u64][live_col_ref u64]
 // [prop_count * (prop_col_ref u64)][prop_count * (kind u8)][prop_count * (elem u8)]
 // [prop_count * (backlink_ref u64)][prop_count * (link_target u16)][prop_count * (del_rule u8)]
 // [prop_count * (value_index_ref u64)][prop_count * (indexed u8)]
@@ -47,7 +47,7 @@ pub const Value = union(enum) {
 // per-property arrays keep their existing offsets unchanged.
 const off_prop_count: usize = 0;
 const off_next_row: usize = 2;
-const off_pk_index_ref: usize = 10;
+const primaryKeyIndexRefOffset: usize = 10;
 const off_version_col_ref: usize = 18;
 const off_live_col_ref: usize = 26;
 const off_keyrow_index_ref: usize = 34;
@@ -95,7 +95,7 @@ pub fn writeCatalog(
     next_row: u64,
     keyrow_index_ref: Reference,
     next_key: u64,
-    pk_index_ref: Reference,
+    primaryKeyIndexRef: Reference,
     version_col_ref: Reference,
     live_col_ref: Reference,
     prop_col_refs: []const Reference,
@@ -112,7 +112,7 @@ pub fn writeCatalog(
     std.mem.writeInt(u64, a.bytes[off_next_row..][0..8], next_row, .little);
     std.mem.writeInt(u64, a.bytes[off_keyrow_index_ref..][0..8], keyrow_index_ref, .little);
     std.mem.writeInt(u64, a.bytes[off_next_key..][0..8], next_key, .little);
-    std.mem.writeInt(u64, a.bytes[off_pk_index_ref..][0..8], pk_index_ref, .little);
+    std.mem.writeInt(u64, a.bytes[primaryKeyIndexRefOffset..][0..8], primaryKeyIndexRef, .little);
     std.mem.writeInt(u64, a.bytes[off_version_col_ref..][0..8], version_col_ref, .little);
     std.mem.writeInt(u64, a.bytes[off_live_col_ref..][0..8], live_col_ref, .little);
     for (prop_col_refs, 0..) |ref, i| {
@@ -139,8 +139,8 @@ pub fn writeCatalog(
     return a.ref;
 }
 
-// createDefs allocates columns, a pk index, version/live columns, and a catalog
-// node from explicit per-property definitions. defs[0].kind must be .int (the pk).
+// createDefs allocates columns, a primaryKey index, version/live columns, and a catalog
+// node from explicit per-property definitions. defs[0].kind must be .int (the primaryKey).
 pub fn createDefs(transaction: *WriteTransaction, defs: []const PropDef) !Reference {
     std.debug.assert(defs.len >= 1 and defs[0].kind == .int);
     const prop_count: PropCount = @intCast(defs.len);
@@ -166,7 +166,7 @@ pub fn createDefs(transaction: *WriteTransaction, defs: []const PropDef) !Refere
     }
     const version_col_ref = try Column.create(transaction);
     const live_col_ref = try Column.create(transaction);
-    const pk_index_ref = try Index.create(transaction);
+    const primaryKeyIndexRef = try Index.create(transaction);
     const keyrow = try Index.create(transaction);
     return writeCatalog(
         transaction,
@@ -174,7 +174,7 @@ pub fn createDefs(transaction: *WriteTransaction, defs: []const PropDef) !Refere
         0,
         keyrow,
         0,
-        pk_index_ref,
+        primaryKeyIndexRef,
         version_col_ref,
         live_col_ref,
         prop_col_refs[0..prop_count],
@@ -200,7 +200,7 @@ pub fn createTyped(transaction: *WriteTransaction, kinds: []const PropKind) !Ref
 }
 
 // Create prop_count property columns, a version column, a live column, and an
-// empty pk index. All property kinds default to .int.
+// empty primaryKey index. All property kinds default to .int.
 pub fn create(transaction: *WriteTransaction, prop_count: PropCount) !Reference {
     std.debug.assert(prop_count <= max_prop_count);
     var all_int: [max_prop_count]PropKind = undefined;
@@ -214,7 +214,7 @@ pub const CatalogView = struct {
     next_row: u64,
     keyrow_index_ref: Reference,
     next_key: u64,
-    pk_index_ref: Reference,
+    primaryKeyIndexRef: Reference,
     version_col_ref: Reference,
     live_col_ref: Reference,
     bytes: []const u8,
@@ -289,7 +289,7 @@ pub fn loadCatalog(transaction: anytype, catalogRef: Reference) !CatalogView {
         .next_row = std.mem.readInt(u64, bytes[off_next_row..][0..8], .little),
         .keyrow_index_ref = std.mem.readInt(u64, bytes[off_keyrow_index_ref..][0..8], .little),
         .next_key = std.mem.readInt(u64, bytes[off_next_key..][0..8], .little),
-        .pk_index_ref = std.mem.readInt(u64, bytes[off_pk_index_ref..][0..8], .little),
+        .primaryKeyIndexRef = std.mem.readInt(u64, bytes[primaryKeyIndexRefOffset..][0..8], .little),
         .version_col_ref = std.mem.readInt(u64, bytes[off_version_col_ref..][0..8], .little),
         .live_col_ref = std.mem.readInt(u64, bytes[off_live_col_ref..][0..8], .little),
         .bytes = bytes,
@@ -320,7 +320,7 @@ pub const CatalogSnapshot = struct {
     next_row: u64,
     keyrow_index_ref: Reference,
     next_key: u64,
-    pk_index_ref: Reference,
+    primaryKeyIndexRef: Reference,
     version_col_ref: Reference,
     live_col_ref: Reference,
     props: [max_prop_count]PropSnap,
@@ -339,7 +339,7 @@ pub const CatalogSnapshot = struct {
         s.next_row = v.next_row;
         s.keyrow_index_ref = v.keyrow_index_ref;
         s.next_key = v.next_key;
-        s.pk_index_ref = v.pk_index_ref;
+        s.primaryKeyIndexRef = v.primaryKeyIndexRef;
         s.version_col_ref = v.version_col_ref;
         s.live_col_ref = v.live_col_ref;
         var j: usize = 0;
@@ -387,7 +387,7 @@ pub const CatalogSnapshot = struct {
             self.next_row,
             self.keyrow_index_ref,
             self.next_key,
-            self.pk_index_ref,
+            self.primaryKeyIndexRef,
             self.version_col_ref,
             self.live_col_ref,
             cols[0..pc],
@@ -419,33 +419,33 @@ pub fn propCount(transaction: anytype, catalogRef: Reference) !PropCount {
     return view.prop_count;
 }
 
-// liveCount returns the number of live rows tracked by the pk index.
+// liveCount returns the number of live rows tracked by the primaryKey index.
 pub fn liveCount(transaction: anytype, catalogRef: Reference) !u64 {
     const view = try loadCatalog(transaction, catalogRef);
-    return Index.count(transaction, view.pk_index_ref);
+    return Index.count(transaction, view.primaryKeyIndexRef);
 }
 
 // Resolve an object key to its physical row via the key-to-row index.
-// Returns null if the okey has no mapping.
-pub fn okeyToRow(transaction: anytype, catalogRef: Reference, okey: u64) !?u64 {
+// Returns null if the objectKey has no mapping.
+pub fn objectKeyToRow(transaction: anytype, catalogRef: Reference, objectKey: u64) !?u64 {
     const v = try loadCatalog(transaction, catalogRef);
-    return Index.get(transaction, v.keyrow_index_ref, okey);
+    return Index.get(transaction, v.keyrow_index_ref, objectKey);
 }
 
-// Resolve a primary key to its stable object key via the pk index.
-// Returns null if the pk has no mapping.
-pub fn pkToOkey(transaction: anytype, catalogRef: Reference, pk: u64) !?u64 {
+// Resolve a primary key to its stable object key via the primaryKey index.
+// Returns null if the primaryKey has no mapping.
+pub fn primaryKeyToObjectKey(transaction: anytype, catalogRef: Reference, primaryKey: u64) !?u64 {
     const v = try loadCatalog(transaction, catalogRef);
-    return Index.get(transaction, v.pk_index_ref, pk);
+    return Index.get(transaction, v.primaryKeyIndexRef, primaryKey);
 }
 
-// Resolve (catalogRef, pk, prop) to the property column ref and the row;
-// null if pk absent or row tombstoned. The pk index maps pk -> okey, and the
-// keyrow index maps okey -> physical row.
-pub fn resolveProp(transaction: anytype, catalogRef: Reference, pk: u64, prop: usize) !?struct { row: u64, prop_col: Reference } {
+// Resolve (catalogRef, primaryKey, prop) to the property column ref and the row;
+// null if primaryKey absent or row tombstoned. The primaryKey index maps primaryKey -> objectKey, and the
+// keyrow index maps objectKey -> physical row.
+pub fn resolveProp(transaction: anytype, catalogRef: Reference, primaryKey: u64, prop: usize) !?struct { row: u64, prop_col: Reference } {
     const v = try loadCatalog(transaction, catalogRef);
-    const okey = (try Index.get(transaction, v.pk_index_ref, pk)) orelse return null;
-    const row = (try Index.get(transaction, v.keyrow_index_ref, okey)) orelse return null;
+    const objectKey = (try Index.get(transaction, v.primaryKeyIndexRef, primaryKey)) orelse return null;
+    const row = (try Index.get(transaction, v.keyrow_index_ref, objectKey)) orelse return null;
     if ((try Column.get(transaction, v.live_col_ref, row)) == 0) return null;
     return .{ .row = row, .prop_col = v.propColRef(prop) };
 }
@@ -529,7 +529,7 @@ test "CatalogSnapshot round-trips every field through load and write" {
     try testing.expectEqual(v0.prop_count, v1.prop_count);
     try testing.expectEqual(v0.next_row, v1.next_row);
     try testing.expectEqual(v0.next_key, v1.next_key);
-    try testing.expectEqual(v0.pk_index_ref, v1.pk_index_ref);
+    try testing.expectEqual(v0.primaryKeyIndexRef, v1.primaryKeyIndexRef);
     try testing.expectEqual(v0.keyrow_index_ref, v1.keyrow_index_ref);
     try testing.expectEqual(v0.version_col_ref, v1.version_col_ref);
     try testing.expectEqual(v0.live_col_ref, v1.live_col_ref);

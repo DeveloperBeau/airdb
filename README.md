@@ -55,7 +55,7 @@ const airdb = @import("airdb");
 var database = try airdb.Database.create(allocator, "/abs/path/app.airdb");
 defer database.deinit();
 
-// Define a type: pk (int) + name (blob) + an indexed int.
+// Define a type: primaryKey (int) + name (blob) + an indexed int.
 var w = try database.beginWrite();
 var dir = try airdb.typedir.createWithDefs(&w, &.{
     &.{ .{ .kind = .int }, .{ .kind = .blob }, .{ .kind = .int, .indexed = true } },

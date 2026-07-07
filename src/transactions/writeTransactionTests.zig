@@ -45,7 +45,7 @@ fn churnLogicalSize(path: []const u8, retain: u64, n: u64) !u64 {
             var w = try database.beginWrite();
             catalogRef = database.active_root;
             var out: [1]u64 = undefined;
-            const ver = (try rows.getByPk(&w, catalogRef, i, &out)).?;
+            const ver = (try rows.getByPrimaryKey(&w, catalogRef, i, &out)).?;
             catalogRef = switch (try rows.delete(&w, catalogRef, i, ver)) {
                 .ok => |c| c,
                 else => unreachable,
@@ -77,15 +77,15 @@ test "steady-state batched inserts keep the free list bounded" {
     }
     const batches: usize = 10;
     const inserts_per_batch: usize = 500;
-    var pk: u64 = 0;
+    var primaryKey: u64 = 0;
     var batch: usize = 0;
     while (batch < batches) : (batch += 1) {
         var w = try database.beginWrite();
         var catalogRef = w.new_root;
         var i: usize = 0;
         while (i < inserts_per_batch) : (i += 1) {
-            catalogRef = (try rows.insert(&w, catalogRef, &.{ pk, pk })).catalogRef;
-            pk += 1;
+            catalogRef = (try rows.insert(&w, catalogRef, &.{ primaryKey, primaryKey })).catalogRef;
+            primaryKey += 1;
         }
         w.setRoot(catalogRef);
         _ = try w.commit();

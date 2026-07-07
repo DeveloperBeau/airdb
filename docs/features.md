@@ -70,9 +70,9 @@ Code pointers use `module.function` names under `src/`.
 ## Bulk operations
 
 - `bulk.bulkImport` — build a whole table bottom-up into an empty type
-  (columns, pk/key→row indexes, value indexes), byte-identical to sequential
+  (columns, primaryKey/key→row indexes, value indexes), byte-identical to sequential
   inserts, all-or-nothing validation before a single node is written.
-- `bulk.bulkAppend` — right-edge fast path for ascending-pk batches on
+- `bulk.bulkAppend` — right-edge fast path for ascending-primaryKey batches on
   populated types; falls back to row-by-row when the batch doesn't qualify
   (`bulkAppendOrInsert`). Replaced edge nodes are freed, not leaked.
 

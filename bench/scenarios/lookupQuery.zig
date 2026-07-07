@@ -31,7 +31,7 @@ const batch_size: usize = 10_000;
 // Number of point lookups to sample for latency percentiles.
 const lookup_count: usize = 100_000;
 
-// Distinct category values; each row gets category = pk % category_mod.
+// Distinct category values; each row gets category = primaryKey % category_mod.
 const category_mod: u64 = 100;
 
 // The category the equality query selects on.
@@ -62,7 +62,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     var database = try airdb.Database.create(alloc, path);
     defer database.deinit();
 
-    // Two-int type: {pk, category}. Property 0 is the primary key, property 1
+    // Two-int type: {primaryKey, category}. Property 0 is the primary key, property 1
     // is the low-cardinality category, declared indexed so the equality query
     // is served by its value index rather than a full scan.
     var catalogRef: Reference = blk: {
@@ -83,8 +83,8 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         catalogRef = database.active_root; // reload the committed catalog ref
         var j: usize = 0;
         while (j < this_batch) : (j += 1) {
-            const pk: u64 = inserted + j;
-            const r = try rows.insert(&w, catalogRef, &.{ pk, pk % category_mod });
+            const primaryKey: u64 = inserted + j;
+            const r = try rows.insert(&w, catalogRef, &.{ primaryKey, primaryKey % category_mod });
             catalogRef = r.catalogRef;
         }
         w.setRoot(catalogRef);
@@ -110,10 +110,10 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         x ^= x << 13;
         x ^= x >> 7;
         x ^= x << 17;
-        const pk: u64 = x % n_u64;
+        const primaryKey: u64 = x % n_u64;
         var out: [2]u64 = undefined;
         const t0 = nowNs(io);
-        _ = try rows.getByPk(&rd, catalogRef, pk, &out);
+        _ = try rows.getByPrimaryKey(&rd, catalogRef, primaryKey, &out);
         const dt: u64 = @intCast(nowNs(io) - t0);
         try lat.add(alloc, dt);
     }

@@ -3,8 +3,8 @@
 //
 // Embedded objects live under the typedir multi-type API, not the raw single
 // catalog. The directory carries two types:
-//   type 0  owner  {int pk, link(cascade -> type 1)}   non-embedded
-//   type 1  child  {int pk, int value}                 embedded (single-owner)
+//   type 0  owner  {int primaryKey, link(cascade -> type 1)}   non-embedded
+//   type 1  child  {int primaryKey, int value}                 embedded (single-owner)
 // The owner's prop 1 is the to-one link the embedded child hangs off; declaring
 // type 1 embedded marks it single-owner. insertEmbedded/clearEmbedded drive the
 // child lifecycle through that link (mirrors the typedir embedded tests).
@@ -46,7 +46,7 @@ const child_type: u16 = 1;
 const embed_prop: usize = 1;
 const child_props: usize = 2;
 
-// Owner: {int pk, link(cascade -> child)}. Child: {int pk, int value}, embedded.
+// Owner: {int primaryKey, link(cascade -> child)}. Child: {int primaryKey, int value}, embedded.
 const owner_schema = [_][]const catalog.PropDef{
     &.{ .{ .kind = .int }, .{ .kind = .link, .link_target = child_type, .del_rule = .cascade } },
     &.{ .{ .kind = .int }, .{ .kind = .int } },
@@ -104,10 +104,10 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
             var dir = w.new_root;
             var j: usize = 0;
             while (j < this_batch) : (j += 1) {
-                const pk: u64 = inserted + j;
+                const primaryKey: u64 = inserted + j;
                 const t0 = nowNs(io);
-                dir = (try typeRouting.insert(&w, dir, owner_type, &.{ .{ .int = pk }, .{ .link = null } })).dir;
-                dir = try typedir.insertEmbedded(&w, dir, owner_type, pk, embed_prop, &.{ .{ .int = pk }, .{ .int = pk *% 2654435761 } });
+                dir = (try typeRouting.insert(&w, dir, owner_type, &.{ .{ .int = primaryKey }, .{ .link = null } })).dir;
+                dir = try typedir.insertEmbedded(&w, dir, owner_type, primaryKey, embed_prop, &.{ .{ .int = primaryKey }, .{ .int = primaryKey *% 2654435761 } });
                 const dt: u64 = @intCast(nowNs(io) - t0);
                 try create_lat.add(alloc, dt);
                 try combined.add(alloc, dt);
@@ -135,9 +135,9 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         var out: [child_props]Value = undefined;
         var k: usize = 0;
         while (k < read_n) : (k += 1) {
-            const pk: u64 = (k * read_stride) % owners;
+            const primaryKey: u64 = (k * read_stride) % owners;
             const t0 = nowNs(io);
-            _ = try typeRouting.getLinked(&r, dir, owner_type, pk, embed_prop, &out);
+            _ = try typeRouting.getLinked(&r, dir, owner_type, primaryKey, embed_prop, &out);
             const dt: u64 = @intCast(nowNs(io) - t0);
             try read_lat.add(alloc, dt);
             try combined.add(alloc, dt);
@@ -156,10 +156,10 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
             var dir = w.new_root;
             var j: usize = 0;
             while (j < this_batch) : (j += 1) {
-                const pk: u64 = ((done + j) * update_stride) % owners;
+                const primaryKey: u64 = ((done + j) * update_stride) % owners;
                 const t0 = nowNs(io);
-                dir = try typedir.clearEmbedded(&w, dir, owner_type, pk, embed_prop);
-                dir = try typedir.insertEmbedded(&w, dir, owner_type, pk, embed_prop, &.{ .{ .int = pk }, .{ .int = pk *% 40503 } });
+                dir = try typedir.clearEmbedded(&w, dir, owner_type, primaryKey, embed_prop);
+                dir = try typedir.insertEmbedded(&w, dir, owner_type, primaryKey, embed_prop, &.{ .{ .int = primaryKey }, .{ .int = primaryKey *% 40503 } });
                 const dt: u64 = @intCast(nowNs(io) - t0);
                 try update_lat.add(alloc, dt);
                 try combined.add(alloc, dt);
@@ -182,10 +182,10 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
             var dir = w.new_root;
             var j: usize = 0;
             while (j < this_batch) : (j += 1) {
-                const pk: u64 = ((done + j) * delete_stride) % owners;
-                const had_child = (try typeRouting.getLink(&w, dir, owner_type, pk, embed_prop)) != null;
+                const primaryKey: u64 = ((done + j) * delete_stride) % owners;
+                const had_child = (try typeRouting.getLink(&w, dir, owner_type, primaryKey, embed_prop)) != null;
                 const t0 = nowNs(io);
-                dir = try typedir.clearEmbedded(&w, dir, owner_type, pk, embed_prop);
+                dir = try typedir.clearEmbedded(&w, dir, owner_type, primaryKey, embed_prop);
                 const dt: u64 = @intCast(nowNs(io) - t0);
                 if (had_child) {
                     deleted += 1;

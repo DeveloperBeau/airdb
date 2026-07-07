@@ -44,8 +44,8 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     defer alloc.free(path_b);
     defer harness.removeScratch(ctx.*, path_b);
 
-    // --- Build the rows once, shared by both paths. Two-int type {pk, value};
-    // pk = i, value = i. A flat backing buffer sliced into per-row windows so
+    // --- Build the rows once, shared by both paths. Two-int type {primaryKey, value};
+    // primaryKey = i, value = i. A flat backing buffer sliced into per-row windows so
     // bulkImport sees a []const []const u64.
     const storage = try alloc.alloc([2]u64, ctx.n);
     defer alloc.free(storage);
@@ -107,8 +107,8 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         catalogRef = databaseB.active_root; // reload the committed catalog ref
         var j: usize = 0;
         while (j < this_batch) : (j += 1) {
-            const pk: u64 = inserted + j;
-            const r = try rawRows.insert(&w, catalogRef, &.{ pk, pk });
+            const primaryKey: u64 = inserted + j;
+            const r = try rawRows.insert(&w, catalogRef, &.{ primaryKey, primaryKey });
             catalogRef = r.catalogRef;
         }
         w.setRoot(catalogRef);

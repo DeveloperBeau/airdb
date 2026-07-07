@@ -93,7 +93,7 @@ pub const forEachEntry = Tree.forEachEntry;
 /// level: removals never merge or drop leaves, so the rightmost leaf can be
 /// empty while the tree still holds keys -- blindly following the rightmost
 /// path would report a non-empty tree as empty, and bulkAppend would then
-/// admit a batch whose keys do not clear the true maximum, corrupting the pk
+/// admit a batch whose keys do not clear the true maximum, corrupting the primaryKey
 /// index with duplicates and broken ordering.
 pub fn maxKey(transaction: anytype, root: Reference) !?u64 {
     var cur: Reference = root;

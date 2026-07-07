@@ -25,29 +25,29 @@ const loadCatalog = catalog.loadCatalog;
 // Per-property value index maintenance.
 //
 // A value index has the same shape as a backlink index: value -> set_root,
-// where set_root is an index of okey -> 1. It is kept transactionally in sync
+// where set_root is an index of objectKey -> 1. It is kept transactionally in sync
 // with the base row on every insert, update, and delete of an indexed property,
 // so an equality/range query reads from a view that can never diverge from the
 // rows. These helpers mirror the backlink add/remove path in links.zig.
 // ---------------------------------------------------------------------------
 
-/// Add `okey` to the value-index inner set for `value`, returning the new index ref.
+/// Add `objectKey` to the value-index inner set for `value`, returning the new index ref.
 /// Pub: the migration backfill reuses it to index pre-migration rows.
-pub fn viAdd(transaction: *WriteTransaction, vi_ref: Reference, value: u64, okey: u64) !Reference {
+pub fn viAdd(transaction: *WriteTransaction, vi_ref: Reference, value: u64, objectKey: u64) !Reference {
     const existing = try Index.get(transaction, vi_ref, value);
     var set_root = existing orelse try Index.create(transaction);
-    set_root = try Index.insert(transaction, set_root, okey, 1);
+    set_root = try Index.insert(transaction, set_root, objectKey, 1);
     return try Index.insert(transaction, vi_ref, value, set_root);
 }
 
-// Remove `okey` from the value-index inner set for `value`. No-op if absent.
+// Remove `objectKey` from the value-index inner set for `value`. No-op if absent.
 // When the inner set empties, its outer entry is removed and the set's nodes
 // freed: high-churn workloads would otherwise accumulate one empty set per
 // distinct value ever indexed, reclaimable only by a full file copy.
-fn viRemove(transaction: *WriteTransaction, vi_ref: Reference, value: u64, okey: u64) !Reference {
+fn viRemove(transaction: *WriteTransaction, vi_ref: Reference, value: u64, objectKey: u64) !Reference {
     const existing = try Index.get(transaction, vi_ref, value);
     const set_root = existing orelse return vi_ref;
-    const new_set = try Index.remove(transaction, set_root, okey);
+    const new_set = try Index.remove(transaction, set_root, objectKey);
     if ((try Index.count(transaction, new_set)) == 0) {
         const new_vi = try Index.remove(transaction, vi_ref, value);
         try Index.freeTree(transaction, new_set);
@@ -56,21 +56,21 @@ fn viRemove(transaction: *WriteTransaction, vi_ref: Reference, value: u64, okey:
     return try Index.insert(transaction, vi_ref, value, new_set);
 }
 
-// Add okey->value to indexed property p's value index. Returns the new catalog.
-fn addValueIndex(transaction: *WriteTransaction, catalogRef: Reference, p: usize, value: u64, okey: u64) !Reference {
+// Add objectKey->value to indexed property p's value index. Returns the new catalog.
+fn addValueIndex(transaction: *WriteTransaction, catalogRef: Reference, p: usize, value: u64, objectKey: u64) !Reference {
     const v = try loadCatalog(transaction, catalogRef);
-    const new_vi = try viAdd(transaction, v.valueIndexRef(p), value, okey);
+    const new_vi = try viAdd(transaction, v.valueIndexRef(p), value, objectKey);
     return try catalog.setValueIndexRef(transaction, catalogRef, p, new_vi);
 }
 
-// Remove okey from indexed property p's value-index set for `value`.
-fn removeValueIndex(transaction: *WriteTransaction, catalogRef: Reference, p: usize, value: u64, okey: u64) !Reference {
+// Remove objectKey from indexed property p's value-index set for `value`.
+fn removeValueIndex(transaction: *WriteTransaction, catalogRef: Reference, p: usize, value: u64, objectKey: u64) !Reference {
     const v = try loadCatalog(transaction, catalogRef);
-    const new_vi = try viRemove(transaction, v.valueIndexRef(p), value, okey);
+    const new_vi = try viRemove(transaction, v.valueIndexRef(p), value, objectKey);
     return try catalog.setValueIndexRef(transaction, catalogRef, p, new_vi);
 }
 
-/// Append a new row to all columns and update the pk index.
+/// Append a new row to all columns and update the primaryKey index.
 /// values.len must equal the prop_count stored in the catalog.
 /// Returns error.DuplicateKey if values[0] (the primary key) already exists.
 pub fn insert(transaction: *WriteTransaction, catalogRef: Reference, values: []const u64) !struct { catalogRef: Reference, row: u64 } {
@@ -78,10 +78,10 @@ pub fn insert(transaction: *WriteTransaction, catalogRef: Reference, values: []c
     std.debug.assert(values.len == s.prop_count);
     const prop_count = s.prop_count;
     const row = s.next_row;
-    const okey = s.next_key;
+    const objectKey = s.next_key;
 
-    const pk = values[0];
-    if ((try Index.get(transaction, s.pk_index_ref, pk)) != null) return error.DuplicateKey;
+    const primaryKey = values[0];
+    if ((try Index.get(transaction, s.primaryKeyIndexRef, primaryKey)) != null) return error.DuplicateKey;
 
     // COW-append to each property column.
     {
@@ -92,23 +92,23 @@ pub fn insert(transaction: *WriteTransaction, catalogRef: Reference, values: []c
     }
     s.version_col_ref = try Column.append(transaction, s.version_col_ref, transaction.new_version);
     s.live_col_ref = try Column.append(transaction, s.live_col_ref, 1);
-    // pk index maps pk -> okey; keyrow index maps okey -> physical row.
-    s.pk_index_ref = try Index.insert(transaction, s.pk_index_ref, pk, okey);
-    s.keyrow_index_ref = try Index.insert(transaction, s.keyrow_index_ref, okey, row);
+    // primaryKey index maps primaryKey -> objectKey; keyrow index maps objectKey -> physical row.
+    s.primaryKeyIndexRef = try Index.insert(transaction, s.primaryKeyIndexRef, primaryKey, objectKey);
+    s.keyrow_index_ref = try Index.insert(transaction, s.keyrow_index_ref, objectKey, row);
     s.next_row = row + 1;
-    s.next_key = okey + 1;
+    s.next_key = objectKey + 1;
 
     const newCatalog = try s.replace(transaction);
-    // Maintain the value index for each indexed property: add this row's okey to
+    // Maintain the value index for each indexed property: add this row's objectKey to
     // the inner set at its stored value, in the same transaction as the row.
     var updatedCatalog = newCatalog;
     {
         var p: usize = 0;
         while (p < prop_count) : (p += 1) {
-            if (s.props[p].indexed) updatedCatalog = try addValueIndex(transaction, updatedCatalog, p, values[p], okey);
+            if (s.props[p].indexed) updatedCatalog = try addValueIndex(transaction, updatedCatalog, p, values[p], objectKey);
         }
     }
-    return .{ .catalogRef = updatedCatalog, .row = okey };
+    return .{ .catalogRef = updatedCatalog, .row = objectKey };
 }
 
 /// The row's current version, reported when an optimistic write loses the race.
@@ -127,23 +127,23 @@ pub const DeleteResult = union(enum) {
     not_found,
 };
 
-/// Overwrite the row identified by `pk` with `values`, guarded by the row's
+/// Overwrite the row identified by `primaryKey` with `values`, guarded by the row's
 /// expected version. Copy-on-writes only the columns whose value changed and
 /// keeps every indexed property's value index in sync.
-pub fn update(transaction: *WriteTransaction, catalogRef: Reference, pk: u64, values: []const u64, expected_version: u64) !UpdateResult {
+pub fn update(transaction: *WriteTransaction, catalogRef: Reference, primaryKey: u64, values: []const u64, expected_version: u64) !UpdateResult {
     var s = try catalog.CatalogSnapshot.load(transaction, catalogRef);
     std.debug.assert(values.len == s.prop_count);
-    std.debug.assert(values[0] == pk); // pk is identity, must not change
-    const okey = (try Index.get(transaction, s.pk_index_ref, pk)) orelse return .not_found;
-    // The pk index resolved but the key->row index did not: treat the divergence
+    std.debug.assert(values[0] == primaryKey); // primaryKey is identity, must not change
+    const objectKey = (try Index.get(transaction, s.primaryKeyIndexRef, primaryKey)) orelse return .not_found;
+    // The primaryKey index resolved but the key->row index did not: treat the divergence
     // as absent rather than crashing on corrupt data.
-    const row = (try Index.get(transaction, s.keyrow_index_ref, okey)) orelse return .not_found;
+    const row = (try Index.get(transaction, s.keyrow_index_ref, objectKey)) orelse return .not_found;
     const cur = try Column.get(transaction, s.version_col_ref, row);
     if (cur != expected_version) return .{ .conflict = .{ .current_version = cur } };
     const pc = s.prop_count;
 
     // Snapshot the current value of each indexed property before overwriting the
-    // column, so the value index can move the okey from its old to its new value.
+    // column, so the value index can move the objectKey from its old to its new value.
     var old_vals: [max_prop_count]u64 = undefined;
     {
         var j: usize = 0;
@@ -169,27 +169,27 @@ pub fn update(transaction: *WriteTransaction, catalogRef: Reference, pk: u64, va
         var p: usize = 0;
         while (p < pc) : (p += 1) {
             if (s.props[p].indexed and old_vals[p] != values[p]) {
-                updatedCatalog = try removeValueIndex(transaction, updatedCatalog, p, old_vals[p], okey);
-                updatedCatalog = try addValueIndex(transaction, updatedCatalog, p, values[p], okey);
+                updatedCatalog = try removeValueIndex(transaction, updatedCatalog, p, old_vals[p], objectKey);
+                updatedCatalog = try addValueIndex(transaction, updatedCatalog, p, values[p], objectKey);
             }
         }
     }
     return .{ .ok = .{ .catalogRef = updatedCatalog, .version = transaction.new_version } };
 }
 
-/// Tombstone the row identified by `pk`, guarded by the row's expected version.
-/// Drops the pk and key->row index entries and every value-index entry, but
+/// Tombstone the row identified by `primaryKey`, guarded by the row's expected version.
+/// Drops the primaryKey and key->row index entries and every value-index entry, but
 /// leaves the physical column cells intact for pinned readers.
-pub fn delete(transaction: *WriteTransaction, catalogRef: Reference, pk: u64, expected_version: u64) !DeleteResult {
+pub fn delete(transaction: *WriteTransaction, catalogRef: Reference, primaryKey: u64, expected_version: u64) !DeleteResult {
     var s = try catalog.CatalogSnapshot.load(transaction, catalogRef);
-    const okey = (try Index.get(transaction, s.pk_index_ref, pk)) orelse return .not_found;
-    const row = (try Index.get(transaction, s.keyrow_index_ref, okey)) orelse return .not_found;
+    const objectKey = (try Index.get(transaction, s.primaryKeyIndexRef, primaryKey)) orelse return .not_found;
+    const row = (try Index.get(transaction, s.keyrow_index_ref, objectKey)) orelse return .not_found;
     const cur = try Column.get(transaction, s.version_col_ref, row);
     if (cur != expected_version) return .{ .conflict = .{ .current_version = cur } };
     const pc = s.prop_count;
 
     // Read the value of each indexed property while the row is still readable,
-    // so its okey can be dropped from the value index. Property columns are not
+    // so its objectKey can be dropped from the value index. Property columns are not
     // mutated by delete, so the snapshot's cols still address the current values.
     var old_vals: [max_prop_count]u64 = undefined;
     {
@@ -201,20 +201,20 @@ pub fn delete(transaction: *WriteTransaction, catalogRef: Reference, pk: u64, ex
 
     s.live_col_ref = try Column.set(transaction, s.live_col_ref, row, 0); // tombstone
     s.version_col_ref = try Column.set(transaction, s.version_col_ref, row, transaction.new_version); // bump version stamp
-    s.pk_index_ref = try Index.remove(transaction, s.pk_index_ref, pk); // remove pk from the index
+    s.primaryKeyIndexRef = try Index.remove(transaction, s.primaryKeyIndexRef, primaryKey); // remove primaryKey from the index
     // Drop the object key from the key->row index. Copy-on-write keeps the old
     // index version intact for any reader pinned to the prior snapshot, so this
     // is MVCC-safe; it prevents a stale key from aliasing a row a later
     // relocation reuses.
-    s.keyrow_index_ref = try Index.remove(transaction, s.keyrow_index_ref, okey);
+    s.keyrow_index_ref = try Index.remove(transaction, s.keyrow_index_ref, objectKey);
 
     const newCatalog = try s.replace(transaction);
-    // Drop this row's okey from the value index for every indexed property.
+    // Drop this row's objectKey from the value index for every indexed property.
     var updatedCatalog = newCatalog;
     {
         var p: usize = 0;
         while (p < pc) : (p += 1) {
-            if (s.props[p].indexed) updatedCatalog = try removeValueIndex(transaction, updatedCatalog, p, old_vals[p], okey);
+            if (s.props[p].indexed) updatedCatalog = try removeValueIndex(transaction, updatedCatalog, p, old_vals[p], objectKey);
         }
     }
     return .{ .ok = updatedCatalog };
@@ -222,20 +222,20 @@ pub fn delete(transaction: *WriteTransaction, catalogRef: Reference, pk: u64, ex
 
 /// Read a row by primary key into `out` (raw u64 cells). Returns the row
 /// version, or null when the key is not found or the row is tombstoned.
-pub fn getByPk(transaction: anytype, catalogRef: Reference, pk: u64, out: []u64) !?u64 {
+pub fn getByPrimaryKey(transaction: anytype, catalogRef: Reference, primaryKey: u64, out: []u64) !?u64 {
     const v = try loadCatalog(transaction, catalogRef);
     std.debug.assert(out.len == v.prop_count);
-    const okey = (try Index.get(transaction, v.pk_index_ref, pk)) orelse return null;
-    return getByObjectKey(transaction, catalogRef, okey, out);
+    const objectKey = (try Index.get(transaction, v.primaryKeyIndexRef, primaryKey)) orelse return null;
+    return getByObjectKey(transaction, catalogRef, objectKey, out);
 }
 
-/// Read a row by its stable object key. Resolves the okey to a physical row via
-/// the key-to-row index. Returns the row version, or null if the okey is unknown
+/// Read a row by its stable object key. Resolves the objectKey to a physical row via
+/// the key-to-row index. Returns the row version, or null if the objectKey is unknown
 /// or the row is tombstoned.
-pub fn getByObjectKey(transaction: anytype, catalogRef: Reference, okey: u64, out: []u64) !?u64 {
+pub fn getByObjectKey(transaction: anytype, catalogRef: Reference, objectKey: u64, out: []u64) !?u64 {
     const v = try loadCatalog(transaction, catalogRef);
     std.debug.assert(out.len == v.prop_count);
-    const row = (try catalog.okeyToRow(transaction, catalogRef, okey)) orelse return null;
+    const row = (try catalog.objectKeyToRow(transaction, catalogRef, objectKey)) orelse return null;
     const live_col_ref = v.live_col_ref;
     const version_col_ref = v.version_col_ref;
     var prop_refs: [max_prop_count]Reference = undefined;

@@ -209,7 +209,7 @@ test "verifyIntegrity passes after churn on an indexed type" {
     defer database.deinit();
     const tid: u16 = 0;
 
-    // One type: int pk + one indexed int property.
+    // One type: int primaryKey + one indexed int property.
     {
         var w = try database.beginWrite();
         const dir = try typedir.createTypes(&w, &.{&.{ .{ .kind = .int }, .{ .kind = .int, .indexed = true } }}, &.{false});
@@ -217,39 +217,39 @@ test "verifyIntegrity passes after churn on an indexed type" {
         _ = try w.commit();
     }
 
-    // Seed 200 rows; value = pk % 16 so many rows share each inner set.
+    // Seed 200 rows; value = primaryKey % 16 so many rows share each inner set.
     {
         var w = try database.beginWrite();
         var dir = database.active_root;
-        var pk: u64 = 0;
-        while (pk < 200) : (pk += 1) {
-            dir = (try typeRouting.insert(&w, dir, tid, &.{ .{ .int = pk }, .{ .int = pk % 16 } })).dir;
+        var primaryKey: u64 = 0;
+        while (primaryKey < 200) : (primaryKey += 1) {
+            dir = (try typeRouting.insert(&w, dir, tid, &.{ .{ .int = primaryKey }, .{ .int = primaryKey % 16 } })).dir;
         }
         w.setRoot(dir);
         _ = try w.commit();
     }
 
-    // Churn: update the value of every even pk, delete every 5th pk.
+    // Churn: update the value of every even primaryKey, delete every 5th primaryKey.
     {
         var w = try database.beginWrite();
         var dir = database.active_root;
-        var pk: u64 = 0;
-        while (pk < 200) : (pk += 1) {
+        var primaryKey: u64 = 0;
+        while (primaryKey < 200) : (primaryKey += 1) {
             var out: [2]catalog.Value = undefined;
-            const ver = (try typeRouting.get(&w, dir, tid, pk, &out)).?;
-            if (pk % 5 == 0) {
-                dir = switch (try typeRouting.delete(&w, dir, tid, pk, ver)) {
+            const ver = (try typeRouting.get(&w, dir, tid, primaryKey, &out)).?;
+            if (primaryKey % 5 == 0) {
+                dir = switch (try typeRouting.delete(&w, dir, tid, primaryKey, ver)) {
                     .ok => |d| d,
                     else => unreachable,
                 };
-            } else if (pk % 2 == 0) {
-                const ur = try typeRouting.update(&w, dir, tid, pk, &.{ .{ .int = pk }, .{ .int = (pk + 7) % 16 } }, ver);
+            } else if (primaryKey % 2 == 0) {
+                const ur = try typeRouting.update(&w, dir, tid, primaryKey, &.{ .{ .int = primaryKey }, .{ .int = (primaryKey + 7) % 16 } }, ver);
                 dir = ur.ok.dir;
             }
         }
         // Insert a fresh batch with reused values.
-        while (pk < 260) : (pk += 1) {
-            dir = (try typeRouting.insert(&w, dir, tid, &.{ .{ .int = pk }, .{ .int = pk % 16 } })).dir;
+        while (primaryKey < 260) : (primaryKey += 1) {
+            dir = (try typeRouting.insert(&w, dir, tid, &.{ .{ .int = primaryKey }, .{ .int = primaryKey % 16 } })).dir;
         }
         w.setRoot(dir);
         _ = try w.commit();
@@ -271,16 +271,16 @@ test "verifyIntegrity detects a corrupted value index" {
     {
         var w = try database.beginWrite();
         var dir = try typedir.createTypes(&w, &.{&.{ .{ .kind = .int }, .{ .kind = .int, .indexed = true } }}, &.{false});
-        var pk: u64 = 0;
-        while (pk < 8) : (pk += 1) {
-            dir = (try typeRouting.insert(&w, dir, tid, &.{ .{ .int = pk }, .{ .int = pk } })).dir;
+        var primaryKey: u64 = 0;
+        while (primaryKey < 8) : (primaryKey += 1) {
+            dir = (try typeRouting.insert(&w, dir, tid, &.{ .{ .int = primaryKey }, .{ .int = primaryKey } })).dir;
         }
         w.setRoot(dir);
         _ = try w.commit();
     }
     try verification.verifyIntegrity(&database); // clean before corruption
 
-    // White-box corruption: register an existing live okey under a value that no
+    // White-box corruption: register an existing live objectKey under a value that no
     // row actually has. The forward direction still holds (every row stays
     // covered), so this exercises the backward check: the bogus entry resolves to
     // a live row whose property value differs from the indexed value.
@@ -289,10 +289,10 @@ test "verifyIntegrity detects a corrupted value index" {
         const dir = database.active_root;
         const catalogRef = try typedir.catalogRef(&w, dir, tid);
         const cv = try catalog.loadCatalog(&w, catalogRef);
-        const okey = (try catalog.pkToOkey(&w, catalogRef, 0)).?; // row pk 0 has value 0
+        const objectKey = (try catalog.primaryKeyToObjectKey(&w, catalogRef, 0)).?; // row primaryKey 0 has value 0
         const bogus_value: u64 = 999_999; // no row carries this value
         var set_root = try Index.create(&w);
-        set_root = try Index.insert(&w, set_root, okey, 1);
+        set_root = try Index.insert(&w, set_root, objectKey, 1);
         const new_vi = try Index.insert(&w, cv.valueIndexRef(p), bogus_value, set_root);
         const newCatalog = try catalog.setValueIndexRef(&w, catalogRef, p, new_vi);
         const new_dir = try typedir.setCatalogRef(&w, dir, tid, newCatalog);
@@ -342,7 +342,7 @@ test "verifyIntegrity detects a corrupted backlink index" {
     defer testing.allocator.free(path);
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
-    var target_okey: u64 = undefined;
+    var targetObjectKey: u64 = undefined;
 
     {
         var w = try database.beginWrite();
@@ -351,8 +351,8 @@ test "verifyIntegrity detects a corrupted backlink index" {
         }, &.{false});
         const a = try typeRouting.insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .link = null } });
         dir = a.dir;
-        target_okey = a.row;
-        dir = (try typeRouting.insert(&w, dir, 0, &.{ .{ .int = 2 }, .{ .link = target_okey } })).dir;
+        targetObjectKey = a.row;
+        dir = (try typeRouting.insert(&w, dir, 0, &.{ .{ .int = 2 }, .{ .link = targetObjectKey } })).dir;
         w.setRoot(dir);
         _ = try w.commit();
     }
@@ -365,7 +365,7 @@ test "verifyIntegrity detects a corrupted backlink index" {
         const dir = database.active_root;
         const catalogRef = try typedir.catalogRef(&w, dir, 0);
         const cv = try catalog.loadCatalog(&w, catalogRef);
-        const new_bl = try Index.remove(&w, cv.backlinkRef(1), target_okey);
+        const new_bl = try Index.remove(&w, cv.backlinkRef(1), targetObjectKey);
         const newCatalog = try catalog.setBacklinkRef(&w, catalogRef, 1, new_bl);
         const new_dir = try typedir.setCatalogRef(&w, dir, 0, newCatalog);
         w.setRoot(new_dir);
@@ -386,9 +386,9 @@ test "verifyIntegrity passes on a non-indexed type" {
     {
         var w = try database.beginWrite();
         var dir = try typedir.createTypes(&w, &.{&.{ .{ .kind = .int }, .{ .kind = .int } }}, &.{false});
-        var pk: u64 = 0;
-        while (pk < 50) : (pk += 1) {
-            dir = (try typeRouting.insert(&w, dir, tid, &.{ .{ .int = pk }, .{ .int = pk * 3 } })).dir;
+        var primaryKey: u64 = 0;
+        while (primaryKey < 50) : (primaryKey += 1) {
+            dir = (try typeRouting.insert(&w, dir, tid, &.{ .{ .int = primaryKey }, .{ .int = primaryKey * 3 } })).dir;
         }
         w.setRoot(dir);
         _ = try w.commit();
@@ -784,7 +784,7 @@ test "beginReadAt opens a past version within the retention window" {
     defer database.deinit();
     database.setRetainVersions(std.math.maxInt(u64)); // retain everything
 
-    // v_a: pk 1 ; v_b: + pk 2 ; v_c: + pk 3 (additive, so each version's live set differs)
+    // v_a: primaryKey 1 ; v_b: + primaryKey 2 ; v_c: + primaryKey 3 (additive, so each version's live set differs)
     var va: u64 = undefined;
     var vb: u64 = undefined;
     var vc: u64 = undefined;
@@ -809,15 +809,15 @@ test "beginReadAt opens a past version within the retention window" {
     }
 
     var out: [2]u64 = undefined;
-    // Past snapshot at v_a: only pk 1 exists.
+    // Past snapshot at v_a: only primaryKey 1 exists.
     {
         var r = try database.beginReadAt(va);
         defer r.end();
         try testing.expectEqual(@as(u64, 1), try compaction.liveCount(&r, r.root()));
-        try testing.expect((try rows.getByPk(&r, r.root(), 1, &out)) != null);
-        try testing.expectEqual(@as(?u64, null), try rows.getByPk(&r, r.root(), 2, &out));
+        try testing.expect((try rows.getByPrimaryKey(&r, r.root(), 1, &out)) != null);
+        try testing.expectEqual(@as(?u64, null), try rows.getByPrimaryKey(&r, r.root(), 2, &out));
     }
-    // Past snapshot at v_b: pk 1 and 2.
+    // Past snapshot at v_b: primaryKey 1 and 2.
     {
         var r = try database.beginReadAt(vb);
         defer r.end();
@@ -928,7 +928,7 @@ test "beginReadAt rejects a version aged out of the retention window" {
     try testing.expect(database.oldestReadableVersion() == database.active_version);
 }
 
-// Churn a single int-pk type at `path` with a steady live set: seed `live`
+// Churn a single int-primaryKey type at `path` with a steady live set: seed `live`
 // rows, then on each iteration insert `live` fresh rows and delete the `live`
 // oldest live rows (net-zero live count). Dead rows accumulate, so next_row
 // grows without bound unless compaction reclaims it. When `auto` is set, the
@@ -940,7 +940,7 @@ fn churnNetZero(path: []const u8, live: u64, iters: u64, auto: bool) !struct { n
     database.auto_compact = auto;
     const tid: u16 = 0;
 
-    // Single type: int pk + one int prop.
+    // Single type: int primaryKey + one int prop.
     {
         var w = try database.beginWrite();
         const dir = try typedir.createTypes(&w, &.{&.{ .{ .kind = .int }, .{ .kind = .int } }}, &.{false});
@@ -948,7 +948,7 @@ fn churnNetZero(path: []const u8, live: u64, iters: u64, auto: bool) !struct { n
         _ = try w.commit();
     }
 
-    // Seed the live set (pks [0, live)).
+    // Seed the live set (primaryKeys [0, live)).
     var hi: u64 = 0;
     {
         var w = try database.beginWrite();
@@ -1068,13 +1068,13 @@ test "a failed commit inside maybeCompactStep neither crashes nor wedges the wri
     {
         var w = try database.beginWrite();
         var dir = database.active_root;
-        var pk: u64 = 0;
-        while (pk < 10) : (pk += 1) dir = (try typeRouting.insert(&w, dir, tid, &.{ .{ .int = pk }, .{ .int = pk } })).dir;
+        var primaryKey: u64 = 0;
+        while (primaryKey < 10) : (primaryKey += 1) dir = (try typeRouting.insert(&w, dir, tid, &.{ .{ .int = primaryKey }, .{ .int = primaryKey } })).dir;
         var out: [2]catalog.Value = undefined;
-        pk = 0;
-        while (pk < 8) : (pk += 1) {
-            const ver = (try typeRouting.get(&w, dir, tid, pk, &out)).?;
-            dir = switch (try typeRouting.delete(&w, dir, tid, pk, ver)) {
+        primaryKey = 0;
+        while (primaryKey < 8) : (primaryKey += 1) {
+            const ver = (try typeRouting.get(&w, dir, tid, primaryKey, &out)).?;
+            dir = switch (try typeRouting.delete(&w, dir, tid, primaryKey, ver)) {
                 .ok => |d| d,
                 else => unreachable,
             };
@@ -1122,13 +1122,13 @@ test "the compaction cursor never resumes across types" {
         var dir = database.active_root;
         var t: u16 = 0;
         while (t < 2) : (t += 1) {
-            var pk: u64 = 0;
-            while (pk < 12) : (pk += 1) dir = (try typeRouting.insert(&w, dir, t, &.{ .{ .int = pk }, .{ .int = pk } })).dir;
+            var primaryKey: u64 = 0;
+            while (primaryKey < 12) : (primaryKey += 1) dir = (try typeRouting.insert(&w, dir, t, &.{ .{ .int = primaryKey }, .{ .int = primaryKey } })).dir;
             var out: [2]catalog.Value = undefined;
-            pk = 0;
-            while (pk < 8) : (pk += 1) {
-                const ver = (try typeRouting.get(&w, dir, t, pk, &out)).?;
-                dir = switch (try typeRouting.delete(&w, dir, t, pk, ver)) {
+            primaryKey = 0;
+            while (primaryKey < 8) : (primaryKey += 1) {
+                const ver = (try typeRouting.get(&w, dir, t, primaryKey, &out)).?;
+                dir = switch (try typeRouting.delete(&w, dir, t, primaryKey, ver)) {
                     .ok => |d| d,
                     else => unreachable,
                 };
@@ -1156,9 +1156,9 @@ test "the compaction cursor never resumes across types" {
     while (t < 2) : (t += 1) {
         try testing.expectEqual(@as(u64, 4), try typeRouting.liveCount(&r, r.root(), t));
         var out: [2]catalog.Value = undefined;
-        var pk: u64 = 8;
-        while (pk < 12) : (pk += 1) {
-            try testing.expect((try typeRouting.get(&r, r.root(), t, pk, &out)) != null);
+        var primaryKey: u64 = 8;
+        while (primaryKey < 12) : (primaryKey += 1) {
+            try testing.expect((try typeRouting.get(&r, r.root(), t, primaryKey, &out)) != null);
         }
         const catalogRef = try typedir.catalogRef(&r, r.root(), t);
         try testing.expectEqual(@as(u64, 4), (try catalog.loadCatalog(&r, catalogRef)).next_row);
@@ -1231,9 +1231,9 @@ test "maybeCompactStep is a no-op when nothing to compact" {
     {
         var w = try database.beginWrite();
         var dir = try typedir.createTypes(&w, &.{&.{ .{ .kind = .int }, .{ .kind = .int } }}, &.{false});
-        var pk: u64 = 0;
-        while (pk < 3) : (pk += 1) {
-            dir = (try typeRouting.insert(&w, dir, tid, &.{ .{ .int = pk }, .{ .int = pk } })).dir;
+        var primaryKey: u64 = 0;
+        while (primaryKey < 3) : (primaryKey += 1) {
+            dir = (try typeRouting.insert(&w, dir, tid, &.{ .{ .int = primaryKey }, .{ .int = primaryKey } })).dir;
         }
         w.setRoot(dir);
         _ = try w.commit();

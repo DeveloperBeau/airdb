@@ -2,8 +2,8 @@
 // churn while incremental compaction keeps the type packed, and measure that the
 // dead-row ratio (and therefore the file footprint) stays bounded over time.
 //
-// Each iteration inserts k fresh rows (new, monotonically increasing pks) and
-// deletes the k oldest live pks, so the live count stays flat at W while dead
+// Each iteration inserts k fresh rows (new, monotonically increasing primaryKeys) and
+// deletes the k oldest live primaryKeys, so the live count stays flat at W while dead
 // rows accumulate at the bottom of the column. After every iteration we drive
 // compaction.compactStep to repack the live tail rows into the holes and
 // truncate the dead tail, timing each step for latency percentiles.
@@ -71,7 +71,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     var database = try airdb.Database.create(alloc, path);
     defer database.deinit();
 
-    // Two-int type: {pk, value}. Property 0 is the primary key.
+    // Two-int type: {primaryKey, value}. Property 0 is the primary key.
     var catalogRef: Reference = blk: {
         var w = try database.beginWrite();
         const c = try catalog.create(&w, 2);
@@ -84,19 +84,19 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     {
         var w = try database.beginWrite();
         catalogRef = database.active_root;
-        var pk: u64 = 0;
-        while (pk < working_set) : (pk += 1) {
-            const r = try rows.insert(&w, catalogRef, &.{ pk, pk });
+        var primaryKey: u64 = 0;
+        while (primaryKey < working_set) : (primaryKey += 1) {
+            const r = try rows.insert(&w, catalogRef, &.{ primaryKey, primaryKey });
             catalogRef = r.catalogRef;
         }
         w.setRoot(catalogRef);
         _ = try w.commit();
     }
 
-    // Live pks form a sliding window [oldest_pk, next_pk); its width stays at
+    // Live primaryKeys form a sliding window [oldestPrimaryKey, nextPrimaryKey); its width stays at
     // working_set, so deletes always target rows that exist.
-    var next_pk: u64 = working_set;
-    var oldest_pk: u64 = 0;
+    var nextPrimaryKey: u64 = working_set;
+    var oldestPrimaryKey: u64 = 0;
 
     var step_lat = harness.Latencies.init();
     defer step_lat.deinit(alloc);
@@ -108,24 +108,24 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
 
     var it: u64 = 0;
     while (it < iters) : (it += 1) {
-        // Churn: insert k fresh rows and delete the k oldest live pks in one transaction.
+        // Churn: insert k fresh rows and delete the k oldest live primaryKeys in one transaction.
         {
             var w = try database.beginWrite();
             catalogRef = database.active_root;
 
             var j: usize = 0;
             while (j < k) : (j += 1) {
-                const pk = next_pk + j;
-                const r = try rows.insert(&w, catalogRef, &.{ pk, pk });
+                const primaryKey = nextPrimaryKey + j;
+                const r = try rows.insert(&w, catalogRef, &.{ primaryKey, primaryKey });
                 catalogRef = r.catalogRef;
             }
 
             j = 0;
             while (j < k) : (j += 1) {
-                const pk = oldest_pk + j;
+                const primaryKey = oldestPrimaryKey + j;
                 var out: [2]u64 = undefined;
-                const ver = (try rows.getByPk(&w, catalogRef, pk, &out)) orelse unreachable;
-                catalogRef = switch (try rows.delete(&w, catalogRef, pk, ver)) {
+                const ver = (try rows.getByPrimaryKey(&w, catalogRef, primaryKey, &out)) orelse unreachable;
+                catalogRef = switch (try rows.delete(&w, catalogRef, primaryKey, ver)) {
                     .ok => |c| c,
                     else => unreachable,
                 };
@@ -134,8 +134,8 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
             w.setRoot(catalogRef);
             _ = try w.commit();
 
-            next_pk += k;
-            oldest_pk += k;
+            nextPrimaryKey += k;
+            oldestPrimaryKey += k;
         }
 
         // Compaction: repack the type until fully packed, one step per write transaction.

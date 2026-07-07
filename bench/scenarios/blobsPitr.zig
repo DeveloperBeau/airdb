@@ -36,7 +36,7 @@ const blob_count: usize = 8;
 
 // --- Part B knobs -----------------------------------------------------------
 // Rows committed per write transaction during the (untimed) insert phase. The
-// first batch establishes the historical version, so only pks in [0, pitr_batch)
+// first batch establishes the historical version, so only primaryKeys in [0, pitr_batch)
 // are guaranteed to exist at v_old; lookups stay inside that range.
 const pitr_batch: usize = 100;
 const pitr_rows: usize = 1_000;
@@ -125,7 +125,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     // Retain everything so the early version's nodes stay readable.
     pitrDatabase.setRetainVersions(std.math.maxInt(u64));
 
-    // Two-int type {pk, value}; property 0 is the primary key.
+    // Two-int type {primaryKey, value}; property 0 is the primary key.
     {
         var w = try pitrDatabase.beginWrite();
         const c = try catalog.create(&w, 2);
@@ -142,19 +142,19 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         var catalogRef = pitrDatabase.active_root;
         var j: usize = 0;
         while (j < this_batch) : (j += 1) {
-            const pk: u64 = inserted + j;
-            const r = try rows.insert(&w, catalogRef, &.{ pk, pk *% 7 });
+            const primaryKey: u64 = inserted + j;
+            const r = try rows.insert(&w, catalogRef, &.{ primaryKey, primaryKey *% 7 });
             catalogRef = r.catalogRef;
         }
         w.setRoot(catalogRef);
         const v = try w.commit();
-        if (inserted == 0) v_old = v; // pks [0, pitr_batch) exist from here on
+        if (inserted == 0) v_old = v; // primaryKeys [0, pitr_batch) exist from here on
         inserted += this_batch;
     }
 
-    // Deterministic xorshift64 over a fixed seed; pk stays in [0, pitr_batch) so
+    // Deterministic xorshift64 over a fixed seed; primaryKey stays in [0, pitr_batch) so
     // every lookup resolves at both the latest and the historical version.
-    const pk_mod: u64 = pitr_batch;
+    const primaryKeyModulus: u64 = pitr_batch;
 
     // Latest-snapshot lookups.
     var lat_latest = harness.Latencies.init();
@@ -168,17 +168,17 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
             x ^= x << 13;
             x ^= x >> 7;
             x ^= x << 17;
-            const pk: u64 = x % pk_mod;
+            const primaryKey: u64 = x % primaryKeyModulus;
             var out: [2]u64 = undefined;
             const t0 = nowNs(io);
-            _ = try rows.getByPk(&rl, catalogRef, pk, &out);
+            _ = try rows.getByPrimaryKey(&rl, catalogRef, primaryKey, &out);
             const dt: u64 = @intCast(nowNs(io) - t0);
             try lat_latest.add(alloc, dt);
         }
         rl.end();
     }
 
-    // Historical-snapshot lookups at v_old (same pk sequence).
+    // Historical-snapshot lookups at v_old (same primaryKey sequence).
     var lat_hist = harness.Latencies.init();
     defer lat_hist.deinit(alloc);
     {
@@ -190,10 +190,10 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
             x ^= x << 13;
             x ^= x >> 7;
             x ^= x << 17;
-            const pk: u64 = x % pk_mod;
+            const primaryKey: u64 = x % primaryKeyModulus;
             var out: [2]u64 = undefined;
             const t0 = nowNs(io);
-            _ = try rows.getByPk(&rh, catalogRef, pk, &out);
+            _ = try rows.getByPrimaryKey(&rh, catalogRef, primaryKey, &out);
             const dt: u64 = @intCast(nowNs(io) - t0);
             try lat_hist.add(alloc, dt);
         }

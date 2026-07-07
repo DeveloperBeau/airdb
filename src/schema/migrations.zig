@@ -112,9 +112,9 @@ fn backfillValueIndex(transaction: *WriteTransaction, keyrow_ref: Reference, new
         transaction: *WriteTransaction,
         vi: *Reference,
         col: Reference,
-        fn onEntry(self: @This(), okey: u64, row: u64) anyerror!void {
+        fn onEntry(self: @This(), objectKey: u64, row: u64) anyerror!void {
             const raw = try Column.get(self.transaction, self.col, row);
-            self.vi.* = try rows.viAdd(self.transaction, self.vi.*, raw, okey);
+            self.vi.* = try rows.viAdd(self.transaction, self.vi.*, raw, objectKey);
         }
     };
     try Index.forEachEntry(transaction, keyrow_ref, Sink{ .transaction = transaction, .vi = &vi, .col = new_col }, Sink.onEntry);

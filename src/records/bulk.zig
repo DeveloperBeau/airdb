@@ -22,7 +22,7 @@ const max_prop_count = catalog.max_prop_count;
 // operations in column.zig and index.zig).
 // ---------------------------------------------------------------------------
 
-pub const ValueOkeys = struct { value: u64, okeys: []const u64 };
+pub const ValueObjectKeys = struct { value: u64, objectKeys: []const u64 };
 
 /// Build a column tree holding `values` at row indices 0..values.len. Returns
 /// the root Reference. Equivalent to Column.create followed by an append per value.
@@ -87,10 +87,10 @@ pub fn bulkIndex(transaction: *WriteTransaction, keys: []const u64, vals: []cons
     return level.items[0].ref;
 }
 
-/// Build a value index (value -> inner okey-set) from `entries`, sorted by
-/// value, each with ascending okeys. Each inner set maps okey -> 1, matching
-/// the shape rows.viAdd maintains (value -> Index{okey -> 1}).
-pub fn bulkValueIndex(transaction: *WriteTransaction, entries: []const ValueOkeys) !Reference {
+/// Build a value index (value -> inner objectKey-set) from `entries`, sorted by
+/// value, each with ascending objectKeys. Each inner set maps objectKey -> 1, matching
+/// the shape rows.viAdd maintains (value -> Index{objectKey -> 1}).
+pub fn bulkValueIndex(transaction: *WriteTransaction, entries: []const ValueObjectKeys) !Reference {
     if (entries.len == 0) return Index.create(transaction);
     const al = transaction.database.store.allocator;
 
@@ -99,16 +99,16 @@ pub fn bulkValueIndex(transaction: *WriteTransaction, entries: []const ValueOkey
     const inner_roots = try al.alloc(u64, entries.len);
     defer al.free(inner_roots);
 
-    // A reusable buffer of 1s big enough for the largest okey set.
-    var max_okeys: usize = 0;
-    for (entries) |e| max_okeys = @max(max_okeys, e.okeys.len);
-    const ones = try al.alloc(u64, max_okeys);
+    // A reusable buffer of 1s big enough for the largest objectKey set.
+    var maxObjectKeys: usize = 0;
+    for (entries) |e| maxObjectKeys = @max(maxObjectKeys, e.objectKeys.len);
+    const ones = try al.alloc(u64, maxObjectKeys);
     defer al.free(ones);
     @memset(ones, 1);
 
     for (entries, 0..) |e, k| {
         values[k] = e.value;
-        inner_roots[k] = try bulkIndex(transaction, e.okeys, ones[0..e.okeys.len]);
+        inner_roots[k] = try bulkIndex(transaction, e.objectKeys, ones[0..e.objectKeys.len]);
     }
 
     return bulkIndex(transaction, values, inner_roots);
@@ -120,16 +120,16 @@ pub fn bulkValueIndex(transaction: *WriteTransaction, entries: []const ValueOkey
 // bulkImport ingests a whole table of rows into an EMPTY type in one shot,
 // building every column and index bottom-up so the result is indistinguishable
 // from inserting the same rows one at a time in primary-key order. The columns,
-// version/live columns, pk index, key->row index, and per-indexed-property value
+// version/live columns, primaryKey index, key->row index, and per-indexed-property value
 // indexes are all built directly from the sorted input.
 //
 // Object-key convention (matched to rows.insert): a fresh insert takes the
-// catalog's current next_key as the new row's okey and assigns physical row =
-// next_row, then bumps both by one. Inserting the rows in ascending-pk order
-// therefore gives the r-th-smallest pk an okey of (start_next_key + r) and a
-// physical row of r. bulkImport reproduces exactly that mapping: it sorts by pk,
-// then assigns okey_r = old_next_key + r and physical row r = r. So a bulk row
-// and its single-insert twin resolve pk -> okey -> row identically, and every
+// catalog's current next_key as the new row's objectKey and assigns physical row =
+// next_row, then bumps both by one. Inserting the rows in ascending-primaryKey order
+// therefore gives the r-th-smallest primaryKey an objectKey of (start_next_key + r) and a
+// physical row of r. bulkImport reproduces exactly that mapping: it sorts by primaryKey,
+// then assigns objectKeyR = old_next_key + r and physical row r = r. So a bulk row
+// and its single-insert twin resolve primaryKey -> objectKey -> row identically, and every
 // lookup, scan, and value-index query matches.
 //
 // All rejections happen BEFORE any node is written, so a bad input can never
@@ -173,7 +173,7 @@ fn validateImportInput(s: *const catalog.CatalogSnapshot, rows: []const []const 
 }
 
 // The primary-key sort order of `rows`: perm[r] is the input index of the r-th
-// row in ascending-pk order. The caller owns the returned slice. A duplicate
+// row in ascending-primaryKey order. The caller owns the returned slice. A duplicate
 // primary key (adjacent equal after sort) is rejected before anything is
 // written. With `presorted`, the input order is trusted (asserted ascending
 // under runtime safety) and the sort is skipped.
@@ -216,11 +216,11 @@ fn freePreallocatedTrees(transaction: *WriteTransaction, s: *const catalog.Catal
     }
     try Column.freeTree(transaction, s.version_col_ref);
     try Column.freeTree(transaction, s.live_col_ref);
-    try Index.freeTree(transaction, s.pk_index_ref);
+    try Index.freeTree(transaction, s.primaryKeyIndexRef);
     try Index.freeTree(transaction, s.keyrow_index_ref);
 }
 
-// Build the property columns, version/live columns, and pk/key->row indexes
+// Build the property columns, version/live columns, and primaryKey/key->row indexes
 // bottom-up from the sorted input, storing the new roots into the snapshot.
 fn buildImportTrees(
     transaction: *WriteTransaction,
@@ -253,25 +253,25 @@ fn buildImportTrees(
     @memset(stamps, 1);
     s.live_col_ref = try bulkColumn(transaction, stamps[0..n]);
 
-    // pk index (pk -> okey) and key->row index (okey -> physical row). okeys are
-    // assigned in sorted-pk order from the type's current next_key, so
-    // okey_r == old_next_key + r and physical row r == r.
-    const pks = try al.alloc(u64, n);
-    defer al.free(pks);
-    const okeys = try al.alloc(u64, n);
-    defer al.free(okeys);
+    // primaryKey index (primaryKey -> objectKey) and key->row index (objectKey -> physical row). objectKeys are
+    // assigned in sorted-primaryKey order from the type's current next_key, so
+    // objectKeyR == old_next_key + r and physical row r == r.
+    const primaryKeys = try al.alloc(u64, n);
+    defer al.free(primaryKeys);
+    const objectKeys = try al.alloc(u64, n);
+    defer al.free(objectKeys);
     const phys_rows = try al.alloc(u64, n);
     defer al.free(phys_rows);
     for (perm, 0..) |src, r| {
-        pks[r] = rows[src][0];
-        okeys[r] = old_next_key + @as(u64, @intCast(r));
+        primaryKeys[r] = rows[src][0];
+        objectKeys[r] = old_next_key + @as(u64, @intCast(r));
         phys_rows[r] = @intCast(r);
     }
-    s.pk_index_ref = try bulkIndex(transaction, pks[0..n], okeys[0..n]);
-    s.keyrow_index_ref = try bulkIndex(transaction, okeys[0..n], phys_rows[0..n]);
+    s.primaryKeyIndexRef = try bulkIndex(transaction, primaryKeys[0..n], objectKeys[0..n]);
+    s.keyrow_index_ref = try bulkIndex(transaction, objectKeys[0..n], phys_rows[0..n]);
 }
 
-// Value indexes: for each indexed property, group its okeys by value and store
+// Value indexes: for each indexed property, group its objectKeys by value and store
 // the built index root into the snapshot.
 fn buildValueIndexes(
     transaction: *WriteTransaction,
@@ -289,10 +289,10 @@ fn buildValueIndexes(
     }
 }
 
-// Build the value index for indexed property `p`: emit (value -> {okey -> 1})
-// with values ascending and each inner okey set ascending, matching the shape
-// rows.viAdd maintains. okeys are assigned in sorted-pk order (okey_r =
-// old_next_key + r), so sorting (value, okey) pairs yields ascending okeys
+// Build the value index for indexed property `p`: emit (value -> {objectKey -> 1})
+// with values ascending and each inner objectKey set ascending, matching the shape
+// rows.viAdd maintains. objectKeys are assigned in sorted-primaryKey order (objectKeyR =
+// old_next_key + r), so sorting (value, objectKey) pairs yields ascending objectKeys
 // within each value group.
 fn buildPropValueIndex(
     transaction: *WriteTransaction,
@@ -303,30 +303,30 @@ fn buildPropValueIndex(
     al: std.mem.Allocator,
 ) !Reference {
     const n = perm.len;
-    const Pair = struct { value: u64, okey: u64 };
+    const Pair = struct { value: u64, objectKey: u64 };
     const pairs = try al.alloc(Pair, n);
     defer al.free(pairs);
-    for (perm, 0..) |src, r| pairs[r] = .{ .value = rows[src][p], .okey = old_next_key + @as(u64, @intCast(r)) };
+    for (perm, 0..) |src, r| pairs[r] = .{ .value = rows[src][p], .objectKey = old_next_key + @as(u64, @intCast(r)) };
     std.mem.sort(Pair, pairs, {}, struct {
         fn lt(_: void, a: Pair, b: Pair) bool {
             if (a.value != b.value) return a.value < b.value;
-            return a.okey < b.okey;
+            return a.objectKey < b.objectKey;
         }
     }.lt);
 
-    // A contiguous okey buffer in (value, okey) order; each entry's okeys slice
+    // A contiguous objectKey buffer in (value, objectKey) order; each entry's objectKeys slice
     // points into it.
-    const sorted_okeys = try al.alloc(u64, n);
-    defer al.free(sorted_okeys);
-    for (pairs, 0..) |pr, i| sorted_okeys[i] = pr.okey;
+    const sortedObjectKeys = try al.alloc(u64, n);
+    defer al.free(sortedObjectKeys);
+    for (pairs, 0..) |pr, i| sortedObjectKeys[i] = pr.objectKey;
 
-    var entries = std.ArrayList(ValueOkeys).empty;
+    var entries = std.ArrayList(ValueObjectKeys).empty;
     defer entries.deinit(al);
     var i: usize = 0;
     while (i < n) {
         var j = i + 1;
         while (j < n and pairs[j].value == pairs[i].value) j += 1;
-        try entries.append(al, .{ .value = pairs[i].value, .okeys = sorted_okeys[i..j] });
+        try entries.append(al, .{ .value = pairs[i].value, .objectKeys = sortedObjectKeys[i..j] });
         i = j;
     }
     return bulkValueIndex(transaction, entries.items);
@@ -338,16 +338,16 @@ fn buildPropValueIndex(
 // bulkAppend fast-paths a batch of rows whose primary keys all land strictly to
 // the RIGHT of the type's current key space onto the right edge of every tree,
 // without touching any left subtree. The result is byte-identical to inserting
-// the same rows one at a time in ascending-pk order: each new row gets the next
+// the same rows one at a time in ascending-primaryKey order: each new row gets the next
 // physical row and object key in batch order, the version stamp matches
-// rows.insert (transaction.new_version), live = 1, and the pk and key->row indexes
+// rows.insert (transaction.new_version), live = 1, and the primaryKey and key->row indexes
 // grow only along their rightmost path.
 //
 // A batch only qualifies when nothing about it would force a non-right-edge
 // write: no property is indexed and none is a link/link_set (those maintain
-// secondary structures keyed by value/target, not by row), the batch pks are
-// strictly ascending and unique, and the smallest batch pk is strictly greater
-// than the type's current max pk. Any other shape returns error.NotAppendable
+// secondary structures keyed by value/target, not by row), the batch primaryKeys are
+// strictly ascending and unique, and the smallest batch primaryKey is strictly greater
+// than the type's current max primaryKey. Any other shape returns error.NotAppendable
 // with NOTHING written, so the caller's fallback can replay row-by-row.
 //
 // Crucially, every qualification check is read-only and runs BEFORE the first
@@ -371,27 +371,27 @@ pub fn bulkAppend(transaction: *WriteTransaction, catalogRef: Reference, rows: [
     const al = transaction.database.store.allocator;
 
     // Object keys and physical rows are assigned in batch order from the type's
-    // current counters, exactly as sequential ascending-pk inserts would: the
-    // j-th row gets okey = next_key + j and physical row = next_row + j.
-    const pks = try al.alloc(u64, n);
-    defer al.free(pks);
-    const okeys = try al.alloc(u64, n);
-    defer al.free(okeys);
+    // current counters, exactly as sequential ascending-primaryKey inserts would: the
+    // j-th row gets objectKey = next_key + j and physical row = next_row + j.
+    const primaryKeys = try al.alloc(u64, n);
+    defer al.free(primaryKeys);
+    const objectKeys = try al.alloc(u64, n);
+    defer al.free(objectKeys);
     const phys_rows = try al.alloc(u64, n);
     defer al.free(phys_rows);
     for (rows, 0..) |row, j| {
-        pks[j] = row[0];
-        okeys[j] = old_next_key + @as(u64, @intCast(j));
+        primaryKeys[j] = row[0];
+        objectKeys[j] = old_next_key + @as(u64, @intCast(j));
         phys_rows[j] = old_next_row + @as(u64, @intCast(j));
     }
 
     try appendColumnRuns(transaction, &s, rows);
 
-    // pk index (pk -> okey) and key->row index (okey -> physical row). Both runs
-    // land on the right edge: batch pks are ascending and above the current max,
-    // and okeys are consecutive from next_key (thus above every existing okey).
-    s.pk_index_ref = try Index.appendRun(transaction, s.pk_index_ref, pks[0..n], okeys[0..n], al);
-    s.keyrow_index_ref = try Index.appendRun(transaction, s.keyrow_index_ref, okeys[0..n], phys_rows[0..n], al);
+    // primaryKey index (primaryKey -> objectKey) and key->row index (objectKey -> physical row). Both runs
+    // land on the right edge: batch primaryKeys are ascending and above the current max,
+    // and objectKeys are consecutive from next_key (thus above every existing objectKey).
+    s.primaryKeyIndexRef = try Index.appendRun(transaction, s.primaryKeyIndexRef, primaryKeys[0..n], objectKeys[0..n], al);
+    s.keyrow_index_ref = try Index.appendRun(transaction, s.keyrow_index_ref, objectKeys[0..n], phys_rows[0..n], al);
 
     s.next_row = old_next_row + @as(u64, @intCast(n));
     s.next_key = old_next_key + @as(u64, @intCast(n));
@@ -450,7 +450,7 @@ fn qualifyRightEdgeAppend(
         }
     }
 
-    // Batch pks must be strictly ascending and unique; any non-ascending or
+    // Batch primaryKeys must be strictly ascending and unique; any non-ascending or
     // duplicate-in-batch shape is NotAppendable so the fallback handles it
     // (including per-row duplicate detection against the existing rows).
     {
@@ -460,21 +460,21 @@ fn qualifyRightEdgeAppend(
         }
     }
 
-    // The smallest batch pk (rows[0][0], since ascending) must clear the current
-    // max pk in the type. An empty type (no max) admits any ascending batch.
-    if (try Index.maxKey(transaction, s.pk_index_ref)) |max_pk| {
-        if (rows[0][0] <= max_pk) return error.NotAppendable;
+    // The smallest batch primaryKey (rows[0][0], since ascending) must clear the current
+    // max primaryKey in the type. An empty type (no max) admits any ascending batch.
+    if (try Index.maxKey(transaction, s.primaryKeyIndexRef)) |maxPrimaryKey| {
+        if (rows[0][0] <= maxPrimaryKey) return error.NotAppendable;
     }
 
-    // If the BLIND rightmost pk-index leaf is empty (removals never merge
-    // leaves), its RECORDED LOW may exceed every surviving key -- a pk-history
+    // If the BLIND rightmost primaryKey-index leaf is empty (removals never merge
+    // leaves), its RECORDED LOW may exceed every surviving key -- a primaryKey-history
     // gap. Index.appendRun rebuilds exactly that leaf and derives the new
     // parent low from the batch's first key; a batch below the recorded low
     // would break the ascending-lows invariant and make the appended rows
     // unreachable. Such a batch must take the row-by-row fallback. (The
-    // keyrow index is immune: new okeys are allocated above every okey -- and
+    // keyrow index is immune: new objectKeys are allocated above every objectKey -- and
     // therefore every stale low -- the tree has ever held.)
-    if (try emptyRightmostLow(transaction, s.pk_index_ref)) |stale_low| {
+    if (try emptyRightmostLow(transaction, s.primaryKeyIndexRef)) |stale_low| {
         if (rows[0][0] < stale_low) return error.NotAppendable;
     }
 }

@@ -34,7 +34,7 @@ pub fn shouldCompact(transaction: anytype, catalogRef: Reference) !bool {
 }
 
 // Rebuild the type's columns to contain only live rows, packed densely, and
-// remap the key->row index. Object keys, pk index, and backlink indexes are
+// remap the key->row index. Object keys, primaryKey index, and backlink indexes are
 // preserved (keyed by object key). Returns the new catalog ref.
 pub fn compactType(transaction: *WriteTransaction, catalogRef: Reference) !Reference {
     var s = try catalog.CatalogSnapshot.load(transaction, catalogRef);
@@ -75,14 +75,14 @@ pub fn compactType(transaction: *WriteTransaction, catalogRef: Reference) !Refer
         const ver = try Column.get(transaction, old_ver, pr.row);
         s.version_col_ref = try Column.append(transaction, s.version_col_ref, ver);
         s.live_col_ref = try Column.append(transaction, s.live_col_ref, 1);
-        s.keyrow_index_ref = try Index.insert(transaction, s.keyrow_index_ref, pr.okey, new_row);
+        s.keyrow_index_ref = try Index.insert(transaction, s.keyrow_index_ref, pr.objectKey, new_row);
         new_row += 1;
     }
 
     // Free the replaced structures: the old property/version/live columns and
     // the old key->row index are fully copied out above and unreferenced by the
     // new catalog. Without this a full compact of a large type left its entire
-    // old column set as permanently unreclaimable garbage. (The pk index,
+    // old column set as permanently unreclaimable garbage. (The primaryKey index,
     // backlinks, and value indexes are carried over, not rebuilt.)
     {
         var j: usize = 0;
@@ -98,7 +98,7 @@ pub fn compactType(transaction: *WriteTransaction, catalogRef: Reference) !Refer
 
 // Truncate a fully-packed type's columns down to `new_len` rows and publish a
 // catalog with next_row == new_len. All live rows must already lie in
-// [0, new_len); the dead tail is dropped. Object key/pk/backlink indexes are
+// [0, new_len); the dead tail is dropped. Object key/primaryKey/backlink indexes are
 // preserved unchanged. Returns the new catalog ref.
 fn truncatePacked(transaction: *WriteTransaction, catalogRef: Reference, new_len: u64) !Reference {
     var s = try catalog.CatalogSnapshot.load(transaction, catalogRef);
@@ -125,15 +125,15 @@ fn truncatePacked(transaction: *WriteTransaction, catalogRef: Reference, new_len
 pub const CompactCursor = @import("../database.zig").CompactCursor;
 
 // Map a physical row to its stable object key. There is no reverse key->row
-// index, so we go through the primary key: property 0 holds the pk, and the pk
-// index maps pk -> okey (the same association objects.insert builds and
-// resolveProp reads). Valid for any live row; the row's pk cell is preserved by
+// index, so we go through the primary key: property 0 holds the primaryKey, and the primaryKey
+// index maps primaryKey -> objectKey (the same association objects.insert builds and
+// resolveProp reads). Valid for any live row; the row's primaryKey cell is preserved by
 // relocateRow, so this holds even after earlier relocations in the same run.
-fn rowToOkey(transaction: anytype, v: catalog.CatalogView, row: u64) !u64 {
-    const pk = try Column.get(transaction, v.propColRef(0), row);
-    // A live row whose pk does not resolve means the pk index diverged from the
+fn rowToObjectKey(transaction: anytype, v: catalog.CatalogView, row: u64) !u64 {
+    const primaryKey = try Column.get(transaction, v.propColRef(0), row);
+    // A live row whose primaryKey does not resolve means the primaryKey index diverged from the
     // columns: surface corruption instead of crashing mid-compaction.
-    return (try Index.get(transaction, v.pk_index_ref, pk)) orelse error.Corrupt;
+    return (try Index.get(transaction, v.primaryKeyIndexRef, primaryKey)) orelse error.Corrupt;
 }
 
 // Hard safety check before truncating a packed type's dead tail: no live row
@@ -217,8 +217,8 @@ pub fn compactStep(transaction: *WriteTransaction, catalogRef: Reference, type_i
         if (cursor.high_hi <= lc or cursor.hole_lo >= lc) break;
 
         const high_row = cursor.high_hi - 1;
-        const okey = try rowToOkey(transaction, try catalog.loadCatalog(transaction, cur), high_row);
-        cur = try relocateRow(transaction, cur, okey, cursor.hole_lo);
+        const objectKey = try rowToObjectKey(transaction, try catalog.loadCatalog(transaction, cur), high_row);
+        cur = try relocateRow(transaction, cur, objectKey, cursor.hole_lo);
         // The hole is now live and the high row now dead; step past both.
         cursor.hole_lo += 1;
         cursor.high_hi -= 1;
@@ -251,30 +251,30 @@ pub const CompactionError = error{CompactionMismatch};
 
 // Order-independent 64-bit mix of a primary key, folded with XOR so the running
 // accumulator does not depend on traversal order.
-inline fn mixPk(pk: u64) u64 {
-    return std.hash.Wyhash.hash(0, std.mem.asBytes(&pk));
+inline fn mixPrimaryKey(primaryKey: u64) u64 {
+    return std.hash.Wyhash.hash(0, std.mem.asBytes(&primaryKey));
 }
 
 // Walk a catalog's key->row index, reading each live row's primary key (prop 0),
-// and fold the pk set into `fold` (XOR of mixed pks) while counting rows. The
+// and fold the primaryKey set into `fold` (XOR of mixed primaryKeys) while counting rows. The
 // fold is identity-preserving and order-independent.
-fn foldPks(allocator: std.mem.Allocator, transaction: anytype, catalogRef: Reference, fold: *u64, count: *u64) !void {
+fn foldPrimaryKeys(allocator: std.mem.Allocator, transaction: anytype, catalogRef: Reference, fold: *u64, count: *u64) !void {
     const v = try catalog.loadCatalog(transaction, catalogRef);
     const prop0 = v.propColRef(0);
     var pairs = try collectKeyRowPairs(allocator, transaction, v.keyrow_index_ref);
     defer pairs.deinit(allocator);
     for (pairs.items) |pr| {
-        const pk = try Column.get(transaction, prop0, pr.row);
-        fold.* ^= mixPk(pk);
+        const primaryKey = try Column.get(transaction, prop0, pr.row);
+        fold.* ^= mixPrimaryKey(primaryKey);
         count.* += 1;
     }
 }
 
-// Fold SRC's pk set (like foldPks) AND, for every live source object, prove that
+// Fold SRC's primaryKey set (like foldPrimaryKeys) AND, for every live source object, prove that
 // the destination preserves it: (a) the object is readable in dst by its
 // original object key, and (b) every to-one link property holds the same raw
 // target in dst as in src. Returns error.CompactionMismatch on any failure.
-fn foldPksAndCheck(allocator: std.mem.Allocator, src: anytype, sc: Reference, dst: anytype, dc: Reference, fold: *u64, count: *u64) !void {
+fn foldPrimaryKeysAndCheck(allocator: std.mem.Allocator, src: anytype, sc: Reference, dst: anytype, dc: Reference, fold: *u64, count: *u64) !void {
     const sv = try catalog.loadCatalog(src, sc);
     const dv = try catalog.loadCatalog(dst, dc);
     const pc = sv.prop_count;
@@ -295,21 +295,21 @@ fn foldPksAndCheck(allocator: std.mem.Allocator, src: anytype, sc: Reference, ds
     }
     const s_prop0 = s_prop[0];
 
-    // Collect SRC's live (okey, row) pairs.
+    // Collect SRC's live (objectKey, row) pairs.
     var pairs = try collectKeyRowPairs(allocator, src, sv.keyrow_index_ref);
     defer pairs.deinit(allocator);
 
     var out: [max_prop_count]catalog.Value = undefined;
     for (pairs.items) |pr| {
-        // pk fold over the source.
-        const pk = try Column.get(src, s_prop0, pr.row);
-        fold.* ^= mixPk(pk);
+        // primaryKey fold over the source.
+        const primaryKey = try Column.get(src, s_prop0, pr.row);
+        fold.* ^= mixPrimaryKey(primaryKey);
         count.* += 1;
 
         // (a) readability: the same object key must decode in dst.
-        if ((try objects.getTypedByOkey(dst, dc, pr.okey, out[0..pc])) == null) return error.CompactionMismatch;
+        if ((try objects.getTypedByObjectKey(dst, dc, pr.objectKey, out[0..pc])) == null) return error.CompactionMismatch;
 
-        const drow = (try catalog.okeyToRow(dst, dc, pr.okey)) orelse return error.CompactionMismatch;
+        const drow = (try catalog.objectKeyToRow(dst, dc, pr.objectKey)) orelse return error.CompactionMismatch;
         try checkRowProperties(src, dst, dv, kinds[0..pc], s_prop[0..pc], d_prop[0..pc], pr, drow);
     }
 }
@@ -339,13 +339,13 @@ fn checkRowProperties(
         if (dv.indexed(p)) {
             const d_raw = try Column.get(dst, d_prop[p], drow);
             const inner = (try Index.get(dst, dv.valueIndexRef(p), d_raw)) orelse return error.CompactionMismatch;
-            if ((try Index.get(dst, inner, pr.okey)) == null) return error.CompactionMismatch;
+            if ((try Index.get(dst, inner, pr.objectKey)) == null) return error.CompactionMismatch;
         }
     }
 }
 
 // Verify the destination is equivalent to the source before it is published.
-// Proves, per type: identical type count, identical live count, identical pk set
+// Proves, per type: identical type count, identical live count, identical primaryKey set
 // (order-independent fold), every source object readable in dst by its original
 // key, and identical to-one forward links. Any divergence aborts the compaction.
 fn verifyEquivalent(allocator: std.mem.Allocator, src: anytype, src_dir: Reference, dst: anytype, dst_dir: Reference) !void {
@@ -359,13 +359,13 @@ fn verifyEquivalent(allocator: std.mem.Allocator, src: anytype, src_dir: Referen
         // 1. live count.
         if ((try liveCount(src, sc)) != (try liveCount(dst, dc))) return error.CompactionMismatch;
 
-        // 2. pk-set fold + readability + forward-link match.
+        // 2. primaryKey-set fold + readability + forward-link match.
         var src_fold: u64 = 0;
         var src_n: u64 = 0;
-        try foldPksAndCheck(allocator, src, sc, dst, dc, &src_fold, &src_n);
+        try foldPrimaryKeysAndCheck(allocator, src, sc, dst, dc, &src_fold, &src_n);
         var dst_fold: u64 = 0;
         var dst_n: u64 = 0;
-        try foldPks(allocator, dst, dc, &dst_fold, &dst_n);
+        try foldPrimaryKeys(allocator, dst, dc, &dst_fold, &dst_n);
         if (src_fold != dst_fold or src_n != dst_n) return error.CompactionMismatch;
     }
 }

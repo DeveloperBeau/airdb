@@ -94,7 +94,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     {
         var w = try database.beginWrite();
         const catalogRef = try catalog.createDefs(&w, &.{
-            .{ .kind = .int }, // 0 pk
+            .{ .kind = .int }, // 0 primaryKey
             .{ .kind = .int }, // 1 int
             .{ .kind = .int }, // 2 bool (0/1)
             .{ .kind = .blob }, // 3 string
@@ -130,9 +130,9 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
             var catalogRef = w.new_root;
             var j: usize = 0;
             while (j < this_batch) : (j += 1) {
-                const pk: u64 = inserted + j;
-                // okeys are assigned 0,1,2,... so okey == pk for a fresh insert.
-                var rng: u64 = pk +% 0x9E3779B97F4A7C15;
+                const primaryKey: u64 = inserted + j;
+                // objectKeys are assigned 0,1,2,... so objectKey == primaryKey for a fresh insert.
+                var rng: u64 = primaryKey +% 0x9E3779B97F4A7C15;
                 const iv = xorshift(&rng);
 
                 var blob_buf: [32]u8 = undefined;
@@ -147,11 +147,11 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
                 const set_blobs = [_][]const u8{ "m0", "m1", "m2" };
 
                 const row = [prop_count]Value{
-                    .{ .int = pk },
+                    .{ .int = primaryKey },
                     .{ .int = iv },
-                    .{ .int = pk & 1 }, // bool
+                    .{ .int = primaryKey & 1 }, // bool
                     .{ .bytes = &blob_buf },
-                    .{ .link = if (pk == 0) null else pk - 1 }, // self-link to prior okey
+                    .{ .link = if (primaryKey == 0) null else primaryKey - 1 }, // self-link to prior objectKey
                     .{ .dict_int = &dict_entries },
                     .{ .set_int = &set_ints },
                     .{ .set_blob = &set_blobs },
@@ -187,14 +187,14 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         var out: [prop_count]Value = undefined;
         var k: usize = 0;
         while (k < read_n) : (k += 1) {
-            const pk: u64 = (k * read_stride) % rows;
+            const primaryKey: u64 = (k * read_stride) % rows;
             const t0 = nowNs(io);
-            _ = try objects.getTyped(&r, catalogRef, pk, &out); // int/bool/blob/link
-            _ = try collections.dictCount(&r, catalogRef, pk, p_dict);
-            _ = try collections.dictGet(&r, catalogRef, pk, p_dict, "alpha");
-            _ = try collections.setCountInt(&r, catalogRef, pk, p_set_int);
-            _ = try collections.setCountBlob(&r, catalogRef, pk, p_set_blob);
-            _ = try collections.setContainsBlob(&r, catalogRef, pk, p_set_blob, "m1");
+            _ = try objects.getTyped(&r, catalogRef, primaryKey, &out); // int/bool/blob/link
+            _ = try collections.dictCount(&r, catalogRef, primaryKey, p_dict);
+            _ = try collections.dictGet(&r, catalogRef, primaryKey, p_dict, "alpha");
+            _ = try collections.setCountInt(&r, catalogRef, primaryKey, p_set_int);
+            _ = try collections.setCountBlob(&r, catalogRef, primaryKey, p_set_blob);
+            _ = try collections.setContainsBlob(&r, catalogRef, primaryKey, p_set_blob, "m1");
             const dt: u64 = @intCast(nowNs(io) - t0);
             try read_lat.add(alloc, dt);
             try combined.add(alloc, dt);
@@ -213,12 +213,12 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
             var catalogRef = w.new_root;
             var j: usize = 0;
             while (j < this_batch) : (j += 1) {
-                const pk: u64 = ((done + j) * update_stride) % rows;
-                const target: u64 = (pk + 7) % rows;
+                const primaryKey: u64 = ((done + j) * update_stride) % rows;
+                const target: u64 = (primaryKey + 7) % rows;
                 const t0 = nowNs(io);
-                catalogRef = try collections.setAddInt(&w, catalogRef, pk, p_set_int, 1_000_000 + pk);
-                catalogRef = try collections.dictPut(&w, catalogRef, pk, p_dict, "delta", pk);
-                catalogRef = try links.setLink(&w, catalogRef, pk, p_link, target);
+                catalogRef = try collections.setAddInt(&w, catalogRef, primaryKey, p_set_int, 1_000_000 + primaryKey);
+                catalogRef = try collections.dictPut(&w, catalogRef, primaryKey, p_dict, "delta", primaryKey);
+                catalogRef = try links.setLink(&w, catalogRef, primaryKey, p_link, target);
                 const dt: u64 = @intCast(nowNs(io) - t0);
                 try update_lat.add(alloc, dt);
                 try combined.add(alloc, dt);
@@ -242,10 +242,10 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
             var raw: [prop_count]u64 = undefined;
             var j: usize = 0;
             while (j < this_batch) : (j += 1) {
-                const pk: u64 = ((done + j) * delete_stride) % rows;
-                const ver = (try rawRows.getByPk(&w, catalogRef, pk, &raw)) orelse continue;
+                const primaryKey: u64 = ((done + j) * delete_stride) % rows;
+                const ver = (try rawRows.getByPrimaryKey(&w, catalogRef, primaryKey, &raw)) orelse continue;
                 const t0 = nowNs(io);
-                const dres = try objects.deleteTyped(&w, catalogRef, pk, ver);
+                const dres = try objects.deleteTyped(&w, catalogRef, primaryKey, ver);
                 const dt: u64 = @intCast(nowNs(io) - t0);
                 switch (dres) {
                     .ok => |c| {
