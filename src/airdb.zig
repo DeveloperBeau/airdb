@@ -6,6 +6,7 @@ pub const catalog = @import("catalog.zig");
 pub const collections = @import("collections.zig");
 pub const links = @import("links.zig");
 pub const compaction = @import("compaction.zig");
+pub const compactionCopy = @import("compactionCopy.zig");
 pub const relocation = @import("relocation.zig");
 pub const migrations = @import("migrations.zig");
 pub const query = @import("query.zig");
