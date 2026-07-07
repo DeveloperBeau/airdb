@@ -1,15 +1,15 @@
-// Bottom-up level builders and right-edge run append for the u64-keyed B+tree
-// in index.zig, re-exported there as Index.packLeaves / Index.stackInner /
-// Index.collapseToRoot / Index.appendRun.
-//
-// These build complete tree levels directly from sorted input rather than
-// inserting one pair at a time. The produced nodes are byte-for-byte the same
-// on-disk format the sequential readers expect, so a bulk-built tree is
-// indistinguishable from one grown via the normal insert path.
-//
-// The `transaction` parameter follows index.zig's convention: a comptime duck-typed
-// transaction capability requiring deref(ref, length), alloc(size),
-// writableCopy(ref, length), and free(ref, length).
+//! Bottom-up level builders and right-edge run append for the u64-keyed B+tree
+//! in index.zig, re-exported there as Index.packLeaves / Index.stackInner /
+//! Index.collapseToRoot / Index.appendRun.
+//!
+//! These build complete tree levels directly from sorted input rather than
+//! inserting one pair at a time. The produced nodes are byte-for-byte the same
+//! on-disk format the sequential readers expect, so a bulk-built tree is
+//! indistinguishable from one grown via the normal insert path.
+//!
+//! The `transaction` parameter follows index.zig's convention: a comptime duck-typed
+//! transaction capability requiring deref(ref, length), alloc(size),
+//! writableCopy(ref, length), and free(ref, length).
 
 const std = @import("std");
 const Reference = @import("../storage/reference.zig").Reference;

@@ -1,19 +1,33 @@
+//! On-disk node formats for the key->value B+tree: fixed-size leaf and inner
+//! encodings shared (via bTreeCore) by index.zig's inline numeric keys and
+//! byteKeyIndex.zig's blob-ref byte keys.
+
 const std = @import("std");
 
+/// Maximum (key, value) pairs per leaf node.
 pub const leafCap: u16 = 64;
+/// Maximum children per inner node.
 pub const fanout: u16 = 64;
+/// Kind byte marking a leaf node.
 pub const kindLeaf: u8 = 0;
+/// Kind byte marking an inner node.
 pub const kindInner: u8 = 1;
-pub const headerSize: usize = 3; // [kind u8][count u16]
-pub const leafNodeSize: usize = headerSize + @as(usize, leafCap) * 16; // (key,value)
+/// Byte offset of a node's first entry: [kind u8][count u16].
+pub const headerSize: usize = 3;
+/// Fixed leaf allocation size: the header plus leafCap (key, value) pairs.
+pub const leafNodeSize: usize = headerSize + @as(usize, leafCap) * 16;
 
-// Inner layout: [kind u8][childCount u16] then childCount entries of
-// (childRef u64, lowKey u64, subtreeCount u64). The subtree count makes
-// Index.count a single-node read instead of a full-tree walk, which is what
-// keeps liveCount / shouldCompact O(1)-per-node on the compaction hot path.
+/// Bytes per inner-node child entry.
+/// Inner layout: [kind u8][childCount u16] then childCount entries of
+/// (childRef u64, lowKey u64, subtreeCount u64). The subtree count makes
+/// Index.count a single-node read instead of a full-tree walk, which is what
+/// keeps liveCount / shouldCompact O(1)-per-node on the compaction hot path.
 pub const innerStride: usize = 24;
+/// Fixed inner allocation size: the header plus fanout child entries.
 pub const innerNodeSize: usize = headerSize + @as(usize, fanout) * innerStride;
 
+/// Encode the parallel (keys, vals) pairs into `buffer` as a leaf node;
+/// returns the encoded byte length.
 pub fn encodeLeaf(buffer: []u8, keys: []const u64, vals: []const u64) usize {
     std.debug.assert(keys.len == vals.len and keys.len <= leafCap);
     buffer[0] = kindLeaf;
@@ -27,15 +41,21 @@ pub fn encodeLeaf(buffer: []u8, keys: []const u64, vals: []const u64) usize {
     return offset;
 }
 
+/// A validated read-only view of a leaf node; construct via parseLeaf.
 pub const LeafView = struct {
     bytes: []const u8,
     count: u16,
+    /// The stored key at `entryIndex`.
     pub fn key(self: LeafView, entryIndex: usize) u64 {
         return std.mem.readInt(u64, self.bytes[headerSize + entryIndex * 16 ..][0..8], .little);
     }
+    /// The value stored alongside the key at `entryIndex`.
     pub fn value(self: LeafView, entryIndex: usize) u64 {
         return std.mem.readInt(u64, self.bytes[headerSize + entryIndex * 16 + 8 ..][0..8], .little);
     }
+    /// First slot whose stored key is >= `searchKey` (== count when every
+    /// key is smaller). Binary search, O(log leafCap); inline numeric keys
+    /// only.
     pub fn lowerBound(self: LeafView, searchKey: u64) usize {
         var low: usize = 0;
         var high: usize = self.count;
@@ -47,6 +67,8 @@ pub const LeafView = struct {
     }
 };
 
+/// Validate `bytes` as a leaf node and return its view; error.Corrupt on a
+/// wrong kind byte, an oversized count, or a short buffer.
 pub fn parseLeaf(bytes: []const u8) error{Corrupt}!LeafView {
     if (bytes.len < headerSize) return error.Corrupt;
     if (bytes[0] != kindLeaf) return error.Corrupt;
@@ -60,6 +82,8 @@ pub fn parseLeaf(bytes: []const u8) error{Corrupt}!LeafView {
 // Inner-node encoding
 // ---------------------------------------------------------------------------
 
+/// Encode the parallel (refs, lows, counts) child entries into `buffer` as an
+/// inner node; returns the encoded byte length.
 pub fn encodeInner(buffer: []u8, refs: []const u64, lows: []const u64, counts: []const u64) usize {
     std.debug.assert(refs.len == lows.len and refs.len == counts.len and refs.len <= fanout);
     buffer[0] = kindInner;
@@ -74,15 +98,19 @@ pub fn encodeInner(buffer: []u8, refs: []const u64, lows: []const u64, counts: [
     return offset;
 }
 
+/// A validated read-only view of an inner node; construct via parseInner.
 pub const InnerView = struct {
     bytes: []const u8,
     childCount: u16,
+    /// The ref of child `entryIndex`.
     pub fn childRef(self: InnerView, entryIndex: usize) u64 {
         return std.mem.readInt(u64, self.bytes[headerSize + entryIndex * innerStride ..][0..8], .little);
     }
+    /// The smallest key routed to child `entryIndex` (its recorded low).
     pub fn lowKey(self: InnerView, entryIndex: usize) u64 {
         return std.mem.readInt(u64, self.bytes[headerSize + entryIndex * innerStride + 8 ..][0..8], .little);
     }
+    /// The number of entries stored under child `entryIndex`.
     pub fn subtreeCount(self: InnerView, entryIndex: usize) u64 {
         return std.mem.readInt(u64, self.bytes[headerSize + entryIndex * innerStride + 16 ..][0..8], .little);
     }
@@ -95,6 +123,8 @@ pub const InnerView = struct {
     }
 };
 
+/// Validate `bytes` as an inner node and return its view; error.Corrupt on a
+/// wrong kind byte, an oversized child count, or a short buffer.
 pub fn parseInner(bytes: []const u8) error{Corrupt}!InnerView {
     if (bytes.len < headerSize) return error.Corrupt;
     if (bytes[0] != kindInner) return error.Corrupt;

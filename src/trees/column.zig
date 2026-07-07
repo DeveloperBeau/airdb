@@ -1,12 +1,15 @@
-// The `transaction` parameter of every operation is `anytype`: a comptime duck-typed
-// transaction capability, monomorphized at compile time (no vtable on this
-// B+tree hot path). Read-only operations need only
-//   deref(ref, length) ![]const u8
-// and mutating operations additionally require
-//   alloc(size) !Allocation, writableCopy(ref, length) !Allocation,
-//   free(ref, length) !void
-// where Allocation is arena.Allocation. WriteTransaction is the production
-// implementation; ReadTransaction satisfies the read-only subset.
+//! Column tree: a counted B+tree mapping a dense row index to a u64 value,
+//! the storage behind every property/version/live column.
+//!
+//! The `transaction` parameter of every operation is `anytype`: a comptime duck-typed
+//! transaction capability, monomorphized at compile time (no vtable on this
+//! B+tree hot path). Read-only operations need only
+//!   deref(ref, length) ![]const u8
+//! and mutating operations additionally require
+//!   alloc(size) !Allocation, writableCopy(ref, length) !Allocation,
+//!   free(ref, length) !void
+//! where Allocation is arena.Allocation. WriteTransaction is the production
+//! implementation; ReadTransaction satisfies the read-only subset.
 
 const std = @import("std");
 const Reference = @import("../storage/reference.zig").Reference;
@@ -29,8 +32,7 @@ const parseInner = node.parseInner;
 const InnerView = node.InnerView;
 
 // ---------------------------------------------------------------------------
-// Column operations (Tasks 2-3)
-// Task 4 will add leaf splitting.
+// Column operations
 // ---------------------------------------------------------------------------
 
 /// Allocate an empty leaf column node and return its Reference.
@@ -40,10 +42,10 @@ pub fn create(transaction: anytype) !Reference {
     return allocation.ref;
 }
 
-// A legal tree with fanout 64 covering 2^64 rows is at most ~11 levels deep, so
-// any walk deeper than this is following a corrupt ref cycle. Every recursive
-// walker carries a depth and fails with error.Corrupt instead of overflowing
-// the stack.
+/// Corrupt-cycle guard for every recursive walker: a legal tree with fanout
+/// 64 covering 2^64 rows is at most ~11 levels deep, so any walk deeper than
+/// this is following a corrupt ref cycle. Walkers carry a depth and fail with
+/// error.Corrupt instead of overflowing the stack.
 pub const maxDepth: usize = 16;
 
 /// Deref a node by first reading its kind byte, then dereffing the full node.
