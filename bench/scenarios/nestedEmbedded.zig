@@ -1,5 +1,5 @@
 // nested_embedded -- cost of embedded-WITHIN-embedded objects at nesting depth
-// 1, 2 and 3, to expose the depth-cost curve of the typedir embedded path.
+// 1, 2 and 3, to expose the depth-cost curve of the typeDirectory embedded path.
 //
 // An embedded child can itself own an embedded child (the engine places no
 // nesting cap: insertEmbedded works on any owner type that has a cascade to-one
@@ -53,9 +53,9 @@ const depthStride: u64 = 1_000_000;
 // A 4-type chain: types 0..2 carry a cascade to-one link to the next type;
 // type 3 is the leaf. Type 0 is the non-embedded root, types 1..3 are embedded.
 const chainSchema = [_][]const catalog.PropertyDefinition{
-    &.{ .{ .kind = .int }, .{ .kind = .link, .linkTarget = 1, .delRule = .cascade } },
-    &.{ .{ .kind = .int }, .{ .kind = .link, .linkTarget = 2, .delRule = .cascade } },
-    &.{ .{ .kind = .int }, .{ .kind = .link, .linkTarget = 3, .delRule = .cascade } },
+    &.{ .{ .kind = .int }, .{ .kind = .link, .linkTarget = 1, .deletionRule = .cascade } },
+    &.{ .{ .kind = .int }, .{ .kind = .link, .linkTarget = 2, .deletionRule = .cascade } },
+    &.{ .{ .kind = .int }, .{ .kind = .link, .linkTarget = 3, .deletionRule = .cascade } },
     &.{ .{ .kind = .int }, .{ .kind = .int } },
 };
 const chainEmbedded = [_]bool{ false, true, true, true };

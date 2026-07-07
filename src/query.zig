@@ -60,7 +60,7 @@ fn openScan(transaction: anytype, catalogRef: Reference) !Scan {
     const view = try catalog.loadCatalog(transaction, catalogRef);
     var scan: Scan = undefined;
     scan.propertyCount = view.propertyCount;
-    scan.liveRef = view.liveColRef;
+    scan.liveRef = view.liveColumnRef;
     scan.keyrowIndexRef = view.keyrowIndexRef;
     scan.nextRow = view.nextRow;
     var propertyIndex: usize = 0;
@@ -360,7 +360,7 @@ pub fn sortByPropertyAscending(
 ) !void {
     const view = try catalog.loadCatalog(transaction, catalogRef);
     if (property >= view.propertyCount) return error.BadProperty;
-    const col = view.propertyColumnRef(property);
+    const column = view.propertyColumnRef(property);
     const SortPair = struct { value: u64, key: u64 };
     const pairs = try allocator.alloc(SortPair, objectKeys.len);
     defer allocator.free(pairs);
@@ -368,7 +368,7 @@ pub fn sortByPropertyAscending(
         // A caller-supplied objectKey that no longer resolves (stale or deleted) is
         // an input error, not a crash.
         const row = (try catalog.objectKeyToRow(transaction, catalogRef, key)) orelse return error.NotFound;
-        pairs[rowIndex] = .{ .value = try Column.get(transaction, col, row), .key = key };
+        pairs[rowIndex] = .{ .value = try Column.get(transaction, column, row), .key = key };
     }
     std.mem.sort(SortPair, pairs, {}, struct {
         fn lessThan(_: void, left: SortPair, right: SortPair) bool {

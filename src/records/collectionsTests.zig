@@ -2,7 +2,7 @@ const std = @import("std");
 const collections = @import("collections.zig");
 const catalog = @import("../schema/catalog.zig");
 const Value = catalog.Value;
-const listLen = collections.listLen;
+const listLength = collections.listLength;
 const listGetInt = collections.listGetInt;
 const listGetBlob = collections.listGetBlob;
 const listAppendInt = collections.listAppendInt;
@@ -87,12 +87,12 @@ test "list of int: insert seeds members and reads back" {
     var w = try database.beginWrite();
     var catalogRef = try catalog.createFromDefinitions(&w, &.{ .{ .kind = .int }, .{ .kind = .list, .element = .int } });
     catalogRef = (try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .listInt = &.{ 10, 20, 30 } } })).catalogRef;
-    try testing.expectEqual(@as(?u64, 3), try listLen(&w, catalogRef, 1, 1));
+    try testing.expectEqual(@as(?u64, 3), try listLength(&w, catalogRef, 1, 1));
     try testing.expectEqual(@as(u64, 20), try listGetInt(&w, catalogRef, 1, 1, 1));
     var out: [2]Value = undefined;
     _ = (try getTyped(&w, catalogRef, 1, &out)).?;
     try testing.expectEqual(@as(u64, 1), out[0].int);
-    try testing.expect(out[1].collRoot != 0);
+    try testing.expect(out[1].collectionRoot != 0);
     w.deinit();
 }
 
@@ -107,7 +107,7 @@ test "list of int: append grows the list" {
     var catalogRef = try catalog.createFromDefinitions(&w, &.{ .{ .kind = .int }, .{ .kind = .list, .element = .int } });
     catalogRef = (try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .listInt = &.{ 10, 20, 30 } } })).catalogRef;
     catalogRef = try listAppendInt(&w, catalogRef, 1, 1, 40);
-    try testing.expectEqual(@as(?u64, 4), try listLen(&w, catalogRef, 1, 1));
+    try testing.expectEqual(@as(?u64, 4), try listLength(&w, catalogRef, 1, 1));
     try testing.expectEqual(@as(u64, 40), try listGetInt(&w, catalogRef, 1, 1, 3));
     w.deinit();
 }
@@ -137,7 +137,7 @@ test "list of blob: insert and read back element strings" {
     var w = try database.beginWrite();
     var catalogRef = try catalog.createFromDefinitions(&w, &.{ .{ .kind = .int }, .{ .kind = .list, .element = .blob } });
     catalogRef = (try insertTyped(&w, catalogRef, &.{ .{ .int = 7 }, .{ .listBlob = &.{ "alpha", "beta", "gamma" } } })).catalogRef;
-    try testing.expectEqual(@as(?u64, 3), try listLen(&w, catalogRef, 7, 1));
+    try testing.expectEqual(@as(?u64, 3), try listLength(&w, catalogRef, 7, 1));
     try testing.expectEqualStrings("beta", try listGetBlob(&w, catalogRef, 7, 1, 1));
     catalogRef = try listAppendBlob(&w, catalogRef, 7, 1, "delta");
     try testing.expectEqualStrings("delta", try listGetBlob(&w, catalogRef, 7, 1, 3));
@@ -272,7 +272,7 @@ test "collections persist across commit and reopen" {
         defer database.deinit();
         var r = try database.beginRead();
         const catalogRef = r.root();
-        try testing.expectEqual(@as(?u64, 4), try listLen(&r, catalogRef, 42, 1));
+        try testing.expectEqual(@as(?u64, 4), try listLength(&r, catalogRef, 42, 1));
         try testing.expectEqual(@as(u64, 4), try listGetInt(&r, catalogRef, 42, 1, 3));
         try testing.expectEqual(@as(?u64, 4), try setCountInt(&r, catalogRef, 42, 2));
         try testing.expect(try setContainsInt(&r, catalogRef, 42, 2, 400));
@@ -301,7 +301,7 @@ test "large list and set: 50k elements each, append and membership" {
         catalogRef = try listAppendInt(&w, catalogRef, 1, 1, i);
         catalogRef = try setAddInt(&w, catalogRef, 1, 2, i *% 2654435761 % 1_000_003);
     }
-    try testing.expectEqual(@as(?u64, N), try listLen(&w, catalogRef, 1, 1));
+    try testing.expectEqual(@as(?u64, N), try listLength(&w, catalogRef, 1, 1));
     try testing.expectEqual(@as(u64, 12345), try listGetInt(&w, catalogRef, 1, 1, 12345));
     const sc = (try setCountInt(&w, catalogRef, 1, 2)).?;
     try testing.expect(sc > 0 and sc <= N);

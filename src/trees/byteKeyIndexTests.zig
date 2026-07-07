@@ -4,16 +4,16 @@ const std = @import("std");
 const testing = std.testing;
 const Database = @import("../database.zig").Database;
 const blob = @import("../records/blob.zig");
-const bindex = @import("byteKeyIndex.zig");
+const byteKeyIndex = @import("byteKeyIndex.zig");
 const node = @import("indexNode.zig");
 
-const create = bindex.create;
-const insert = bindex.insert;
-const get = bindex.get;
-const remove = bindex.remove;
-const count = bindex.count;
-const freeTree = bindex.freeTree;
-const forEachEntry = bindex.forEachEntry;
+const create = byteKeyIndex.create;
+const insert = byteKeyIndex.insert;
+const get = byteKeyIndex.get;
+const remove = byteKeyIndex.remove;
+const count = byteKeyIndex.count;
+const freeTree = byteKeyIndex.freeTree;
+const forEachEntry = byteKeyIndex.forEachEntry;
 
 const innerNodeSize = node.innerNodeSize;
 const encodeInner = node.encodeInner;
@@ -24,7 +24,7 @@ fn bidxTmpPath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const
     return std.fs.path.join(allocator, &.{ pathBuffer[0..dlen], name });
 }
 
-test "a bindex ref cycle fails with error.Corrupt" {
+test "a byteKeyIndex ref cycle fails with error.Corrupt" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try bidxTmpPath(testing.allocator, &tmp, "bidx_cycle.airdb");

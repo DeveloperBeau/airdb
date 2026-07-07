@@ -212,11 +212,11 @@ fn primaryKeySortOrder(
 fn freePreallocatedTrees(transaction: *WriteTransaction, snapshot: *const catalog.CatalogSnapshot) !void {
     var propertyIndex: usize = 0;
     while (propertyIndex < snapshot.propertyCount) : (propertyIndex += 1) {
-        try Column.freeTree(transaction, snapshot.properties[propertyIndex].col);
+        try Column.freeTree(transaction, snapshot.properties[propertyIndex].column);
         if (snapshot.properties[propertyIndex].indexed) try Index.freeTree(transaction, snapshot.properties[propertyIndex].valueIndex);
     }
-    try Column.freeTree(transaction, snapshot.versionColRef);
-    try Column.freeTree(transaction, snapshot.liveColRef);
+    try Column.freeTree(transaction, snapshot.versionColumnRef);
+    try Column.freeTree(transaction, snapshot.liveColumnRef);
     try Index.freeTree(transaction, snapshot.primaryKeyIndexRef);
     try Index.freeTree(transaction, snapshot.keyrowIndexRef);
 }
@@ -240,7 +240,7 @@ fn buildImportTrees(
         var propertyIndex: usize = 0;
         while (propertyIndex < snapshot.propertyCount) : (propertyIndex += 1) {
             for (permutation, 0..) |sourceRow, rank| columnValues[rank] = rows[sourceRow][propertyIndex];
-            snapshot.properties[propertyIndex].col = try bulkColumn(transaction, columnValues[0..rowCount]);
+            snapshot.properties[propertyIndex].column = try bulkColumn(transaction, columnValues[0..rowCount]);
         }
     }
 
@@ -250,9 +250,9 @@ fn buildImportTrees(
     const stamps = try allocator.alloc(u64, rowCount);
     defer allocator.free(stamps);
     @memset(stamps, transaction.newVersion);
-    snapshot.versionColRef = try bulkColumn(transaction, stamps[0..rowCount]);
+    snapshot.versionColumnRef = try bulkColumn(transaction, stamps[0..rowCount]);
     @memset(stamps, 1);
-    snapshot.liveColRef = try bulkColumn(transaction, stamps[0..rowCount]);
+    snapshot.liveColumnRef = try bulkColumn(transaction, stamps[0..rowCount]);
 
     // primaryKey index (primaryKey -> objectKey) and key->row index (objectKey -> physical row). objectKeys are
     // assigned in sorted-primaryKey order from the type's current nextKey, so
@@ -417,7 +417,7 @@ fn appendColumnRuns(
         var propertyIndex: usize = 0;
         while (propertyIndex < snapshot.propertyCount) : (propertyIndex += 1) {
             for (rows, 0..) |row, rowIndex| columnValues[rowIndex] = row[propertyIndex];
-            snapshot.properties[propertyIndex].col = try Column.appendRun(transaction, snapshot.properties[propertyIndex].col, columnValues[0..rowCount], allocator);
+            snapshot.properties[propertyIndex].column = try Column.appendRun(transaction, snapshot.properties[propertyIndex].column, columnValues[0..rowCount], allocator);
         }
     }
 
@@ -425,9 +425,9 @@ fn appendColumnRuns(
     const stamps = try allocator.alloc(u64, rowCount);
     defer allocator.free(stamps);
     @memset(stamps, transaction.newVersion);
-    snapshot.versionColRef = try Column.appendRun(transaction, snapshot.versionColRef, stamps[0..rowCount], allocator);
+    snapshot.versionColumnRef = try Column.appendRun(transaction, snapshot.versionColumnRef, stamps[0..rowCount], allocator);
     @memset(stamps, 1);
-    snapshot.liveColRef = try Column.appendRun(transaction, snapshot.liveColRef, stamps[0..rowCount], allocator);
+    snapshot.liveColumnRef = try Column.appendRun(transaction, snapshot.liveColumnRef, stamps[0..rowCount], allocator);
 }
 
 // Qualify a batch for the right-edge fast path, returning error.NotAppendable

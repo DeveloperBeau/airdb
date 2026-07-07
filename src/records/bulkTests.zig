@@ -24,7 +24,7 @@ const Database = @import("../database.zig").Database;
 
 const query = @import("../query.zig");
 
-const typedir = @import("../schema/typeDirectory.zig");
+const typeDirectory = @import("../schema/typeDirectory.zig");
 
 fn bulkTmpPath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const u8) ![]const u8 {
     var pathBuffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
@@ -378,10 +378,10 @@ test "bulkImport equals row-by-row for a scalar indexed type" {
         var database = try Database.create(testing.allocator, pathA);
         defer database.deinit();
         var w = try database.beginWrite();
-        const dir = try typedir.createTypes(&w, &.{&importDefinitions}, &.{false});
-        const catalog0 = try typedir.catalogRef(&w, dir, 0);
+        const dir = try typeDirectory.createTypes(&w, &.{&importDefinitions}, &.{false});
+        const catalog0 = try typeDirectory.catalogRef(&w, dir, 0);
         const newCatalog = try bulkImport(&w, catalog0, rowSlices, .{});
-        const newDir = try typedir.setCatalogRef(&w, dir, 0, newCatalog);
+        const newDir = try typeDirectory.setCatalogRef(&w, dir, 0, newCatalog);
         w.setRoot(newDir);
         _ = try w.commit();
         try verification.verifyIntegrity(&database); // both value-index directions, in memory
@@ -411,7 +411,7 @@ test "bulkImport equals row-by-row for a scalar indexed type" {
     var rb = try databaseB.beginRead();
     defer rb.end();
 
-    const catalogA = try typedir.catalogRef(&ra, ra.root(), 0);
+    const catalogA = try typeDirectory.catalogRef(&ra, ra.root(), 0);
     const catalogB = rb.root();
 
     // Counts equal.
@@ -540,10 +540,10 @@ test "bulkImport edge sizes: empty, single, leafCap" {
         defer database.deinit();
         {
             var w = try database.beginWrite();
-            const dir = try typedir.createTypes(&w, &.{&importDefinitions}, &.{false});
-            const catalog0 = try typedir.catalogRef(&w, dir, 0);
+            const dir = try typeDirectory.createTypes(&w, &.{&importDefinitions}, &.{false});
+            const catalog0 = try typeDirectory.catalogRef(&w, dir, 0);
             const newCatalog = try bulkImport(&w, catalog0, rowSlices, .{ .presorted = true });
-            const newDir = try typedir.setCatalogRef(&w, dir, 0, newCatalog);
+            const newDir = try typeDirectory.setCatalogRef(&w, dir, 0, newCatalog);
             w.setRoot(newDir);
             _ = try w.commit();
         }
@@ -551,7 +551,7 @@ test "bulkImport edge sizes: empty, single, leafCap" {
 
         var r = try database.beginRead();
         defer r.end();
-        const catalogRef = try typedir.catalogRef(&r, r.root(), 0);
+        const catalogRef = try typeDirectory.catalogRef(&r, r.root(), 0);
         try testing.expectEqual(n, try catalog.liveCount(&r, catalogRef));
         const cv = try catalog.loadCatalog(&r, catalogRef);
         try testing.expectEqual(n, cv.nextRow);
@@ -602,12 +602,12 @@ test "bulkAppend equals row-by-row for a contiguous monotonic batch" {
         var database = try Database.create(testing.allocator, pathA);
         defer database.deinit();
         var w = try database.beginWrite();
-        const dir = try typedir.createTypes(&w, &.{&appendDefinitions}, &.{false});
-        var catalogRef = try typedir.catalogRef(&w, dir, 0);
+        const dir = try typeDirectory.createTypes(&w, &.{&appendDefinitions}, &.{false});
+        var catalogRef = try typeDirectory.catalogRef(&w, dir, 0);
         var primaryKey: u64 = 0;
         while (primaryKey < BASE) : (primaryKey += 1) catalogRef = (try rawRows.insert(&w, catalogRef, &.{ primaryKey, primaryKey * 3 })).catalogRef;
         const newCatalog = try bulkAppend(&w, catalogRef, batch);
-        const newDir = try typedir.setCatalogRef(&w, dir, 0, newCatalog);
+        const newDir = try typeDirectory.setCatalogRef(&w, dir, 0, newCatalog);
         w.setRoot(newDir);
         _ = try w.commit();
         try verification.verifyIntegrity(&database);
@@ -637,7 +637,7 @@ test "bulkAppend equals row-by-row for a contiguous monotonic batch" {
     var rb = try databaseB.beginRead();
     defer rb.end();
 
-    const catalogA = try typedir.catalogRef(&ra, ra.root(), 0);
+    const catalogA = try typeDirectory.catalogRef(&ra, ra.root(), 0);
     const catalogB = rb.root();
 
     // Counts equal.
@@ -777,12 +777,12 @@ test "bulkAppendOrInsert falls back and equals row-by-row for a scattered batch"
         var database = try Database.create(testing.allocator, pathA);
         defer database.deinit();
         var w = try database.beginWrite();
-        const dir = try typedir.createTypes(&w, &.{&appendDefinitions}, &.{false});
-        var catalogRef = try typedir.catalogRef(&w, dir, 0);
+        const dir = try typeDirectory.createTypes(&w, &.{&appendDefinitions}, &.{false});
+        var catalogRef = try typeDirectory.catalogRef(&w, dir, 0);
         var primaryKey: u64 = 0;
         while (primaryKey < BASE) : (primaryKey += 1) catalogRef = (try rawRows.insert(&w, catalogRef, &.{ primaryKey, primaryKey * 3 })).catalogRef;
         const newCatalog = try bulkAppendOrInsert(&w, catalogRef, &batch);
-        const newDir = try typedir.setCatalogRef(&w, dir, 0, newCatalog);
+        const newDir = try typeDirectory.setCatalogRef(&w, dir, 0, newCatalog);
         w.setRoot(newDir);
         _ = try w.commit();
         try verification.verifyIntegrity(&database);
@@ -813,7 +813,7 @@ test "bulkAppendOrInsert falls back and equals row-by-row for a scattered batch"
     var rb = try databaseB.beginRead();
     defer rb.end();
 
-    const catalogA = try typedir.catalogRef(&ra, ra.root(), 0);
+    const catalogA = try typeDirectory.catalogRef(&ra, ra.root(), 0);
     const catalogB = rb.root();
 
     try testing.expectEqual(@as(u64, TOTAL), try catalog.liveCount(&ra, catalogA));

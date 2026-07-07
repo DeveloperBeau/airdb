@@ -16,19 +16,19 @@ pub fn relocateRow(transaction: *WriteTransaction, catalogRef: Reference, object
     const oldRow = (try Index.get(transaction, snapshot.keyrowIndexRef, objectKey)) orelse return catalogRef;
     if (oldRow == newRow) return catalogRef;
     // Bijection / safety guards.
-    std.debug.assert((try Column.get(transaction, snapshot.liveColRef, oldRow)) == 1);
-    std.debug.assert((try Column.get(transaction, snapshot.liveColRef, newRow)) == 0);
+    std.debug.assert((try Column.get(transaction, snapshot.liveColumnRef, oldRow)) == 1);
+    std.debug.assert((try Column.get(transaction, snapshot.liveColumnRef, newRow)) == 0);
 
     // Copy each property cell + the version cell from oldRow to newRow.
     var propertyIndex: usize = 0;
     while (propertyIndex < snapshot.propertyCount) : (propertyIndex += 1) {
-        const cell = try Column.get(transaction, snapshot.properties[propertyIndex].col, oldRow);
-        snapshot.properties[propertyIndex].col = try Column.set(transaction, snapshot.properties[propertyIndex].col, newRow, cell);
+        const cell = try Column.get(transaction, snapshot.properties[propertyIndex].column, oldRow);
+        snapshot.properties[propertyIndex].column = try Column.set(transaction, snapshot.properties[propertyIndex].column, newRow, cell);
     }
-    const oldver = try Column.get(transaction, snapshot.versionColRef, oldRow);
-    snapshot.versionColRef = try Column.set(transaction, snapshot.versionColRef, newRow, oldver);
-    snapshot.liveColRef = try Column.set(transaction, snapshot.liveColRef, newRow, 1);
-    snapshot.liveColRef = try Column.set(transaction, snapshot.liveColRef, oldRow, 0);
+    const oldver = try Column.get(transaction, snapshot.versionColumnRef, oldRow);
+    snapshot.versionColumnRef = try Column.set(transaction, snapshot.versionColumnRef, newRow, oldver);
+    snapshot.liveColumnRef = try Column.set(transaction, snapshot.liveColumnRef, newRow, 1);
+    snapshot.liveColumnRef = try Column.set(transaction, snapshot.liveColumnRef, oldRow, 0);
     snapshot.keyrowIndexRef = try Index.insert(transaction, snapshot.keyrowIndexRef, objectKey, newRow);
 
     return snapshot.replace(transaction);

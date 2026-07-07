@@ -1,12 +1,12 @@
 const std = @import("std");
 const testing = std.testing;
-const coord = @import("coordination.zig");
+const coordination = @import("coordination.zig");
 const platform = @import("../platform.zig");
-const Coordination = coord.Coordination;
-const coordIo = coord.coordIo;
-const sentinelMax = coord.sentinelMax;
+const Coordination = coordination.Coordination;
+const coordIo = coordination.coordIo;
+const sentinelMax = coordination.sentinelMax;
 
-test "coord create initializes magic and zero attach count, reopen reads them" {
+test "coordination create initializes magic and zero attach count, reopen reads them" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var pathBuffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
@@ -51,9 +51,9 @@ test "a second openOrCreate preserves live coordination state" {
     _ = c1.detach();
 }
 
-test "openOrCreate succeeds while another holder owns the coord flock" {
+test "openOrCreate succeeds while another holder owns the coordination flock" {
     // The init fast path must not block behind the write lock: an existing
-    // (stamped) coord file opens without touching the flock.
+    // (stamped) coordination file opens without touching the flock.
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var pathBuffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
@@ -83,7 +83,7 @@ test "latestVersion round-trips through the mapping" {
     try testing.expectEqual(@as(u64, 42), c.latestVersion());
 }
 
-test "exclusive lock blocks a second holder via the same coord file" {
+test "exclusive lock blocks a second holder via the same coordination file" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var pathBuffer: [std.Io.Dir.max_path_bytes]u8 = undefined;

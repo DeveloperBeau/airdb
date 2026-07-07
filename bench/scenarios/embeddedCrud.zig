@@ -1,13 +1,13 @@
 // embedded_crud -- CRUD latency for EMBEDDED objects (subentities): owner rows
 // that each own exactly one embedded child via a cascade-rule to-one link.
 //
-// Embedded objects live under the typedir multi-type API, not the raw single
+// Embedded objects live under the typeDirectory multi-type API, not the raw single
 // catalog. The directory carries two types:
 //   type 0  owner  {int primaryKey, link(cascade -> type 1)}   non-embedded
 //   type 1  child  {int primaryKey, int value}                 embedded (single-owner)
 // The owner's property 1 is the to-one link the embedded child hangs off; declaring
 // type 1 embedded marks it single-owner. insertEmbedded/clearEmbedded drive the
-// child lifecycle through that link (mirrors the typedir embedded tests).
+// child lifecycle through that link (mirrors the typeDirectory embedded tests).
 //
 // Phase honesty:
 //   CREATE  insert owner row + insertEmbedded one child (timed together).
@@ -48,7 +48,7 @@ const childProperties: usize = 2;
 
 // Owner: {int primaryKey, link(cascade -> child)}. Child: {int primaryKey, int value}, embedded.
 const ownerSchema = [_][]const catalog.PropertyDefinition{
-    &.{ .{ .kind = .int }, .{ .kind = .link, .linkTarget = childType, .delRule = .cascade } },
+    &.{ .{ .kind = .int }, .{ .kind = .link, .linkTarget = childType, .deletionRule = .cascade } },
     &.{ .{ .kind = .int }, .{ .kind = .int } },
 };
 

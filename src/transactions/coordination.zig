@@ -23,12 +23,12 @@
 const std = @import("std");
 const platform = @import("../platform.zig");
 
-/// The blocking Io instance used for all coord-file operations.
+/// The blocking Io instance used for all coordination-file operations.
 pub fn coordIo() std.Io {
     return std.Io.Threaded.global_single_threaded.io();
 }
 
-/// Magic stamped at offset 0 once a coord file is fully initialized.
+/// Magic stamped at offset 0 once a coordination file is fully initialized.
 pub const coordMagic: u64 = 0x6169726462_4300;
 const coordSize: usize = 4096;
 const offMagic: usize = 0; // u64
@@ -60,7 +60,7 @@ pub const Coordination = struct {
     section: platform.Section,
     map: []align(std.heap.page_size_min) u8,
 
-    /// Open an existing coord file or create one if it does not exist.
+    /// Open an existing coordination file or create one if it does not exist.
     /// Does not truncate an existing file.
     /// If the file is new (magic absent), zeroes the mapping and writes the magic.
     /// If the file already has the magic, leaves all fields intact.
@@ -68,7 +68,7 @@ pub const Coordination = struct {
         const io = coordIo();
 
         // Try open first; create only on FileNotFound.
-        // This avoids any risk of truncating an existing coord file.
+        // This avoids any risk of truncating an existing coordination file.
         const file = std.Io.Dir.openFileAbsolute(io, path, .{ .mode = .read_write }) catch |err| switch (err) {
             error.FileNotFound => try std.Io.Dir.createFileAbsolute(io, path, .{ .read = true, .truncate = false }),
             else => return err,
@@ -78,13 +78,13 @@ pub const Coordination = struct {
         const length = try file.length(io);
         if (length < coordSize) try file.setLength(io, coordSize);
 
-        // Fixed-size coord file: a single section covering the whole page. No growth.
+        // Fixed-size coordination file: a single section covering the whole page. No growth.
         var section = try platform.mapSection(file, 0, coordSize);
         errdefer section.unmap();
         const map = section.map;
 
         // Initialize with double-checked locking. Two processes racing on a
-        // brand-new coord file must not both see "magic absent" and zero the
+        // brand-new coordination file must not both see "magic absent" and zero the
         // page: the loser would wipe the winner's attach count, participant
         // slot, and published pins, letting a writer compute a reclaim horizon
         // that ignores live readers. The exclusive flock serializes the
@@ -108,7 +108,7 @@ pub const Coordination = struct {
         return Coordination{ .file = file, .section = section, .map = map };
     }
 
-    /// Unmap the coord page and close the file.
+    /// Unmap the coordination page and close the file.
     pub fn deinit(self: *Coordination) void {
         self.section.unmap();
         self.file.close(coordIo());
@@ -147,7 +147,7 @@ pub const Coordination = struct {
         return @atomicLoad(u64, self.latestPtr(), .acquire);
     }
 
-    /// Block until this process/thread holds an exclusive flock on the coord file.
+    /// Block until this process/thread holds an exclusive flock on the coordination file.
     pub fn lockExclusive(self: *Coordination) !void {
         _ = try platform.lockFileExclusive(self.file, true);
     }

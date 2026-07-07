@@ -8,8 +8,8 @@ const Database = databaseModule.Database;
 const ringCapacity = databaseModule.ringCapacity;
 const Reference = @import("storage/reference.zig").Reference;
 const FreeList = @import("storage/freeList.zig").FreeList;
-const coordMod = @import("transactions/coordination.zig");
-const typedir = @import("schema/typeDirectory.zig");
+const sentinelMax = @import("transactions/coordination.zig").sentinelMax;
+const typeDirectory = @import("schema/typeDirectory.zig");
 const typeRouting = @import("schema/typeRouting.zig");
 const compaction = @import("storage/compaction.zig");
 const catalog = @import("schema/catalog.zig");
@@ -115,7 +115,7 @@ test "free list persists across commit and reopen" {
     {
         var database = try Database.open(testing.allocator, path);
         defer database.deinit();
-        try testing.expect(database.freeListLenForTest() >= 1);
+        try testing.expect(database.freeListLengthForTest() >= 1);
     }
 }
 
@@ -212,7 +212,7 @@ test "verifyIntegrity passes after churn on an indexed type" {
     // One type: int primaryKey + one indexed int property.
     {
         var w = try database.beginWrite();
-        const dir = try typedir.createTypes(&w, &.{&.{ .{ .kind = .int }, .{ .kind = .int, .indexed = true } }}, &.{false});
+        const dir = try typeDirectory.createTypes(&w, &.{&.{ .{ .kind = .int }, .{ .kind = .int, .indexed = true } }}, &.{false});
         w.setRoot(dir);
         _ = try w.commit();
     }
@@ -270,7 +270,7 @@ test "verifyIntegrity detects a corrupted value index" {
 
     {
         var w = try database.beginWrite();
-        var dir = try typedir.createTypes(&w, &.{&.{ .{ .kind = .int }, .{ .kind = .int, .indexed = true } }}, &.{false});
+        var dir = try typeDirectory.createTypes(&w, &.{&.{ .{ .kind = .int }, .{ .kind = .int, .indexed = true } }}, &.{false});
         var primaryKey: u64 = 0;
         while (primaryKey < 8) : (primaryKey += 1) {
             dir = (try typeRouting.insert(&w, dir, tid, &.{ .{ .int = primaryKey }, .{ .int = primaryKey } })).dir;
@@ -287,7 +287,7 @@ test "verifyIntegrity detects a corrupted value index" {
     {
         var w = try database.beginWrite();
         const dir = database.activeRoot;
-        const catalogRef = try typedir.catalogRef(&w, dir, tid);
+        const catalogRef = try typeDirectory.catalogRef(&w, dir, tid);
         const cv = try catalog.loadCatalog(&w, catalogRef);
         const objectKey = (try catalog.primaryKeyToObjectKey(&w, catalogRef, 0)).?; // row primaryKey 0 has value 0
         const bogusValue: u64 = 999_999; // no row carries this value
@@ -295,7 +295,7 @@ test "verifyIntegrity detects a corrupted value index" {
         setRoot = try Index.insert(&w, setRoot, objectKey, 1);
         const newVi = try Index.insert(&w, cv.valueIndexRef(p), bogusValue, setRoot);
         const newCatalog = try catalog.setValueIndexRef(&w, catalogRef, p, newVi);
-        const newDir = try typedir.setCatalogRef(&w, dir, tid, newCatalog);
+        const newDir = try typeDirectory.setCatalogRef(&w, dir, tid, newCatalog);
         w.setRoot(newDir);
         _ = try w.commit();
     }
@@ -314,7 +314,7 @@ test "verifyIntegrity passes on a clean link graph after churn" {
 
     {
         var w = try database.beginWrite();
-        var dir = try typedir.createTypes(&w, &.{
+        var dir = try typeDirectory.createTypes(&w, &.{
             &.{ .{ .kind = .int }, .{ .kind = .blob } }, // 0: target type
             &.{ .{ .kind = .int }, .{ .kind = .link, .linkTarget = 0 }, .{ .kind = .linkSet, .linkTarget = 0 } }, // 1: source
         }, &.{ false, false });
@@ -326,9 +326,9 @@ test "verifyIntegrity passes on a clean link graph after churn" {
         dir = (try typeRouting.insert(&w, dir, 1, &.{ .{ .int = 2 }, .{ .link = b.objectKey }, .{ .linkSet = &.{} } })).dir;
         // Churn: move source 1's to-one link, drop one set member.
         dir = try typeRouting.setLink(&w, dir, 1, 1, 1, b.objectKey);
-        const sourceCatalog = try typedir.catalogRef(&w, dir, 1);
+        const sourceCatalog = try typeDirectory.catalogRef(&w, dir, 1);
         const newCatalog = try links.linkSetRemove(&w, sourceCatalog, 1, 2, a.objectKey);
-        dir = try typedir.setCatalogRef(&w, dir, 1, newCatalog);
+        dir = try typeDirectory.setCatalogRef(&w, dir, 1, newCatalog);
         w.setRoot(dir);
         _ = try w.commit();
     }
@@ -346,7 +346,7 @@ test "verifyIntegrity detects a corrupted backlink index" {
 
     {
         var w = try database.beginWrite();
-        var dir = try typedir.createTypes(&w, &.{
+        var dir = try typeDirectory.createTypes(&w, &.{
             &.{ .{ .kind = .int }, .{ .kind = .link, .linkTarget = 0 } },
         }, &.{false});
         const a = try typeRouting.insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .link = null } });
@@ -363,11 +363,11 @@ test "verifyIntegrity detects a corrupted backlink index" {
     {
         var w = try database.beginWrite();
         const dir = database.activeRoot;
-        const catalogRef = try typedir.catalogRef(&w, dir, 0);
+        const catalogRef = try typeDirectory.catalogRef(&w, dir, 0);
         const cv = try catalog.loadCatalog(&w, catalogRef);
         const newBl = try Index.remove(&w, cv.backlinkRef(1), targetObjectKey);
         const newCatalog = try catalog.setBacklinkRef(&w, catalogRef, 1, newBl);
-        const newDir = try typedir.setCatalogRef(&w, dir, 0, newCatalog);
+        const newDir = try typeDirectory.setCatalogRef(&w, dir, 0, newCatalog);
         w.setRoot(newDir);
         _ = try w.commit();
     }
@@ -385,7 +385,7 @@ test "verifyIntegrity passes on a non-indexed type" {
 
     {
         var w = try database.beginWrite();
-        var dir = try typedir.createTypes(&w, &.{&.{ .{ .kind = .int }, .{ .kind = .int } }}, &.{false});
+        var dir = try typeDirectory.createTypes(&w, &.{&.{ .{ .kind = .int }, .{ .kind = .int } }}, &.{false});
         var primaryKey: u64 = 0;
         while (primaryKey < 50) : (primaryKey += 1) {
             dir = (try typeRouting.insert(&w, dir, tid, &.{ .{ .int = primaryKey }, .{ .int = primaryKey * 3 } })).dir;
@@ -429,7 +429,7 @@ test "two Database instances on one file share a coordination attach count" {
     defer a.deinit();
     var b = try Database.open(testing.allocator, path);
     defer b.deinit();
-    try testing.expectEqual(@as(u32, 2), a.coord.attachCount());
+    try testing.expectEqual(@as(u32, 2), a.coordination.attachCount());
 }
 
 test "a second Database instance sees a commit made by the first after refresh-on-read" {
@@ -487,11 +487,11 @@ test "Database publishes its minimum pinned version to its participant slot" {
         _ = try w.commit();
     }
     // No readers: this process publishes the sentinel (imposes no horizon constraint).
-    try testing.expectEqual(coordMod.sentinelMax, database.coord.slotMinPinnedForTest(database.participantSlot.?));
+    try testing.expectEqual(sentinelMax, database.coordination.slotMinPinnedForTest(database.participantSlot.?));
     var r = try database.beginRead(); // pins the current version
-    try testing.expectEqual(database.activeVersion, database.coord.slotMinPinnedForTest(database.participantSlot.?));
+    try testing.expectEqual(database.activeVersion, database.coordination.slotMinPinnedForTest(database.participantSlot.?));
     r.end();
-    try testing.expectEqual(coordMod.sentinelMax, database.coord.slotMinPinnedForTest(database.participantSlot.?));
+    try testing.expectEqual(sentinelMax, database.coordination.slotMinPinnedForTest(database.participantSlot.?));
 }
 
 test "allocations beyond the initial mapping grow the file and data survives reopen" {
@@ -700,7 +700,7 @@ test "a failed refresh leaves version and free list untouched" {
     var b = try Database.open(testing.allocator, path);
     defer b.deinit();
     const bVersion = b.activeVersion;
-    const bFlLen = b.freeListLenForTest();
+    const bFlLen = b.freeListLengthForTest();
 
     // a commits a version with a non-empty free list, then its node is
     // corrupted in the shared mapping so b's refresh decode must fail.
@@ -720,7 +720,7 @@ test "a failed refresh leaves version and free list untouched" {
 
     try testing.expectError(error.BadRef, b.beginRead());
     try testing.expectEqual(bVersion, b.activeVersion);
-    try testing.expectEqual(bFlLen, b.freeListLenForTest());
+    try testing.expectEqual(bFlLen, b.freeListLengthForTest());
 }
 
 test "a retried commit's ring entry wins over the aborted duplicate" {
@@ -943,7 +943,7 @@ fn churnNetZero(path: []const u8, live: u64, iters: u64, auto: bool) !struct { n
     // Single type: int primaryKey + one int property.
     {
         var w = try database.beginWrite();
-        const dir = try typedir.createTypes(&w, &.{&.{ .{ .kind = .int }, .{ .kind = .int } }}, &.{false});
+        const dir = try typeDirectory.createTypes(&w, &.{&.{ .{ .kind = .int }, .{ .kind = .int } }}, &.{false});
         w.setRoot(dir);
         _ = try w.commit();
     }
@@ -997,7 +997,7 @@ fn churnNetZero(path: []const u8, live: u64, iters: u64, auto: bool) !struct { n
 
     var r = try database.beginRead();
     defer r.end();
-    const catalogRef = try typedir.catalogRef(&r, r.root(), tid);
+    const catalogRef = try typeDirectory.catalogRef(&r, r.root(), tid);
     return .{
         .nextRow = (try catalog.loadCatalog(&r, catalogRef)).nextRow,
         .live = try compaction.liveCount(&r, catalogRef),
@@ -1061,7 +1061,7 @@ test "a failed commit inside maybeCompactStep neither crashes nor wedges the wri
     const tid: u16 = 0;
     {
         var w = try database.beginWrite();
-        const dir = try typedir.createTypes(&w, &.{&.{ .{ .kind = .int }, .{ .kind = .int } }}, &.{false});
+        const dir = try typeDirectory.createTypes(&w, &.{&.{ .{ .kind = .int }, .{ .kind = .int } }}, &.{false});
         w.setRoot(dir);
         _ = try w.commit();
     }
@@ -1110,7 +1110,7 @@ test "the compaction cursor never resumes across types" {
     // live=4, nextRow=12 and dead tails.
     {
         var w = try database.beginWrite();
-        const dir = try typedir.createTypes(&w, &.{
+        const dir = try typeDirectory.createTypes(&w, &.{
             &.{ .{ .kind = .int }, .{ .kind = .int } },
             &.{ .{ .kind = .int }, .{ .kind = .int } },
         }, &.{ false, false });
@@ -1160,7 +1160,7 @@ test "the compaction cursor never resumes across types" {
         while (primaryKey < 12) : (primaryKey += 1) {
             try testing.expect((try typeRouting.get(&r, r.root(), t, primaryKey, &out)) != null);
         }
-        const catalogRef = try typedir.catalogRef(&r, r.root(), t);
+        const catalogRef = try typeDirectory.catalogRef(&r, r.root(), t);
         try testing.expectEqual(@as(u64, 4), (try catalog.loadCatalog(&r, catalogRef)).nextRow);
     }
 }
@@ -1230,7 +1230,7 @@ test "maybeCompactStep is a no-op when nothing to compact" {
     const tid: u16 = 0;
     {
         var w = try database.beginWrite();
-        var dir = try typedir.createTypes(&w, &.{&.{ .{ .kind = .int }, .{ .kind = .int } }}, &.{false});
+        var dir = try typeDirectory.createTypes(&w, &.{&.{ .{ .kind = .int }, .{ .kind = .int } }}, &.{false});
         var primaryKey: u64 = 0;
         while (primaryKey < 3) : (primaryKey += 1) {
             dir = (try typeRouting.insert(&w, dir, tid, &.{ .{ .int = primaryKey }, .{ .int = primaryKey } })).dir;
@@ -1247,7 +1247,7 @@ test "maybeCompactStep is a no-op when nothing to compact" {
     // The type is untouched: all three rows remain live and packed.
     var r = try database.beginRead();
     defer r.end();
-    const catalogRef = try typedir.catalogRef(&r, r.root(), tid);
+    const catalogRef = try typeDirectory.catalogRef(&r, r.root(), tid);
     try testing.expectEqual(@as(u64, 3), try compaction.liveCount(&r, catalogRef));
     try testing.expectEqual(@as(u64, 3), (try catalog.loadCatalog(&r, catalogRef)).nextRow);
 }
@@ -1285,12 +1285,12 @@ test "a free list spanning multiple chunks survives commit and reopen" {
         w.setRoot(root.ref);
         _ = try w.commit();
     }
-    try testing.expect(database.freeListLenForTest() >= nExtents);
+    try testing.expect(database.freeListLengthForTest() >= nExtents);
     database.deinit();
 
     var database2 = try Database.open(testing.allocator, path);
     defer database2.deinit();
-    try testing.expect(database2.freeListLenForTest() >= nExtents);
+    try testing.expect(database2.freeListLengthForTest() >= nExtents);
     try verification.verifyIntegrity(&database2);
 }
 

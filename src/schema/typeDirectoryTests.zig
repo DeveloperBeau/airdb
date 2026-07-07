@@ -1,6 +1,6 @@
 const std = @import("std");
 const testing = std.testing;
-const typedir = @import("typeDirectory.zig");
+const typeDirectory = @import("typeDirectory.zig");
 const typeRouting = @import("typeRouting.zig");
 const Database = @import("../database.zig").Database;
 const catalog = @import("catalog.zig");
@@ -9,17 +9,17 @@ const links = @import("../records/links.zig");
 const Objects = @import("../records/objects.zig");
 const rows = @import("../records/rows.zig");
 const PropertyKind = catalog.PropertyKind;
-const Value = typedir.Value;
-const createTypes = typedir.createTypes;
-const createWithDefinitions = typedir.createWithDefinitions;
-const create = typedir.create;
-const typeCount = typedir.typeCount;
-const catalogRef = typedir.catalogRef;
-const setCatalogRef = typedir.setCatalogRef;
-const addTypeDefinitions = typedir.addTypeDefinitions;
-const addType = typedir.addType;
-const isEmbedded = typedir.isEmbedded;
-const validate = typedir.validate;
+const Value = typeDirectory.Value;
+const createTypes = typeDirectory.createTypes;
+const createWithDefinitions = typeDirectory.createWithDefinitions;
+const create = typeDirectory.create;
+const typeCount = typeDirectory.typeCount;
+const catalogRef = typeDirectory.catalogRef;
+const setCatalogRef = typeDirectory.setCatalogRef;
+const addTypeDefinitions = typeDirectory.addTypeDefinitions;
+const addType = typeDirectory.addType;
+const isEmbedded = typeDirectory.isEmbedded;
+const validate = typeDirectory.validate;
 const insert = typeRouting.insert;
 const get = typeRouting.get;
 const update = typeRouting.update;
@@ -33,8 +33,8 @@ const linkSetContains = typeRouting.linkSetContains;
 const resolveLink = typeRouting.resolveLink;
 const getLinked = typeRouting.getLinked;
 const deleteNullifyCrossType = typeRouting.deleteNullifyCrossType;
-const insertEmbedded = typedir.insertEmbedded;
-const clearEmbedded = typedir.clearEmbedded;
+const insertEmbedded = typeDirectory.insertEmbedded;
+const clearEmbedded = typeDirectory.clearEmbedded;
 
 fn tdTmpPath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const u8) ![]const u8 {
     var pathBuffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
@@ -244,7 +244,7 @@ test "multi-type directory carries links and collections via createWithDefs" {
     dir = added.dir;
     try testing.expectEqual(@as(u16, 2), added.typeId);
     dir = (try insert(&w, dir, 2, &.{ .{ .int = 1 }, .{ .listInt = &.{ 7, 8, 9 } } })).dir;
-    try testing.expectEqual(@as(?u64, 3), try collections.listLen(&w, try catalogRef(&w, dir, 2), 1, 1));
+    try testing.expectEqual(@as(?u64, 3), try collections.listLength(&w, try catalogRef(&w, dir, 2), 1, 1));
     w.deinit();
 }
 
@@ -364,7 +364,7 @@ test "block prevents deleting a referenced object" {
     const PD = catalog.PropertyDefinition;
     const schema = [_][]const PD{
         &.{ .{ .kind = .int }, .{ .kind = .blob } }, // Author
-        &.{ .{ .kind = .int }, .{ .kind = .link, .linkTarget = 0, .delRule = .block } }, // Book.author (block)
+        &.{ .{ .kind = .int }, .{ .kind = .link, .linkTarget = 0, .deletionRule = .block } }, // Book.author (block)
     };
     var dir = try createWithDefinitions(&w, &schema);
     const author = try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .bytes = "Ada" } });
@@ -401,7 +401,7 @@ test "cascade deletes owned children" {
     var w = try database.beginWrite();
     const PD = catalog.PropertyDefinition;
     const schema = [_][]const PD{
-        &.{ .{ .kind = .int }, .{ .kind = .linkSet, .linkTarget = 1, .delRule = .cascade } }, // Parent.children
+        &.{ .{ .kind = .int }, .{ .kind = .linkSet, .linkTarget = 1, .deletionRule = .cascade } }, // Parent.children
         &.{.{ .kind = .int }}, // Child
     };
     var dir = try createWithDefinitions(&w, &schema);
@@ -449,7 +449,7 @@ test "directory records per-type embedded flags" {
 }
 
 const embeddedOwnerSchema = [_][]const catalog.PropertyDefinition{
-    &.{ .{ .kind = .int }, .{ .kind = .link, .linkTarget = 1, .delRule = .cascade } }, // 0: owner
+    &.{ .{ .kind = .int }, .{ .kind = .link, .linkTarget = 1, .deletionRule = .cascade } }, // 0: owner
     &.{ .{ .kind = .int }, .{ .kind = .blob } }, // 1: embedded child
 };
 
@@ -601,7 +601,7 @@ test "a self-linked object is deletable across transactions" {
     {
         var w = try database.beginWrite();
         var dir = try createWithDefinitions(&w, &.{
-            &.{ .{ .kind = .int }, .{ .kind = .link, .linkTarget = 0, .delRule = .block } },
+            &.{ .{ .kind = .int }, .{ .kind = .link, .linkTarget = 0, .deletionRule = .block } },
         });
         const a = try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .link = null } });
         dir = a.dir;
@@ -637,7 +637,7 @@ test "cascade is cycle-safe" {
     var w = try database.beginWrite();
     const PD = catalog.PropertyDefinition;
     const schema = [_][]const PD{
-        &.{ .{ .kind = .int }, .{ .kind = .link, .linkTarget = 0, .delRule = .cascade } }, // Node.next (self type)
+        &.{ .{ .kind = .int }, .{ .kind = .link, .linkTarget = 0, .deletionRule = .cascade } }, // Node.next (self type)
     };
     var dir = try createWithDefinitions(&w, &schema);
     const a = try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .link = null } });
@@ -750,7 +750,7 @@ test "a cascade delete frees the child's collection storage" {
     {
         var w = try database.beginWrite();
         var dir = try createWithDefinitions(&w, &.{
-            &.{ .{ .kind = .int }, .{ .kind = .link, .linkTarget = 1, .delRule = .cascade } }, // 0: owner
+            &.{ .{ .kind = .int }, .{ .kind = .link, .linkTarget = 1, .deletionRule = .cascade } }, // 0: owner
             &.{ .{ .kind = .int }, .{ .kind = .set, .element = .int } }, // 1: child
         });
         const child = try insert(&w, dir, 1, &.{ .{ .int = 100 }, .{ .setInt = &.{ 1, 2, 3 } } });
@@ -779,9 +779,9 @@ test "a cascade delete frees the child's collection storage" {
 }
 
 const embeddedBlockSchema = [_][]const catalog.PropertyDefinition{
-    &.{ .{ .kind = .int }, .{ .kind = .link, .linkTarget = 1, .delRule = .cascade } }, // 0: owner
+    &.{ .{ .kind = .int }, .{ .kind = .link, .linkTarget = 1, .deletionRule = .cascade } }, // 0: owner
     &.{ .{ .kind = .int }, .{ .kind = .blob } }, // 1: embedded child
-    &.{ .{ .kind = .int }, .{ .kind = .link, .linkTarget = 1, .delRule = .block } }, // 2: blocker
+    &.{ .{ .kind = .int }, .{ .kind = .link, .linkTarget = 1, .deletionRule = .block } }, // 2: blocker
 };
 
 test "replacing an embedded child surfaces a blocked delete" {

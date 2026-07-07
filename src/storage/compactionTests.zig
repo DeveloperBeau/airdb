@@ -4,7 +4,7 @@ const Io = std.Io;
 const compaction = @import("compaction.zig");
 const catalog = @import("../schema/catalog.zig");
 const links = @import("../records/links.zig");
-const typedir = @import("../schema/typeDirectory.zig");
+const typeDirectory = @import("../schema/typeDirectory.zig");
 const typeRouting = @import("../schema/typeRouting.zig");
 const objects = @import("../records/objects.zig");
 const rows = @import("../records/rows.zig");
@@ -299,13 +299,13 @@ test "all value kinds deep-copy across databases preserving keys" {
         try testing.expectEqualStrings("bb", o2[1].bytes);
 
         // list/set contents match.
-        try testing.expectEqual(@as(?u64, 2), try collections.listLen(&r, catalogRef, 1, 2));
+        try testing.expectEqual(@as(?u64, 2), try collections.listLength(&r, catalogRef, 1, 2));
         try testing.expectEqual(@as(u64, 10), try collections.listGetInt(&r, catalogRef, 1, 2, 0));
         try testing.expectEqual(@as(u64, 20), try collections.listGetInt(&r, catalogRef, 1, 2, 1));
         try testing.expectEqual(@as(?u64, 2), try collections.setCountInt(&r, catalogRef, 1, 3));
         try testing.expect(try collections.setContainsInt(&r, catalogRef, 1, 3, 5));
         try testing.expect(try collections.setContainsInt(&r, catalogRef, 1, 3, 6));
-        try testing.expectEqual(@as(?u64, 0), try collections.listLen(&r, catalogRef, 2, 2));
+        try testing.expectEqual(@as(?u64, 0), try collections.listLength(&r, catalogRef, 2, 2));
         try testing.expectEqual(@as(?u64, 1), try collections.setCountInt(&r, catalogRef, 2, 3));
         try testing.expect(try collections.setContainsInt(&r, catalogRef, 2, 3, 7));
 
@@ -347,7 +347,7 @@ test "compactToNewFile produces a verified, smaller, equivalent file" {
             &.{ .{ .kind = .int }, .{ .kind = .blob } }, // 0: Author{int primaryKey, blob name}
             &.{ .{ .kind = .int }, .{ .kind = .link, .linkTarget = 0 }, .{ .kind = .set, .element = .int } }, // 1: Book{int primaryKey, link author, set tags}
         };
-        var dir = try typedir.createTypes(&w, &schema, &.{ false, false });
+        var dir = try typeDirectory.createTypes(&w, &schema, &.{ false, false });
 
         var i: u64 = 0;
         var nbuf: [32]u8 = undefined;
@@ -442,7 +442,7 @@ test "compaction preserves dict and set-of-blob" {
         const schema = [_][]const PD{
             &.{ .{ .kind = .int }, .{ .kind = .dict }, .{ .kind = .set, .element = .blob } },
         };
-        var dir = try typedir.createTypes(&w, &schema, &.{false});
+        var dir = try typeDirectory.createTypes(&w, &schema, &.{false});
 
         const r1 = try typeRouting.insert(&w, dir, 0, &.{
             .{ .int = 1 },
@@ -477,7 +477,7 @@ test "compaction preserves dict and set-of-blob" {
         var r = try reopenedDestination.beginRead();
         defer r.end();
         const dir = r.root();
-        const catalogRef = try typedir.catalogRef(&r, dir, 0);
+        const catalogRef = try typeDirectory.catalogRef(&r, dir, 0);
 
         try testing.expectEqual(@as(u64, 1), try typeRouting.liveCount(&r, dir, 0));
 
@@ -523,7 +523,7 @@ test "compaction preserves a large (chunked) blob" {
         const schema = [_][]const PD{
             &.{ .{ .kind = .int }, .{ .kind = .blob } },
         };
-        var dir = try typedir.createTypes(&w, &schema, &.{false});
+        var dir = try typeDirectory.createTypes(&w, &schema, &.{false});
         dir = (try typeRouting.insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .bytes = big } })).dir;
         dir = (try typeRouting.insert(&w, dir, 0, &.{ .{ .int = 2 }, .{ .bytes = "small" } })).dir;
         w.setRoot(dir);
@@ -893,7 +893,7 @@ test "compactInPlace preserves value indexes and passes verifyIntegrity" {
     {
         var database = try Database.create(testing.allocator, path);
         var w = try database.beginWrite();
-        var dir = try typedir.createTypes(&w, &.{
+        var dir = try typeDirectory.createTypes(&w, &.{
             &.{ .{ .kind = .int }, .{ .kind = .int, .indexed = true } },
         }, &.{false});
         var primaryKey: u64 = 0;
@@ -912,7 +912,7 @@ test "compactInPlace preserves value indexes and passes verifyIntegrity" {
     try verification.verifyIntegrity(&database); // the audit must agree the indexes are intact
     var r = try database.beginRead();
     defer r.end();
-    const catalogRef = try typedir.catalogRef(&r, r.root(), 0);
+    const catalogRef = try typeDirectory.catalogRef(&r, r.root(), 0);
     var hits = std.ArrayList(u64).empty;
     defer hits.deinit(testing.allocator);
     try query.where(&r, catalogRef, &.{.{ .property = 1, .operator = .eq, .value = 3 }}, &hits, testing.allocator);
@@ -939,7 +939,7 @@ test "compactInPlace shrinks and preserves data" {
             &.{ .{ .kind = .int }, .{ .kind = .blob } }, // 0: Author{int primaryKey, blob name}
             &.{ .{ .kind = .int }, .{ .kind = .link, .linkTarget = 0 } }, // 1: Book{int primaryKey, link author}
         };
-        var dir = try typedir.createTypes(&w, &schema, &.{ false, false });
+        var dir = try typeDirectory.createTypes(&w, &schema, &.{ false, false });
 
         var i: u64 = 0;
         var nbuf: [32]u8 = undefined;

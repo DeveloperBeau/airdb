@@ -13,7 +13,7 @@ const Database = @import("database.zig").Database;
 const ReadTransaction = @import("transactions/readTransaction.zig").ReadTransaction;
 const slotAOff = @import("database.zig").slotAOff;
 const slotBOff = @import("database.zig").slotBOff;
-const typedir = @import("schema/typeDirectory.zig");
+const typeDirectory = @import("schema/typeDirectory.zig");
 const catalog = @import("schema/catalog.zig");
 const Column = @import("trees/column.zig");
 const Index = @import("trees/index.zig");
@@ -87,11 +87,11 @@ pub fn verifyIntegrity(database: *Database) VerifyError!void {
 fn auditValueIndexes(database: *Database) VerifyError!void {
     if (database.activeRoot == 0) return;
     var readTransaction = ReadTransaction{ .database = database, .rootRef = database.activeRoot, .version = database.activeVersion };
-    const typeCount = typedir.typeCount(&readTransaction, database.activeRoot) catch return;
+    const typeCount = typeDirectory.typeCount(&readTransaction, database.activeRoot) catch return;
     if (typeCount > 256) return;
     var typeId: u16 = 0;
     while (typeId < typeCount) : (typeId += 1) {
-        const catalogRef = typedir.catalogRef(&readTransaction, database.activeRoot, typeId) catch return;
+        const catalogRef = typeDirectory.catalogRef(&readTransaction, database.activeRoot, typeId) catch return;
         const catalogView = catalog.loadCatalog(&readTransaction, catalogRef) catch return;
         var propertyIndex: usize = 0;
         while (propertyIndex < catalogView.propertyCount) : (propertyIndex += 1) {
@@ -103,8 +103,8 @@ fn auditValueIndexes(database: *Database) VerifyError!void {
             if (!catalogView.indexed(propertyIndex)) continue;
             const valueIndexRef = catalogView.valueIndexRef(propertyIndex);
             const propertyColumn = catalogView.propertyColumnRef(propertyIndex);
-            try auditValueIndexForward(&readTransaction, catalogView.keyrowIndexRef, valueIndexRef, propertyColumn, catalogView.liveColRef);
-            try auditValueIndexBackward(&readTransaction, valueIndexRef, catalogView.keyrowIndexRef, propertyColumn, catalogView.liveColRef);
+            try auditValueIndexForward(&readTransaction, catalogView.keyrowIndexRef, valueIndexRef, propertyColumn, catalogView.liveColumnRef);
+            try auditValueIndexBackward(&readTransaction, valueIndexRef, catalogView.keyrowIndexRef, propertyColumn, catalogView.liveColumnRef);
         }
     }
 }
@@ -115,20 +115,20 @@ fn auditValueIndexes(database: *Database) VerifyError!void {
 // index does not cover is error.ValueIndexMissingEntry. Any structural failure
 // reading the index/columns of an established typed catalog is itself a
 // divergence and reported the same way.
-fn auditValueIndexForward(readTransaction: *ReadTransaction, keyrowRef: Reference, valueIndexRef: Reference, propertyColumn: Reference, liveCol: Reference) VerifyError!void {
+fn auditValueIndexForward(readTransaction: *ReadTransaction, keyrowRef: Reference, valueIndexRef: Reference, propertyColumn: Reference, liveColumn: Reference) VerifyError!void {
     const Ctx = struct {
         readTransaction: *ReadTransaction,
         valueIndexRef: Reference,
         propertyColumn: Reference,
-        liveCol: Reference,
+        liveColumn: Reference,
         fn onEntry(self: @This(), objectKey: u64, row: u64) anyerror!void {
-            if ((try Column.get(self.readTransaction, self.liveCol, row)) == 0) return; // defensive: skip dead
+            if ((try Column.get(self.readTransaction, self.liveColumn, row)) == 0) return; // defensive: skip dead
             const value = try Column.get(self.readTransaction, self.propertyColumn, row);
             const inner = (try Index.get(self.readTransaction, self.valueIndexRef, value)) orelse return error.ValueIndexMissingEntry;
             if ((try Index.get(self.readTransaction, inner, objectKey)) == null) return error.ValueIndexMissingEntry;
         }
     };
-    Index.forEachEntry(readTransaction, keyrowRef, Ctx{ .readTransaction = readTransaction, .valueIndexRef = valueIndexRef, .propertyColumn = propertyColumn, .liveCol = liveCol }, Ctx.onEntry) catch return error.ValueIndexMissingEntry;
+    Index.forEachEntry(readTransaction, keyrowRef, Ctx{ .readTransaction = readTransaction, .valueIndexRef = valueIndexRef, .propertyColumn = propertyColumn, .liveColumn = liveColumn }, Ctx.onEntry) catch return error.ValueIndexMissingEntry;
 }
 
 // Backward direction of the value-index invariant: walk every (value, inner-set)
@@ -138,30 +138,30 @@ fn auditValueIndexForward(readTransaction: *ReadTransaction, keyrowRef: Referenc
 // error.ValueIndexStaleEntry. Empty inner sets are skipped defensively: current
 // maintenance removes an entry the moment its set empties, but tolerating one
 // keeps the audit usable on files written before that pruning existed.
-fn auditValueIndexBackward(readTransaction: *ReadTransaction, valueIndexRef: Reference, keyrowRef: Reference, propertyColumn: Reference, liveCol: Reference) VerifyError!void {
+fn auditValueIndexBackward(readTransaction: *ReadTransaction, valueIndexRef: Reference, keyrowRef: Reference, propertyColumn: Reference, liveColumn: Reference) VerifyError!void {
     const Ctx = struct {
         readTransaction: *ReadTransaction,
         keyrowRef: Reference,
         propertyColumn: Reference,
-        liveCol: Reference,
+        liveColumn: Reference,
         fn onEntry(self: @This(), value: u64, innerRoot: u64) anyerror!void {
             if ((try Index.count(self.readTransaction, innerRoot)) == 0) return; // empty set left by delete
             const Inner = struct {
                 readTransaction: *ReadTransaction,
                 keyrowRef: Reference,
                 propertyColumn: Reference,
-                liveCol: Reference,
+                liveColumn: Reference,
                 value: u64,
                 fn onKey(inner: @This(), objectKey: u64) anyerror!void {
                     const row = (try Index.get(inner.readTransaction, inner.keyrowRef, objectKey)) orelse return error.ValueIndexStaleEntry;
-                    if ((try Column.get(inner.readTransaction, inner.liveCol, row)) == 0) return error.ValueIndexStaleEntry;
+                    if ((try Column.get(inner.readTransaction, inner.liveColumn, row)) == 0) return error.ValueIndexStaleEntry;
                     if ((try Column.get(inner.readTransaction, inner.propertyColumn, row)) != inner.value) return error.ValueIndexStaleEntry;
                 }
             };
-            try Index.forEachKey(self.readTransaction, innerRoot, Inner{ .readTransaction = self.readTransaction, .keyrowRef = self.keyrowRef, .propertyColumn = self.propertyColumn, .liveCol = self.liveCol, .value = value }, Inner.onKey);
+            try Index.forEachKey(self.readTransaction, innerRoot, Inner{ .readTransaction = self.readTransaction, .keyrowRef = self.keyrowRef, .propertyColumn = self.propertyColumn, .liveColumn = self.liveColumn, .value = value }, Inner.onKey);
         }
     };
-    Index.forEachEntry(readTransaction, valueIndexRef, Ctx{ .readTransaction = readTransaction, .keyrowRef = keyrowRef, .propertyColumn = propertyColumn, .liveCol = liveCol }, Ctx.onEntry) catch return error.ValueIndexStaleEntry;
+    Index.forEachEntry(readTransaction, valueIndexRef, Ctx{ .readTransaction = readTransaction, .keyrowRef = keyrowRef, .propertyColumn = propertyColumn, .liveColumn = liveColumn }, Ctx.onEntry) catch return error.ValueIndexStaleEntry;
 }
 
 // Forward direction of the backlink invariant: every live row's outbound
@@ -172,14 +172,14 @@ fn auditBacklinksForward(readTransaction: *ReadTransaction, catalogView: catalog
         readTransaction: *ReadTransaction,
         backlinkRef: Reference,
         propertyColumn: Reference,
-        liveCol: Reference,
+        liveColumn: Reference,
         kind: catalog.PropertyKind,
         fn checkOne(self: @This(), target: u64, sourceObjectKey: u64) anyerror!void {
             const inner = (try Index.get(self.readTransaction, self.backlinkRef, target)) orelse return error.BacklinkMissingEntry;
             if ((try Index.get(self.readTransaction, inner, sourceObjectKey)) == null) return error.BacklinkMissingEntry;
         }
         fn onEntry(self: @This(), objectKey: u64, row: u64) anyerror!void {
-            if ((try Column.get(self.readTransaction, self.liveCol, row)) == 0) return; // defensive: skip dead
+            if ((try Column.get(self.readTransaction, self.liveColumn, row)) == 0) return; // defensive: skip dead
             const raw = try Column.get(self.readTransaction, self.propertyColumn, row);
             if (self.kind == .link) {
                 if (raw == 0) return; // null link
@@ -203,7 +203,7 @@ fn auditBacklinksForward(readTransaction: *ReadTransaction, catalogView: catalog
         .readTransaction = readTransaction,
         .backlinkRef = catalogView.backlinkRef(propertyIndex),
         .propertyColumn = catalogView.propertyColumnRef(propertyIndex),
-        .liveCol = catalogView.liveColRef,
+        .liveColumn = catalogView.liveColumnRef,
         .kind = kind,
     }, Ctx.onEntry) catch return error.BacklinkMissingEntry;
 }
@@ -216,7 +216,7 @@ fn auditBacklinksBackward(readTransaction: *ReadTransaction, catalogView: catalo
         readTransaction: *ReadTransaction,
         keyrow: Reference,
         propertyColumn: Reference,
-        liveCol: Reference,
+        liveColumn: Reference,
         kind: catalog.PropertyKind,
         fn onEntry(self: @This(), target: u64, innerRoot: u64) anyerror!void {
             if ((try Index.count(self.readTransaction, innerRoot)) == 0) return;
@@ -224,12 +224,12 @@ fn auditBacklinksBackward(readTransaction: *ReadTransaction, catalogView: catalo
                 readTransaction: *ReadTransaction,
                 keyrow: Reference,
                 propertyColumn: Reference,
-                liveCol: Reference,
+                liveColumn: Reference,
                 kind: catalog.PropertyKind,
                 target: u64,
                 fn onKey(inner: @This(), sourceObjectKey: u64) anyerror!void {
                     const row = (try Index.get(inner.readTransaction, inner.keyrow, sourceObjectKey)) orelse return error.BacklinkStaleEntry;
-                    if ((try Column.get(inner.readTransaction, inner.liveCol, row)) == 0) return error.BacklinkStaleEntry;
+                    if ((try Column.get(inner.readTransaction, inner.liveColumn, row)) == 0) return error.BacklinkStaleEntry;
                     const raw = try Column.get(inner.readTransaction, inner.propertyColumn, row);
                     if (inner.kind == .link) {
                         if (raw == 0 or raw - 1 != inner.target) return error.BacklinkStaleEntry;
@@ -242,7 +242,7 @@ fn auditBacklinksBackward(readTransaction: *ReadTransaction, catalogView: catalo
                 .readTransaction = self.readTransaction,
                 .keyrow = self.keyrow,
                 .propertyColumn = self.propertyColumn,
-                .liveCol = self.liveCol,
+                .liveColumn = self.liveColumn,
                 .kind = self.kind,
                 .target = target,
             }, Inner.onKey);
@@ -252,7 +252,7 @@ fn auditBacklinksBackward(readTransaction: *ReadTransaction, catalogView: catalo
         .readTransaction = readTransaction,
         .keyrow = catalogView.keyrowIndexRef,
         .propertyColumn = catalogView.propertyColumnRef(propertyIndex),
-        .liveCol = catalogView.liveColRef,
+        .liveColumn = catalogView.liveColumnRef,
         .kind = kind,
     }, Ctx.onEntry) catch return error.BacklinkStaleEntry;
 }

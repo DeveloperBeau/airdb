@@ -130,7 +130,7 @@ pub fn setLink(transaction: *WriteTransaction, catalogRef: Reference, primaryKey
     if (oldTarget == target) return catalogRef; // unchanged
 
     const newRaw: u64 = if (target) |unwrapped| unwrapped + 1 else 0;
-    var newCatalog = try catalog.replaceCollRoot(transaction, catalogRef, row, property, newRaw);
+    var newCatalog = try catalog.replaceCollectionRoot(transaction, catalogRef, row, property, newRaw);
     if (oldTarget) |previousTarget| newCatalog = try removeBacklink(transaction, newCatalog, property, previousTarget, objectKey);
     if (target) |newTarget| newCatalog = try addBacklink(transaction, newCatalog, property, newTarget, objectKey);
     return newCatalog;
@@ -192,7 +192,7 @@ pub fn linkSetAdd(transaction: *WriteTransaction, catalogRef: Reference, primary
     const oldRoot = try Column.get(transaction, resolved.propertyColumn, row);
     if ((try Index.get(transaction, oldRoot, target)) != null) return catalogRef; // already a member
     const newRoot = try Index.insert(transaction, oldRoot, target, 1);
-    var newCatalog = try catalog.replaceCollRoot(transaction, catalogRef, row, property, newRoot);
+    var newCatalog = try catalog.replaceCollectionRoot(transaction, catalogRef, row, property, newRoot);
     newCatalog = try addBacklink(transaction, newCatalog, property, target, objectKey);
     return newCatalog;
 }
@@ -208,7 +208,7 @@ pub fn linkSetRemove(transaction: *WriteTransaction, catalogRef: Reference, prim
     const oldRoot = try Column.get(transaction, resolved.propertyColumn, row);
     if ((try Index.get(transaction, oldRoot, target)) == null) return catalogRef; // not a member
     const newRoot = try Index.remove(transaction, oldRoot, target);
-    var newCatalog = try catalog.replaceCollRoot(transaction, catalogRef, row, property, newRoot);
+    var newCatalog = try catalog.replaceCollectionRoot(transaction, catalogRef, row, property, newRoot);
     newCatalog = try removeBacklink(transaction, newCatalog, property, target, objectKey);
     return newCatalog;
 }
@@ -276,9 +276,9 @@ pub fn nullifyInboundInCatalog(transaction: *WriteTransaction, catalogRef: Refer
 // forever, leaving self-linked objects undeletable.
 fn nullifySourceLink(transaction: *WriteTransaction, catalogRef: Reference, property: usize, srcRow: u64, bumpVersion: bool) !Reference {
     var snapshot = try catalog.CatalogSnapshot.load(transaction, catalogRef);
-    snapshot.properties[property].col = try Column.set(transaction, snapshot.properties[property].col, srcRow, 0);
+    snapshot.properties[property].column = try Column.set(transaction, snapshot.properties[property].column, srcRow, 0);
     if (bumpVersion) {
-        snapshot.versionColRef = try Column.set(transaction, snapshot.versionColRef, srcRow, transaction.newVersion);
+        snapshot.versionColumnRef = try Column.set(transaction, snapshot.versionColumnRef, srcRow, transaction.newVersion);
     }
     return snapshot.replace(transaction);
 }
@@ -288,11 +288,11 @@ fn nullifySourceLink(transaction: *WriteTransaction, catalogRef: Reference, prop
 // same conflict-surfacing rule as nullifySourceLink.
 fn nullifySourceLinkSet(transaction: *WriteTransaction, catalogRef: Reference, property: usize, srcRow: u64, objectKey: u64, bumpVersion: bool) !Reference {
     var snapshot = try catalog.CatalogSnapshot.load(transaction, catalogRef);
-    const srcSet = try Column.get(transaction, snapshot.properties[property].col, srcRow);
+    const srcSet = try Column.get(transaction, snapshot.properties[property].column, srcRow);
     const newSet = try Index.remove(transaction, srcSet, objectKey);
-    snapshot.properties[property].col = try Column.set(transaction, snapshot.properties[property].col, srcRow, newSet);
+    snapshot.properties[property].column = try Column.set(transaction, snapshot.properties[property].column, srcRow, newSet);
     if (bumpVersion) {
-        snapshot.versionColRef = try Column.set(transaction, snapshot.versionColRef, srcRow, transaction.newVersion);
+        snapshot.versionColumnRef = try Column.set(transaction, snapshot.versionColumnRef, srcRow, transaction.newVersion);
     }
     return snapshot.replace(transaction);
 }

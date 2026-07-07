@@ -217,7 +217,7 @@ pub fn currentPid() u32 {
 /// PIDs are recycled by every OS, so "pid is alive" cannot distinguish a
 /// crashed reader from an unrelated new process that inherited its pid; the
 /// start time can. Returns null when the query fails (callers treat that
-/// conservatively). Truncated to u32 by the coord layer -- a false match needs
+/// conservatively). Truncated to u32 by the coordination layer -- a false match needs
 /// a recycled pid AND a start-time collision in the same microsecond class.
 pub fn processStartToken(pid: u32) ?u64 {
     if (pid == 0) return null;

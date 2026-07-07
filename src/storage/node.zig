@@ -24,7 +24,7 @@ pub const NodeHeader = struct {
     pub const EncodeResult = struct {
         headerLen: usize,
         /// Total node length: the header plus a `payloadLen`-byte payload.
-        pub fn totalLenWithPayload(self: EncodeResult, payloadLen: usize) usize {
+        pub fn totalLengthWithPayload(self: EncodeResult, payloadLen: usize) usize {
             return self.headerLen + payloadLen;
         }
     };
@@ -61,7 +61,7 @@ test "encode then decode node header round-trips for every kind" {
     for (cases) |testCase| {
         var buffer: [16]u8 = undefined;
         const written = NodeHeader.encode(&buffer, .{ .kind = testCase.kind, .elementCount = testCase.count });
-        const view = try NodeView.parse(buffer[0..written.totalLenWithPayload(0)]);
+        const view = try NodeView.parse(buffer[0..written.totalLengthWithPayload(0)]);
         try testing.expectEqual(testCase.kind, view.header.kind);
         try testing.expectEqual(testCase.count, view.header.elementCount);
     }

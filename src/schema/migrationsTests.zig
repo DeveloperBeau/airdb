@@ -131,7 +131,7 @@ test "addProperty(linkSet) leaves pre-migration rows deletable" {
     // broke every collection accessor on migrated rows and made them
     // undeletable through the graph-safe delete (its outbound cleanup walks
     // linkSet roots and hit error.BadRef).
-    const typedir = @import("typeDirectory.zig");
+    const typeDirectory = @import("typeDirectory.zig");
     const typeRouting = @import("typeRouting.zig");
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -141,12 +141,12 @@ test "addProperty(linkSet) leaves pre-migration rows deletable" {
     defer database.deinit();
     {
         var w = try database.beginWrite();
-        var dir = try typedir.createTypes(&w, &.{&.{.{ .kind = .int }}}, &.{false});
+        var dir = try typeDirectory.createTypes(&w, &.{&.{.{ .kind = .int }}}, &.{false});
         dir = (try typeRouting.insert(&w, dir, 0, &.{.{ .int = 1 }})).dir;
         // Migrate: add a linkSet property targeting the same type.
-        const catalogRef = try typedir.catalogRef(&w, dir, 0);
+        const catalogRef = try typeDirectory.catalogRef(&w, dir, 0);
         const newCatalog = try addProperty(&w, catalogRef, .{ .kind = .linkSet, .linkTarget = 0 }, 0);
-        dir = try typedir.setCatalogRef(&w, dir, 0, newCatalog);
+        dir = try typeDirectory.setCatalogRef(&w, dir, 0, newCatalog);
         w.setRoot(dir);
         _ = try w.commit();
     }

@@ -4,7 +4,7 @@
 //! the type directory) over a Database. Nothing inner imports this file.
 
 const Database = @import("database.zig").Database;
-const typedir = @import("schema/typeDirectory.zig");
+const typeDirectory = @import("schema/typeDirectory.zig");
 const compaction = @import("storage/compaction.zig");
 
 /// Outcome of one maybeCompactStep call: whether a step ran, the rows moved,
@@ -24,13 +24,13 @@ pub fn maybeCompactStep(database: *Database, typeId: u16, budget: usize) !Compac
     var writeTransaction = try database.beginWrite();
     errdefer writeTransaction.deinit();
     const dir = database.activeRoot;
-    const catalogRef = try typedir.catalogRef(&writeTransaction, dir, typeId);
+    const catalogRef = try typeDirectory.catalogRef(&writeTransaction, dir, typeId);
     if (!try compaction.shouldCompact(&writeTransaction, catalogRef)) {
         writeTransaction.deinit();
         return .{ .ran = false, .moved = 0, .done = false };
     }
     const step = try compaction.compactStep(&writeTransaction, catalogRef, typeId, budget);
-    const newDir = try typedir.setCatalogRef(&writeTransaction, dir, typeId, step.catalogRef);
+    const newDir = try typeDirectory.setCatalogRef(&writeTransaction, dir, typeId, step.catalogRef);
     writeTransaction.setRoot(newDir);
     _ = try writeTransaction.commit();
     return .{ .ran = true, .moved = step.moved, .done = step.done };

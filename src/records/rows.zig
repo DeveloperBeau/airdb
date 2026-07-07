@@ -11,7 +11,7 @@ const WriteTransaction = @import("../transactions/writeTransaction.zig").WriteTr
 const Reference = @import("../storage/reference.zig").Reference;
 const Column = @import("../trees/column.zig");
 const Index = @import("../trees/index.zig");
-const bindex = @import("../trees/byteKeyIndex.zig");
+const byteKeyIndex = @import("../trees/byteKeyIndex.zig");
 const blob = @import("blob.zig");
 const catalog = @import("../schema/catalog.zig");
 
@@ -88,11 +88,11 @@ pub fn insert(transaction: *WriteTransaction, catalogRef: Reference, values: []c
     {
         var propertyIndex: usize = 0;
         while (propertyIndex < propertyCount) : (propertyIndex += 1) {
-            snapshot.properties[propertyIndex].col = try Column.append(transaction, snapshot.properties[propertyIndex].col, values[propertyIndex]);
+            snapshot.properties[propertyIndex].column = try Column.append(transaction, snapshot.properties[propertyIndex].column, values[propertyIndex]);
         }
     }
-    snapshot.versionColRef = try Column.append(transaction, snapshot.versionColRef, transaction.newVersion);
-    snapshot.liveColRef = try Column.append(transaction, snapshot.liveColRef, 1);
+    snapshot.versionColumnRef = try Column.append(transaction, snapshot.versionColumnRef, transaction.newVersion);
+    snapshot.liveColumnRef = try Column.append(transaction, snapshot.liveColumnRef, 1);
     // primaryKey index maps primaryKey -> objectKey; keyrow index maps objectKey -> physical row.
     snapshot.primaryKeyIndexRef = try Index.insert(transaction, snapshot.primaryKeyIndexRef, primaryKey, objectKey);
     snapshot.keyrowIndexRef = try Index.insert(transaction, snapshot.keyrowIndexRef, objectKey, row);
@@ -139,7 +139,7 @@ pub fn update(transaction: *WriteTransaction, catalogRef: Reference, primaryKey:
     // The primaryKey index resolved but the key->row index did not: treat the divergence
     // as absent rather than crashing on corrupt data.
     const row = (try Index.get(transaction, snapshot.keyrowIndexRef, objectKey)) orelse return .notFound;
-    const currentVersion = try Column.get(transaction, snapshot.versionColRef, row);
+    const currentVersion = try Column.get(transaction, snapshot.versionColumnRef, row);
     if (currentVersion != expectedVersion) return .{ .conflict = .{ .currentVersion = currentVersion } };
     const propertyCount = snapshot.propertyCount;
 
@@ -149,7 +149,7 @@ pub fn update(transaction: *WriteTransaction, catalogRef: Reference, primaryKey:
     {
         var propertyIndex: usize = 0;
         while (propertyIndex < propertyCount) : (propertyIndex += 1) {
-            if (snapshot.properties[propertyIndex].indexed) oldValues[propertyIndex] = try Column.get(transaction, snapshot.properties[propertyIndex].col, row);
+            if (snapshot.properties[propertyIndex].indexed) oldValues[propertyIndex] = try Column.get(transaction, snapshot.properties[propertyIndex].column, row);
         }
     }
 
@@ -158,10 +158,10 @@ pub fn update(transaction: *WriteTransaction, catalogRef: Reference, primaryKey:
     // update on a wide type no longer rewrites every property column.
     var propertyIndex: usize = 0;
     while (propertyIndex < propertyCount) : (propertyIndex += 1) {
-        const currentValue = try Column.get(transaction, snapshot.properties[propertyIndex].col, row);
-        if (currentValue != values[propertyIndex]) snapshot.properties[propertyIndex].col = try Column.set(transaction, snapshot.properties[propertyIndex].col, row, values[propertyIndex]);
+        const currentValue = try Column.get(transaction, snapshot.properties[propertyIndex].column, row);
+        if (currentValue != values[propertyIndex]) snapshot.properties[propertyIndex].column = try Column.set(transaction, snapshot.properties[propertyIndex].column, row, values[propertyIndex]);
     }
-    snapshot.versionColRef = try Column.set(transaction, snapshot.versionColRef, row, transaction.newVersion);
+    snapshot.versionColumnRef = try Column.set(transaction, snapshot.versionColumnRef, row, transaction.newVersion);
 
     const newCatalog = try snapshot.replace(transaction);
     // Re-point the value index for any indexed property whose value changed.
@@ -185,23 +185,23 @@ pub fn delete(transaction: *WriteTransaction, catalogRef: Reference, primaryKey:
     var snapshot = try catalog.CatalogSnapshot.load(transaction, catalogRef);
     const objectKey = (try Index.get(transaction, snapshot.primaryKeyIndexRef, primaryKey)) orelse return .notFound;
     const row = (try Index.get(transaction, snapshot.keyrowIndexRef, objectKey)) orelse return .notFound;
-    const currentVersion = try Column.get(transaction, snapshot.versionColRef, row);
+    const currentVersion = try Column.get(transaction, snapshot.versionColumnRef, row);
     if (currentVersion != expectedVersion) return .{ .conflict = .{ .currentVersion = currentVersion } };
     const propertyCount = snapshot.propertyCount;
 
     // Read the value of each indexed property while the row is still readable,
     // so its objectKey can be dropped from the value index. Property columns are not
-    // mutated by delete, so the snapshot's cols still address the current values.
+    // mutated by delete, so the snapshot's columns still address the current values.
     var oldValues: [maxPropertyCount]u64 = undefined;
     {
         var propertyIndex: usize = 0;
         while (propertyIndex < propertyCount) : (propertyIndex += 1) {
-            if (snapshot.properties[propertyIndex].indexed) oldValues[propertyIndex] = try Column.get(transaction, snapshot.properties[propertyIndex].col, row);
+            if (snapshot.properties[propertyIndex].indexed) oldValues[propertyIndex] = try Column.get(transaction, snapshot.properties[propertyIndex].column, row);
         }
     }
 
-    snapshot.liveColRef = try Column.set(transaction, snapshot.liveColRef, row, 0); // tombstone
-    snapshot.versionColRef = try Column.set(transaction, snapshot.versionColRef, row, transaction.newVersion); // bump version stamp
+    snapshot.liveColumnRef = try Column.set(transaction, snapshot.liveColumnRef, row, 0); // tombstone
+    snapshot.versionColumnRef = try Column.set(transaction, snapshot.versionColumnRef, row, transaction.newVersion); // bump version stamp
     snapshot.primaryKeyIndexRef = try Index.remove(transaction, snapshot.primaryKeyIndexRef, primaryKey); // remove primaryKey from the index
     // Drop the object key from the key->row index. Copy-on-write keeps the old
     // index version intact for any reader pinned to the prior snapshot, so this
@@ -237,18 +237,18 @@ pub fn getByObjectKey(transaction: anytype, catalogRef: Reference, objectKey: u6
     const view = try loadCatalog(transaction, catalogRef);
     std.debug.assert(out.len == view.propertyCount);
     const row = (try catalog.objectKeyToRow(transaction, catalogRef, objectKey)) orelse return null;
-    const liveColRef = view.liveColRef;
-    const versionColRef = view.versionColRef;
+    const liveColumnRef = view.liveColumnRef;
+    const versionColumnRef = view.versionColumnRef;
     var propertyRefs: [maxPropertyCount]Reference = undefined;
     {
         var propertyIndex: usize = 0;
         while (propertyIndex < view.propertyCount) : (propertyIndex += 1) propertyRefs[propertyIndex] = view.propertyColumnRef(propertyIndex);
     }
     const propertyCount = view.propertyCount;
-    if ((try Column.get(transaction, liveColRef, row)) == 0) return null;
+    if ((try Column.get(transaction, liveColumnRef, row)) == 0) return null;
     var propertyIndex: usize = 0;
     while (propertyIndex < propertyCount) : (propertyIndex += 1) out[propertyIndex] = try Column.get(transaction, propertyRefs[propertyIndex], row);
-    return try Column.get(transaction, versionColRef, row);
+    return try Column.get(transaction, versionColumnRef, row);
 }
 
 /// Free the blob and collection storage held in a deleted row's columns.
@@ -277,9 +277,9 @@ pub fn freeRowStorage(transaction: *WriteTransaction, kinds: []const PropertyKin
             },
             .set => switch (elements[propertyIndex]) {
                 .int => try Index.freeTree(transaction, raw[propertyIndex]),
-                .blob => try bindex.freeTree(transaction, raw[propertyIndex]),
+                .blob => try byteKeyIndex.freeTree(transaction, raw[propertyIndex]),
             },
-            .dict => try bindex.freeTree(transaction, raw[propertyIndex]),
+            .dict => try byteKeyIndex.freeTree(transaction, raw[propertyIndex]),
             .linkSet => try Index.freeTree(transaction, raw[propertyIndex]),
             .int, .link => {},
         }

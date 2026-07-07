@@ -37,7 +37,7 @@ Code pointers use `module.function` names under `src/`.
 
 ## Typed object store
 
-- Up to 256 types per database (`typedir`), up to 256 properties per type
+- Up to 256 types per database (`typeDirectory`), up to 256 properties per type
   (`catalog`). Property kinds: `int`, `blob`, `list` (int/blob elements),
   `set` (int/blob), `dict` (byte key → u64), `link`, `link_set`.
 - Primary key: u64 (property 0). Stable object keys decouple identity from
@@ -85,7 +85,7 @@ Code pointers use `module.function` names under `src/`.
 
 ## Multi-process
 
-- Up to 64 simultaneously attached instances; one writer at a time via the coord lock.
+- Up to 64 simultaneously attached instances; one writer at a time via the coordination lock.
 - Reader pins published per process; the space-reclaim horizon respects every
   live reader, with pid+incarnation liveness so recycled pids can't pin the
   horizon.

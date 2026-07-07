@@ -70,7 +70,7 @@ pub const WriteTransaction = struct {
             // slot this process cannot advertise its readers, so it stays
             // bump-only (Database.open/create refuse slotless attaches, so this is
             // pure defense).
-            const globalHorizon: u64 = if (self.database.participantSlot == null) 0 else self.database.coord.globalHorizon(self.database.activeVersion);
+            const globalHorizon: u64 = if (self.database.participantSlot == null) 0 else self.database.coordination.globalHorizon(self.database.activeVersion);
             self.cachedHorizon = globalHorizon;
             break :blk globalHorizon;
         };
@@ -157,7 +157,7 @@ pub const WriteTransaction = struct {
         self.inFlightFrees.deinit(self.database.store.allocator);
         self.workFreelist.deinit();
         self.transactionReuse.deinit();
-        self.database.coord.unlock();
+        self.database.coordination.unlock();
     }
 
     /// Two-slot atomic durable commit.
@@ -215,7 +215,7 @@ pub const WriteTransaction = struct {
         // Step 6: publish the new version in memory only after both flushes succeed.
         database.activeVersion = self.newVersion;
         database.activeRoot = self.newRoot;
-        database.coord.setLatestVersion(self.newVersion);
+        database.coordination.setLatestVersion(self.newVersion);
         // Install the new free list. errdefer for newFl will NOT fire here
         // because we are on the success return path (return self.newVersion below).
         database.freeList.deinit();
@@ -226,7 +226,7 @@ pub const WriteTransaction = struct {
         self.inFlightFrees.deinit(self.database.store.allocator);
         self.workFreelist.deinit();
         self.transactionReuse.deinit();
-        self.database.coord.unlock();
+        self.database.coordination.unlock();
         return self.newVersion;
     }
 
@@ -270,7 +270,7 @@ pub const WriteTransaction = struct {
                 if (next != 0 and next >= cref) return error.Corrupt;
                 try newFl.add(.{
                     .offset = cref,
-                    .len = @intCast(FreeList.chunkByteLen(extentCount)),
+                    .len = @intCast(FreeList.chunkByteLength(extentCount)),
                     .freedVersion = self.newVersion,
                 });
                 cref = next;
@@ -312,7 +312,7 @@ pub const WriteTransaction = struct {
                 chunkIndex -= 1;
                 const chunkStart = chunkIndex * FreeList.chunkExtentCap;
                 const chunkEnd = @min(chunkStart + FreeList.chunkExtentCap, items.len);
-                const chunkLen = FreeList.chunkByteLen(chunkEnd - chunkStart);
+                const chunkLen = FreeList.chunkByteLength(chunkEnd - chunkStart);
                 const node = try database.bumpGrowing(chunkLen);
                 const written = FreeList.encodeChunk(items[chunkStart..chunkEnd], headRef, node.bytes);
                 std.debug.assert(written == chunkLen);

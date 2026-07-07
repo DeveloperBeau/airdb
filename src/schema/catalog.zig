@@ -18,7 +18,7 @@ pub const ElementKind = enum(u8) { int = 0, blob = 1 };
 pub const DeletionRule = enum(u8) { nullify = 0, cascade = 1, block = 2 };
 /// Everything the schema records about one property: its kind, element type,
 /// link target type, deletion rule, and whether it carries a value index.
-pub const PropertyDefinition = struct { kind: PropertyKind, element: ElementKind = .int, linkTarget: u16 = 0, delRule: DeletionRule = .nullify, indexed: bool = false };
+pub const PropertyDefinition = struct { kind: PropertyKind, element: ElementKind = .int, linkTarget: u16 = 0, deletionRule: DeletionRule = .nullify, indexed: bool = false };
 /// A single byte-keyed dictionary entry: a byte-string key mapped to a u64 value
 /// (an int, or an object key for a "dict of links" -- u64 covers both).
 pub const DictEntry = struct { key: []const u8, value: u64 };
@@ -45,15 +45,15 @@ pub const Value = union(enum) {
     setInt: []const u64,
     setBlob: []const []const u8,
     dictInt: []const DictEntry,
-    collRoot: Reference, // read side: getTyped returns this for list/set/dict/linkSet properties
+    collectionRoot: Reference, // read side: getTyped returns this for list/set/dict/linkSet properties
     link: ?u64,
     linkSet: []const u64, // to-many: initial set of target objectKeys
 };
 
 // Catalog node layout:
-// [propertyCount u16][nextRow u64][primaryKeyIndexRef u64][versionColRef u64][liveColRef u64]
+// [propertyCount u16][nextRow u64][primaryKeyIndexRef u64][versionColumnRef u64][liveColumnRef u64]
 // [propertyCount * (propertyColumnRef u64)][propertyCount * (kind u8)][propertyCount * (element u8)]
-// [propertyCount * (backlinkRef u64)][propertyCount * (linkTarget u16)][propertyCount * (delRule u8)]
+// [propertyCount * (backlinkRef u64)][propertyCount * (linkTarget u16)][propertyCount * (deletionRule u8)]
 // [propertyCount * (valueIndexRef u64)][propertyCount * (indexed u8)]
 //
 // The value-index ref and indexed flag arrays are appended last so the earlier
@@ -113,8 +113,8 @@ pub fn writeCatalog(
     keyrowIndexRef: Reference,
     nextKey: u64,
     primaryKeyIndexRef: Reference,
-    versionColRef: Reference,
-    liveColRef: Reference,
+    versionColumnRef: Reference,
+    liveColumnRef: Reference,
     propertyColumnRefs: []const Reference,
     kinds: []const PropertyKind,
     elements: []const ElementKind,
@@ -130,8 +130,8 @@ pub fn writeCatalog(
     std.mem.writeInt(u64, allocation.bytes[offKeyrowIndexRef..][0..8], keyrowIndexRef, .little);
     std.mem.writeInt(u64, allocation.bytes[offNextKey..][0..8], nextKey, .little);
     std.mem.writeInt(u64, allocation.bytes[primaryKeyIndexRefOffset..][0..8], primaryKeyIndexRef, .little);
-    std.mem.writeInt(u64, allocation.bytes[offVersionColRef..][0..8], versionColRef, .little);
-    std.mem.writeInt(u64, allocation.bytes[offLiveColRef..][0..8], liveColRef, .little);
+    std.mem.writeInt(u64, allocation.bytes[offVersionColRef..][0..8], versionColumnRef, .little);
+    std.mem.writeInt(u64, allocation.bytes[offLiveColRef..][0..8], liveColumnRef, .little);
     for (propertyColumnRefs, 0..) |ref, propertyIndex| {
         std.mem.writeInt(u64, allocation.bytes[propertyColumnsOffset + propertyIndex * 8 ..][0..8], ref, .little);
     }
@@ -180,12 +180,12 @@ pub fn createFromDefinitions(transaction: *WriteTransaction, definitions: []cons
         elements[propertyIndex] = definitions[propertyIndex].element;
         backlinks[propertyIndex] = if (definitions[propertyIndex].kind == .link or definitions[propertyIndex].kind == .linkSet) try Index.create(transaction) else 0;
         targets[propertyIndex] = definitions[propertyIndex].linkTarget;
-        rules[propertyIndex] = definitions[propertyIndex].delRule;
+        rules[propertyIndex] = definitions[propertyIndex].deletionRule;
         indexedFlags[propertyIndex] = definitions[propertyIndex].indexed;
         valueIndexRefs[propertyIndex] = if (definitions[propertyIndex].indexed) try Index.create(transaction) else 0;
     }
-    const versionColRef = try Column.create(transaction);
-    const liveColRef = try Column.create(transaction);
+    const versionColumnRef = try Column.create(transaction);
+    const liveColumnRef = try Column.create(transaction);
     const primaryKeyIndexRef = try Index.create(transaction);
     const keyrow = try Index.create(transaction);
     return writeCatalog(
@@ -195,8 +195,8 @@ pub fn createFromDefinitions(transaction: *WriteTransaction, definitions: []cons
         keyrow,
         0,
         primaryKeyIndexRef,
-        versionColRef,
-        liveColRef,
+        versionColumnRef,
+        liveColumnRef,
         propertyColumnRefs[0..propertyCount],
         kinds[0..propertyCount],
         elements[0..propertyCount],
@@ -241,8 +241,8 @@ pub const CatalogView = struct {
     keyrowIndexRef: Reference,
     nextKey: u64,
     primaryKeyIndexRef: Reference,
-    versionColRef: Reference,
-    liveColRef: Reference,
+    versionColumnRef: Reference,
+    liveColumnRef: Reference,
     bytes: []const u8,
 
     /// The ref of property `propertyIndex`'s column tree.
@@ -275,7 +275,7 @@ pub const CatalogView = struct {
     }
 
     /// The deletion rule of link property `propertyIndex`.
-    pub fn delRule(self: CatalogView, propertyIndex: usize) DeletionRule {
+    pub fn deletionRule(self: CatalogView, propertyIndex: usize) DeletionRule {
         const rulesBase = propertyColumnsOffset + @as(usize, self.propertyCount) * 8 + @as(usize, self.propertyCount) * 2 + @as(usize, self.propertyCount) * 8 + @as(usize, self.propertyCount) * 2;
         return @enumFromInt(self.bytes[rulesBase + propertyIndex]);
     }
@@ -326,15 +326,15 @@ pub fn loadCatalog(transaction: anytype, catalogRef: Reference) !CatalogView {
         .keyrowIndexRef = std.mem.readInt(u64, bytes[offKeyrowIndexRef..][0..8], .little),
         .nextKey = std.mem.readInt(u64, bytes[offNextKey..][0..8], .little),
         .primaryKeyIndexRef = std.mem.readInt(u64, bytes[primaryKeyIndexRefOffset..][0..8], .little),
-        .versionColRef = std.mem.readInt(u64, bytes[offVersionColRef..][0..8], .little),
-        .liveColRef = std.mem.readInt(u64, bytes[offLiveColRef..][0..8], .little),
+        .versionColumnRef = std.mem.readInt(u64, bytes[offVersionColRef..][0..8], .little),
+        .liveColumnRef = std.mem.readInt(u64, bytes[offLiveColRef..][0..8], .little),
         .bytes = bytes,
     };
 }
 
 /// One property's full catalog record, as carried by CatalogSnapshot.
 pub const PropertySnapshot = struct {
-    col: Reference,
+    column: Reference,
     kind: PropertyKind,
     element: ElementKind,
     backlink: Reference,
@@ -357,8 +357,8 @@ pub const CatalogSnapshot = struct {
     keyrowIndexRef: Reference,
     nextKey: u64,
     primaryKeyIndexRef: Reference,
-    versionColRef: Reference,
-    liveColRef: Reference,
+    versionColumnRef: Reference,
+    liveColumnRef: Reference,
     properties: [maxPropertyCount]PropertySnapshot,
     /// The node this snapshot was loaded from and its on-disk size, so
     /// replace() can free it. propertyCount may change after load (migrations),
@@ -378,17 +378,17 @@ pub const CatalogSnapshot = struct {
         snapshot.keyrowIndexRef = view.keyrowIndexRef;
         snapshot.nextKey = view.nextKey;
         snapshot.primaryKeyIndexRef = view.primaryKeyIndexRef;
-        snapshot.versionColRef = view.versionColRef;
-        snapshot.liveColRef = view.liveColRef;
+        snapshot.versionColumnRef = view.versionColumnRef;
+        snapshot.liveColumnRef = view.liveColumnRef;
         var propertyIndex: usize = 0;
         while (propertyIndex < view.propertyCount) : (propertyIndex += 1) {
             snapshot.properties[propertyIndex] = .{
-                .col = view.propertyColumnRef(propertyIndex),
+                .column = view.propertyColumnRef(propertyIndex),
                 .kind = view.kind(propertyIndex),
                 .element = view.elementKind(propertyIndex),
                 .backlink = view.backlinkRef(propertyIndex),
                 .target = view.linkTarget(propertyIndex),
-                .rule = view.delRule(propertyIndex),
+                .rule = view.deletionRule(propertyIndex),
                 .valueIndex = view.valueIndexRef(propertyIndex),
                 .indexed = view.indexed(propertyIndex),
             };
@@ -398,7 +398,7 @@ pub const CatalogSnapshot = struct {
 
     /// Allocate and encode a fresh catalog node from this snapshot.
     pub fn write(self: *const CatalogSnapshot, transaction: *WriteTransaction) !Reference {
-        var cols: [maxPropertyCount]Reference = undefined;
+        var columns: [maxPropertyCount]Reference = undefined;
         var kinds: [maxPropertyCount]PropertyKind = undefined;
         var elements: [maxPropertyCount]ElementKind = undefined;
         var backlinks: [maxPropertyCount]Reference = undefined;
@@ -410,7 +410,7 @@ pub const CatalogSnapshot = struct {
         var propertyIndex: usize = 0;
         while (propertyIndex < propertyCount) : (propertyIndex += 1) {
             const property = self.properties[propertyIndex];
-            cols[propertyIndex] = property.col;
+            columns[propertyIndex] = property.column;
             kinds[propertyIndex] = property.kind;
             elements[propertyIndex] = property.element;
             backlinks[propertyIndex] = property.backlink;
@@ -426,9 +426,9 @@ pub const CatalogSnapshot = struct {
             self.keyrowIndexRef,
             self.nextKey,
             self.primaryKeyIndexRef,
-            self.versionColRef,
-            self.liveColRef,
-            cols[0..propertyCount],
+            self.versionColumnRef,
+            self.liveColumnRef,
+            columns[0..propertyCount],
             kinds[0..propertyCount],
             elements[0..propertyCount],
             backlinks[0..propertyCount],
@@ -487,17 +487,17 @@ pub fn resolveProperty(transaction: anytype, catalogRef: Reference, primaryKey: 
     const view = try loadCatalog(transaction, catalogRef);
     const objectKey = (try Index.get(transaction, view.primaryKeyIndexRef, primaryKey)) orelse return null;
     const row = (try Index.get(transaction, view.keyrowIndexRef, objectKey)) orelse return null;
-    if ((try Column.get(transaction, view.liveColRef, row)) == 0) return null;
+    if ((try Column.get(transaction, view.liveColumnRef, row)) == 0) return null;
     return .{ .row = row, .propertyColumn = view.propertyColumnRef(property) };
 }
 
 /// Write `newRoot` into property `property`'s column at `row`, bump that
 /// row's version stamp, and return the new catalog ref (copy-on-write). Two
 /// column walks plus a catalog rewrite, O(log n + propertyCount).
-pub fn replaceCollRoot(transaction: *WriteTransaction, catalogRef: Reference, row: u64, property: usize, newRoot: Reference) !Reference {
+pub fn replaceCollectionRoot(transaction: *WriteTransaction, catalogRef: Reference, row: u64, property: usize, newRoot: Reference) !Reference {
     var snapshot = try CatalogSnapshot.load(transaction, catalogRef);
-    snapshot.properties[property].col = try Column.set(transaction, snapshot.properties[property].col, row, newRoot);
-    snapshot.versionColRef = try Column.set(transaction, snapshot.versionColRef, row, transaction.newVersion);
+    snapshot.properties[property].column = try Column.set(transaction, snapshot.properties[property].column, row, newRoot);
+    snapshot.versionColumnRef = try Column.set(transaction, snapshot.versionColumnRef, row, transaction.newVersion);
     return snapshot.replace(transaction);
 }
 
@@ -522,7 +522,7 @@ pub fn setValueIndexRef(transaction: *WriteTransaction, catalogRef: Reference, p
 /// catalog ref, preserving everything else. O(propertyCount) catalog rewrite.
 pub fn setPropertyColumnRef(transaction: *WriteTransaction, catalogRef: Reference, propertyIndex: usize, newColumn: Reference) !Reference {
     var snapshot = try CatalogSnapshot.load(transaction, catalogRef);
-    snapshot.properties[propertyIndex].col = newColumn;
+    snapshot.properties[propertyIndex].column = newColumn;
     return snapshot.replace(transaction);
 }
 
@@ -565,7 +565,7 @@ test "CatalogSnapshot round-trips every field through load and write" {
     const catalogRef = try createFromDefinitions(&writeTransaction, &.{
         .{ .kind = .int },
         .{ .kind = .int, .indexed = true },
-        .{ .kind = .link, .linkTarget = 3, .delRule = .cascade },
+        .{ .kind = .link, .linkTarget = 3, .deletionRule = .cascade },
         .{ .kind = .list, .element = .blob },
     });
     const snapshot = try CatalogSnapshot.load(&writeTransaction, catalogRef);
@@ -577,8 +577,8 @@ test "CatalogSnapshot round-trips every field through load and write" {
     try testing.expectEqual(view0.nextKey, view1.nextKey);
     try testing.expectEqual(view0.primaryKeyIndexRef, view1.primaryKeyIndexRef);
     try testing.expectEqual(view0.keyrowIndexRef, view1.keyrowIndexRef);
-    try testing.expectEqual(view0.versionColRef, view1.versionColRef);
-    try testing.expectEqual(view0.liveColRef, view1.liveColRef);
+    try testing.expectEqual(view0.versionColumnRef, view1.versionColumnRef);
+    try testing.expectEqual(view0.liveColumnRef, view1.liveColumnRef);
     var propertyIndex: usize = 0;
     while (propertyIndex < view0.propertyCount) : (propertyIndex += 1) {
         try testing.expectEqual(view0.propertyColumnRef(propertyIndex), view1.propertyColumnRef(propertyIndex));
@@ -586,7 +586,7 @@ test "CatalogSnapshot round-trips every field through load and write" {
         try testing.expectEqual(view0.elementKind(propertyIndex), view1.elementKind(propertyIndex));
         try testing.expectEqual(view0.backlinkRef(propertyIndex), view1.backlinkRef(propertyIndex));
         try testing.expectEqual(view0.linkTarget(propertyIndex), view1.linkTarget(propertyIndex));
-        try testing.expectEqual(view0.delRule(propertyIndex), view1.delRule(propertyIndex));
+        try testing.expectEqual(view0.deletionRule(propertyIndex), view1.deletionRule(propertyIndex));
         try testing.expectEqual(view0.valueIndexRef(propertyIndex), view1.valueIndexRef(propertyIndex));
         try testing.expectEqual(view0.indexed(propertyIndex), view1.indexed(propertyIndex));
     }
@@ -769,7 +769,7 @@ test "non-indexed catalog: value index refs zero and existing fields intact" {
     const catalogRef = try createFromDefinitions(&writeTransaction, &.{
         .{ .kind = .int },
         .{ .kind = .list, .element = .blob },
-        .{ .kind = .link, .linkTarget = 4, .delRule = .cascade },
+        .{ .kind = .link, .linkTarget = 4, .deletionRule = .cascade },
     });
     const view = try loadCatalog(&writeTransaction, catalogRef);
     var propertyIndex: usize = 0;
@@ -790,8 +790,8 @@ test "non-indexed catalog: value index refs zero and existing fields intact" {
     try testing.expectEqual(@as(Reference, 0), view.backlinkRef(1));
     try testing.expectEqual(@as(u16, 4), view.linkTarget(2));
     try testing.expectEqual(@as(u16, 0), view.linkTarget(0));
-    try testing.expectEqual(DeletionRule.cascade, view.delRule(2));
-    try testing.expectEqual(DeletionRule.nullify, view.delRule(0));
+    try testing.expectEqual(DeletionRule.cascade, view.deletionRule(2));
+    try testing.expectEqual(DeletionRule.nullify, view.deletionRule(0));
     writeTransaction.deinit();
 }
 
@@ -805,13 +805,13 @@ test "createDefs records a per-property deletion rule" {
     var writeTransaction = try database.beginWrite();
     const catalogRef = try createFromDefinitions(&writeTransaction, &.{
         .{ .kind = .int },
-        .{ .kind = .link, .linkTarget = 2, .delRule = .cascade },
-        .{ .kind = .link, .linkTarget = 3, .delRule = .block },
+        .{ .kind = .link, .linkTarget = 2, .deletionRule = .cascade },
+        .{ .kind = .link, .linkTarget = 3, .deletionRule = .block },
     });
     const view = try loadCatalog(&writeTransaction, catalogRef);
-    try testing.expectEqual(DeletionRule.nullify, view.delRule(0));
-    try testing.expectEqual(DeletionRule.cascade, view.delRule(1));
-    try testing.expectEqual(DeletionRule.block, view.delRule(2));
+    try testing.expectEqual(DeletionRule.nullify, view.deletionRule(0));
+    try testing.expectEqual(DeletionRule.cascade, view.deletionRule(1));
+    try testing.expectEqual(DeletionRule.block, view.deletionRule(2));
     // existing per-property data still intact
     try testing.expectEqual(@as(u16, 2), view.linkTarget(1));
     writeTransaction.deinit();

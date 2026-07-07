@@ -98,7 +98,7 @@ test "steady-state batched inserts keep the free list bounded" {
     // insertsPerBatch * batches, while the healthy working set stays under
     // one batch's width. Deriving the bound from the loop constant keeps the
     // assertion honest if someone retunes the batch size.
-    try testing.expect(database.freeListLenForTest() < insertsPerBatch);
+    try testing.expect(database.freeListLengthForTest() < insertsPerBatch);
 }
 
 test "an abandoned transaction's bump allocations are rolled back" {

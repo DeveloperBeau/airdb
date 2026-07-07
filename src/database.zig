@@ -18,7 +18,7 @@ const Reference = @import("storage/reference.zig").Reference;
 const Slot = @import("storage/slots.zig").Slot;
 const FreeList = @import("storage/freeList.zig").FreeList;
 const Coordination = @import("transactions/coordination.zig").Coordination;
-const coordMod = @import("transactions/coordination.zig");
+const sentinelMax = @import("transactions/coordination.zig").sentinelMax;
 const versioning = @import("transactions/versioning.zig");
 const freeListRecovery = @import("storage/freeListRecovery.zig");
 
@@ -99,8 +99,8 @@ pub const Database = struct {
     /// Byte length of the live free-list node on disk (0 if none).
     freeListNodeLen: usize,
     /// Coordination file for multi-process attach count and latest-version signal.
-    coord: Coordination,
-    /// Index into the coord participant slot array claimed by this Database instance, or null
+    coordination: Coordination,
+    /// Index into the coordination participant slot array claimed by this Database instance, or null
     /// if all 64 slots were occupied at open/create time.
     participantSlot: ?usize,
     // NOTE: the retention window is NOT an in-memory field. It lives in the
@@ -170,21 +170,21 @@ pub const Database = struct {
         try store.syncer.flush(store.file);
 
         // Coord setup -- done last so the errdefer has no further try-s after it.
-        const coordPath = try std.fmt.allocPrint(allocator, "{s}.coord", .{path});
-        defer allocator.free(coordPath);
-        var coord = try Coordination.openOrCreate(coordPath);
+        const coordinationPath = try std.fmt.allocPrint(allocator, "{s}.coord", .{path});
+        defer allocator.free(coordinationPath);
+        var coordination = try Coordination.openOrCreate(coordinationPath);
         var slot: ?usize = null;
         errdefer {
-            if (slot) |claimed| coord.releaseSlot(claimed);
-            _ = coord.detach();
-            coord.deinit();
+            if (slot) |claimed| coordination.releaseSlot(claimed);
+            _ = coordination.detach();
+            coordination.deinit();
         }
-        _ = coord.attach();
+        _ = coordination.attach();
         // A participant slot is MANDATORY: without one this instance's reader
         // pins are invisible to other processes' reclaim horizons, so any
         // snapshot it opened could be scribbled by a concurrent writer. Refuse
         // the attach rather than silently degrade to corruptible reads.
-        slot = (try coord.claimSlot()) orelse return error.TooManyAttachments;
+        slot = (try coordination.claimSlot()) orelse return error.TooManyAttachments;
 
         return Database{
             .store = store,
@@ -195,7 +195,7 @@ pub const Database = struct {
             .freeList = FreeList.init(allocator),
             .freeListNodeRef = 0,
             .freeListNodeLen = 0,
-            .coord = coord,
+            .coordination = coordination,
             .participantSlot = slot,
             .autoCompact = false,
         };
@@ -217,7 +217,7 @@ pub const Database = struct {
 
         // Build a partial Database so versioning.selectActiveSlot and
         // freeListRecovery.loadFreeList can run against it.
-        // coord is left undefined; it is set at the very end.
+        // coordination is left undefined; it is set at the very end.
         // On any error path, errdefer store.deinit() (above) frees the file+mmap,
         // and errdefer database.freeList.deinit() (below) frees any allocated extents.
         // database.pins is always empty here (no allocation), so it is safe to drop.
@@ -230,7 +230,7 @@ pub const Database = struct {
             .freeList = FreeList.init(allocator),
             .freeListNodeRef = 0,
             .freeListNodeLen = 0,
-            .coord = undefined,
+            .coordination = undefined,
             .participantSlot = null,
             .autoCompact = false,
         };
@@ -243,31 +243,31 @@ pub const Database = struct {
         if (active.freeListRef != 0) try freeListRecovery.loadFreeList(&database, active.freeListRef);
 
         // Coord setup -- done last so the errdefer has no further try-s after it.
-        const coordPath = try std.fmt.allocPrint(allocator, "{s}.coord", .{path});
-        defer allocator.free(coordPath);
-        var coord = try Coordination.openOrCreate(coordPath);
+        const coordinationPath = try std.fmt.allocPrint(allocator, "{s}.coord", .{path});
+        defer allocator.free(coordinationPath);
+        var coordination = try Coordination.openOrCreate(coordinationPath);
         var slot: ?usize = null;
         errdefer {
-            if (slot) |claimed| coord.releaseSlot(claimed);
-            _ = coord.detach();
-            coord.deinit();
+            if (slot) |claimed| coordination.releaseSlot(claimed);
+            _ = coordination.detach();
+            coordination.deinit();
         }
-        _ = coord.attach();
+        _ = coordination.attach();
         // Mandatory for the same reason as in createWith: invisible pins mean
         // corruptible snapshots.
-        slot = (try coord.claimSlot()) orelse return error.TooManyAttachments;
+        slot = (try coordination.claimSlot()) orelse return error.TooManyAttachments;
 
-        database.coord = coord;
+        database.coordination = coordination;
         database.participantSlot = slot;
         return database;
     }
 
     /// Detach from the database: release this instance's participant slot,
-    /// decrement the attach count, and unmap/close the coord and data files.
+    /// decrement the attach count, and unmap/close the coordination and data files.
     pub fn deinit(self: *Database) void {
-        if (self.participantSlot) |slotIndex| self.coord.releaseSlot(slotIndex);
-        _ = self.coord.detach();
-        self.coord.deinit();
+        if (self.participantSlot) |slotIndex| self.coordination.releaseSlot(slotIndex);
+        _ = self.coordination.detach();
+        self.coordination.deinit();
         self.freeList.deinit();
         self.pins.deinit();
         self.store.deinit();
@@ -280,11 +280,11 @@ pub const Database = struct {
 
     /// Begin a read snapshot of the latest committed version, refreshing to
     /// any newer version another process published. Pins the version (and
-    /// publishes the pin to the coord file) so its nodes cannot be reused
+    /// publishes the pin to the coordination file) so its nodes cannot be reused
     /// until end().
     pub fn beginRead(self: *Database) !ReadTransaction {
         // Pin-then-validate loop. Between refreshing to the latest published
-        // version and this process's pin becoming visible in the coord slot, a
+        // version and this process's pin becoming visible in the coordination slot, a
         // writer in another process may commit a NEWER version and compute a
         // reclaim horizon that does not include the pin -- admitting reuse of
         // exactly the nodes this snapshot references (with a zero retention
@@ -309,9 +309,9 @@ pub const Database = struct {
                 try self.pins.put(activeVersion, 1);
             }
             self.publishPins();
-            const latestVersion = self.coord.latestVersion();
+            const latestVersion = self.coordination.latestVersion();
             const retain = self.retainVersions();
-            const floor = if (retain == coordMod.sentinelMax) 0 else latestVersion -| retain;
+            const floor = if (retain == sentinelMax) 0 else latestVersion -| retain;
             if (activeVersion >= floor) {
                 return ReadTransaction{ .database = self, .rootRef = root, .version = activeVersion };
             }
@@ -331,7 +331,7 @@ pub const Database = struct {
         // Must be inside the retention window: older versions' nodes may already
         // be reclaimed. maxInt means "retain everything".
         const retain = self.retainVersions();
-        if (retain != coordMod.sentinelMax) {
+        if (retain != sentinelMax) {
             if (version < self.activeVersion -| retain) return error.VersionUnavailable;
         }
         const root = if (version == self.activeVersion)
@@ -352,8 +352,8 @@ pub const Database = struct {
         // retention floor of the newest possible in-flight writer, no such
         // writer can have reused a node this snapshot references. Otherwise
         // unpin and refuse the read rather than risk a corrupt snapshot.
-        if (retain != coordMod.sentinelMax) {
-            const latestVersion = self.coord.latestVersion();
+        if (retain != sentinelMax) {
+            const latestVersion = self.coordination.latestVersion();
             if (version < latestVersion -| retain) {
                 var transaction = ReadTransaction{ .database = self, .rootRef = root, .version = version };
                 transaction.end(); // unpin
@@ -377,7 +377,7 @@ pub const Database = struct {
 
     /// Number of processes currently attached to this database.
     pub fn attachedProcesses(self: *Database) u32 {
-        return self.coord.attachCount();
+        return self.coordination.attachCount();
     }
 
     /// Logical size: the high-water mark of allocated arena bytes.
@@ -387,7 +387,7 @@ pub const Database = struct {
 
     /// Physical size of the backing file on disk.
     pub fn fileSize(self: *Database) !u64 {
-        return self.store.fileLen();
+        return self.store.fileLength();
     }
 
     /// The shared retention window: recently-freed space is withheld from reuse
@@ -420,7 +420,7 @@ pub const Database = struct {
         return versioning.oldestReadableVersion(self);
     }
 
-    /// Shared body for beginWrite and beginWriteTry. Caller must hold the coord
+    /// Shared body for beginWrite and beginWriteTry. Caller must hold the coordination
     /// lock before calling; an errdefer in the caller releases the lock if this
     /// function returns an error.
     fn beginWriteLocked(self: *Database) !WriteTransaction {
@@ -458,16 +458,16 @@ pub const Database = struct {
     /// acquired. The lock is released when the returned WriteTransaction is committed or
     /// abandoned via deinit.
     pub fn beginWrite(self: *Database) !WriteTransaction {
-        try self.coord.lockExclusive();
-        errdefer self.coord.unlock(); // release if refresh or setup fails
+        try self.coordination.lockExclusive();
+        errdefer self.coordination.unlock(); // release if refresh or setup fails
         return self.beginWriteLocked();
     }
 
     /// Like beginWrite but returns error.WouldBlock immediately if another writer
     /// currently holds the lock.
     pub fn beginWriteTry(self: *Database) !WriteTransaction {
-        try self.coord.tryLockExclusive();
-        errdefer self.coord.unlock(); // release if refresh or setup fails
+        try self.coordination.tryLockExclusive();
+        errdefer self.coordination.unlock(); // release if refresh or setup fails
         return self.beginWriteLocked();
     }
 
@@ -491,7 +491,7 @@ pub const Database = struct {
     }
 
     /// Test-only accessor: number of extents in the committed free list.
-    pub fn freeListLenForTest(self: *Database) usize {
+    pub fn freeListLengthForTest(self: *Database) usize {
         return self.freeList.extents.items.len;
     }
 

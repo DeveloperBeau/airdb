@@ -673,7 +673,7 @@ test "updateTyped carries collection properties through unchanged" {
 
     _ = (try getTyped(&w, catalogRef, 1, &out)).?;
     try testing.expectEqual(@as(u64, 20), out[1].int);
-    try testing.expectEqual(@as(?u64, 3), try collections.listLen(&w, catalogRef, 1, 2));
+    try testing.expectEqual(@as(?u64, 3), try collections.listLength(&w, catalogRef, 1, 2));
     try testing.expectEqual(@as(u64, 8), try collections.listGetInt(&w, catalogRef, 1, 2, 1));
 }
 

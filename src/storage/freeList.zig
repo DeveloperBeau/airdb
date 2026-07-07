@@ -118,14 +118,14 @@ pub const FreeList = struct {
     pub const maxChunks: usize = 1 << 20;
 
     /// Encoded byte length of a chunk holding `count` extents.
-    pub fn chunkByteLen(count: usize) usize {
+    pub fn chunkByteLength(count: usize) usize {
         return chunkHeaderBytes + count * extentBytes;
     }
 
     /// Encode `extents` plus the next chunk's ref into `buffer` as one chunk;
     /// returns the encoded byte length. O(extents).
     pub fn encodeChunk(extents: []const FreeExtent, nextRef: u64, buffer: []u8) usize {
-        std.debug.assert(buffer.len >= chunkByteLen(extents.len));
+        std.debug.assert(buffer.len >= chunkByteLength(extents.len));
         std.mem.writeInt(u32, buffer[0..4], @intCast(extents.len), .little);
         std.mem.writeInt(u64, buffer[4..12], nextRef, .little);
         var offset: usize = chunkHeaderBytes;
@@ -151,7 +151,7 @@ pub const FreeList = struct {
         if (buffer.len < chunkHeaderBytes) return error.Corrupt;
         const count = std.mem.readInt(u32, buffer[0..4], .little);
         const next = std.mem.readInt(u64, buffer[4..12], .little);
-        if (buffer.len < chunkByteLen(count)) return error.Corrupt;
+        if (buffer.len < chunkByteLength(count)) return error.Corrupt;
         var offset: usize = chunkHeaderBytes;
         var entryIndex: u32 = 0;
         while (entryIndex < count) : (entryIndex += 1) {

@@ -122,7 +122,7 @@ pub fn getTyped(transaction: anytype, catalogRef: Reference, primaryKey: u64, ou
                 error.BlobChunked => .{ .blobRef = raw[propertyIndex] },
                 else => return err,
             },
-            .list, .set, .dict, .linkSet => .{ .collRoot = raw[propertyIndex] },
+            .list, .set, .dict, .linkSet => .{ .collectionRoot = raw[propertyIndex] },
             .link => .{ .link = if (raw[propertyIndex] == 0) null else raw[propertyIndex] - 1 },
         };
     }
@@ -153,7 +153,7 @@ pub fn getTypedByObjectKey(transaction: anytype, catalogRef: Reference, objectKe
                 error.BlobChunked => .{ .blobRef = raw[propertyIndex] },
                 else => return err,
             },
-            .list, .set, .dict, .linkSet => .{ .collRoot = raw[propertyIndex] },
+            .list, .set, .dict, .linkSet => .{ .collectionRoot = raw[propertyIndex] },
             .link => .{ .link = if (raw[propertyIndex] == 0) null else raw[propertyIndex] - 1 },
         };
     }
@@ -168,7 +168,7 @@ pub fn deleteAndNullify(transaction: *WriteTransaction, catalogRef: Reference, p
     const view = try loadCatalog(transaction, catalogRef);
     const objectKey = (try Index.get(transaction, view.primaryKeyIndexRef, primaryKey)) orelse return .notFound;
     const row = (try catalog.objectKeyToRow(transaction, catalogRef, objectKey)) orelse return .notFound;
-    const currentVersion = try Column.get(transaction, view.versionColRef, row);
+    const currentVersion = try Column.get(transaction, view.versionColumnRef, row);
     if (currentVersion != expectedVersion) return .{ .conflict = .{ .currentVersion = currentVersion } };
     const fixed = try links.fixBacklinksForDelete(transaction, catalogRef, objectKey);
     return try rows.delete(transaction, fixed, primaryKey, expectedVersion);
