@@ -70,12 +70,12 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     defer alloc.free(path);
     defer harness.removeScratch(ctx.*, path);
 
-    var db = try airdb.Db.create(alloc, path);
-    errdefer db.deinit();
+    var database = try airdb.Database.create(alloc, path);
+    errdefer database.deinit();
 
     // Build the directory: non-embedded owner + embedded child.
     {
-        var w = try db.beginWrite();
+        var w = try database.beginWrite();
         const dir = try typedir.createTypes(&w, &owner_schema, &.{ false, true });
         w.setRoot(dir);
         _ = try w.commit();
@@ -100,7 +100,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         var inserted: usize = 0;
         while (inserted < owners) {
             const this_batch = @min(batch_size, owners - inserted);
-            var w = try db.beginWrite();
+            var w = try database.beginWrite();
             var dir = w.new_root;
             var j: usize = 0;
             while (j < this_batch) : (j += 1) {
@@ -130,7 +130,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     // --- READ phase: materialize the embedded child --------------------------
     {
         const phase_start = nowNs(io);
-        var r = try db.beginRead();
+        var r = try database.beginRead();
         const dir = r.root();
         var out: [child_props]Value = undefined;
         var k: usize = 0;
@@ -152,7 +152,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         var done: usize = 0;
         while (done < update_n) {
             const this_batch = @min(batch_size, update_n - done);
-            var w = try db.beginWrite();
+            var w = try database.beginWrite();
             var dir = w.new_root;
             var j: usize = 0;
             while (j < this_batch) : (j += 1) {
@@ -178,7 +178,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         var done: usize = 0;
         while (done < delete_n) {
             const this_batch = @min(batch_size, delete_n - done);
-            var w = try db.beginWrite();
+            var w = try database.beginWrite();
             var dir = w.new_root;
             var j: usize = 0;
             while (j < this_batch) : (j += 1) {
@@ -200,8 +200,8 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         total_ns += @intCast(nowNs(io) - phase_start);
     }
 
-    const file_bytes = try db.fileSize();
-    const logical_bytes = db.logicalSize();
+    const file_bytes = try database.fileSize();
+    const logical_bytes = database.logicalSize();
 
     const ops: u64 = @as(u64, owners) + read_n + update_n + deleted;
 
@@ -231,6 +231,6 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         .note = note,
     };
 
-    db.deinit();
+    database.deinit();
     return result;
 }

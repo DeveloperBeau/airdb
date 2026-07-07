@@ -72,8 +72,8 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     defer alloc.free(buf);
     for (buf, 0..) |*b, i| b.* = @truncate(i *% 2654435761);
 
-    var db = try airdb.Db.create(alloc, blob_path);
-    errdefer db.deinit();
+    var database = try airdb.Database.create(alloc, blob_path);
+    errdefer database.deinit();
 
     var refs: [blob_count]Reference = undefined;
 
@@ -82,7 +82,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     const put_start = nowNs(io);
     var i: usize = 0;
     while (i < blob_count) : (i += 1) {
-        var w = try db.beginWrite();
+        var w = try database.beginWrite();
         refs[i] = try blob.put(&w, buf);
         _ = try w.commit();
         put_bytes += blob_bytes;
@@ -92,7 +92,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     // GET: read every blob back in a single read snapshot.
     var get_bytes: u64 = 0;
     const get_start = nowNs(io);
-    var rd = try db.beginRead();
+    var rd = try database.beginRead();
     i = 0;
     while (i < blob_count) : (i += 1) {
         const out = try blob.getAlloc(&rd, refs[i], alloc);
@@ -109,25 +109,25 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     rd.end();
     const get_ns: u64 = @intCast(nowNs(io) - get_start);
 
-    // Capture the (large) blob-db metrics before closing it.
-    const file_bytes = try db.fileSize();
-    const logical_bytes = db.logicalSize();
-    db.deinit();
+    // Capture the (large) blob-database metrics before closing it.
+    const file_bytes = try database.fileSize();
+    const logical_bytes = database.logicalSize();
+    database.deinit();
 
     // --- Part B: point-in-time read overhead --------------------------------
     const pitr_path = try harness.scratchPath(ctx.*, name ++ "-pitr.airdb");
     defer alloc.free(pitr_path);
     defer harness.removeScratch(ctx.*, pitr_path);
 
-    var pdb = try airdb.Db.create(alloc, pitr_path);
-    defer pdb.deinit();
+    var pitrDatabase = try airdb.Database.create(alloc, pitr_path);
+    defer pitrDatabase.deinit();
 
     // Retain everything so the early version's nodes stay readable.
-    pdb.setRetainVersions(std.math.maxInt(u64));
+    pitrDatabase.setRetainVersions(std.math.maxInt(u64));
 
     // Two-int type {pk, value}; property 0 is the primary key.
     {
-        var w = try pdb.beginWrite();
+        var w = try pitrDatabase.beginWrite();
         const c = try catalog.create(&w, 2);
         w.setRoot(c);
         _ = try w.commit();
@@ -138,8 +138,8 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     var inserted: usize = 0;
     while (inserted < pitr_rows) {
         const this_batch = @min(pitr_batch, pitr_rows - inserted);
-        var w = try pdb.beginWrite();
-        var cat = pdb.active_root;
+        var w = try pitrDatabase.beginWrite();
+        var cat = pitrDatabase.active_root;
         var j: usize = 0;
         while (j < this_batch) : (j += 1) {
             const pk: u64 = inserted + j;
@@ -160,7 +160,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     var lat_latest = harness.Latencies.init();
     defer lat_latest.deinit(alloc);
     {
-        var rl = try pdb.beginRead();
+        var rl = try pitrDatabase.beginRead();
         const cat = rl.root();
         var x: u64 = 0x9E3779B97F4A7C15;
         var k: usize = 0;
@@ -182,7 +182,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     var lat_hist = harness.Latencies.init();
     defer lat_hist.deinit(alloc);
     {
-        var rh = try pdb.beginReadAt(v_old);
+        var rh = try pitrDatabase.beginReadAt(v_old);
         const cat = rh.root();
         var x: u64 = 0x9E3779B97F4A7C15;
         var k: usize = 0;
@@ -212,7 +212,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         alloc,
         "blobs={d}x{d}MiB(chunked) put_MiBps={d:.0} get_MiBps={d:.0} " ++
             "latest_p50_us={d:.2} hist_p50_us={d:.2} overhead_pct={d:.1} " ++
-            "(file/logical from blob db; latencies from latest reads)",
+            "(file/logical from blob database; latencies from latest reads)",
         .{
             blob_count,
             blob_bytes / (1024 * 1024),

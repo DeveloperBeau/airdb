@@ -128,7 +128,7 @@ fn blobDup(transaction: *WriteTransaction, ref: u64) !u64 {
         return blob.put(transaction, bytes);
     } else |err| switch (err) {
         error.BlobChunked => {
-            const alloc = transaction.db.store.allocator;
+            const alloc = transaction.database.store.allocator;
             const bytes = try blob.getAlloc(transaction, ref, alloc);
             defer alloc.free(bytes);
             return blob.put(transaction, bytes);

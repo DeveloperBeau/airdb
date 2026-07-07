@@ -16,7 +16,7 @@ const nullifyInboundInCatalog = links.nullifyInboundInCatalog;
 
 const testing = std.testing;
 
-const Db = @import("../database.zig").Db;
+const Database = @import("../database.zig").Database;
 
 const insertTyped = @import("objects.zig").insertTyped;
 
@@ -35,9 +35,9 @@ test "link-set accessors return error.NotFound for an absent pk" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "link_notfound.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     defer w.deinit();
     var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link_set } });
     cat = (try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .link_set = &.{} } })).cat;
@@ -56,9 +56,9 @@ test "insert stores a link and records the backlink" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "link1.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .blob }, .{ .kind = .link } });
     const boss = try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .bytes = "Boss" }, .{ .link = null } });
     cat = boss.cat;
@@ -80,9 +80,9 @@ test "setLink moves a link and updates both backlink sets" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "link2_move.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
     const a = try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .link = null } });
     cat = a.cat;
@@ -105,13 +105,13 @@ test "nullifying a source's link bumps its version" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "nullify_version.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
     var a_okey: u64 = undefined;
 
     // Commit 1: target + linked source.
     {
-        var w = try db.beginWrite();
+        var w = try database.beginWrite();
         var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
         const a = try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .link = null } });
         cat = a.cat;
@@ -125,12 +125,12 @@ test "nullifying a source's link bumps its version" {
     var out: [2]catalog.Value = undefined;
     var stale: u64 = undefined;
     {
-        var r = try db.beginRead();
+        var r = try database.beginRead();
         defer r.end();
         stale = (try getTyped(&r, r.root(), 2, &out)).?;
     }
     {
-        var w = try db.beginWrite();
+        var w = try database.beginWrite();
         var raw: [2]u64 = undefined;
         const av = (try @import("rows.zig").getByPk(&w, w.new_root, 1, &raw)).?;
         const cat = switch (try @import("objects.zig").deleteAndNullify(&w, w.new_root, 1, av)) {
@@ -144,7 +144,7 @@ test "nullifying a source's link bumps its version" {
     // The pre-nullify version must now conflict instead of resurrecting the
     // dangling link.
     {
-        var w = try db.beginWrite();
+        var w = try database.beginWrite();
         defer w.deinit();
         const res = try @import("objects.zig").updateTyped(&w, w.new_root, 2, &.{ .{ .int = 2 }, .{ .link = a_okey } }, stale);
         try testing.expect(res == .conflict);
@@ -156,9 +156,9 @@ test "a multi-leaf backlink set is pruned and freed when emptied" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "bl_prune_big.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     defer w.deinit();
     var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
     const target = try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .link = null } });
@@ -183,9 +183,9 @@ test "an emptied backlink set is pruned from the backlink index" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "bl_prune.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     defer w.deinit();
     var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
     const a = try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .link = null } });
@@ -204,9 +204,9 @@ test "setLink clearing a link drops the backlink" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "link2_clear.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
     const b = try insertTyped(&w, cat, &.{ .{ .int = 2 }, .{ .link = null } });
     cat = b.cat;
@@ -224,9 +224,9 @@ test "nullifyInboundInCatalog clears only links whose target type matches the fi
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "nullify_filter.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     // props: pk(int), prop1(link -> type 5), prop2(link -> type 9)
     var cat = try catalog.createDefs(&w, &.{
         .{ .kind = .int },
@@ -254,9 +254,9 @@ test "deleting a target nullifies inbound to-one links" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "link3_target.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
     const a = try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .link = null } });
     cat = a.cat;
@@ -279,9 +279,9 @@ test "deleting a source removes its outbound backlink entry" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "link3_source.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
     const a = try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .link = null } });
     cat = a.cat;
@@ -302,9 +302,9 @@ test "links and backlinks persist across commit and reopen" {
     defer testing.allocator.free(path);
     var boss_row: u64 = undefined;
     {
-        var db = try Db.create(testing.allocator, path);
-        defer db.deinit();
-        var w = try db.beginWrite();
+        var database = try Database.create(testing.allocator, path);
+        defer database.deinit();
+        var w = try database.beginWrite();
         var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
         const boss = try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .link = null } });
         cat = boss.cat;
@@ -315,9 +315,9 @@ test "links and backlinks persist across commit and reopen" {
         _ = try w.commit();
     }
     {
-        var db = try Db.open(testing.allocator, path);
-        defer db.deinit();
-        var r = try db.beginRead();
+        var database = try Database.open(testing.allocator, path);
+        defer database.deinit();
+        var r = try database.beginRead();
         try testing.expectEqual(@as(u64, 49), try backlinkCount(&r, r.root(), 1, boss_row));
         try testing.expectEqual(@as(?u64, boss_row), try getLink(&r, r.root(), 25, 1));
         r.end();
@@ -329,9 +329,9 @@ test "a self-link is allowed and recorded" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "linkcycle_self.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
     const a = try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .link = null } });
     cat = a.cat;
@@ -346,9 +346,9 @@ test "a two-node cycle is allowed" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "linkcycle_cycle.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
     const a = try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .link = null } });
     cat = a.cat;
@@ -367,9 +367,9 @@ test "to-many link set: insert seeds members and backlinks" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "lset1_insert.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     // props: pk(int), tags(link_set -> same type)
     var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link_set } });
     const a = try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .link_set = &.{} } });
@@ -394,9 +394,9 @@ test "to-many link set: membership query reflects members" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "lset1_member.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link_set } });
     const a = try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .link_set = &.{} } });
     cat = a.cat;
@@ -414,9 +414,9 @@ test "to-many link set: add inserts a new member" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "lset1_addnew.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link_set } });
     const a = try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .link_set = &.{} } });
     cat = a.cat;
@@ -436,9 +436,9 @@ test "to-many link set: adding an existing member is a no-op" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "lset1_addexist.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link_set } });
     const a = try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .link_set = &.{} } });
     cat = a.cat;
@@ -457,9 +457,9 @@ test "to-many link set: remove drops a member" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "lset1_remove.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link_set } });
     const a = try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .link_set = &.{} } });
     cat = a.cat;
@@ -482,9 +482,9 @@ test "deleting a to-many target removes it from all linkers" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "lset2_target.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link_set } });
     const a = try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .link_set = &.{} } });
     cat = a.cat;
@@ -508,9 +508,9 @@ test "deleting a to-many linker cleans its backlinks" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "lset2_linker.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link_set } });
     const a = try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .link_set = &.{} } });
     cat = a.cat;
@@ -532,9 +532,9 @@ test "to-many links persist across commit and reopen" {
     defer testing.allocator.free(path);
     var hub_row: u64 = undefined;
     {
-        var db = try Db.create(testing.allocator, path);
-        defer db.deinit();
-        var w = try db.beginWrite();
+        var database = try Database.create(testing.allocator, path);
+        defer database.deinit();
+        var w = try database.beginWrite();
         var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link_set } });
         const hub = try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .link_set = &.{} } });
         cat = hub.cat;
@@ -548,9 +548,9 @@ test "to-many links persist across commit and reopen" {
         _ = try w.commit();
     }
     {
-        var db = try Db.open(testing.allocator, path);
-        defer db.deinit();
-        var r = try db.beginRead();
+        var database = try Database.open(testing.allocator, path);
+        defer database.deinit();
+        var r = try database.beginRead();
         try testing.expectEqual(@as(u64, 29), try backlinkCount(&r, r.root(), 1, hub_row));
         try testing.expect(try linkSetContains(&r, r.root(), 15, 1, hub_row));
         r.end();

@@ -169,15 +169,15 @@ pub fn getAlloc(transaction: anytype, ref: Reference, allocator: std.mem.Allocat
     return buf;
 }
 
-/// Copy the blob at `src_ref` (inline OR chunked) from a source db into `dst`,
+/// Copy the blob at `src_ref` (inline OR chunked) from a source database into `dst`,
 /// returning its new Reference in the destination. The null ref (0) copies to 0.
 /// Materializes the blob in RAM during the copy (acceptable for a maintenance
 /// op); a future optimization could stream chunks without buffering the whole
 /// blob. Accepts any source transaction exposing `deref(ref, len) ![]const u8`.
 pub fn copyInto(src: anytype, dst: *WriteTransaction, src_ref: Reference) !Reference {
     if (src_ref == 0) return 0;
-    const buf = try getAlloc(src, src_ref, dst.db.store.allocator);
-    defer dst.db.store.allocator.free(buf);
+    const buf = try getAlloc(src, src_ref, dst.database.store.allocator);
+    defer dst.database.store.allocator.free(buf);
     return try put(dst, buf);
 }
 
@@ -216,7 +216,7 @@ pub fn free(transaction: *WriteTransaction, ref: Reference) !void {
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
-const Db = @import("../database.zig").Db;
+const Database = @import("../database.zig").Database;
 const Io = std.Io;
 
 fn blobTmpPath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const u8) ![]const u8 {
@@ -230,9 +230,9 @@ test "blob put then get round-trips bytes; empty is the null ref" {
     defer tmp.cleanup();
     const path = try blobTmpPath(testing.allocator, &tmp, "blob1.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     const ref = try put(&w, "hello world");
     try testing.expect(ref != 0);
     try testing.expectEqualStrings("hello world", try get(&w, ref));
@@ -249,9 +249,9 @@ test "free releases a blob node" {
     defer tmp.cleanup();
     const path = try blobTmpPath(testing.allocator, &tmp, "blob2.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     const ref = try put(&w, "data");
     try free(&w, ref); // must not error
     try free(&w, 0); // freeing the null ref is a no-op
@@ -263,9 +263,9 @@ test "chunked blob over the inline cap round-trips" {
     defer tmp.cleanup();
     const path = try blobTmpPath(testing.allocator, &tmp, "blob3.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
 
     // Just past the inline cap: forces the chunked representation (2 chunks).
     {
@@ -320,9 +320,9 @@ test "a corrupt chunked header is an error, not a panic or a poisoned free list"
     defer tmp.cleanup();
     const path = try blobTmpPath(testing.allocator, &tmp, "blob_corrupt.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     defer w.deinit();
 
     const n = inline_max + 1; // 2 chunks
@@ -334,7 +334,7 @@ test "a corrupt chunked header is an error, not a panic or a poisoned free list"
     const off: usize = @intCast(ref);
     // (a) chunk_count inconsistent with total_len: previously underflowed
     // `total_len - start` (panic) and fed garbage extents to the free list.
-    std.mem.writeInt(u32, db.store.map[off + idx_count_off ..][0..4], 1000, .little);
+    std.mem.writeInt(u32, database.store.map[off + idx_count_off ..][0..4], 1000, .little);
     try testing.expectError(error.Corrupt, size(&w, ref));
     var out_buf: [16]u8 = undefined;
     try testing.expectError(error.Corrupt, readInto(&w, ref, out_buf[0..]));
@@ -343,7 +343,7 @@ test "a corrupt chunked header is an error, not a panic or a poisoned free list"
     try testing.expectEqual(frees_before, w.in_flight_frees.items.len + w.transactionReuse.extents.items.len);
 
     // (b) an out-of-range tag byte is Corrupt everywhere.
-    db.store.map[off] = 7;
+    database.store.map[off] = 7;
     try testing.expectError(error.Corrupt, get(&w, ref));
     try testing.expectError(error.Corrupt, size(&w, ref));
     try testing.expectError(error.Corrupt, free(&w, ref));
@@ -354,9 +354,9 @@ test "free of a chunked blob" {
     defer tmp.cleanup();
     const path = try blobTmpPath(testing.allocator, &tmp, "blob4.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
 
     const n = inline_max + chunk_size + 7; // 3 chunks
     const src = try testing.allocator.alloc(u8, n);

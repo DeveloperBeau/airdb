@@ -2,7 +2,7 @@
 
 const std = @import("std");
 const testing = std.testing;
-const Db = @import("../database.zig").Db;
+const Database = @import("../database.zig").Database;
 const blob = @import("../records/blob.zig");
 const bindex = @import("byteKeyIndex.zig");
 const node = @import("indexNode.zig");
@@ -29,9 +29,9 @@ test "a bindex ref cycle fails with error.Corrupt" {
     defer tmp.cleanup();
     const path = try bidxTmpPath(testing.allocator, &tmp, "bidx_cycle.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     defer w.deinit();
 
     // Inner node whose only child is itself; its low key is a real blob so the
@@ -59,9 +59,9 @@ test "freeTree over a three-level tree frees every blob exactly once" {
     defer tmp.cleanup();
     const path = try bidxTmpPath(testing.allocator, &tmp, "bidx_freedup.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     defer w.deinit();
 
     var root = try create(&w);
@@ -97,9 +97,9 @@ test "removing split-boundary keys never dangles routing separators" {
     defer tmp.cleanup();
     const path = try bidxTmpPath(testing.allocator, &tmp, "bidx_boundary.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     defer w.deinit();
 
     var root = try create(&w);
@@ -140,9 +140,9 @@ test "insert and get round-trip byte keys" {
     defer tmp.cleanup();
     const path = try bidxTmpPath(testing.allocator, &tmp, "bidx1.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     var root = try create(&w);
     // Scrambled insertion order.
     root = try insert(&w, root, "banana", 1);
@@ -165,9 +165,9 @@ test "keys iterate in ascending byte order" {
     defer tmp.cleanup();
     const path = try bidxTmpPath(testing.allocator, &tmp, "bidx2.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     var root = try create(&w);
     root = try insert(&w, root, "cherry", 30);
     root = try insert(&w, root, "app", 40);
@@ -212,9 +212,9 @@ test "insert overwrites an existing key" {
     defer tmp.cleanup();
     const path = try bidxTmpPath(testing.allocator, &tmp, "bidx3.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     var root = try create(&w);
     root = try insert(&w, root, "k", 1);
     try testing.expectEqual(@as(?u64, 1), try get(&w, root, "k"));
@@ -229,9 +229,9 @@ test "remove deletes a key" {
     defer tmp.cleanup();
     const path = try bidxTmpPath(testing.allocator, &tmp, "bidx4.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     var root = try create(&w);
     root = try insert(&w, root, "apple", 2);
     root = try insert(&w, root, "banana", 1);
@@ -253,9 +253,9 @@ test "many keys across splits" {
     defer tmp.cleanup();
     const path = try bidxTmpPath(testing.allocator, &tmp, "bidx5.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     var root = try create(&w);
 
     const N: u64 = 1000;

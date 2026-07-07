@@ -75,4 +75,4 @@ Highlights from the notes lines:
   kept dead rows under its bound during the run — the scenario fails loudly
   if it doesn't.
 - Free-list and setLength counters (`fl_*`, `setlength_*`) come from
-  measurement-only counters on the Db and never affect behavior.
+  measurement-only counters on the Database and never affect behavior.

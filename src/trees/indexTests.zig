@@ -2,7 +2,7 @@
 
 const std = @import("std");
 const testing = std.testing;
-const Db = @import("../database.zig").Db;
+const Database = @import("../database.zig").Database;
 const WriteTransaction = @import("../database.zig").WriteTransaction;
 const Reference = @import("../storage/reference.zig").Reference;
 const index = @import("index.zig");
@@ -36,9 +36,9 @@ test "a ref cycle or unknown kind byte fails with error.Corrupt" {
     defer tmp.cleanup();
     const path = try idxTmpPath(testing.allocator, &tmp, "idx_cycle.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     defer w.deinit();
 
     // An inner node whose only child is itself: every walk must hit the depth
@@ -68,9 +68,9 @@ test "get and count traverse an inner node over two leaves" {
     defer tmp.cleanup();
     const path = try idxTmpPath(testing.allocator, &tmp, "idx3.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     var a = try create(&w);
     a = try insert(&w, a, 1, 11);
     a = try insert(&w, a, 3, 33);
@@ -92,9 +92,9 @@ test "insert builds a balanced tree across many leaves and reads back correctly"
     defer tmp.cleanup();
     const path = try idxTmpPath(testing.allocator, &tmp, "idx4.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     var root = try create(&w);
     const N: u64 = 5000;
     var i: u64 = 0;
@@ -122,9 +122,9 @@ test "single-leaf index: insert, get, upsert, remove, count" {
     defer tmp.cleanup();
     const path = try idxTmpPath(testing.allocator, &tmp, "idx1.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     var root = try create(&w);
     try testing.expect((try get(&w, root, 5)) == null);
     root = try insert(&w, root, 5, 50);
@@ -147,12 +147,12 @@ test "a committed index version stays intact for a pinned reader while a later c
     defer tmp.cleanup();
     const path = try idxTmpPath(testing.allocator, &tmp, "idx5.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
 
     // Commit version 1: keys 0..1999, value = key*10.
     {
-        var w = try db.beginWrite();
+        var w = try database.beginWrite();
         var root = try create(&w);
         var i: u64 = 0;
         while (i < 2000) : (i += 1) root = try insert(&w, root, i, i * 10);
@@ -161,13 +161,13 @@ test "a committed index version stays intact for a pinned reader while a later c
     }
 
     // Pin a reader on version 1.
-    var r1 = try db.beginRead();
+    var r1 = try database.beginRead();
     const root_v1 = r1.root();
     try testing.expectEqual(@as(?u64, 1234 * 10), try get(&r1, root_v1, 1234));
 
     // Commit version 2: update key 1234, remove key 500.
     {
-        var w = try db.beginWrite();
+        var w = try database.beginWrite();
         var root = w.new_root; // start from the latest committed root (refreshed in beginWrite)
         root = try insert(&w, root, 1234, 999999);
         root = try remove(&w, root, 500);
@@ -181,7 +181,7 @@ test "a committed index version stays intact for a pinned reader while a later c
     r1.end();
 
     // A fresh read sees version 2.
-    var r2 = try db.beginRead();
+    var r2 = try database.beginRead();
     try testing.expectEqual(@as(?u64, 999999), try get(&r2, r2.root(), 1234));
     try testing.expect((try get(&r2, r2.root(), 500)) == null);
     try testing.expectEqual(@as(?u64, 1235 * 10), try get(&r2, r2.root(), 1235)); // untouched key
@@ -198,9 +198,9 @@ test "maxKey survives an emptied rightmost leaf" {
     defer tmp.cleanup();
     const path = try idxTmpPath(testing.allocator, &tmp, "idx_maxkey.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     defer w.deinit();
 
     var root = try create(&w);
@@ -225,9 +225,9 @@ test "stored subtree counts match a full iteration under churn" {
     defer tmp.cleanup();
     const path = try idxTmpPath(testing.allocator, &tmp, "idx_counts.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     defer w.deinit();
 
     var root = try create(&w);
@@ -266,9 +266,9 @@ test "forEachKey visits all keys in ascending order" {
     defer tmp.cleanup();
     const path = try idxTmpPath(testing.allocator, &tmp, "iter.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     var root = try create(&w);
     var i: u64 = 0;
     while (i < 500) : (i += 1) {
@@ -300,9 +300,9 @@ test "forEachEntry visits key/value pairs in ascending key order" {
     defer tmp.cleanup();
     const path = try idxTmpPath(testing.allocator, &tmp, "iter_entry.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     var root = try create(&w);
     var i: u64 = 0;
     while (i < 200) : (i += 1) {
@@ -362,9 +362,9 @@ test "forEachEntryInRange visits only [lo,hi] ascending" {
     defer tmp.cleanup();
     const path = try idxTmpPath(testing.allocator, &tmp, "range1.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     const root = try buildScrambled0to1000(&w);
 
     var keys = std.ArrayList(u64).empty;
@@ -397,9 +397,9 @@ test "forEachEntryInRange empty range" {
     defer tmp.cleanup();
     const path = try idxTmpPath(testing.allocator, &tmp, "range2.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     const root = try buildScrambled0to1000(&w);
 
     var keys = std.ArrayList(u64).empty;
@@ -422,9 +422,9 @@ test "forEachEntryInRange single key" {
     defer tmp.cleanup();
     const path = try idxTmpPath(testing.allocator, &tmp, "range3.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     const root = try buildScrambled0to1000(&w);
 
     var keys = std.ArrayList(u64).empty;
@@ -451,9 +451,9 @@ test "forEachEntryInRange spans multiple leaves" {
     defer tmp.cleanup();
     const path = try idxTmpPath(testing.allocator, &tmp, "range4.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     const root = try buildScrambled0to1000(&w);
 
     var keys = std.ArrayList(u64).empty;
@@ -487,9 +487,9 @@ test "ordered index persists across reopen and matches a reference map under chu
     defer ref_map.deinit();
     const N: u64 = 100_000;
     {
-        var db = try Db.create(testing.allocator, path);
-        defer db.deinit();
-        var w = try db.beginWrite();
+        var database = try Database.create(testing.allocator, path);
+        defer database.deinit();
+        var w = try database.beginWrite();
         var root = try create(&w);
         var i: u64 = 0;
         while (i < N) : (i += 1) {
@@ -508,9 +508,9 @@ test "ordered index persists across reopen and matches a reference map under chu
         _ = try w.commit();
     }
     {
-        var db = try Db.open(testing.allocator, path);
-        defer db.deinit();
-        var r = try db.beginRead();
+        var database = try Database.open(testing.allocator, path);
+        defer database.deinit();
+        var r = try database.beginRead();
         try testing.expectEqual(@as(u64, ref_map.count()), try count(&r, r.root()));
         var it = ref_map.iterator();
         while (it.next()) |e| {
@@ -530,10 +530,10 @@ fn appendRunVal(k: u64) u64 {
     return k *% 7 +% 3;
 }
 
-fn appendTmpDb(tmp: *testing.TmpDir, name: []const u8) !Db {
+fn appendTmpDatabase(tmp: *testing.TmpDir, name: []const u8) !Database {
     const path = try idxTmpPath(testing.allocator, tmp, name);
     defer testing.allocator.free(path);
-    return Db.create(testing.allocator, path);
+    return Database.create(testing.allocator, path);
 }
 
 // Build a base tree of keys 0..base via sequential insert, append the run
@@ -605,9 +605,9 @@ fn checkAppendEquiv(w: *WriteTransaction, base: u64, run: u64) !void {
 test "appendRun partial last leaf then new leaves" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try appendTmpDb(&tmp, "append1.airdb");
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try appendTmpDatabase(&tmp, "append1.airdb");
+    defer database.deinit();
+    var w = try database.beginWrite();
     try checkAppendEquiv(&w, 100, 200); // 100 % 64 == 36 in the last leaf
     w.deinit();
 }
@@ -615,9 +615,9 @@ test "appendRun partial last leaf then new leaves" {
 test "appendRun overflow rightmost inner node" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try appendTmpDb(&tmp, "append2.airdb");
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try appendTmpDatabase(&tmp, "append2.airdb");
+    defer database.deinit();
+    var w = try database.beginWrite();
     // A multi-level base plus a run large enough that the new leaves alone
     // exceed FANOUT, forcing a split at the leaf-parent (non-root) inner level.
     try checkAppendEquiv(&w, 3000, 5000);
@@ -627,9 +627,9 @@ test "appendRun overflow rightmost inner node" {
 test "appendRun grows tree height by one" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try appendTmpDb(&tmp, "append3.airdb");
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try appendTmpDatabase(&tmp, "append3.airdb");
+    defer database.deinit();
+    var w = try database.beginWrite();
     // Single-leaf base, run crossing FANOUT*LEAF_CAP (== 4096) so the result
     // must be three levels tall.
     try checkAppendEquiv(&w, 50, 4200);
@@ -639,9 +639,9 @@ test "appendRun grows tree height by one" {
 test "appendRun single-leaf base tree" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try appendTmpDb(&tmp, "append4.airdb");
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try appendTmpDatabase(&tmp, "append4.airdb");
+    defer database.deinit();
+    var w = try database.beginWrite();
     try checkAppendEquiv(&w, 40, 50); // base < LEAF_CAP
     w.deinit();
 }
@@ -649,9 +649,9 @@ test "appendRun single-leaf base tree" {
 test "appendRun run far larger than base" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try appendTmpDb(&tmp, "append5.airdb");
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try appendTmpDatabase(&tmp, "append5.airdb");
+    defer database.deinit();
+    var w = try database.beginWrite();
     try checkAppendEquiv(&w, 10, 5000);
     w.deinit();
 }
@@ -659,9 +659,9 @@ test "appendRun run far larger than base" {
 test "appendRun empty run is a no-op" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try appendTmpDb(&tmp, "append6.airdb");
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try appendTmpDatabase(&tmp, "append6.airdb");
+    defer database.deinit();
+    var w = try database.beginWrite();
     var base_root = try create(&w);
     var k: u64 = 0;
     while (k < 100) : (k += 1) base_root = try insert(&w, base_root, k, appendRunVal(k));

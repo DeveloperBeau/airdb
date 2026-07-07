@@ -3,9 +3,9 @@ const verification = @import("verification.zig");
 const maintenance = @import("maintenance.zig");
 const testing = std.testing;
 const Io = std.Io;
-const db_mod = @import("database.zig");
-const Db = db_mod.Db;
-const ring_capacity = db_mod.ring_capacity;
+const databaseModule = @import("database.zig");
+const Database = databaseModule.Database;
+const ring_capacity = databaseModule.ring_capacity;
 const Reference = @import("storage/reference.zig").Reference;
 const FreeList = @import("storage/freeList.zig").FreeList;
 const coord_mod = @import("transactions/coordination.zig");
@@ -25,22 +25,22 @@ fn tmpFilePath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const
 test "commit then reopen sees the committed root" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const path = try tmpFilePath(testing.allocator, &tmp, "db.airdb");
+    const path = try tmpFilePath(testing.allocator, &tmp, "database.airdb");
     defer testing.allocator.free(path);
 
     {
-        var db = try Db.create(testing.allocator, path);
-        defer db.deinit();
-        var w = try db.beginWrite();
+        var database = try Database.create(testing.allocator, path);
+        defer database.deinit();
+        var w = try database.beginWrite();
         const a = try w.alloc(8);
         @memcpy(a.bytes, "HELLOAID");
         w.setRoot(a.ref);
         _ = try w.commit();
     }
     {
-        var db = try Db.open(testing.allocator, path);
-        defer db.deinit();
-        var r = try db.beginRead();
+        var database = try Database.open(testing.allocator, path);
+        defer database.deinit();
+        var r = try database.beginRead();
         const root_ref = r.root();
         try testing.expect(root_ref != 0);
         const bytes = try r.deref(root_ref, 8);
@@ -53,24 +53,24 @@ test "ending a read transaction twice does not release another reader's pin" {
     defer tmp.cleanup();
     const path = try tmpFilePath(testing.allocator, &tmp, "doubleend.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
     {
-        var w = try db.beginWrite();
+        var w = try database.beginWrite();
         const a = try w.alloc(8);
         @memcpy(a.bytes, "PINDATA_");
         w.setRoot(a.ref);
         _ = try w.commit();
     }
-    var r1 = try db.beginRead();
-    var r2 = try db.beginRead(); // same version, pin count 2
+    var r1 = try database.beginRead();
+    var r2 = try database.beginRead(); // same version, pin count 2
     const v = r1.version;
     r1.end();
     r1.end(); // must be a no-op, not a second decrement
-    try testing.expectEqual(@as(u32, 1), db.pins.get(v).?); // r2 still pinned
-    try testing.expectEqual(v, db.horizon());
+    try testing.expectEqual(@as(u32, 1), database.pins.get(v).?); // r2 still pinned
+    try testing.expectEqual(v, database.horizon());
     r2.end();
-    try testing.expectEqual(db.active_version, db.horizon());
+    try testing.expectEqual(database.active_version, database.horizon());
 }
 
 test "version horizon tracks the oldest live reader" {
@@ -78,23 +78,23 @@ test "version horizon tracks the oldest live reader" {
     defer tmp.cleanup();
     const path = try tmpFilePath(testing.allocator, &tmp, "horizon.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
 
-    try testing.expectEqual(db.active_version, db.horizon());
+    try testing.expectEqual(database.active_version, database.horizon());
 
-    var r1 = try db.beginRead();
-    const v = db.active_version;
+    var r1 = try database.beginRead();
+    const v = database.active_version;
     {
-        var w = try db.beginWrite();
+        var w = try database.beginWrite();
         const a = try w.alloc(8);
         @memcpy(a.bytes, "NEWDATA_");
         w.setRoot(a.ref);
         _ = try w.commit();
     }
-    try testing.expectEqual(v, db.horizon()); // r1 still pinned at v
+    try testing.expectEqual(v, database.horizon()); // r1 still pinned at v
     r1.end();
-    try testing.expectEqual(db.active_version, db.horizon());
+    try testing.expectEqual(database.active_version, database.horizon());
 }
 
 test "free list persists across commit and reopen" {
@@ -103,9 +103,9 @@ test "free list persists across commit and reopen" {
     const path = try tmpFilePath(testing.allocator, &tmp, "fl.airdb");
     defer testing.allocator.free(path);
     {
-        var db = try Db.create(testing.allocator, path);
-        defer db.deinit();
-        var w = try db.beginWrite();
+        var database = try Database.create(testing.allocator, path);
+        defer database.deinit();
+        var w = try database.beginWrite();
         const a = try w.alloc(8);
         @memcpy(a.bytes, "FIRSTVAL");
         const b = try w.writableCopy(a.ref, 8); // frees the old node at this version
@@ -113,9 +113,9 @@ test "free list persists across commit and reopen" {
         _ = try w.commit();
     }
     {
-        var db = try Db.open(testing.allocator, path);
-        defer db.deinit();
-        try testing.expect(db.freeListLenForTest() >= 1);
+        var database = try Database.open(testing.allocator, path);
+        defer database.deinit();
+        try testing.expect(database.freeListLenForTest() >= 1);
     }
 }
 
@@ -124,14 +124,14 @@ test "verifyIntegrity passes on a freshly committed database" {
     defer tmp.cleanup();
     const path = try tmpFilePath(testing.allocator, &tmp, "vi.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     const a = try w.alloc(8);
     @memcpy(a.bytes, "INTEGER_");
     w.setRoot(a.ref);
     _ = try w.commit();
-    try verification.verifyIntegrity(&db); // void on clean db
+    try verification.verifyIntegrity(&database); // void on clean database
 }
 
 test "verifyIntegrity detects a root reference out of bounds" {
@@ -139,15 +139,15 @@ test "verifyIntegrity detects a root reference out of bounds" {
     defer tmp.cleanup();
     const path = try tmpFilePath(testing.allocator, &tmp, "vi2.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     const a = try w.alloc(8);
     @memcpy(a.bytes, "INTEGER_");
     w.setRoot(a.ref);
     _ = try w.commit();
-    db.active_root = db.store.map.len + 8; // point past the mapped region
-    try testing.expectError(error.RootRefOutOfBounds, verification.verifyIntegrity(&db));
+    database.active_root = database.store.map.len + 8; // point past the mapped region
+    try testing.expectError(error.RootRefOutOfBounds, verification.verifyIntegrity(&database));
 }
 
 test "verifyIntegrity detects a corrupt header" {
@@ -155,15 +155,15 @@ test "verifyIntegrity detects a corrupt header" {
     defer tmp.cleanup();
     const path = try tmpFilePath(testing.allocator, &tmp, "vi_hdr.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     const a = try w.alloc(8);
     @memcpy(a.bytes, "INTEGER_");
     w.setRoot(a.ref);
     _ = try w.commit();
-    db.store.header_checksum_ok = false; // simulate an unreadable header
-    try testing.expectError(error.HeaderCorrupt, verification.verifyIntegrity(&db));
+    database.store.header_checksum_ok = false; // simulate an unreadable header
+    try testing.expectError(error.HeaderCorrupt, verification.verifyIntegrity(&database));
 }
 
 test "verifyIntegrity detects a free-list node reference out of bounds" {
@@ -171,16 +171,16 @@ test "verifyIntegrity detects a free-list node reference out of bounds" {
     defer tmp.cleanup();
     const path = try tmpFilePath(testing.allocator, &tmp, "vi_fln.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     const a = try w.alloc(8);
     @memcpy(a.bytes, "INTEGER_");
     w.setRoot(a.ref);
     _ = try w.commit();
-    db.free_list_node_ref = @intCast(db.store.map.len + 8); // past the mapped region (8-aligned)
-    db.free_list_node_len = 16;
-    try testing.expectError(error.FreeListCorrupt, verification.verifyIntegrity(&db));
+    database.free_list_node_ref = @intCast(database.store.map.len + 8); // past the mapped region (8-aligned)
+    database.free_list_node_len = 16;
+    try testing.expectError(error.FreeListCorrupt, verification.verifyIntegrity(&database));
 }
 
 test "verifyIntegrity detects a free extent out of bounds" {
@@ -188,16 +188,16 @@ test "verifyIntegrity detects a free extent out of bounds" {
     defer tmp.cleanup();
     const path = try tmpFilePath(testing.allocator, &tmp, "vi_ext.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     const a = try w.alloc(8);
     @memcpy(a.bytes, "INTEGER_");
     w.setRoot(a.ref);
     _ = try w.commit();
     // Inject an extent whose offset is past the mapped region.
-    try db.free_list.extents.append(db.store.allocator, .{ .offset = @intCast(db.store.map.len + 8), .len = 8, .freed_version = 1 });
-    try testing.expectError(error.FreeExtentOutOfBounds, verification.verifyIntegrity(&db));
+    try database.free_list.extents.append(database.store.allocator, .{ .offset = @intCast(database.store.map.len + 8), .len = 8, .freed_version = 1 });
+    try testing.expectError(error.FreeExtentOutOfBounds, verification.verifyIntegrity(&database));
 }
 
 test "verifyIntegrity passes after churn on an indexed type" {
@@ -205,13 +205,13 @@ test "verifyIntegrity passes after churn on an indexed type" {
     defer tmp.cleanup();
     const path = try tmpFilePath(testing.allocator, &tmp, "vi_idx_churn.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
     const tid: u16 = 0;
 
     // One type: int pk + one indexed int property.
     {
-        var w = try db.beginWrite();
+        var w = try database.beginWrite();
         const dir = try typedir.createTypes(&w, &.{&.{ .{ .kind = .int }, .{ .kind = .int, .indexed = true } }}, &.{false});
         w.setRoot(dir);
         _ = try w.commit();
@@ -219,8 +219,8 @@ test "verifyIntegrity passes after churn on an indexed type" {
 
     // Seed 200 rows; value = pk % 16 so many rows share each inner set.
     {
-        var w = try db.beginWrite();
-        var dir = db.active_root;
+        var w = try database.beginWrite();
+        var dir = database.active_root;
         var pk: u64 = 0;
         while (pk < 200) : (pk += 1) {
             dir = (try typeRouting.insert(&w, dir, tid, &.{ .{ .int = pk }, .{ .int = pk % 16 } })).dir;
@@ -231,8 +231,8 @@ test "verifyIntegrity passes after churn on an indexed type" {
 
     // Churn: update the value of every even pk, delete every 5th pk.
     {
-        var w = try db.beginWrite();
-        var dir = db.active_root;
+        var w = try database.beginWrite();
+        var dir = database.active_root;
         var pk: u64 = 0;
         while (pk < 200) : (pk += 1) {
             var out: [2]catalog.Value = undefined;
@@ -255,7 +255,7 @@ test "verifyIntegrity passes after churn on an indexed type" {
         _ = try w.commit();
     }
 
-    try verification.verifyIntegrity(&db); // forward + backward audit must find no divergence
+    try verification.verifyIntegrity(&database); // forward + backward audit must find no divergence
 }
 
 test "verifyIntegrity detects a corrupted value index" {
@@ -263,13 +263,13 @@ test "verifyIntegrity detects a corrupted value index" {
     defer tmp.cleanup();
     const path = try tmpFilePath(testing.allocator, &tmp, "vi_idx_corrupt.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
     const tid: u16 = 0;
     const p: usize = 1; // the indexed property
 
     {
-        var w = try db.beginWrite();
+        var w = try database.beginWrite();
         var dir = try typedir.createTypes(&w, &.{&.{ .{ .kind = .int }, .{ .kind = .int, .indexed = true } }}, &.{false});
         var pk: u64 = 0;
         while (pk < 8) : (pk += 1) {
@@ -278,15 +278,15 @@ test "verifyIntegrity detects a corrupted value index" {
         w.setRoot(dir);
         _ = try w.commit();
     }
-    try verification.verifyIntegrity(&db); // clean before corruption
+    try verification.verifyIntegrity(&database); // clean before corruption
 
     // White-box corruption: register an existing live okey under a value that no
     // row actually has. The forward direction still holds (every row stays
     // covered), so this exercises the backward check: the bogus entry resolves to
     // a live row whose property value differs from the indexed value.
     {
-        var w = try db.beginWrite();
-        const dir = db.active_root;
+        var w = try database.beginWrite();
+        const dir = database.active_root;
         const cat = try typedir.catalogRef(&w, dir, tid);
         const cv = try catalog.loadCatalog(&w, cat);
         const okey = (try catalog.pkToOkey(&w, cat, 0)).?; // row pk 0 has value 0
@@ -300,7 +300,7 @@ test "verifyIntegrity detects a corrupted value index" {
         _ = try w.commit();
     }
 
-    try testing.expectError(error.ValueIndexStaleEntry, verification.verifyIntegrity(&db));
+    try testing.expectError(error.ValueIndexStaleEntry, verification.verifyIntegrity(&database));
 }
 
 test "verifyIntegrity passes on a clean link graph after churn" {
@@ -308,12 +308,12 @@ test "verifyIntegrity passes on a clean link graph after churn" {
     defer tmp.cleanup();
     const path = try tmpFilePath(testing.allocator, &tmp, "vi_bl_clean.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
     const links = @import("records/links.zig");
 
     {
-        var w = try db.beginWrite();
+        var w = try database.beginWrite();
         var dir = try typedir.createTypes(&w, &.{
             &.{ .{ .kind = .int }, .{ .kind = .blob } }, // 0: target type
             &.{ .{ .kind = .int }, .{ .kind = .link, .link_target = 0 }, .{ .kind = .link_set, .link_target = 0 } }, // 1: source
@@ -332,7 +332,7 @@ test "verifyIntegrity passes on a clean link graph after churn" {
         w.setRoot(dir);
         _ = try w.commit();
     }
-    try verification.verifyIntegrity(&db); // forward + backward backlink audit finds no divergence
+    try verification.verifyIntegrity(&database); // forward + backward backlink audit finds no divergence
 }
 
 test "verifyIntegrity detects a corrupted backlink index" {
@@ -340,12 +340,12 @@ test "verifyIntegrity detects a corrupted backlink index" {
     defer tmp.cleanup();
     const path = try tmpFilePath(testing.allocator, &tmp, "vi_bl_corrupt.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
     var target_okey: u64 = undefined;
 
     {
-        var w = try db.beginWrite();
+        var w = try database.beginWrite();
         var dir = try typedir.createTypes(&w, &.{
             &.{ .{ .kind = .int }, .{ .kind = .link, .link_target = 0 } },
         }, &.{false});
@@ -356,13 +356,13 @@ test "verifyIntegrity detects a corrupted backlink index" {
         w.setRoot(dir);
         _ = try w.commit();
     }
-    try verification.verifyIntegrity(&db); // clean before corruption
+    try verification.verifyIntegrity(&database); // clean before corruption
 
     // White-box corruption: drop the target's backlink entry while the source's
     // link column still points at it. Forward audit must flag the divergence.
     {
-        var w = try db.beginWrite();
-        const dir = db.active_root;
+        var w = try database.beginWrite();
+        const dir = database.active_root;
         const cat = try typedir.catalogRef(&w, dir, 0);
         const cv = try catalog.loadCatalog(&w, cat);
         const new_bl = try Index.remove(&w, cv.backlinkRef(1), target_okey);
@@ -371,7 +371,7 @@ test "verifyIntegrity detects a corrupted backlink index" {
         w.setRoot(new_dir);
         _ = try w.commit();
     }
-    try testing.expectError(error.BacklinkMissingEntry, verification.verifyIntegrity(&db));
+    try testing.expectError(error.BacklinkMissingEntry, verification.verifyIntegrity(&database));
 }
 
 test "verifyIntegrity passes on a non-indexed type" {
@@ -379,12 +379,12 @@ test "verifyIntegrity passes on a non-indexed type" {
     defer tmp.cleanup();
     const path = try tmpFilePath(testing.allocator, &tmp, "vi_noidx.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
     const tid: u16 = 0;
 
     {
-        var w = try db.beginWrite();
+        var w = try database.beginWrite();
         var dir = try typedir.createTypes(&w, &.{&.{ .{ .kind = .int }, .{ .kind = .int } }}, &.{false});
         var pk: u64 = 0;
         while (pk < 50) : (pk += 1) {
@@ -394,11 +394,11 @@ test "verifyIntegrity passes on a non-indexed type" {
         _ = try w.commit();
     }
 
-    try verification.verifyIntegrity(&db); // no indexed prop -> audit must not false-positive
+    try verification.verifyIntegrity(&database); // no indexed prop -> audit must not false-positive
 }
 
 test "the 65th attach is refused rather than reading with invisible pins" {
-    // A Db without a participant slot cannot advertise its reader pins, so
+    // A Database without a participant slot cannot advertise its reader pins, so
     // concurrent writers would reclaim under its snapshots. open/create now
     // refuse the attach outright.
     var tmp = testing.tmpDir(.{});
@@ -406,40 +406,40 @@ test "the 65th attach is refused rather than reading with invisible pins" {
     const path = try tmpFilePath(testing.allocator, &tmp, "slots64.airdb");
     defer testing.allocator.free(path);
 
-    var instances: [64]Db = undefined;
+    var instances: [64]Database = undefined;
     var opened: usize = 0;
     defer {
         var i: usize = 0;
         while (i < opened) : (i += 1) instances[i].deinit();
     }
-    instances[0] = try Db.create(testing.allocator, path);
+    instances[0] = try Database.create(testing.allocator, path);
     opened = 1;
     while (opened < 64) : (opened += 1) {
-        instances[opened] = try Db.open(testing.allocator, path);
+        instances[opened] = try Database.open(testing.allocator, path);
     }
-    try testing.expectError(error.TooManyAttachments, Db.open(testing.allocator, path));
+    try testing.expectError(error.TooManyAttachments, Database.open(testing.allocator, path));
 }
 
-test "two Db instances on one file share a coordination attach count" {
+test "two Database instances on one file share a coordination attach count" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try tmpFilePath(testing.allocator, &tmp, "share.airdb");
     defer testing.allocator.free(path);
-    var a = try Db.create(testing.allocator, path);
+    var a = try Database.create(testing.allocator, path);
     defer a.deinit();
-    var b = try Db.open(testing.allocator, path);
+    var b = try Database.open(testing.allocator, path);
     defer b.deinit();
     try testing.expectEqual(@as(u32, 2), a.coord.attachCount());
 }
 
-test "a second Db instance sees a commit made by the first after refresh-on-read" {
+test "a second Database instance sees a commit made by the first after refresh-on-read" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try tmpFilePath(testing.allocator, &tmp, "vis.airdb");
     defer testing.allocator.free(path);
-    var a = try Db.create(testing.allocator, path);
+    var a = try Database.create(testing.allocator, path);
     defer a.deinit();
-    var b = try Db.open(testing.allocator, path);
+    var b = try Database.open(testing.allocator, path);
     defer b.deinit();
     {
         var w = try a.beginWrite();
@@ -458,9 +458,9 @@ test "a second writer is excluded while the first holds the write lock" {
     defer tmp.cleanup();
     const path = try tmpFilePath(testing.allocator, &tmp, "excl.airdb");
     defer testing.allocator.free(path);
-    var a = try Db.create(testing.allocator, path);
+    var a = try Database.create(testing.allocator, path);
     defer a.deinit();
-    var b = try Db.open(testing.allocator, path);
+    var b = try Database.open(testing.allocator, path);
     defer b.deinit();
     var wa = try a.beginWrite();
     try testing.expectError(error.WouldBlock, b.beginWriteTry());
@@ -472,26 +472,26 @@ test "a second writer is excluded while the first holds the write lock" {
     wb.deinit();
 }
 
-test "Db publishes its minimum pinned version to its participant slot" {
+test "Database publishes its minimum pinned version to its participant slot" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try tmpFilePath(testing.allocator, &tmp, "pub.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
     {
-        var w = try db.beginWrite();
+        var w = try database.beginWrite();
         const a = try w.alloc(8);
         @memcpy(a.bytes, "VERSION2");
         w.setRoot(a.ref);
         _ = try w.commit();
     }
     // No readers: this process publishes the sentinel (imposes no horizon constraint).
-    try testing.expectEqual(coord_mod.sentinel_max, db.coord.slotMinPinnedForTest(db.participant_slot.?));
-    var r = try db.beginRead(); // pins the current version
-    try testing.expectEqual(db.active_version, db.coord.slotMinPinnedForTest(db.participant_slot.?));
+    try testing.expectEqual(coord_mod.sentinel_max, database.coord.slotMinPinnedForTest(database.participant_slot.?));
+    var r = try database.beginRead(); // pins the current version
+    try testing.expectEqual(database.active_version, database.coord.slotMinPinnedForTest(database.participant_slot.?));
     r.end();
-    try testing.expectEqual(coord_mod.sentinel_max, db.coord.slotMinPinnedForTest(db.participant_slot.?));
+    try testing.expectEqual(coord_mod.sentinel_max, database.coord.slotMinPinnedForTest(database.participant_slot.?));
 }
 
 test "allocations beyond the initial mapping grow the file and data survives reopen" {
@@ -501,9 +501,9 @@ test "allocations beyond the initial mapping grow the file and data survives reo
     defer testing.allocator.free(path);
     var last_ref: Reference = 0;
     {
-        var db = try Db.create(testing.allocator, path);
-        defer db.deinit();
-        var w = try db.beginWrite();
+        var database = try Database.create(testing.allocator, path);
+        defer database.deinit();
+        var w = try database.beginWrite();
         var i: usize = 0;
         while (i < 400) : (i += 1) {
             const a = try w.alloc(4096);
@@ -512,12 +512,12 @@ test "allocations beyond the initial mapping grow the file and data survives reo
         }
         w.setRoot(last_ref);
         _ = try w.commit();
-        try testing.expect(db.store.map.len > 4096 * 256);
+        try testing.expect(database.store.map.len > 4096 * 256);
     }
     {
-        var db = try Db.open(testing.allocator, path);
-        defer db.deinit();
-        var r = try db.beginRead();
+        var database = try Database.open(testing.allocator, path);
+        defer database.deinit();
+        var r = try database.beginRead();
         const got = try r.deref(r.root(), 4096);
         try testing.expectEqual(@as(u8, @intCast(399 & 0xff)), got[0]);
         r.end();
@@ -529,38 +529,38 @@ test "observability: pinned version and storage size" {
     defer tmp.cleanup();
     const path = try tmpFilePath(testing.allocator, &tmp, "obs.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
 
     // First write+commit advances active_version.
     {
-        var w = try db.beginWrite();
+        var w = try database.beginWrite();
         const a = try w.alloc(8);
         @memcpy(a.bytes, "FIRST!!!");
         w.setRoot(a.ref);
         _ = try w.commit();
     }
     // No open reader: the oldest pinned version is the active version.
-    try testing.expectEqual(db.active_version, db.oldestPinnedVersion());
+    try testing.expectEqual(database.active_version, database.oldestPinnedVersion());
 
     // Hold a reader at the current version, then commit a newer version.
-    var r = try db.beginRead();
+    var r = try database.beginRead();
     {
-        var w = try db.beginWrite();
+        var w = try database.beginWrite();
         const b = try w.alloc(8);
         @memcpy(b.bytes, "SECOND!!");
         w.setRoot(b.ref);
         _ = try w.commit();
     }
     // The held reader pins the older version, below the new active version.
-    try testing.expect(db.oldestPinnedVersion() < db.active_version);
+    try testing.expect(database.oldestPinnedVersion() < database.active_version);
 
-    try testing.expectEqual(@as(u32, 1), db.attachedProcesses());
-    try testing.expect(db.logicalSize() > 0);
-    try testing.expect((try db.fileSize()) >= db.logicalSize());
+    try testing.expectEqual(@as(u32, 1), database.attachedProcesses());
+    try testing.expect(database.logicalSize() > 0);
+    try testing.expect((try database.fileSize()) >= database.logicalSize());
 
     r.end();
-    try testing.expectEqual(db.active_version, db.oldestPinnedVersion());
+    try testing.expectEqual(database.active_version, database.oldestPinnedVersion());
 }
 
 test "metrics report mapped length, versions, and reclaimable bytes" {
@@ -568,18 +568,18 @@ test "metrics report mapped length, versions, and reclaimable bytes" {
     defer tmp.cleanup();
     const path = try tmpFilePath(testing.allocator, &tmp, "metrics.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
     {
-        var w = try db.beginWrite();
+        var w = try database.beginWrite();
         const a = try w.alloc(8);
         @memcpy(a.bytes, "AAAAAAAA");
         w.setRoot(a.ref);
         _ = try w.commit();
     }
-    const old_root = db.active_root;
+    const old_root = database.active_root;
     {
-        var w = try db.beginWrite();
+        var w = try database.beginWrite();
         const b = try w.alloc(8);
         @memcpy(b.bytes, "BBBBBBBB");
         try w.free(old_root, 8);
@@ -587,12 +587,12 @@ test "metrics report mapped length, versions, and reclaimable bytes" {
         _ = try w.commit();
     }
 
-    const m = db.metrics();
+    const m = database.metrics();
     try testing.expect(m.mapped_len >= 4096 * 256);
-    try testing.expectEqual(db.active_version, m.latest_version);
+    try testing.expectEqual(database.active_version, m.latest_version);
     try testing.expect(m.free_extent_count >= 1);
     try testing.expect(m.reclaimable_bytes >= 8);
-    try testing.expectEqual(db.active_version, m.oldest_pinned_version); // no readers
+    try testing.expectEqual(database.active_version, m.oldest_pinned_version); // no readers
     try testing.expect(!m.poisoned);
 }
 
@@ -604,14 +604,14 @@ test "version->root ring records committed versions" {
 
     const k: u64 = 5;
     {
-        var db = try Db.create(testing.allocator, path);
-        defer db.deinit();
+        var database = try Database.create(testing.allocator, path);
+        defer database.deinit();
         // Version 1 (the initial slot) was never written into the ring.
-        try testing.expectEqual(@as(?u64, null), db.versionRoot(1));
+        try testing.expectEqual(@as(?u64, null), database.versionRoot(1));
 
         var i: u64 = 0;
         while (i < k) : (i += 1) {
-            var w = try db.beginWrite();
+            var w = try database.beginWrite();
             const a = try w.alloc(8);
             @memcpy(a.bytes, "RINGDATA");
             w.setRoot(a.ref);
@@ -620,22 +620,22 @@ test "version->root ring records committed versions" {
 
         // Each committed version (2..active_version) maps to a non-zero root.
         var v: u64 = 2;
-        while (v <= db.active_version) : (v += 1) {
-            const r = db.versionRoot(v) orelse return error.TestUnexpectedNull;
+        while (v <= database.active_version) : (v += 1) {
+            const r = database.versionRoot(v) orelse return error.TestUnexpectedNull;
             try testing.expect(r != 0);
         }
         // A version that was never committed yet is null.
-        try testing.expectEqual(@as(?u64, null), db.versionRoot(db.active_version + 1));
+        try testing.expectEqual(@as(?u64, null), database.versionRoot(database.active_version + 1));
     }
 
     // The ring lives in the durable header page, so it survives reopen.
     {
-        var db = try Db.open(testing.allocator, path);
-        defer db.deinit();
-        try testing.expectEqual(@as(u64, 1 + k), db.active_version);
+        var database = try Database.open(testing.allocator, path);
+        defer database.deinit();
+        try testing.expectEqual(@as(u64, 1 + k), database.active_version);
         var v: u64 = 2;
-        while (v <= db.active_version) : (v += 1) {
-            const r = db.versionRoot(v) orelse return error.TestUnexpectedNull;
+        while (v <= database.active_version) : (v += 1) {
+            const r = database.versionRoot(v) orelse return error.TestUnexpectedNull;
             try testing.expect(r != 0);
         }
     }
@@ -647,34 +647,34 @@ test "ring wraps after capacity" {
     const path = try tmpFilePath(testing.allocator, &tmp, "ringwrap.airdb");
     defer testing.allocator.free(path);
 
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
 
     // Commit more than ring_capacity times so the ring wraps and evicts old entries.
     const total: u64 = @as(u64, ring_capacity) + 12;
     var i: u64 = 0;
     while (i < total) : (i += 1) {
-        var w = try db.beginWrite();
+        var w = try database.beginWrite();
         const a = try w.alloc(8);
         @memcpy(a.bytes, "WRAPDATA");
         w.setRoot(a.ref);
         _ = try w.commit();
     }
 
-    const newest = db.active_version; // 1 + total
+    const newest = database.active_version; // 1 + total
     const oldest_live = newest - @as(u64, ring_capacity) + 1;
 
     // The most recent ring_capacity versions are all present.
-    try testing.expectEqual(oldest_live, db.oldestRetainedVersion());
+    try testing.expectEqual(oldest_live, database.oldestRetainedVersion());
     var v: u64 = oldest_live;
     while (v <= newest) : (v += 1) {
-        const r = db.versionRoot(v) orelse return error.TestUnexpectedNull;
+        const r = database.versionRoot(v) orelse return error.TestUnexpectedNull;
         try testing.expect(r != 0);
     }
 
     // Versions older than the live window were evicted.
-    try testing.expectEqual(@as(?u64, null), db.versionRoot(oldest_live - 1));
-    try testing.expectEqual(@as(?u64, null), db.versionRoot(2));
+    try testing.expectEqual(@as(?u64, null), database.versionRoot(oldest_live - 1));
+    try testing.expectEqual(@as(?u64, null), database.versionRoot(2));
 }
 
 test "a failed refresh leaves version and free list untouched" {
@@ -687,7 +687,7 @@ test "a failed refresh leaves version and free list untouched" {
     const path = try tmpFilePath(testing.allocator, &tmp, "refresh_atomic.airdb");
     defer testing.allocator.free(path);
 
-    var a = try Db.create(testing.allocator, path);
+    var a = try Database.create(testing.allocator, path);
     defer a.deinit();
     {
         var w = try a.beginWrite();
@@ -697,7 +697,7 @@ test "a failed refresh leaves version and free list untouched" {
         _ = try w.commit();
     }
 
-    var b = try Db.open(testing.allocator, path);
+    var b = try Database.open(testing.allocator, path);
     defer b.deinit();
     const b_version = b.active_version;
     const b_fl_len = b.freeListLenForTest();
@@ -737,22 +737,22 @@ test "a retried commit's ring entry wins over the aborted duplicate" {
     // Flush sequence: create=2 flushes, first commit=2, so the second commit's
     // data barrier is flush #5.
     var fsync = FailingSyncer{ .fail_on = 5 };
-    var db = try Db.createWith(testing.allocator, path, fsync.any());
-    defer db.deinit();
-    db.setRetainVersions(std.math.maxInt(u64));
+    var database = try Database.createWith(testing.allocator, path, fsync.any());
+    defer database.deinit();
+    database.setRetainVersions(std.math.maxInt(u64));
 
     {
-        var w = try db.beginWrite();
+        var w = try database.beginWrite();
         const a = try w.alloc(8);
         @memcpy(a.bytes, "BASELINE");
         w.setRoot(a.ref);
         _ = try w.commit();
     }
-    const v_target = db.active_version + 1;
+    const v_target = database.active_version + 1;
 
     // Aborted attempt at v_target: the ring entry lands, the flush fails.
     {
-        var w = try db.beginWrite();
+        var w = try database.beginWrite();
         const a = try w.alloc(8);
         @memcpy(a.bytes, "ABORTED!");
         w.setRoot(a.ref);
@@ -761,7 +761,7 @@ test "a retried commit's ring entry wins over the aborted duplicate" {
 
     // Retry commits v_target for real with different data.
     {
-        var w = try db.beginWrite();
+        var w = try database.beginWrite();
         const a = try w.alloc(8);
         @memcpy(a.bytes, "REALDATA");
         w.setRoot(a.ref);
@@ -769,7 +769,7 @@ test "a retried commit's ring entry wins over the aborted duplicate" {
     }
 
     // The past-version read must resolve to the committed root.
-    var r = try db.beginReadAt(v_target);
+    var r = try database.beginReadAt(v_target);
     defer r.end();
     try testing.expectEqualStrings("REALDATA", try r.deref(r.root(), 8));
 }
@@ -780,29 +780,29 @@ test "beginReadAt opens a past version within the retention window" {
     defer tmp.cleanup();
     const path = try tmpFilePath(testing.allocator, &tmp, "pit.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    db.setRetainVersions(std.math.maxInt(u64)); // retain everything
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    database.setRetainVersions(std.math.maxInt(u64)); // retain everything
 
     // v_a: pk 1 ; v_b: + pk 2 ; v_c: + pk 3 (additive, so each version's live set differs)
     var va: u64 = undefined;
     var vb: u64 = undefined;
     var vc: u64 = undefined;
     {
-        var w = try db.beginWrite();
+        var w = try database.beginWrite();
         var cat = try catalog.create(&w, 2);
         cat = (try rows.insert(&w, cat, &.{ 1, 100 })).cat;
         w.setRoot(cat);
         va = try w.commit();
     }
     {
-        var w = try db.beginWrite();
+        var w = try database.beginWrite();
         const cat = (try rows.insert(&w, w.new_root, &.{ 2, 200 })).cat;
         w.setRoot(cat);
         vb = try w.commit();
     }
     {
-        var w = try db.beginWrite();
+        var w = try database.beginWrite();
         const cat = (try rows.insert(&w, w.new_root, &.{ 3, 300 })).cat;
         w.setRoot(cat);
         vc = try w.commit();
@@ -811,7 +811,7 @@ test "beginReadAt opens a past version within the retention window" {
     var out: [2]u64 = undefined;
     // Past snapshot at v_a: only pk 1 exists.
     {
-        var r = try db.beginReadAt(va);
+        var r = try database.beginReadAt(va);
         defer r.end();
         try testing.expectEqual(@as(u64, 1), try compaction.liveCount(&r, r.root()));
         try testing.expect((try rows.getByPk(&r, r.root(), 1, &out)) != null);
@@ -819,18 +819,18 @@ test "beginReadAt opens a past version within the retention window" {
     }
     // Past snapshot at v_b: pk 1 and 2.
     {
-        var r = try db.beginReadAt(vb);
+        var r = try database.beginReadAt(vb);
         defer r.end();
         try testing.expectEqual(@as(u64, 2), try compaction.liveCount(&r, r.root()));
     }
     // Latest: all three.
     {
-        var r = try db.beginRead();
+        var r = try database.beginRead();
         defer r.end();
         try testing.expectEqual(@as(u64, 3), try compaction.liveCount(&r, r.root()));
     }
     // A future version is unavailable.
-    try testing.expectError(error.VersionUnavailable, db.beginReadAt(vc + 5));
+    try testing.expectError(error.VersionUnavailable, database.beginReadAt(vc + 5));
 }
 
 test "the retention window is shared across instances and survives reopen" {
@@ -839,9 +839,9 @@ test "the retention window is shared across instances and survives reopen" {
     const path = try tmpFilePath(testing.allocator, &tmp, "retain_shared.airdb");
     defer testing.allocator.free(path);
     {
-        var a = try Db.create(testing.allocator, path);
+        var a = try Database.create(testing.allocator, path);
         defer a.deinit();
-        var b = try Db.open(testing.allocator, path);
+        var b = try Database.open(testing.allocator, path);
         defer b.deinit();
         // A raises the floor; B sees it immediately through the shared mapping.
         a.setRetainVersions(100);
@@ -854,9 +854,9 @@ test "the retention window is shared across instances and survives reopen" {
         _ = try w.commit();
     }
     {
-        var db = try Db.open(testing.allocator, path);
-        defer db.deinit();
-        try testing.expectEqual(@as(u64, 100), db.retainVersions());
+        var database = try Database.open(testing.allocator, path);
+        defer database.deinit();
+        try testing.expectEqual(@as(u64, 100), database.retainVersions());
     }
 }
 
@@ -865,9 +865,9 @@ test "a writer honors a retention floor raised by another instance" {
     defer tmp.cleanup();
     const path = try tmpFilePath(testing.allocator, &tmp, "retain_writer.airdb");
     defer testing.allocator.free(path);
-    var a = try Db.create(testing.allocator, path);
+    var a = try Database.create(testing.allocator, path);
     defer a.deinit();
-    var b = try Db.open(testing.allocator, path);
+    var b = try Database.open(testing.allocator, path);
     defer b.deinit();
     // Instance a (the "reader" side) demands full retention; b never called
     // setRetainVersions and would previously reuse freed space immediately.
@@ -906,26 +906,26 @@ test "beginReadAt rejects a version aged out of the retention window" {
     defer tmp.cleanup();
     const path = try tmpFilePath(testing.allocator, &tmp, "pit2.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
     // retain_versions defaults to 0: only the active version is readable.
     var va: u64 = undefined;
     {
-        var w = try db.beginWrite();
+        var w = try database.beginWrite();
         var cat = try catalog.create(&w, 2);
         cat = (try rows.insert(&w, cat, &.{ 1, 100 })).cat;
         w.setRoot(cat);
         va = try w.commit();
     }
     {
-        var w = try db.beginWrite();
+        var w = try database.beginWrite();
         const cat = (try rows.insert(&w, w.new_root, &.{ 2, 200 })).cat;
         w.setRoot(cat);
         _ = try w.commit();
     }
     // v_a is older than active - retain_versions(0) -> aged out.
-    try testing.expectError(error.VersionUnavailable, db.beginReadAt(va));
-    try testing.expect(db.oldestReadableVersion() == db.active_version);
+    try testing.expectError(error.VersionUnavailable, database.beginReadAt(va));
+    try testing.expect(database.oldestReadableVersion() == database.active_version);
 }
 
 // Churn a single int-pk type at `path` with a steady live set: seed `live`
@@ -935,14 +935,14 @@ test "beginReadAt rejects a version aged out of the retention window" {
 // caller drives maybeCompactStep after each iteration until the type is packed.
 // Returns the final next_row (physical row high-water) and live count.
 fn churnNetZero(path: []const u8, live: u64, iters: u64, auto: bool) !struct { next_row: u64, live: u64 } {
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    db.auto_compact = auto;
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    database.auto_compact = auto;
     const tid: u16 = 0;
 
     // Single type: int pk + one int prop.
     {
-        var w = try db.beginWrite();
+        var w = try database.beginWrite();
         const dir = try typedir.createTypes(&w, &.{&.{ .{ .kind = .int }, .{ .kind = .int } }}, &.{false});
         w.setRoot(dir);
         _ = try w.commit();
@@ -951,8 +951,8 @@ fn churnNetZero(path: []const u8, live: u64, iters: u64, auto: bool) !struct { n
     // Seed the live set (pks [0, live)).
     var hi: u64 = 0;
     {
-        var w = try db.beginWrite();
-        var dir = db.active_root;
+        var w = try database.beginWrite();
+        var dir = database.active_root;
         while (hi < live) : (hi += 1) {
             dir = (try typeRouting.insert(&w, dir, tid, &.{ .{ .int = hi }, .{ .int = hi } })).dir;
         }
@@ -964,8 +964,8 @@ fn churnNetZero(path: []const u8, live: u64, iters: u64, auto: bool) !struct { n
     var iter: u64 = 0;
     while (iter < iters) : (iter += 1) {
         {
-            var w = try db.beginWrite();
-            var dir = db.active_root;
+            var w = try database.beginWrite();
+            var dir = database.active_root;
             // Insert `live` fresh rows.
             var k: u64 = 0;
             while (k < live) : (k += 1) {
@@ -987,15 +987,15 @@ fn churnNetZero(path: []const u8, live: u64, iters: u64, auto: bool) !struct { n
             _ = try w.commit();
         }
         // Opt-in: drive the incremental step loop so the type stays packed.
-        if (db.auto_compact) {
+        if (database.auto_compact) {
             while (true) {
-                const res = try maintenance.maybeCompactStep(&db, tid, 4);
+                const res = try maintenance.maybeCompactStep(&database, tid, 4);
                 if (!res.ran or res.done) break;
             }
         }
     }
 
-    var r = try db.beginRead();
+    var r = try database.beginRead();
     defer r.end();
     const cat = try typedir.catalogRef(&r, r.root(), tid);
     return .{
@@ -1018,23 +1018,23 @@ test "a failed commit-point flush poisons the instance until reopen" {
     // HEADER flush (the commit point) is #4.
     var fsync = FailingSyncer{ .fail_on = 4 };
     {
-        var db = try Db.createWith(testing.allocator, path, fsync.any());
-        defer db.deinit();
+        var database = try Database.createWith(testing.allocator, path, fsync.any());
+        defer database.deinit();
         {
-            var w = try db.beginWrite();
+            var w = try database.beginWrite();
             errdefer w.deinit();
             const a = try w.alloc(8);
             @memcpy(a.bytes, "POISON!!");
             w.setRoot(a.ref);
             try testing.expectError(error.Durability, w.commit());
         }
-        try testing.expectError(error.CommitIndeterminate, db.beginWrite());
-        try testing.expect(db.metrics().poisoned);
+        try testing.expectError(error.CommitIndeterminate, database.beginWrite());
+        try testing.expect(database.metrics().poisoned);
     }
     // Reopen resolves the header and writes flow again.
-    var db = try Db.open(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.open(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     const a = try w.alloc(8);
     @memcpy(a.bytes, "RESOLVED");
     w.setRoot(a.ref);
@@ -1056,18 +1056,18 @@ test "a failed commit inside maybeCompactStep neither crashes nor wedges the wri
     // Flushes: create = 2, type commit = 2, churn commit = 2 -> the compact
     // step's data barrier is flush #7.
     var fsync = FailingSyncer{ .fail_on = 7 };
-    var db = try Db.createWith(testing.allocator, path, fsync.any());
-    defer db.deinit();
+    var database = try Database.createWith(testing.allocator, path, fsync.any());
+    defer database.deinit();
     const tid: u16 = 0;
     {
-        var w = try db.beginWrite();
+        var w = try database.beginWrite();
         const dir = try typedir.createTypes(&w, &.{&.{ .{ .kind = .int }, .{ .kind = .int } }}, &.{false});
         w.setRoot(dir);
         _ = try w.commit();
     }
     {
-        var w = try db.beginWrite();
-        var dir = db.active_root;
+        var w = try database.beginWrite();
+        var dir = database.active_root;
         var pk: u64 = 0;
         while (pk < 10) : (pk += 1) dir = (try typeRouting.insert(&w, dir, tid, &.{ .{ .int = pk }, .{ .int = pk } })).dir;
         var out: [2]catalog.Value = undefined;
@@ -1084,12 +1084,12 @@ test "a failed commit inside maybeCompactStep neither crashes nor wedges the wri
     }
 
     // The compaction step's commit fails its data barrier.
-    try testing.expectError(error.Durability, maintenance.maybeCompactStep(&db, tid, 100));
+    try testing.expectError(error.Durability, maintenance.maybeCompactStep(&database, tid, 100));
 
     // The write lock must be free and the data intact.
-    var w = try db.beginWriteTry();
+    var w = try database.beginWriteTry();
     w.deinit();
-    var r = try db.beginRead();
+    var r = try database.beginRead();
     defer r.end();
     try testing.expectEqual(@as(u64, 2), try typeRouting.liveCount(&r, r.root(), tid));
 }
@@ -1103,13 +1103,13 @@ test "the compaction cursor never resumes across types" {
     defer tmp.cleanup();
     const path = try tmpFilePath(testing.allocator, &tmp, "cursor_types.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
 
     // Two identically shaped types with identical churn: both end with
     // live=4, next_row=12 and dead tails.
     {
-        var w = try db.beginWrite();
+        var w = try database.beginWrite();
         const dir = try typedir.createTypes(&w, &.{
             &.{ .{ .kind = .int }, .{ .kind = .int } },
             &.{ .{ .kind = .int }, .{ .kind = .int } },
@@ -1118,8 +1118,8 @@ test "the compaction cursor never resumes across types" {
         _ = try w.commit();
     }
     {
-        var w = try db.beginWrite();
-        var dir = db.active_root;
+        var w = try database.beginWrite();
+        var dir = database.active_root;
         var t: u16 = 0;
         while (t < 2) : (t += 1) {
             var pk: u64 = 0;
@@ -1139,18 +1139,18 @@ test "the compaction cursor never resumes across types" {
     }
 
     // Partial step on type 0 persists a cursor; type 1 must NOT resume it.
-    _ = try maintenance.maybeCompactStep(&db, 0, 1);
+    _ = try maintenance.maybeCompactStep(&database, 0, 1);
     while (true) {
-        const res = try maintenance.maybeCompactStep(&db, 1, 2);
+        const res = try maintenance.maybeCompactStep(&database, 1, 2);
         if (!res.ran or res.done) break;
     }
     while (true) {
-        const res = try maintenance.maybeCompactStep(&db, 0, 2);
+        const res = try maintenance.maybeCompactStep(&database, 0, 2);
         if (!res.ran or res.done) break;
     }
 
     // Every surviving row of both types is intact and both are fully packed.
-    var r = try db.beginRead();
+    var r = try database.beginRead();
     defer r.end();
     var t: u16 = 0;
     while (t < 2) : (t += 1) {
@@ -1172,32 +1172,32 @@ test "a corrupt persisted free-list extent fails open instead of poisoning reuse
     defer testing.allocator.free(path);
     var node_ref: Reference = 0;
     {
-        var db = try Db.create(testing.allocator, path);
-        defer db.deinit();
+        var database = try Database.create(testing.allocator, path);
+        defer database.deinit();
         {
-            var w = try db.beginWrite();
+            var w = try database.beginWrite();
             const a = try w.alloc(8);
             @memcpy(a.bytes, "AAAAAAAA");
             w.setRoot(a.ref);
             _ = try w.commit();
         }
-        const old_root = db.active_root;
+        const old_root = database.active_root;
         {
-            var w = try db.beginWrite();
+            var w = try database.beginWrite();
             const b = try w.alloc(8);
             @memcpy(b.bytes, "BBBBBBBB");
             try w.free(old_root, 8);
             w.setRoot(b.ref);
             _ = try w.commit();
         }
-        node_ref = db.free_list_node_ref;
+        node_ref = database.free_list_node_ref;
         try testing.expect(node_ref != 0);
         // Corrupt the first extent's offset into something misaligned.
         const off: usize = @intCast(node_ref);
-        std.mem.writeInt(u64, db.store.map[off + 12 ..][0..8], 12345, .little); // % 8 != 0
-        try db.store.syncer.flush(db.store.file);
+        std.mem.writeInt(u64, database.store.map[off + 12 ..][0..8], 12345, .little); // % 8 != 0
+        try database.store.syncer.flush(database.store.file);
     }
-    try testing.expectError(error.Corrupt, Db.open(testing.allocator, path));
+    try testing.expectError(error.Corrupt, Database.open(testing.allocator, path));
 }
 
 test "maybeCompactStep bounds dead rows under churn" {
@@ -1224,12 +1224,12 @@ test "maybeCompactStep is a no-op when nothing to compact" {
     defer tmp.cleanup();
     const path = try tmpFilePath(testing.allocator, &tmp, "nocompact.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
 
     const tid: u16 = 0;
     {
-        var w = try db.beginWrite();
+        var w = try database.beginWrite();
         var dir = try typedir.createTypes(&w, &.{&.{ .{ .kind = .int }, .{ .kind = .int } }}, &.{false});
         var pk: u64 = 0;
         while (pk < 3) : (pk += 1) {
@@ -1239,13 +1239,13 @@ test "maybeCompactStep is a no-op when nothing to compact" {
         _ = try w.commit();
     }
 
-    const res = try maintenance.maybeCompactStep(&db, tid, 4);
+    const res = try maintenance.maybeCompactStep(&database, tid, 4);
     try testing.expect(!res.ran);
     try testing.expectEqual(@as(usize, 0), res.moved);
     try testing.expect(!res.done);
 
     // The type is untouched: all three rows remain live and packed.
-    var r = try db.beginRead();
+    var r = try database.beginRead();
     defer r.end();
     const cat = try typedir.catalogRef(&r, r.root(), tid);
     try testing.expectEqual(@as(u64, 3), try compaction.liveCount(&r, cat));
@@ -1263,14 +1263,14 @@ test "a free list spanning multiple chunks survives commit and reopen" {
     defer tmp.cleanup();
     const path = try tmpFilePath(testing.allocator, &tmp, "flchain.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    errdefer db.deinit();
+    var database = try Database.create(testing.allocator, path);
+    errdefer database.deinit();
 
     const n_extents = FreeList.chunk_extent_cap + 500;
     const refs = try testing.allocator.alloc(u64, n_extents);
     defer testing.allocator.free(refs);
     {
-        var w = try db.beginWrite();
+        var w = try database.beginWrite();
         for (refs) |*r| r.* = (try w.alloc(8)).ref;
         const root = try w.alloc(8);
         @memcpy(root.bytes, "CHUNKED!");
@@ -1278,20 +1278,20 @@ test "a free list spanning multiple chunks survives commit and reopen" {
         _ = try w.commit();
     }
     {
-        var w = try db.beginWrite();
+        var w = try database.beginWrite();
         for (refs) |r| try w.free(r, 8);
         const root = try w.alloc(8);
         @memcpy(root.bytes, "CHUNKED2");
         w.setRoot(root.ref);
         _ = try w.commit();
     }
-    try testing.expect(db.freeListLenForTest() >= n_extents);
-    db.deinit();
+    try testing.expect(database.freeListLenForTest() >= n_extents);
+    database.deinit();
 
-    var db2 = try Db.open(testing.allocator, path);
-    defer db2.deinit();
-    try testing.expect(db2.freeListLenForTest() >= n_extents);
-    try verification.verifyIntegrity(&db2);
+    var database2 = try Database.open(testing.allocator, path);
+    defer database2.deinit();
+    try testing.expect(database2.freeListLenForTest() >= n_extents);
+    try verification.verifyIntegrity(&database2);
 }
 
 test "a free-list chain whose next ref points up-chain is rejected as corrupt" {
@@ -1306,30 +1306,30 @@ test "a free-list chain whose next ref points up-chain is rejected as corrupt" {
     defer testing.allocator.free(path);
     var node_ref: u64 = 0;
     {
-        var db = try Db.create(testing.allocator, path);
-        defer db.deinit();
+        var database = try Database.create(testing.allocator, path);
+        defer database.deinit();
         {
-            var w = try db.beginWrite();
+            var w = try database.beginWrite();
             const a = try w.alloc(8);
             @memcpy(a.bytes, "CYCLBASE");
             w.setRoot(a.ref);
             _ = try w.commit();
         }
-        const old_root = db.active_root;
+        const old_root = database.active_root;
         {
-            var w = try db.beginWrite();
+            var w = try database.beginWrite();
             const b = try w.alloc(8);
             @memcpy(b.bytes, "CYCLNEXT");
             try w.free(old_root, 8);
             w.setRoot(b.ref);
             _ = try w.commit();
         }
-        node_ref = db.free_list_node_ref;
+        node_ref = database.free_list_node_ref;
         try testing.expect(node_ref != 0);
         // Point the head chunk's next_ref at itself.
         const off: usize = @intCast(node_ref);
-        std.mem.writeInt(u64, db.store.map[off + 4 ..][0..8], node_ref, .little);
-        try db.store.syncer.flush(db.store.file);
+        std.mem.writeInt(u64, database.store.map[off + 4 ..][0..8], node_ref, .little);
+        try database.store.syncer.flush(database.store.file);
     }
-    try testing.expectError(error.Corrupt, Db.open(testing.allocator, path));
+    try testing.expectError(error.Corrupt, Database.open(testing.allocator, path));
 }

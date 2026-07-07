@@ -59,14 +59,14 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     defer harness.removeScratch(ctx.*, path);
 
     // --- Insert phase (setup only, not timed) --------------------------------
-    var db = try airdb.Db.create(alloc, path);
-    defer db.deinit();
+    var database = try airdb.Database.create(alloc, path);
+    defer database.deinit();
 
     // Two-int type: {pk, category}. Property 0 is the primary key, property 1
     // is the low-cardinality category, declared indexed so the equality query
     // is served by its value index rather than a full scan.
     var cat: Reference = blk: {
-        var w = try db.beginWrite();
+        var w = try database.beginWrite();
         const c = try catalog.createDefs(&w, &.{
             .{ .kind = .int },
             .{ .kind = .int, .indexed = true },
@@ -79,8 +79,8 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     var inserted: usize = 0;
     while (inserted < ctx.n) {
         const this_batch = @min(batch_size, ctx.n - inserted);
-        var w = try db.beginWrite();
-        cat = db.active_root; // reload the committed catalog ref
+        var w = try database.beginWrite();
+        cat = database.active_root; // reload the committed catalog ref
         var j: usize = 0;
         while (j < this_batch) : (j += 1) {
             const pk: u64 = inserted + j;
@@ -96,7 +96,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     var lat = harness.Latencies.init();
     defer lat.deinit(alloc);
 
-    var rd = try db.beginRead();
+    var rd = try database.beginRead();
     cat = rd.root();
 
     // Deterministic xorshift64 over a fixed seed; index = x % n keeps every
@@ -162,8 +162,8 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         .p50_ns = lat.pct(50),
         .p99_ns = lat.pct(99),
         .max_ns = lat.pct(100),
-        .file_bytes = try db.fileSize(),
-        .logical_bytes = db.logicalSize(),
+        .file_bytes = try database.fileSize(),
+        .logical_bytes = database.logicalSize(),
         .peak_rss_bytes = airdb.peakResidentBytes(),
         .note = note,
     };

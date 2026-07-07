@@ -198,7 +198,7 @@ pub fn nullifyInboundInCatalog(transaction: *WriteTransaction, cat: Reference, o
     var cur = cat;
     const v0 = try catalog.loadCatalog(transaction, cat);
     const pc = v0.prop_count;
-    const alloc = transaction.db.store.allocator;
+    const alloc = transaction.database.store.allocator;
     var p: usize = 0;
     while (p < pc) : (p += 1) {
         const kind = blk: {
@@ -291,7 +291,7 @@ pub fn cleanOutboundInCatalog(transaction: *WriteTransaction, cat: Reference, ok
     var cur = cat;
     const v0 = try catalog.loadCatalog(transaction, cat);
     const pc = v0.prop_count;
-    const alloc = transaction.db.store.allocator;
+    const alloc = transaction.database.store.allocator;
     var p: usize = 0;
     while (p < pc) : (p += 1) {
         const kind = blk: {

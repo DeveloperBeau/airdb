@@ -11,7 +11,7 @@ const removeProperty = migrations.removeProperty;
 
 const testing = std.testing;
 
-const Db = @import("../database.zig").Db;
+const Database = @import("../database.zig").Database;
 
 const create = catalog.create;
 
@@ -34,9 +34,9 @@ test "addProperty backfills the default for existing rows" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "mig1_backfill.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     // start with pk + one value
     var cat = try create(&w, 2);
     cat = (try insert(&w, cat, &.{ 1, 10 })).cat;
@@ -56,9 +56,9 @@ test "addProperty: new inserts supply the added property" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "mig1_newinsert.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     var cat = try create(&w, 2);
     cat = (try insert(&w, cat, &.{ 1, 10 })).cat;
     cat = (try insert(&w, cat, &.{ 2, 20 })).cat;
@@ -76,9 +76,9 @@ test "removeProperty drops a property and shifts the rest" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "mig1_remove.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     var cat = try create(&w, 2);
     cat = (try insert(&w, cat, &.{ 1, 10 })).cat;
     cat = try addProperty(&w, cat, .{ .kind = .int }, 7);
@@ -101,10 +101,10 @@ test "addProperty(indexed) backfills the value index for existing rows" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "mig_vidx.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
     {
-        var w = try db.beginWrite();
+        var w = try database.beginWrite();
         var cat = try create(&w, 2);
         cat = (try insert(&w, cat, &.{ 1, 10 })).cat;
         cat = (try insert(&w, cat, &.{ 2, 20 })).cat;
@@ -114,8 +114,8 @@ test "addProperty(indexed) backfills the value index for existing rows" {
         w.setRoot(cat);
         _ = try w.commit();
     }
-    try verification.verifyIntegrity(&db);
-    var r = try db.beginRead();
+    try verification.verifyIntegrity(&database);
+    var r = try database.beginRead();
     defer r.end();
     var hits = std.ArrayList(u64).empty;
     defer hits.deinit(testing.allocator);
@@ -137,10 +137,10 @@ test "addProperty(link_set) leaves pre-migration rows deletable" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "mig_collroot.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
     {
-        var w = try db.beginWrite();
+        var w = try database.beginWrite();
         var dir = try typedir.createTypes(&w, &.{&.{.{ .kind = .int }}}, &.{false});
         dir = (try typeRouting.insert(&w, dir, 0, &.{.{ .int = 1 }})).dir;
         // Migrate: add a link_set property targeting the same type.
@@ -150,9 +150,9 @@ test "addProperty(link_set) leaves pre-migration rows deletable" {
         w.setRoot(dir);
         _ = try w.commit();
     }
-    try verification.verifyIntegrity(&db); // the audit must not trip over the backfilled roots
+    try verification.verifyIntegrity(&database); // the audit must not trip over the backfilled roots
     {
-        var w = try db.beginWrite();
+        var w = try database.beginWrite();
         var out: [2]catalog.Value = undefined;
         const ver = (try typeRouting.get(&w, w.new_root, 0, 1, &out)).?;
         const res = try typeRouting.deleteNullifyX(&w, w.new_root, 0, 1, ver);
@@ -167,9 +167,9 @@ test "addProperty rejects an indexed collection" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "mig_idxcoll.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     defer w.deinit();
     const cat = try create(&w, 1);
     try testing.expectError(error.Unsupported, addProperty(&w, cat, .{ .kind = .list, .indexed = true }, 0));
@@ -180,9 +180,9 @@ test "addProperty link type gets a backlink index" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "mig2.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     var cat = try create(&w, 1); // just a pk
     cat = (try insert(&w, cat, &.{1})).cat;
     cat = try addProperty(&w, cat, .{ .kind = .link }, 0); // 0 == null link
@@ -203,11 +203,11 @@ test "addProperty copies a blob default per row instead of sharing one node" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "blobdefault.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
 
     {
-        var w = try db.beginWrite();
+        var w = try database.beginWrite();
         var cat = try catalog.createTyped(&w, &.{ .int, .int });
         cat = (try insert(&w, cat, &.{ 1, 10 })).cat;
         cat = (try insert(&w, cat, &.{ 2, 20 })).cat;
@@ -216,7 +216,7 @@ test "addProperty copies a blob default per row instead of sharing one node" {
         w.setRoot(cat);
         _ = try w.commit();
     }
-    var w = try db.beginWrite();
+    var w = try database.beginWrite();
     defer w.deinit();
     // Every row reads the default bytes, but from its OWN node.
     var raw1: [3]u64 = undefined;

@@ -10,8 +10,8 @@ Code pointers use `module.function` names under `src/`.
 - Full durability barrier per commit: `F_FULLFSYNC` on Apple platforms (drive
   write cache included), `fsync` elsewhere (`syncer.FileSyncer`).
 - Crash recovery follows the committed slot pointer, with CRC fallback to the
-  previous version surfaced via `Db.metrics().recovered_fallback`.
-- `Db.verifyIntegrity`: header/slot/root/free-list validation plus
+  previous version surfaced via `Database.metrics().recovered_fallback`.
+- `Database.verifyIntegrity`: header/slot/root/free-list validation plus
   bidirectional audits of every value index and backlink index.
 - Corrupt input is an error, never a crash: parsers validate counts and enum
   bytes, tree walks are depth-capped against ref cycles, and every read passes
@@ -20,8 +20,8 @@ Code pointers use `module.function` names under `src/`.
 ## Transactions
 
 - Single writer (cross-process lock), many readers, no blocking between them.
-- `Db.beginRead` — snapshot at the latest version; `ReadTransaction.end` unpins.
-- `Db.beginWrite` / `beginWriteTry` — exclusive write transaction; `commit`
+- `Database.beginRead` — snapshot at the latest version; `ReadTransaction.end` unpins.
+- `Database.beginWrite` / `beginWriteTry` — exclusive write transaction; `commit`
   is the durable point, `deinit` aborts and rolls back the bump allocator so
   aborted work costs no file space.
 - Optimistic per-row versioning: `update`/`delete` take an expected version
@@ -29,9 +29,9 @@ Code pointers use `module.function` names under `src/`.
 
 ## Point-in-time reads
 
-- `Db.beginReadAt(version)` opens a committed past version (bounded by the
+- `Database.beginReadAt(version)` opens a committed past version (bounded by the
   128-version ring and the retention window).
-- `Db.setRetainVersions(n)` — shared, persisted retention floor honored by
+- `Database.setRetainVersions(n)` — shared, persisted retention floor honored by
   writers in every attached process.
 - `oldestReadableVersion` / `oldestRetainedVersion` report the readable range.
 
@@ -78,7 +78,7 @@ Code pointers use `module.function` names under `src/`.
 
 ## Compaction
 
-- `Db.maybeCompactStep(type_id, budget)` — incremental, budget-proportional
+- `Database.maybeCompactStep(type_id, budget)` — incremental, budget-proportional
   packing with a resumable cursor and a proof-gated tail truncation.
 - `compaction.compactInPlace(path)` — full-file shrink with a
   verify-before-swap equivalence gate and atomic rename publish.
@@ -89,7 +89,7 @@ Code pointers use `module.function` names under `src/`.
 - Reader pins published per process; the space-reclaim horizon respects every
   live reader, with pid+incarnation liveness so recycled pids can't pin the
   horizon.
-- `Db.attachedProcesses`, `Db.metrics()` for observability.
+- `Database.attachedProcesses`, `Database.metrics()` for observability.
 
 ## C ABI (`include/airdb.h`)
 

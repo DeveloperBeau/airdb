@@ -1,7 +1,7 @@
 const std = @import("std");
 const objects = @import("objects.zig");
 const rows = @import("rows.zig");
-const Db = @import("../database.zig").Db;
+const Database = @import("../database.zig").Database;
 const Reference = @import("../storage/reference.zig").Reference;
 const catalog = @import("../schema/catalog.zig");
 const collections = @import("collections.zig");
@@ -42,9 +42,9 @@ test "insert appends a row" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "obj2_append.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     var cat = try create(&w, 3);
     const r1 = try insert(&w, cat, &.{ 100, 7, 1 });
     cat = r1.cat;
@@ -59,9 +59,9 @@ test "insert rejects a duplicate primary key" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "obj2_dup.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     var cat = try create(&w, 3);
     cat = (try insert(&w, cat, &.{ 100, 7, 1 })).cat;
     try testing.expectError(error.DuplicateKey, insert(&w, cat, &.{ 100, 9, 1 }));
@@ -73,9 +73,9 @@ test "getByPk reads property values and the row version" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "obj3.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     var cat = try create(&w, 3);
     cat = (try insert(&w, cat, &.{ 100, 7, 1 })).cat;
     cat = (try insert(&w, cat, &.{ 200, 8, 0 })).cat;
@@ -95,25 +95,25 @@ test "update applies on a matching version" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "obj4_apply.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
     var cat: Reference = undefined;
     var fetched_version: u64 = undefined;
     {
-        var w = try db.beginWrite();
+        var w = try database.beginWrite();
         cat = try create(&w, 3);
         cat = (try insert(&w, cat, &.{ 100, 7, 1 })).cat;
         w.setRoot(cat);
         _ = try w.commit();
     }
     {
-        var r = try db.beginRead();
+        var r = try database.beginRead();
         var out: [3]u64 = undefined;
         fetched_version = (try getByPk(&r, r.root(), 100, &out)).?;
         r.end();
     }
     {
-        var w = try db.beginWrite();
+        var w = try database.beginWrite();
         const res = try update(&w, w.new_root, 100, &.{ 100, 77, 1 }, fetched_version);
         try testing.expect(res == .ok);
         cat = res.ok.cat;
@@ -121,7 +121,7 @@ test "update applies on a matching version" {
         _ = try w.commit();
     }
     {
-        var r = try db.beginRead();
+        var r = try database.beginRead();
         var out: [3]u64 = undefined;
         _ = try getByPk(&r, r.root(), 100, &out);
         try testing.expectEqual(@as(u64, 77), out[1]);
@@ -134,9 +134,9 @@ test "update copies only the columns whose value changed" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "obj4_diff.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     var cat = try create(&w, 3);
     cat = (try insert(&w, cat, &.{ 1, 10, 20 })).cat;
 
@@ -168,25 +168,25 @@ test "update conflicts on a stale version" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "obj4_conflict.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
     var cat: Reference = undefined;
     var fetched_version: u64 = undefined;
     {
-        var w = try db.beginWrite();
+        var w = try database.beginWrite();
         cat = try create(&w, 3);
         cat = (try insert(&w, cat, &.{ 100, 7, 1 })).cat;
         w.setRoot(cat);
         _ = try w.commit();
     }
     {
-        var r = try db.beginRead();
+        var r = try database.beginRead();
         var out: [3]u64 = undefined;
         fetched_version = (try getByPk(&r, r.root(), 100, &out)).?;
         r.end();
     }
     {
-        var w = try db.beginWrite();
+        var w = try database.beginWrite();
         const res = try update(&w, w.new_root, 100, &.{ 100, 77, 1 }, fetched_version);
         try testing.expect(res == .ok);
         cat = res.ok.cat;
@@ -201,9 +201,9 @@ test "delete conflicts on a stale version" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "obj5_conflict.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     var cat = try create(&w, 3);
     cat = (try insert(&w, cat, &.{ 100, 7, 1 })).cat;
     cat = (try insert(&w, cat, &.{ 200, 8, 0 })).cat;
@@ -219,9 +219,9 @@ test "delete tombstones a row" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "obj5_tombstone.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     var cat = try create(&w, 3);
     cat = (try insert(&w, cat, &.{ 100, 7, 1 })).cat;
     cat = (try insert(&w, cat, &.{ 200, 8, 0 })).cat;
@@ -240,9 +240,9 @@ test "a deleted primary key can be reinserted" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "obj5_reinsert.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     var cat = try create(&w, 3);
     cat = (try insert(&w, cat, &.{ 100, 7, 1 })).cat;
     cat = (try insert(&w, cat, &.{ 200, 8, 0 })).cat;
@@ -261,9 +261,9 @@ test "objects persist across commit and reopen" {
     const path = try objTmpPath(testing.allocator, &tmp, "obj6.airdb");
     defer testing.allocator.free(path);
     {
-        var db = try Db.create(testing.allocator, path);
-        defer db.deinit();
-        var w = try db.beginWrite();
+        var database = try Database.create(testing.allocator, path);
+        defer database.deinit();
+        var w = try database.beginWrite();
         var cat = try create(&w, 2); // pk + one value
         var i: u64 = 0;
         while (i < 1000) : (i += 1) cat = (try insert(&w, cat, &.{ i, i * 2 })).cat;
@@ -271,9 +271,9 @@ test "objects persist across commit and reopen" {
         _ = try w.commit();
     }
     {
-        var db = try Db.open(testing.allocator, path);
-        defer db.deinit();
-        var r = try db.beginRead();
+        var database = try Database.open(testing.allocator, path);
+        defer database.deinit();
+        var r = try database.beginRead();
         try testing.expectEqual(@as(u64, 1000), try liveCount(&r, r.root()));
         var out: [2]u64 = undefined;
         _ = (try getByPk(&r, r.root(), 777, &out)).?;
@@ -293,9 +293,9 @@ test "100k objects with updates and deletes match a reference map after reopen" 
     defer ref.deinit();
     const N: u64 = 100_000;
     {
-        var db = try Db.create(testing.allocator, path);
-        defer db.deinit();
-        var w = try db.beginWrite();
+        var database = try Database.create(testing.allocator, path);
+        defer database.deinit();
+        var w = try database.beginWrite();
         var cat = try create(&w, 2);
         var out: [2]u64 = undefined;
         var i: u64 = 0;
@@ -326,9 +326,9 @@ test "100k objects with updates and deletes match a reference map after reopen" 
         _ = try w.commit();
     }
     {
-        var db = try Db.open(testing.allocator, path);
-        defer db.deinit();
-        var r = try db.beginRead();
+        var database = try Database.open(testing.allocator, path);
+        defer database.deinit();
+        var r = try database.beginRead();
         try testing.expectEqual(@as(u64, ref.count()), try liveCount(&r, r.root()));
         var out: [2]u64 = undefined;
         var it = ref.iterator();
@@ -346,9 +346,9 @@ test "typed insert and get round-trip a string property" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "str1.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     var cat = try createTyped(&w, &.{ .int, .blob, .int });
     cat = (try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .bytes = "Ada" }, .{ .int = 30 } })).cat;
     cat = (try insertTyped(&w, cat, &.{ .{ .int = 2 }, .{ .bytes = "Linus" }, .{ .int = 54 } })).cat;
@@ -366,9 +366,9 @@ test "typed update on a stale version does not free the old blob" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "str2_stale.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     var cat = try createTyped(&w, &.{ .int, .blob });
     cat = (try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .bytes = "short" } })).cat;
     var out: [2]Value = undefined;
@@ -386,9 +386,9 @@ test "typed update replaces a string" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "str2_replace.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     var cat = try createTyped(&w, &.{ .int, .blob });
     cat = (try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .bytes = "short" } })).cat;
     var out: [2]Value = undefined;
@@ -405,9 +405,9 @@ test "typed delete removes the row" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "str2_delete.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     var cat = try createTyped(&w, &.{ .int, .blob });
     cat = (try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .bytes = "short" } })).cat;
     var out: [2]Value = undefined;
@@ -424,9 +424,9 @@ test "strings persist across reopen" {
     const path = try objTmpPath(testing.allocator, &tmp, "str3.airdb");
     defer testing.allocator.free(path);
     {
-        var db = try Db.create(testing.allocator, path);
-        defer db.deinit();
-        var w = try db.beginWrite();
+        var database = try Database.create(testing.allocator, path);
+        defer database.deinit();
+        var w = try database.beginWrite();
         var cat = try createTyped(&w, &.{ .int, .blob });
         var i: u64 = 0;
         var buf: [32]u8 = undefined;
@@ -438,9 +438,9 @@ test "strings persist across reopen" {
         _ = try w.commit();
     }
     {
-        var db = try Db.open(testing.allocator, path);
-        defer db.deinit();
-        var r = try db.beginRead();
+        var database = try Database.open(testing.allocator, path);
+        defer database.deinit();
+        var r = try database.beginRead();
         var out: [2]Value = undefined;
         _ = (try getTyped(&r, r.root(), 321, &out)).?;
         try testing.expectEqualStrings("name-321", out[1].bytes);
@@ -453,9 +453,9 @@ test "a large blob property decodes to a ref and materializes; small stays inlin
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "bigblob.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     var cat = try createTyped(&w, &.{ .int, .blob });
 
     // A blob well past the inline cap (section_size is 16 MiB) forces chunking.
@@ -493,9 +493,9 @@ test "getByObjectKey reads a row by its stable object key" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "okey.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     var cat = try create(&w, 2);
     const r0 = try insert(&w, cat, &.{ 100, 7 });
     cat = r0.cat;
@@ -519,9 +519,9 @@ test "getByObjectKey resolves through the key-to-row index" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "okey_index.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     var cat = try create(&w, 2);
     const r0 = try insert(&w, cat, &.{ 100, 7 });
     cat = r0.cat;
@@ -580,9 +580,9 @@ test "value index tracks inserts" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "vidx_insert.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .int, .indexed = true } });
     const o0 = try insert(&w, cat, &.{ 1, 10 });
     cat = o0.cat;
@@ -603,9 +603,9 @@ test "value index tracks updates" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "vidx_update.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .int, .indexed = true } });
     const o0 = try insert(&w, cat, &.{ 1, 10 });
     cat = o0.cat;
@@ -630,9 +630,9 @@ test "value index tracks deletes" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "vidx_delete.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .int, .indexed = true } });
     const o0 = try insert(&w, cat, &.{ 1, 10 });
     cat = o0.cat;
@@ -658,9 +658,9 @@ test "updateTyped carries collection properties through unchanged" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "utyped_coll.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     defer w.deinit();
     var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .int }, .{ .kind = .list, .elem = .int } });
     cat = (try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .int = 10 }, .{ .list_int = &.{ 7, 8, 9 } } })).cat;
@@ -684,12 +684,12 @@ test "deleteTyped frees the row's collection storage" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "del_coll_free.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
 
     // Commit a row carrying every collection kind so its trees are committed.
     {
-        var w = try db.beginWrite();
+        var w = try database.beginWrite();
         var cat = try catalog.createDefs(&w, &.{
             .{ .kind = .int },
             .{ .kind = .list, .elem = .blob },
@@ -706,7 +706,7 @@ test "deleteTyped frees the row's collection storage" {
         _ = try w.commit();
     }
     // Deleting the row must record the collection trees as in-flight frees.
-    var w = try db.beginWrite();
+    var w = try database.beginWrite();
     defer w.deinit();
     var out: [4]Value = undefined;
     const ver = (try getTyped(&w, w.new_root, 1, &out)).?;
@@ -726,9 +726,9 @@ test "updateTyped moves backlinks when a link value changes" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "utyped_link.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     defer w.deinit();
     var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
     const a = try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .link = null } });
@@ -764,9 +764,9 @@ test "a multi-leaf value-index set is pruned and freed when emptied" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "vidx_prune_big.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     defer w.deinit();
     var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .int, .indexed = true } });
     const n: u64 = 80;
@@ -788,9 +788,9 @@ test "an emptied value-index set is pruned from the outer index" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "vidx_prune.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     defer w.deinit();
     var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .int, .indexed = true } });
     cat = (try insert(&w, cat, &.{ 1, 10 })).cat;
@@ -813,9 +813,9 @@ test "non-indexed prop has no index" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "vidx_none.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .int } });
     const r0 = try insert(&w, cat, &.{ 1, 100 });
     cat = r0.cat;
@@ -835,9 +835,9 @@ test "reinserting a primary key after delete yields a new object key" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "okey_reinsert.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     var cat = try create(&w, 2);
     const first = try insert(&w, cat, &.{ 100, 7 });
     cat = first.cat;
@@ -871,11 +871,11 @@ test "deleteTyped frees a self-referencing link_set root exactly once" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "selfset.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
 
     {
-        var w = try db.beginWrite();
+        var w = try database.beginWrite();
         var cat = try catalog.createDefs(&w, &.{
             .{ .kind = .int },
             .{ .kind = .link_set },
@@ -886,7 +886,7 @@ test "deleteTyped frees a self-referencing link_set root exactly once" {
         w.setRoot(cat);
         _ = try w.commit();
     }
-    var w = try db.beginWrite();
+    var w = try database.beginWrite();
     defer w.deinit();
     var out: [2]Value = undefined;
     const ver = (try getTyped(&w, w.new_root, 1, &out)).?;

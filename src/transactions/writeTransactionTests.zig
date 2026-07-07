@@ -1,7 +1,7 @@
 const std = @import("std");
 const testing = std.testing;
 const Io = std.Io;
-const Db = @import("../database.zig").Db;
+const Database = @import("../database.zig").Database;
 const Reference = @import("../storage/reference.zig").Reference;
 
 const catalog = @import("../schema/catalog.zig");
@@ -19,12 +19,12 @@ fn tmpFilePath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const
 // then commits a delete, so every cycle frees committed nodes into the free pool.
 // Returns the final logical size (arena high-water).
 fn churnLogicalSize(path: []const u8, retain: u64, n: u64) !u64 {
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    db.setRetainVersions(retain);
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    database.setRetainVersions(retain);
 
     var cat: Reference = blk: {
-        var w = try db.beginWrite();
+        var w = try database.beginWrite();
         const c = try catalog.create(&w, 1);
         w.setRoot(c);
         _ = try w.commit();
@@ -34,16 +34,16 @@ fn churnLogicalSize(path: []const u8, retain: u64, n: u64) !u64 {
     var i: u64 = 0;
     while (i < n) : (i += 1) {
         {
-            var w = try db.beginWrite();
-            cat = db.active_root; // reload the committed catalog ref
+            var w = try database.beginWrite();
+            cat = database.active_root; // reload the committed catalog ref
             const r = try rows.insert(&w, cat, &.{i});
             cat = r.cat;
             w.setRoot(cat);
             _ = try w.commit();
         }
         {
-            var w = try db.beginWrite();
-            cat = db.active_root;
+            var w = try database.beginWrite();
+            cat = database.active_root;
             var out: [1]u64 = undefined;
             const ver = (try rows.getByPk(&w, cat, i, &out)).?;
             cat = switch (try rows.delete(&w, cat, i, ver)) {
@@ -54,7 +54,7 @@ fn churnLogicalSize(path: []const u8, retain: u64, n: u64) !u64 {
             _ = try w.commit();
         }
     }
-    return db.logicalSize();
+    return database.logicalSize();
 }
 
 test "steady-state batched inserts keep the free list bounded" {
@@ -67,10 +67,10 @@ test "steady-state batched inserts keep the free list bounded" {
     defer tmp.cleanup();
     const path = try tmpFilePath(testing.allocator, &tmp, "steadystate.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
     {
-        var w = try db.beginWrite();
+        var w = try database.beginWrite();
         const cat = try catalog.create(&w, 2);
         w.setRoot(cat);
         _ = try w.commit();
@@ -80,7 +80,7 @@ test "steady-state batched inserts keep the free list bounded" {
     var pk: u64 = 0;
     var batch: usize = 0;
     while (batch < batches) : (batch += 1) {
-        var w = try db.beginWrite();
+        var w = try database.beginWrite();
         var cat = w.new_root;
         var i: usize = 0;
         while (i < inserts_per_batch) : (i += 1) {
@@ -98,7 +98,7 @@ test "steady-state batched inserts keep the free list bounded" {
     // inserts_per_batch * batches, while the healthy working set stays under
     // one batch's width. Deriving the bound from the loop constant keeps the
     // assertion honest if someone retunes the batch size.
-    try testing.expect(db.freeListLenForTest() < inserts_per_batch);
+    try testing.expect(database.freeListLenForTest() < inserts_per_batch);
 }
 
 test "an abandoned transaction's bump allocations are rolled back" {
@@ -106,31 +106,31 @@ test "an abandoned transaction's bump allocations are rolled back" {
     defer tmp.cleanup();
     const path = try tmpFilePath(testing.allocator, &tmp, "abortspace.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
 
     // Commit a baseline so logical size is stable.
     {
-        var w = try db.beginWrite();
+        var w = try database.beginWrite();
         const a = try w.alloc(8);
         @memcpy(a.bytes, "BASELINE");
         w.setRoot(a.ref);
         _ = try w.commit();
     }
-    const size_before = db.logicalSize();
+    const size_before = database.logicalSize();
 
     // Abort a transaction that bump-allocated a lot.
     {
-        var w = try db.beginWrite();
+        var w = try database.beginWrite();
         var i: usize = 0;
         while (i < 200) : (i += 1) _ = try w.alloc(4096);
         w.deinit(); // abort
     }
-    try testing.expectEqual(size_before, db.logicalSize());
+    try testing.expectEqual(size_before, database.logicalSize());
 
     // The next commit must not durably absorb the aborted region either.
     {
-        var w = try db.beginWrite();
+        var w = try database.beginWrite();
         const a = try w.alloc(8);
         @memcpy(a.bytes, "AFTERAB_");
         w.setRoot(a.ref);
@@ -138,7 +138,7 @@ test "an abandoned transaction's bump allocations are rolled back" {
     }
     // One 8-byte node plus the free-list node: logical size grows by well under
     // the ~800 KiB the aborted transaction touched.
-    try testing.expect(db.logicalSize() - size_before < 4096);
+    try testing.expect(database.logicalSize() - size_before < 4096);
 }
 
 test "retention window withholds recently freed space from reuse" {
@@ -163,10 +163,10 @@ test "writableCopy allocates a new node, copies bytes, and records the old as fr
     defer tmp.cleanup();
     const path = try tmpFilePath(testing.allocator, &tmp, "cow.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
 
-    var w = try db.beginWrite();
+    var w = try database.beginWrite();
     const a = try w.alloc(8);
     @memcpy(a.bytes, "ORIGINAL");
     const copy = try w.writableCopy(a.ref, 8);
@@ -185,9 +185,9 @@ test "a node freed within a transaction is reused by the next allocation" {
     defer tmp.cleanup();
     const path = try tmpFilePath(testing.allocator, &tmp, "txnreuse.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     const a = try w.alloc(64);
     try w.free(a.ref, 64);
     const b = try w.alloc(64);
@@ -201,16 +201,16 @@ test "a committed node freed within a transaction is not reused mid-transaction"
     defer tmp.cleanup();
     const path = try tmpFilePath(testing.allocator, &tmp, "committedsafe.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
     { // commit a node so it belongs to a committed version
-        var w0 = try db.beginWrite();
+        var w0 = try database.beginWrite();
         const a = try w0.alloc(64);
         w0.setRoot(a.ref);
         _ = try w0.commit();
     }
-    const committed_ref = db.active_root;
-    var w = try db.beginWrite();
+    const committed_ref = database.active_root;
+    var w = try database.beginWrite();
     try w.free(committed_ref, 64); // committed node -> deferred reclaim, NOT transaction-private
     const b = try w.alloc(64);
     // A committed node a reader might still pin must not be reused within this transaction.
@@ -225,18 +225,18 @@ test "single instance reuse works through the global horizon" {
     defer tmp.cleanup();
     const path = try tmpFilePath(testing.allocator, &tmp, "ghreuse.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
     {
-        var w = try db.beginWrite();
+        var w = try database.beginWrite();
         const a = try w.alloc(8);
         @memcpy(a.bytes, "AAAAAAAA");
         w.setRoot(a.ref);
         _ = try w.commit();
     }
-    const old_root = db.active_root;
+    const old_root = database.active_root;
     {
-        var w = try db.beginWrite();
+        var w = try database.beginWrite();
         const b = try w.alloc(8);
         @memcpy(b.bytes, "BBBBBBBB");
         try w.free(old_root, 8);
@@ -244,7 +244,7 @@ test "single instance reuse works through the global horizon" {
         _ = try w.commit();
     }
     {
-        var w = try db.beginWrite();
+        var w = try database.beginWrite();
         const c = try w.alloc(8);
         try testing.expectEqual(old_root, c.ref);
         w.deinit();

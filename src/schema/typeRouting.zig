@@ -144,7 +144,7 @@ pub fn deleteNullifyX(transaction: *WriteTransaction, dir: Reference, type_id: u
 
     if (try isBlocked(transaction, dir, type_id, okey)) return .blocked;
 
-    var visited = std.AutoHashMap(u64, void).init(transaction.db.store.allocator);
+    var visited = std.AutoHashMap(u64, void).init(transaction.database.store.allocator);
     defer visited.deinit();
     const new_dir = try deleteWorker(transaction, dir, type_id, okey, &visited);
     return .{ .ok = new_dir };
@@ -234,8 +234,8 @@ fn deleteWorker(transaction: *WriteTransaction, dir: Reference, type_id: u16, ok
                 }
             } else {
                 var members = std.ArrayList(u64).empty;
-                defer members.deinit(transaction.db.store.allocator);
-                try links.linkSetCollect(transaction, try catalogRef(transaction, cur, type_id), pk, p, &members, transaction.db.store.allocator);
+                defer members.deinit(transaction.database.store.allocator);
+                try links.linkSetCollect(transaction, try catalogRef(transaction, cur, type_id), pk, p, &members, transaction.database.store.allocator);
                 for (members.items) |child| cur = try deleteWorker(transaction, cur, child_type, child, visited);
             }
         }

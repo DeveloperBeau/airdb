@@ -20,7 +20,7 @@ const compactInPlace = compaction.compactInPlace;
 
 const testing = std.testing;
 
-const Db = @import("../database.zig").Db;
+const Database = @import("../database.zig").Database;
 
 const collections = @import("../records/collections.zig");
 
@@ -35,9 +35,9 @@ test "compactType packs live rows and drops dead ones" {
     defer tmp.cleanup();
     const path = try cmpTmpPath(testing.allocator, &tmp, "pack.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     defer w.deinit();
 
     var cat = try catalog.create(&w, 2);
@@ -79,12 +79,12 @@ test "compactType frees the replaced column set" {
     defer tmp.cleanup();
     const path = try cmpTmpPath(testing.allocator, &tmp, "packfree.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
 
     // Commit a type with rows and holes so compaction has real work.
     {
-        var w = try db.beginWrite();
+        var w = try database.beginWrite();
         var cat = try catalog.create(&w, 2);
         var pk: u64 = 0;
         while (pk < 100) : (pk += 1) cat = (try rows.insert(&w, cat, &.{ pk, pk * 10 })).cat;
@@ -100,7 +100,7 @@ test "compactType frees the replaced column set" {
 
     // A full compact must record the old committed columns and key->row index
     // as in-flight frees rather than leaving them as unreclaimable garbage.
-    var w = try db.beginWrite();
+    var w = try database.beginWrite();
     defer w.deinit();
     _ = try compactType(&w, w.new_root);
     try testing.expect(w.in_flight_frees.items.len > 0);
@@ -111,9 +111,9 @@ test "object keys and links survive compaction" {
     defer tmp.cleanup();
     const path = try cmpTmpPath(testing.allocator, &tmp, "links.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     defer w.deinit();
 
     var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
@@ -151,9 +151,9 @@ test "shouldCompact reflects dead ratio" {
     defer tmp.cleanup();
     const path = try cmpTmpPath(testing.allocator, &tmp, "ratio.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     defer w.deinit();
 
     var cat = try catalog.create(&w, 1);
@@ -181,9 +181,9 @@ test "compaction reclaims under churn (scale)" {
     defer tmp.cleanup();
     const path = try cmpTmpPath(testing.allocator, &tmp, "scale.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     defer w.deinit();
 
     const n: u64 = 200_000;
@@ -226,17 +226,17 @@ test "all value kinds deep-copy across databases preserving keys" {
     const dst_path = try cmpTmpPath(testing.allocator, &tmp, "dst.airdb");
     defer testing.allocator.free(dst_path);
 
-    var src_db = try Db.create(testing.allocator, src_path);
-    defer src_db.deinit();
-    var dst_db = try Db.create(testing.allocator, dst_path);
-    defer dst_db.deinit();
+    var sourceDatabase = try Database.create(testing.allocator, src_path);
+    defer sourceDatabase.deinit();
+    var destinationDatabase = try Database.create(testing.allocator, dst_path);
+    defer destinationDatabase.deinit();
 
     var pk1_okey: u64 = undefined;
     var src_next_key: u64 = undefined;
 
     // Build the source database: 3 rows across every value kind, then delete one.
     {
-        var w = try src_db.beginWrite();
+        var w = try sourceDatabase.beginWrite();
         var cat = try catalog.createDefs(&w, &.{
             .{ .kind = .int },
             .{ .kind = .blob },
@@ -270,9 +270,9 @@ test "all value kinds deep-copy across databases preserving keys" {
 
     // Deep-copy the live rows into the destination database.
     {
-        var src_read = try src_db.beginRead();
+        var src_read = try sourceDatabase.beginRead();
         const src_cat = src_read.root();
-        var dst_w = try dst_db.beginWrite();
+        var dst_w = try destinationDatabase.beginWrite();
         var dst_cat = try copyTypeRows(&src_read, src_cat, &dst_w);
         dst_cat = try rebuildBacklinks(&dst_w, dst_cat);
         dst_w.setRoot(dst_cat);
@@ -282,9 +282,9 @@ test "all value kinds deep-copy across databases preserving keys" {
 
     // Reopen the destination and verify every value kind round-tripped.
     {
-        var ddb = try Db.open(testing.allocator, dst_path);
-        defer ddb.deinit();
-        var r = try ddb.beginRead();
+        var reopenedDestination = try Database.open(testing.allocator, dst_path);
+        defer reopenedDestination.deinit();
+        var r = try reopenedDestination.beginRead();
         defer r.end();
         const cat = r.root();
 
@@ -340,9 +340,9 @@ test "compactToNewFile produces a verified, smaller, equivalent file" {
 
     // Build the source: two types, ~300 authors + ~300 books, delete ~100 books.
     {
-        var db = try Db.create(testing.allocator, src_path);
-        defer db.deinit();
-        var w = try db.beginWrite();
+        var database = try Database.create(testing.allocator, src_path);
+        defer database.deinit();
+        var w = try database.beginWrite();
         const schema = [_][]const PD{
             &.{ .{ .kind = .int }, .{ .kind = .blob } }, // 0: Author{int pk, blob name}
             &.{ .{ .kind = .int }, .{ .kind = .link, .link_target = 0 }, .{ .kind = .set, .elem = .int } }, // 1: Book{int pk, link author, set tags}
@@ -384,19 +384,19 @@ test "compactToNewFile produces a verified, smaller, equivalent file" {
     var src_size: u64 = undefined;
     var dst_size: u64 = undefined;
     {
-        var sdb = try Db.open(testing.allocator, src_path);
-        src_size = sdb.arena.top;
-        sdb.deinit();
-        var ddb = try Db.open(testing.allocator, dst_path);
-        dst_size = ddb.arena.top;
-        ddb.deinit();
+        var reopenedSource = try Database.open(testing.allocator, src_path);
+        src_size = reopenedSource.arena.top;
+        reopenedSource.deinit();
+        var reopenedDestination = try Database.open(testing.allocator, dst_path);
+        dst_size = reopenedDestination.arena.top;
+        reopenedDestination.deinit();
     }
     try testing.expect(dst_size < src_size);
 
     // The destination is published; verify equivalence on the live data.
-    var ddb = try Db.open(testing.allocator, dst_path);
-    defer ddb.deinit();
-    var r = try ddb.beginRead();
+    var reopenedDestination = try Database.open(testing.allocator, dst_path);
+    defer reopenedDestination.deinit();
+    var r = try reopenedDestination.beginRead();
     defer r.end();
     const dir = r.root();
 
@@ -436,9 +436,9 @@ test "compaction preserves dict and set-of-blob" {
     // Build the source: a type with {int pk, dict, set(elem=blob)}, two rows with
     // dict entries + blob-set members, then delete one row to leave a gap.
     {
-        var db = try Db.create(testing.allocator, src_path);
-        defer db.deinit();
-        var w = try db.beginWrite();
+        var database = try Database.create(testing.allocator, src_path);
+        defer database.deinit();
+        var w = try database.beginWrite();
         const schema = [_][]const PD{
             &.{ .{ .kind = .int }, .{ .kind = .dict }, .{ .kind = .set, .elem = .blob } },
         };
@@ -472,9 +472,9 @@ test "compaction preserves dict and set-of-blob" {
 
     // Reopen the destination and verify the surviving row's dict + blob-set survived.
     {
-        var ddb = try Db.open(testing.allocator, dst_path);
-        defer ddb.deinit();
-        var r = try ddb.beginRead();
+        var reopenedDestination = try Database.open(testing.allocator, dst_path);
+        defer reopenedDestination.deinit();
+        var r = try reopenedDestination.beginRead();
         defer r.end();
         const dir = r.root();
         const cat = try typedir.catalogRef(&r, dir, 0);
@@ -517,9 +517,9 @@ test "compaction preserves a large (chunked) blob" {
 
     // Build the source: a type {int pk, blob}, one large blob and one small.
     {
-        var db = try Db.create(testing.allocator, src_path);
-        defer db.deinit();
-        var w = try db.beginWrite();
+        var database = try Database.create(testing.allocator, src_path);
+        defer database.deinit();
+        var w = try database.beginWrite();
         const schema = [_][]const PD{
             &.{ .{ .kind = .int }, .{ .kind = .blob } },
         };
@@ -535,9 +535,9 @@ test "compaction preserves a large (chunked) blob" {
 
     // Reopen the destination and verify both blobs survived.
     {
-        var ddb = try Db.open(testing.allocator, dst_path);
-        defer ddb.deinit();
-        var r = try ddb.beginRead();
+        var reopenedDestination = try Database.open(testing.allocator, dst_path);
+        defer reopenedDestination.deinit();
+        var r = try reopenedDestination.beginRead();
         defer r.end();
         const dir = r.root();
 
@@ -562,9 +562,9 @@ test "compactStep packs a delete-heavy type across several small steps" {
     defer tmp.cleanup();
     const path = try cmpTmpPath(testing.allocator, &tmp, "step1.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     defer w.deinit();
 
     var cat = try catalog.create(&w, 2);
@@ -624,9 +624,9 @@ test "compactStep on an all-dead type truncates to zero" {
     defer tmp.cleanup();
     const path = try cmpTmpPath(testing.allocator, &tmp, "step2.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     defer w.deinit();
 
     var cat = try catalog.create(&w, 2);
@@ -663,9 +663,9 @@ test "compactStep is a no-op on an already-packed type" {
     defer tmp.cleanup();
     const path = try cmpTmpPath(testing.allocator, &tmp, "step3.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     defer w.deinit();
 
     var cat = try catalog.create(&w, 2);
@@ -711,14 +711,14 @@ test "compactStep cursor path packs identically to the scan path" {
     }.f;
 
     // Build the SAME data in two databases.
-    var step_db = try Db.create(testing.allocator, step_path);
-    defer step_db.deinit();
-    var ctrl_db = try Db.create(testing.allocator, ctrl_path);
-    defer ctrl_db.deinit();
+    var stepDatabase = try Database.create(testing.allocator, step_path);
+    defer stepDatabase.deinit();
+    var controlDatabase = try Database.create(testing.allocator, ctrl_path);
+    defer controlDatabase.deinit();
 
-    var step_w = try step_db.beginWrite();
+    var step_w = try stepDatabase.beginWrite();
     defer step_w.deinit();
-    var ctrl_w = try ctrl_db.beginWrite();
+    var ctrl_w = try controlDatabase.beginWrite();
     defer ctrl_w.deinit();
 
     var step_cat = try catalog.create(&step_w, 2);
@@ -761,7 +761,7 @@ test "compactStep cursor path packs identically to the scan path" {
     try testing.expectEqual(try liveCount(&ctrl_w, ctrl_cat), try liveCount(&step_w, step_cat));
 
     // Every survivor reads its exact values via its stable object key in the
-    // stepped db; deleted keys are gone. Cross-check pk presence vs the control.
+    // stepped database; deleted keys are gone. Cross-check pk presence vs the control.
     pk = 0;
     while (pk < 20) : (pk += 1) {
         var so: [2]catalog.Value = undefined;
@@ -789,9 +789,9 @@ test "compactStep truncation never drops a live row at the top" {
     defer tmp.cleanup();
     const path = try cmpTmpPath(testing.allocator, &tmp, "trunc_top.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     defer w.deinit();
 
     // Insert 10 rows at physical 0..9, then delete the LOW pks (0..4). The five
@@ -841,9 +841,9 @@ test "compactStep moves at most budget rows per call" {
     defer tmp.cleanup();
     const path = try cmpTmpPath(testing.allocator, &tmp, "budget.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     defer w.deinit();
 
     // A large set with heavy churn so many high rows need relocating.
@@ -891,8 +891,8 @@ test "compactInPlace preserves value indexes and passes verifyIntegrity" {
     defer testing.allocator.free(path);
 
     {
-        var db = try Db.create(testing.allocator, path);
-        var w = try db.beginWrite();
+        var database = try Database.create(testing.allocator, path);
+        var w = try database.beginWrite();
         var dir = try typedir.createTypes(&w, &.{
             &.{ .{ .kind = .int }, .{ .kind = .int, .indexed = true } },
         }, &.{false});
@@ -902,15 +902,15 @@ test "compactInPlace preserves value indexes and passes verifyIntegrity" {
         }
         w.setRoot(dir);
         _ = try w.commit();
-        db.deinit();
+        database.deinit();
     }
 
     try compactInPlace(testing.allocator, path);
 
-    var db = try Db.open(testing.allocator, path);
-    defer db.deinit();
-    try verification.verifyIntegrity(&db); // the audit must agree the indexes are intact
-    var r = try db.beginRead();
+    var database = try Database.open(testing.allocator, path);
+    defer database.deinit();
+    try verification.verifyIntegrity(&database); // the audit must agree the indexes are intact
+    var r = try database.beginRead();
     defer r.end();
     const cat = try typedir.catalogRef(&r, r.root(), 0);
     var hits = std.ArrayList(u64).empty;
@@ -933,8 +933,8 @@ test "compactInPlace shrinks and preserves data" {
     var pre_top: u64 = undefined;
     var author_okeys: [200]u64 = undefined;
     {
-        var db = try Db.create(testing.allocator, path);
-        var w = try db.beginWrite();
+        var database = try Database.create(testing.allocator, path);
+        var w = try database.beginWrite();
         const schema = [_][]const PD{
             &.{ .{ .kind = .int }, .{ .kind = .blob } }, // 0: Author{int pk, blob name}
             &.{ .{ .kind = .int }, .{ .kind = .link, .link_target = 0 } }, // 1: Book{int pk, link author}
@@ -965,8 +965,8 @@ test "compactInPlace shrinks and preserves data" {
         w.setRoot(dir);
         _ = try w.commit();
 
-        pre_top = db.arena.top;
-        db.deinit();
+        pre_top = database.arena.top;
+        database.deinit();
     }
 
     // Compact in place over the SAME path.
@@ -981,13 +981,13 @@ test "compactInPlace shrinks and preserves data" {
     }
 
     // Reopen the SAME path and verify the live data survived intact.
-    var db = try Db.open(testing.allocator, path);
-    defer db.deinit();
+    var database = try Database.open(testing.allocator, path);
+    defer database.deinit();
 
     // The compacted file's logical footprint must not exceed the churned source's.
-    try testing.expect(db.arena.top <= pre_top);
+    try testing.expect(database.arena.top <= pre_top);
 
-    var r = try db.beginRead();
+    var r = try database.beginRead();
     defer r.end();
     const dir = r.root();
 

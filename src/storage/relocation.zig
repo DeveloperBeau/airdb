@@ -37,7 +37,7 @@ pub fn relocateRow(transaction: *WriteTransaction, cat: Reference, okey: u64, ne
 // Tests
 // ---------------------------------------------------------------------------
 
-const Db = @import("../database.zig").Db;
+const Database = @import("../database.zig").Database;
 const testing = std.testing;
 const objects = @import("../records/objects.zig");
 const rows = @import("../records/rows.zig");
@@ -54,9 +54,9 @@ test "relocateRow moves a row and keeps key, pk, and value" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "reloc1.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
 
     var cat = try catalog.create(&w, 2);
     const r1 = try rows.insert(&w, cat, &.{ 1, 100 });
@@ -105,9 +105,9 @@ test "setLink after relocating the SOURCE keeps the backlink graph exact" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "reloc3.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     defer w.deinit();
 
     var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
@@ -154,9 +154,9 @@ test "a same-type link to a relocated object still resolves" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "reloc2.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
 
     // pk + a single .link prop (prop index 1).
     var cat = try catalog.createDefs(&w, &.{

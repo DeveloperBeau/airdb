@@ -50,7 +50,7 @@ pub fn compactType(transaction: *WriteTransaction, cat: Reference) !Reference {
     const old_live = s.live_col_ref;
     const old_keyrow = s.keyrow_index_ref;
 
-    const alloc = transaction.db.store.allocator;
+    const alloc = transaction.database.store.allocator;
     var pairs = try collectKeyRowPairs(alloc, transaction, old_keyrow);
     defer pairs.deinit(alloc);
 
@@ -120,7 +120,7 @@ fn truncatePacked(transaction: *WriteTransaction, cat: Reference, new_len: u64) 
 // seeking live rows that must move down. Both advance monotonically across
 // steps so no slot is ever revisited (relocateRow is not idempotent).
 //
-// The struct itself lives on the Db (the cursor persists across the write
+// The struct itself lives on the Database (the cursor persists across the write
 // transactions of one packing run), so its definition is in database.zig.
 pub const CompactCursor = @import("../database.zig").CompactCursor;
 
@@ -171,7 +171,7 @@ fn advanceHighCursor(transaction: *WriteTransaction, cat: Reference, live_count:
 // live_count to find live rows at physical index >= live_count (rows that must
 // move down). Each paired (hole, high row) is relocated via relocateRow, up to
 // `budget` times; both cursors then step past the consumed slots. The cursor is
-// persisted on the Db so the next call resumes where this one stopped.
+// persisted on the Database so the next call resumes where this one stopped.
 //
 // Reset rule (data-loss-critical): the cursor is only resumed when the freshly
 // loaded live_count AND next_row match the stored ones. Any mismatch -- or no
@@ -195,7 +195,7 @@ pub fn compactStep(transaction: *WriteTransaction, cat: Reference, type_id: u16,
     // Already packed (no live row above live_count). The dead tail is already
     // gone (next_row == live_count), so there is nothing to truncate.
     if (next_row == lc) {
-        transaction.db.compact_cursor = null;
+        transaction.database.compact_cursor = null;
         return .{ .cat = cur, .moved = 0, .done = true };
     }
 
@@ -203,7 +203,7 @@ pub fn compactStep(transaction: *WriteTransaction, cat: Reference, type_id: u16,
     // uniquely identifies the type and its committed state) with this exact
     // shape; otherwise (another type, churn, or a fresh run) restart the scan.
     var cursor: CompactCursor = blk: {
-        if (transaction.db.compact_cursor) |c| {
+        if (transaction.database.compact_cursor) |c| {
             if (c.type_id == type_id and c.cat == cat and c.live_count == lc and c.next_row == next_row) break :blk c;
         }
         break :blk .{ .type_id = type_id, .cat = cat, .live_count = lc, .next_row = next_row, .hole_lo = 0, .high_hi = next_row };
@@ -232,14 +232,14 @@ pub fn compactStep(transaction: *WriteTransaction, cat: Reference, type_id: u16,
     if (cursor.high_hi <= lc) {
         try assertTailDead(transaction, cur, lc, next_row);
         cur = try truncatePacked(transaction, cur, lc);
-        transaction.db.compact_cursor = null;
+        transaction.database.compact_cursor = null;
         return .{ .cat = cur, .moved = moved, .done = true };
     }
 
     // Persist against the catalog ref the NEXT call will see: relocations COW
     // the catalog, so `cur` is what the caller publishes and later re-derives.
     cursor.cat = cur;
-    transaction.db.compact_cursor = cursor;
+    transaction.database.compact_cursor = cursor;
     return .{ .cat = cur, .moved = moved, .done = false };
 }
 
@@ -375,17 +375,17 @@ fn verifyEquivalent(allocator: std.mem.Allocator, src: anytype, src_dir: Referen
 // file is published (committed) it is verified equivalent to the source; on any
 // mismatch the destination is discarded uncommitted and the error propagates.
 pub fn compactToNewFile(allocator: std.mem.Allocator, src_path: []const u8, dst_path: []const u8) !void {
-    var src_db = try @import("../database.zig").Db.open(allocator, src_path);
-    defer src_db.deinit();
-    var src_r = try src_db.beginRead();
+    var sourceDatabase = try @import("../database.zig").Database.open(allocator, src_path);
+    defer sourceDatabase.deinit();
+    var src_r = try sourceDatabase.beginRead();
     defer src_r.end();
     const src_dir = src_r.root();
     const tc = try typedir.typeCount(&src_r, src_dir);
 
-    var dst_db = try @import("../database.zig").Db.create(allocator, dst_path);
-    var dst_db_alive = true;
-    defer if (dst_db_alive) dst_db.deinit();
-    var dst_w = try dst_db.beginWrite();
+    var destinationDatabase = try @import("../database.zig").Database.create(allocator, dst_path);
+    var destinationDatabaseAlive = true;
+    defer if (destinationDatabaseAlive) destinationDatabase.deinit();
+    var dst_w = try destinationDatabase.beginWrite();
     var dst_committed = false;
     defer if (!dst_committed) dst_w.deinit();
 
@@ -430,8 +430,8 @@ pub fn compactToNewFile(allocator: std.mem.Allocator, src_path: []const u8, dst_
     dst_w.setRoot(dst_dir);
     _ = try dst_w.commit();
     dst_committed = true;
-    dst_db.deinit();
-    dst_db_alive = false;
+    destinationDatabase.deinit();
+    destinationDatabaseAlive = false;
 }
 
 const Io = std.Io;
@@ -444,7 +444,7 @@ const Io = std.Io;
 // the single publish point: a crash BEFORE it leaves the original `path`
 // completely untouched (the orphan `.compacting` temp is simply overwritten on
 // the next run); a crash AFTER it leaves the new compacted file in place, and
-// the coord is recreated on the next Db.open.
+// the coord is recreated on the next Database.open.
 //
 // After the rename the stale coordination files are removed so the next open
 // recreates "<path>.coord" fresh: the old coord describes the pre-compaction
@@ -452,7 +452,7 @@ const Io = std.Io;
 //
 // `path` must be ABSOLUTE. The caller must close ALL handles to the database
 // (and end any read/write transactions) before calling this -- there must be no
-// other open Db on `path` while it is replaced.
+// other open Database on `path` while it is replaced.
 pub fn compactInPlace(allocator: std.mem.Allocator, path: []const u8) !void {
     // Build "<path>.compacting" temp path.
     const tmp = try std.fmt.allocPrint(allocator, "{s}.compacting", .{path});

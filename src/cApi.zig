@@ -11,7 +11,7 @@
 // failure.
 
 const std = @import("std");
-const Db = @import("database.zig").Db;
+const Database = @import("database.zig").Database;
 const WriteTransaction = @import("database.zig").WriteTransaction;
 const Reference = @import("storage/reference.zig").Reference;
 const rows = @import("records/rows.zig");
@@ -32,8 +32,8 @@ pub const AIRDB_E_INDETERMINATE: i64 = -8;
 
 const MAX_PROPS: usize = catalog.max_prop_count;
 
-const Database = struct {
-    db: Db,
+const DatabaseHandle = struct {
+    database: Database,
     prop_count: u16,
 };
 
@@ -41,15 +41,15 @@ const alloc = std.heap.c_allocator;
 
 // Distinguish a retryable commit failure from an indeterminate one (the
 // commit-point flush failed and the instance is poisoned until reopen).
-fn commitErrCode(self: *Database) i64 {
-    return if (self.db.poisoned) AIRDB_E_INDETERMINATE else AIRDB_E_GENERIC;
+fn commitErrCode(self: *DatabaseHandle) i64 {
+    return if (self.database.poisoned) AIRDB_E_INDETERMINATE else AIRDB_E_GENERIC;
 }
 
 // Open the database at `path`, creating it with an int-property object type of
 // `prop_count` properties (property 0 is the primary key) if it does not exist.
 // On an existing database the stored property count is used. Returns null on
 // failure.
-export fn airdb_open(path_ptr: [*:0]const u8, prop_count: u16) ?*Database {
+export fn airdb_open(path_ptr: [*:0]const u8, prop_count: u16) ?*DatabaseHandle {
     const path = std.mem.span(path_ptr);
     // The storage layer requires an absolute path. Reject anything else here so
     // a relative path returns a clean error instead of aborting the host.
@@ -58,9 +58,9 @@ export fn airdb_open(path_ptr: [*:0]const u8, prop_count: u16) ?*Database {
     // assert (abort in safe builds), and > 256 would overflow fixed-size
     // per-property buffers in release builds. Reject both cleanly.
     if (prop_count == 0 or prop_count > MAX_PROPS) return null;
-    const self = alloc.create(Database) catch return null;
+    const self = alloc.create(DatabaseHandle) catch return null;
 
-    if (Db.open(alloc, path)) |opened| {
+    if (Database.open(alloc, path)) |opened| {
         return adoptExisting(self, opened);
     } else |open_err| {
         // Create only when the file genuinely does not exist. Any other open
@@ -77,8 +77,8 @@ export fn airdb_open(path_ptr: [*:0]const u8, prop_count: u16) ?*Database {
 
 // Tear down a partially-opened handle after a failed open/create step and
 // return the null that airdb_open reports to the host.
-fn abandonHandle(self: *Database) ?*Database {
-    self.db.deinit();
+fn abandonHandle(self: *DatabaseHandle) ?*DatabaseHandle {
+    self.database.deinit();
     alloc.destroy(self);
     return null;
 }
@@ -86,9 +86,9 @@ fn abandonHandle(self: *Database) ?*Database {
 // airdb_open, existing-file path: adopt the opened database and read the
 // stored property count from its catalog. Any failure tears the handle down
 // and returns null.
-fn adoptExisting(self: *Database, opened: Db) ?*Database {
-    self.db = opened;
-    var r = self.db.beginRead() catch return abandonHandle(self);
+fn adoptExisting(self: *DatabaseHandle, opened: Database) ?*DatabaseHandle {
+    self.database = opened;
+    var r = self.database.beginRead() catch return abandonHandle(self);
     const pc = catalog.propCount(&r, r.root()) catch {
         r.end();
         return abandonHandle(self);
@@ -101,12 +101,12 @@ fn adoptExisting(self: *Database, opened: Db) ?*Database {
 // airdb_open, fresh-file path: create the database and commit an int-property
 // object type of `prop_count` properties. Any failure tears the handle down
 // and returns null.
-fn createFresh(self: *Database, path: []const u8, prop_count: u16) ?*Database {
-    self.db = Db.create(alloc, path) catch {
+fn createFresh(self: *DatabaseHandle, path: []const u8, prop_count: u16) ?*DatabaseHandle {
+    self.database = Database.create(alloc, path) catch {
         alloc.destroy(self);
         return null;
     };
-    var w = self.db.beginWrite() catch return abandonHandle(self);
+    var w = self.database.beginWrite() catch return abandonHandle(self);
     const cat = catalog.create(&w, prop_count) catch {
         w.deinit();
         return abandonHandle(self);
@@ -118,24 +118,24 @@ fn createFresh(self: *Database, path: []const u8, prop_count: u16) ?*Database {
 }
 
 // Close the database and free the handle. Safe to call with null.
-export fn airdb_close(handle: ?*Database) void {
+export fn airdb_close(handle: ?*DatabaseHandle) void {
     const self = handle orelse return;
-    self.db.deinit();
+    self.database.deinit();
     alloc.destroy(self);
 }
 
 // Number of properties of the object type (property 0 is the primary key).
-export fn airdb_prop_count(handle: ?*Database) i64 {
+export fn airdb_prop_count(handle: ?*DatabaseHandle) i64 {
     const self = handle orelse return AIRDB_E_GENERIC;
     return @intCast(self.prop_count);
 }
 
 // Insert a row of `len` u64 values (must equal prop_count; vals[0] is the
 // primary key). Returns the new object key on success.
-export fn airdb_insert(handle: ?*Database, vals: [*]const u64, len: usize) i64 {
+export fn airdb_insert(handle: ?*DatabaseHandle, vals: [*]const u64, len: usize) i64 {
     const self = handle orelse return AIRDB_E_GENERIC;
     if (len != self.prop_count) return AIRDB_E_BAD_ARGS;
-    var w = self.db.beginWrite() catch return commitErrCode(self);
+    var w = self.database.beginWrite() catch return commitErrCode(self);
     const r = rows.insert(&w, w.new_root, vals[0..len]) catch |e| {
         w.deinit();
         return if (e == error.DuplicateKey) AIRDB_E_DUPLICATE else AIRDB_E_GENERIC;
@@ -147,19 +147,19 @@ export fn airdb_insert(handle: ?*Database, vals: [*]const u64, len: usize) i64 {
 
 // Read the row with primary key `pk` into `out` (len must equal prop_count).
 // Returns the row version (>= 1) on success, AIRDB_E_NOT_FOUND if absent.
-export fn airdb_get(handle: ?*Database, pk: u64, out: [*]u64, len: usize) i64 {
+export fn airdb_get(handle: ?*DatabaseHandle, pk: u64, out: [*]u64, len: usize) i64 {
     const self = handle orelse return AIRDB_E_GENERIC;
     if (len != self.prop_count) return AIRDB_E_BAD_ARGS;
-    var r = self.db.beginRead() catch return AIRDB_E_GENERIC;
+    var r = self.database.beginRead() catch return AIRDB_E_GENERIC;
     defer r.end();
     const ver = rows.getByPk(&r, r.root(), pk, out[0..len]) catch return AIRDB_E_GENERIC;
     return if (ver) |v| @intCast(v) else AIRDB_E_NOT_FOUND;
 }
 
 // Number of live rows. Returns the count or a negative error code.
-export fn airdb_count(handle: ?*Database) i64 {
+export fn airdb_count(handle: ?*DatabaseHandle) i64 {
     const self = handle orelse return AIRDB_E_GENERIC;
-    var r = self.db.beginRead() catch return AIRDB_E_GENERIC;
+    var r = self.database.beginRead() catch return AIRDB_E_GENERIC;
     defer r.end();
     const c = catalog.liveCount(&r, r.root()) catch return AIRDB_E_GENERIC;
     return @intCast(c);
@@ -168,11 +168,11 @@ export fn airdb_count(handle: ?*Database) i64 {
 // Update the row with primary key `pk` to `vals` (len must equal prop_count,
 // vals[0] must equal pk). Auto-reads the current version, so it always applies
 // (no optimistic check at this layer). Returns AIRDB_OK or an error code.
-export fn airdb_update(handle: ?*Database, vals: [*]const u64, len: usize) i64 {
+export fn airdb_update(handle: ?*DatabaseHandle, vals: [*]const u64, len: usize) i64 {
     const self = handle orelse return AIRDB_E_GENERIC;
     if (len != self.prop_count) return AIRDB_E_BAD_ARGS;
     const pk = vals[0];
-    var w = self.db.beginWrite() catch return commitErrCode(self);
+    var w = self.database.beginWrite() catch return commitErrCode(self);
     var cur: [MAX_PROPS]u64 = undefined;
     const ver = rows.getByPk(&w, w.new_root, pk, cur[0..len]) catch {
         w.deinit();
@@ -204,9 +204,9 @@ export fn airdb_update(handle: ?*Database, vals: [*]const u64, len: usize) i64 {
 }
 
 // Delete the row with primary key `pk`. Returns AIRDB_OK or an error code.
-export fn airdb_delete(handle: ?*Database, pk: u64) i64 {
+export fn airdb_delete(handle: ?*DatabaseHandle, pk: u64) i64 {
     const self = handle orelse return AIRDB_E_GENERIC;
-    var w = self.db.beginWrite() catch return commitErrCode(self);
+    var w = self.database.beginWrite() catch return commitErrCode(self);
     var cur: [MAX_PROPS]u64 = undefined;
     const ver = rows.getByPk(&w, w.new_root, pk, cur[0..self.prop_count]) catch {
         w.deinit();
@@ -246,7 +246,7 @@ export fn airdb_delete(handle: ?*Database, pk: u64) i64 {
 // on a repeated primary key, AIRDB_E_UNSUPPORTED for a type bulk import cannot
 // build (e.g. links), AIRDB_E_BAD_ARGS on a prop_count mismatch. On every error
 // the write lock is released and nothing is made durable.
-export fn airdb_bulk_insert(handle: ?*Database, rows_flat: [*]const u64, row_count: usize, prop_count: usize) i64 {
+export fn airdb_bulk_insert(handle: ?*DatabaseHandle, rows_flat: [*]const u64, row_count: usize, prop_count: usize) i64 {
     const self = handle orelse return AIRDB_E_GENERIC;
     if (prop_count != self.prop_count) return AIRDB_E_BAD_ARGS;
     if (row_count > std.math.maxInt(i64)) return AIRDB_E_BAD_ARGS; // return value is i64
@@ -259,7 +259,7 @@ export fn airdb_bulk_insert(handle: ?*Database, rows_flat: [*]const u64, row_cou
         row.* = rows_flat[i * prop_count ..][0..prop_count];
     }
 
-    var w = self.db.beginWrite() catch return commitErrCode(self);
+    var w = self.database.beginWrite() catch return commitErrCode(self);
     const newcat = bulk.bulkImport(&w, w.new_root, rows_slices, .{}) catch |e| {
         w.deinit(); // releases the write lock; nothing was made durable
         return switch (e) {
@@ -288,7 +288,7 @@ export fn airdb_bulk_insert(handle: ?*Database, rows_flat: [*]const u64, row_cou
 // (from the fallback), AIRDB_E_BAD_ARGS on a prop_count mismatch. On every error
 // the write lock is released and nothing is made durable. A row_count of 0 is a
 // no-op that commits no change and returns 0.
-export fn airdb_bulk_append(handle: ?*Database, rows_flat: [*]const u64, row_count: usize, prop_count: usize) i64 {
+export fn airdb_bulk_append(handle: ?*DatabaseHandle, rows_flat: [*]const u64, row_count: usize, prop_count: usize) i64 {
     const self = handle orelse return AIRDB_E_GENERIC;
     if (prop_count != self.prop_count) return AIRDB_E_BAD_ARGS;
     if (row_count > std.math.maxInt(i64)) return AIRDB_E_BAD_ARGS; // return value is i64
@@ -301,7 +301,7 @@ export fn airdb_bulk_append(handle: ?*Database, rows_flat: [*]const u64, row_cou
         row.* = rows_flat[i * prop_count ..][0..prop_count];
     }
 
-    var w = self.db.beginWrite() catch return commitErrCode(self);
+    var w = self.database.beginWrite() catch return commitErrCode(self);
     const newcat = bulk.bulkAppendOrInsert(&w, w.new_root, rows_slices) catch |e| {
         w.deinit(); // releases the write lock; nothing was made durable
         return switch (e) {
@@ -342,7 +342,7 @@ export fn airdb_bulk_append(handle: ?*Database, rows_flat: [*]const u64, row_cou
 // ---------------------------------------------------------------------------
 
 const Transaction = struct {
-    dbh: *Database,
+    databaseHandle: *DatabaseHandle,
     w: WriteTransaction,
     cat: Reference, // current catalog ref, threaded across operations
     poisoned: bool = false, // structural op failure: commit must not proceed
@@ -351,11 +351,11 @@ const Transaction = struct {
 // Begin an explicit write transaction. Acquires the write lock. Returns null on
 // failure (null handle, or the write lock / transaction could not be started). The
 // returned handle must be passed to exactly one of airdb_commit / airdb_abort.
-export fn airdb_begin(handle: ?*Database) ?*Transaction {
+export fn airdb_begin(handle: ?*DatabaseHandle) ?*Transaction {
     const self = handle orelse return null;
     const t = alloc.create(Transaction) catch return null;
-    t.dbh = self;
-    t.w = self.db.beginWrite() catch {
+    t.databaseHandle = self;
+    t.w = self.database.beginWrite() catch {
         alloc.destroy(t);
         return null;
     };
@@ -379,7 +379,7 @@ export fn airdb_abort(transaction: ?*Transaction) void {
 export fn airdb_txn_insert(transaction: ?*Transaction, vals: [*]const u64, len: usize) i64 {
     const t = transaction orelse return AIRDB_E_GENERIC;
     if (t.poisoned) return AIRDB_E_GENERIC;
-    if (len != t.dbh.prop_count) return AIRDB_E_BAD_ARGS;
+    if (len != t.databaseHandle.prop_count) return AIRDB_E_BAD_ARGS;
     const r = rows.insert(&t.w, t.cat, vals[0..len]) catch |e| {
         if (e == error.DuplicateKey) return AIRDB_E_DUPLICATE; // pre-mutation check: transaction stays usable
         t.poisoned = true; // mid-mutation failure: the batch may reference freed nodes
@@ -395,7 +395,7 @@ export fn airdb_txn_insert(transaction: ?*Transaction, vals: [*]const u64, len: 
 export fn airdb_txn_update(transaction: ?*Transaction, vals: [*]const u64, len: usize) i64 {
     const t = transaction orelse return AIRDB_E_GENERIC;
     if (t.poisoned) return AIRDB_E_GENERIC;
-    if (len != t.dbh.prop_count) return AIRDB_E_BAD_ARGS;
+    if (len != t.databaseHandle.prop_count) return AIRDB_E_BAD_ARGS;
     const pk = vals[0];
     var cur: [MAX_PROPS]u64 = undefined;
     const ver = rows.getByPk(&t.w, t.cat, pk, cur[0..len]) catch return AIRDB_E_GENERIC;
@@ -421,7 +421,7 @@ export fn airdb_txn_delete(transaction: ?*Transaction, pk: u64) i64 {
     const t = transaction orelse return AIRDB_E_GENERIC;
     if (t.poisoned) return AIRDB_E_GENERIC;
     var cur: [MAX_PROPS]u64 = undefined;
-    const ver = rows.getByPk(&t.w, t.cat, pk, cur[0..t.dbh.prop_count]) catch return AIRDB_E_GENERIC;
+    const ver = rows.getByPk(&t.w, t.cat, pk, cur[0..t.databaseHandle.prop_count]) catch return AIRDB_E_GENERIC;
     if (ver == null) return AIRDB_E_NOT_FOUND;
     const res = rows.delete(&t.w, t.cat, pk, ver.?) catch {
         t.poisoned = true; // mid-mutation failure
@@ -457,7 +457,7 @@ export fn airdb_commit(transaction: ?*Transaction) i64 {
     _ = t.w.commit() catch {
         // commit already released the lock per WriteTransaction.commit's contract; just
         // free the handle. Do NOT double-unlock.
-        const code = commitErrCode(t.dbh);
+        const code = commitErrCode(t.databaseHandle);
         alloc.destroy(t);
         return code;
     };
@@ -561,7 +561,7 @@ test "ffi: open of a corrupt database returns null and never truncates the file"
         airdb_close(h);
     }
 
-    // Corrupt the magic so Db.open fails with something other than FileNotFound.
+    // Corrupt the magic so Database.open fails with something other than FileNotFound.
     const io = std.Io.Threaded.global_single_threaded.io();
     var len_before: u64 = 0;
     {
@@ -912,7 +912,7 @@ test "ffi: a poisoned handle reports AIRDB_E_INDETERMINATE, not generic failure"
     const h = airdb_open(path.ptr, 2) orelse return error.OpenFailed;
     defer airdb_close(h);
 
-    h.db.poisoned = true; // simulate a failed commit-point flush
+    h.database.poisoned = true; // simulate a failed commit-point flush
     try testing.expectEqual(AIRDB_E_INDETERMINATE, airdb_insert(h, &[_]u64{ 1, 10 }, 2));
     try testing.expectEqual(AIRDB_E_INDETERMINATE, airdb_update(h, &[_]u64{ 1, 11 }, 2));
     try testing.expectEqual(AIRDB_E_INDETERMINATE, airdb_delete(h, 1));

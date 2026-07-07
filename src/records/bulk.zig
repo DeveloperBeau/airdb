@@ -28,7 +28,7 @@ pub const ValueOkeys = struct { value: u64, okeys: []const u64 };
 /// the root Reference. Equivalent to Column.create followed by an append per value.
 pub fn bulkColumn(transaction: *WriteTransaction, values: []const u64) !Reference {
     if (values.len == 0) return Column.create(transaction);
-    const al = transaction.db.store.allocator;
+    const al = transaction.database.store.allocator;
 
     // Pack leaves, then stack inner levels until a single root remains.
     var level = try Column.packLeaves(transaction, values, al);
@@ -78,7 +78,7 @@ pub fn bulkIndex(transaction: *WriteTransaction, keys: []const u64, vals: []cons
         while (p < keys.len) : (p += 1) std.debug.assert(keys[p] > keys[p - 1]);
     }
     if (keys.len == 0) return Index.create(transaction);
-    const al = transaction.db.store.allocator;
+    const al = transaction.database.store.allocator;
 
     // Pack leaves, then stack inner levels until a single root remains.
     var level = try Index.packLeaves(transaction, keys, vals, al);
@@ -92,7 +92,7 @@ pub fn bulkIndex(transaction: *WriteTransaction, keys: []const u64, vals: []cons
 /// the shape rows.viAdd maintains (value -> Index{okey -> 1}).
 pub fn bulkValueIndex(transaction: *WriteTransaction, entries: []const ValueOkeys) !Reference {
     if (entries.len == 0) return Index.create(transaction);
-    const al = transaction.db.store.allocator;
+    const al = transaction.database.store.allocator;
 
     const values = try al.alloc(u64, entries.len);
     defer al.free(values);
@@ -145,7 +145,7 @@ pub fn bulkImport(
     const old_next_key = s.next_key;
     try validateImportInput(&s, rows);
 
-    const al = transaction.db.store.allocator;
+    const al = transaction.database.store.allocator;
     const perm = try primaryKeySortOrder(rows, opts.presorted, al);
     defer al.free(perm);
 
@@ -230,7 +230,7 @@ fn buildImportTrees(
     old_next_key: u64,
 ) !void {
     const n = rows.len;
-    const al = transaction.db.store.allocator;
+    const al = transaction.database.store.allocator;
 
     // Property columns: gather each property's values in sorted-row order.
     {
@@ -280,7 +280,7 @@ fn buildValueIndexes(
     perm: []const usize,
     old_next_key: u64,
 ) !void {
-    const al = transaction.db.store.allocator;
+    const al = transaction.database.store.allocator;
     var p: usize = 0;
     while (p < s.prop_count) : (p += 1) {
         if (s.props[p].indexed) {
@@ -368,7 +368,7 @@ pub fn bulkAppend(transaction: *WriteTransaction, cat: Reference, rows: []const 
     const old_next_row = s.next_row;
     const old_next_key = s.next_key;
     const n = rows.len;
-    const al = transaction.db.store.allocator;
+    const al = transaction.database.store.allocator;
 
     // Object keys and physical rows are assigned in batch order from the type's
     // current counters, exactly as sequential ascending-pk inserts would: the
@@ -408,7 +408,7 @@ fn appendColumnRuns(
     rows: []const []const u64,
 ) !void {
     const n = rows.len;
-    const al = transaction.db.store.allocator;
+    const al = transaction.database.store.allocator;
 
     // Property columns: append each property's values in batch order.
     {

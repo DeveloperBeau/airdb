@@ -485,7 +485,7 @@ pub fn setPropColRef(transaction: *WriteTransaction, cat: Reference, p: usize, n
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
-const Db = @import("../database.zig").Db;
+const Database = @import("../database.zig").Database;
 
 fn objTmpPath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const u8) ![]const u8 {
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
@@ -498,9 +498,9 @@ test "create allocates an empty type and load reads it back" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "obj1.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     const cat = try create(&w, 3);
     try testing.expectEqual(@as(PropCount, 3), try propCount(&w, cat));
     try testing.expectEqual(@as(u64, 0), try liveCount(&w, cat));
@@ -512,9 +512,9 @@ test "CatalogSnapshot round-trips every field through load and write" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "snap_rt.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     defer w.deinit();
     const cat = try createDefs(&w, &.{
         .{ .kind = .int },
@@ -551,9 +551,9 @@ test "loadCatalog rejects corrupt disk values instead of panicking" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "corruptcat.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     defer w.deinit();
     const cat = try create(&w, 2);
     _ = try loadCatalog(&w, cat); // clean before corruption
@@ -561,14 +561,14 @@ test "loadCatalog rejects corrupt disk values instead of panicking" {
     // Corrupt a kind byte (out-of-range enum value) directly in the mapping.
     const cat_off: usize = @intCast(cat);
     const kind_byte_off = cat_off + off_prop_cols + 2 * 8; // kindsOffset(2), prop 0
-    const saved_kind = db.store.map[kind_byte_off];
-    db.store.map[kind_byte_off] = 200;
+    const saved_kind = database.store.map[kind_byte_off];
+    database.store.map[kind_byte_off] = 200;
     try testing.expectError(error.Corrupt, loadCatalog(&w, cat));
-    db.store.map[kind_byte_off] = saved_kind;
+    database.store.map[kind_byte_off] = saved_kind;
     _ = try loadCatalog(&w, cat); // restored
 
     // Corrupt the prop count to an implausible value.
-    std.mem.writeInt(u16, db.store.map[cat_off..][0..2], 6000, .little);
+    std.mem.writeInt(u16, database.store.map[cat_off..][0..2], 6000, .little);
     try testing.expectError(error.Corrupt, loadCatalog(&w, cat));
 }
 
@@ -577,9 +577,9 @@ test "createTyped records property kinds; create defaults to all int" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "kinds.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     const cat = try createTyped(&w, &.{ .int, .blob, .int });
     const v = try loadCatalog(&w, cat);
     try testing.expectEqual(PropKind.int, v.kind(0));
@@ -597,9 +597,9 @@ test "createDefs records kind and element kind per property" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "defs.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     const cat = try createDefs(&w, &.{
         .{ .kind = .int },
         .{ .kind = .list, .elem = .int },
@@ -627,9 +627,9 @@ test "createDefs builds a backlink index for each link property" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "linkcat.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     const cat = try createDefs(&w, &.{
         .{ .kind = .int },
         .{ .kind = .int },
@@ -648,9 +648,9 @@ test "createDefs records a link target type id" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "ltarget.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     const cat = try createDefs(&w, &.{
         .{ .kind = .int },
         .{ .kind = .link, .link_target = 3 },
@@ -668,9 +668,9 @@ test "createDefs creates an empty key-to-row index and zero next_key" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "keyrow.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     const cat = try createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .int } });
     const v = try loadCatalog(&w, cat);
     try testing.expect(v.keyrow_index_ref != 0);
@@ -683,9 +683,9 @@ test "catalog persists indexed flag and value index ref" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "vindex.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     const cat = try createDefs(&w, &.{
         .{ .kind = .int },
         .{ .kind = .int, .indexed = true },
@@ -717,9 +717,9 @@ test "non-indexed catalog: value index refs zero and existing fields intact" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "noindex.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     const cat = try createDefs(&w, &.{
         .{ .kind = .int },
         .{ .kind = .list, .elem = .blob },
@@ -754,9 +754,9 @@ test "createDefs records a per-property deletion rule" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "delrule.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     const cat = try createDefs(&w, &.{
         .{ .kind = .int },
         .{ .kind = .link, .link_target = 2, .del_rule = .cascade },

@@ -68,12 +68,12 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     // iters * k inserts + iters * k deletes.
     const iters: u64 = @min(max_iters, @max(@as(u64, 1), @as(u64, @intCast(ctx.n)) / k));
 
-    var db = try airdb.Db.create(alloc, path);
-    defer db.deinit();
+    var database = try airdb.Database.create(alloc, path);
+    defer database.deinit();
 
     // Two-int type: {pk, value}. Property 0 is the primary key.
     var cat: Reference = blk: {
-        var w = try db.beginWrite();
+        var w = try database.beginWrite();
         const c = try catalog.create(&w, 2);
         w.setRoot(c);
         _ = try w.commit();
@@ -82,8 +82,8 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
 
     // --- Seed the live working set (setup only, not timed) -------------------
     {
-        var w = try db.beginWrite();
-        cat = db.active_root;
+        var w = try database.beginWrite();
+        cat = database.active_root;
         var pk: u64 = 0;
         while (pk < working_set) : (pk += 1) {
             const r = try rows.insert(&w, cat, &.{ pk, pk });
@@ -110,8 +110,8 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     while (it < iters) : (it += 1) {
         // Churn: insert k fresh rows and delete the k oldest live pks in one transaction.
         {
-            var w = try db.beginWrite();
-            cat = db.active_root;
+            var w = try database.beginWrite();
+            cat = database.active_root;
 
             var j: usize = 0;
             while (j < k) : (j += 1) {
@@ -140,8 +140,8 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
 
         // Compaction: repack the type until fully packed, one step per write transaction.
         while (true) {
-            var w = try db.beginWrite();
-            cat = db.active_root;
+            var w = try database.beginWrite();
+            cat = database.active_root;
             const t0 = nowNs(io);
             const res = try compaction.compactStep(&w, cat, 0, compact_budget);
             const dt: u64 = @intCast(nowNs(io) - t0);
@@ -161,7 +161,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     var live: u64 = 0;
     var next_row: u64 = 0;
     {
-        var rd = try db.beginRead();
+        var rd = try database.beginRead();
         defer rd.end();
         cat = rd.root();
         live = try compaction.liveCount(&rd, cat);
@@ -189,8 +189,8 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         .p50_ns = step_lat.pct(50),
         .p99_ns = step_lat.pct(99),
         .max_ns = step_lat.pct(100),
-        .file_bytes = try db.fileSize(),
-        .logical_bytes = db.logicalSize(),
+        .file_bytes = try database.fileSize(),
+        .logical_bytes = database.logicalSize(),
         .peak_rss_bytes = airdb.peakResidentBytes(),
         .note = note,
     };

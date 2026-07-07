@@ -1,9 +1,9 @@
 // maintenance.zig -- caller-driven background upkeep for a database instance.
 //
 // Edge-level entry points that sequence inner-layer machinery (compaction,
-// the type directory) over a Db. Nothing inner imports this file.
+// the type directory) over a Database. Nothing inner imports this file.
 
-const Db = @import("database.zig").Db;
+const Database = @import("database.zig").Database;
 const typedir = @import("schema/typeDirectory.zig");
 const compaction = @import("storage/compaction.zig");
 
@@ -20,10 +20,10 @@ pub const CompactStepResult = struct { ran: bool, moved: usize, done: bool };
 /// The `auto_compact` flag is consulted by callers to decide whether to drive
 /// this loop; the function itself does not check it. Does I/O: commits a
 /// write transaction when a step runs.
-pub fn maybeCompactStep(db: *Db, type_id: u16, budget: usize) !CompactStepResult {
-    var w = try db.beginWrite();
+pub fn maybeCompactStep(database: *Database, type_id: u16, budget: usize) !CompactStepResult {
+    var w = try database.beginWrite();
     errdefer w.deinit();
-    const dir = db.active_root;
+    const dir = database.active_root;
     const cat = try typedir.catalogRef(&w, dir, type_id);
     if (!try compaction.shouldCompact(&w, cat)) {
         w.deinit();

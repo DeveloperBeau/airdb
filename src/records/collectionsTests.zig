@@ -26,7 +26,7 @@ const dictCollect = collections.dictCollect;
 
 const testing = std.testing;
 
-const Db = @import("../database.zig").Db;
+const Database = @import("../database.zig").Database;
 
 const insertTyped = @import("objects.zig").insertTyped;
 
@@ -43,9 +43,9 @@ test "collection accessors return error.NotFound for an absent pk" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "coll_notfound.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     defer w.deinit();
     var cat = try catalog.createDefs(&w, &.{
         .{ .kind = .int },
@@ -82,9 +82,9 @@ test "list of int: insert seeds members and reads back" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "listint_seed.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .list, .elem = .int } });
     cat = (try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .list_int = &.{ 10, 20, 30 } } })).cat;
     try testing.expectEqual(@as(?u64, 3), try listLen(&w, cat, 1, 1));
@@ -101,9 +101,9 @@ test "list of int: append grows the list" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "listint_append.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .list, .elem = .int } });
     cat = (try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .list_int = &.{ 10, 20, 30 } } })).cat;
     cat = try listAppendInt(&w, cat, 1, 1, 40);
@@ -117,9 +117,9 @@ test "list of int: set overwrites an element" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "listint_set.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .list, .elem = .int } });
     cat = (try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .list_int = &.{ 10, 20, 30 } } })).cat;
     cat = try listSetInt(&w, cat, 1, 1, 0, 99);
@@ -132,9 +132,9 @@ test "list of blob: insert and read back element strings" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "listblob.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .list, .elem = .blob } });
     cat = (try insertTyped(&w, cat, &.{ .{ .int = 7 }, .{ .list_blob = &.{ "alpha", "beta", "gamma" } } })).cat;
     try testing.expectEqual(@as(?u64, 3), try listLen(&w, cat, 7, 1));
@@ -149,9 +149,9 @@ test "set of int: build from initial members dedups and counts" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "setint_count.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .set, .elem = .int } });
     cat = (try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .set_int = &.{ 5, 9, 5, 12 } } })).cat;
     try testing.expectEqual(@as(?u64, 3), try setCountInt(&w, cat, 1, 1));
@@ -163,9 +163,9 @@ test "set of int: membership reports contains true and false" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "setint_member.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .set, .elem = .int } });
     cat = (try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .set_int = &.{ 5, 9, 5, 12 } } })).cat;
     try testing.expect(try setContainsInt(&w, cat, 1, 1, 9));
@@ -178,9 +178,9 @@ test "set of int: add inserts a new member" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "setint_addnew.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .set, .elem = .int } });
     cat = (try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .set_int = &.{ 5, 9, 12 } } })).cat;
     cat = try setAddInt(&w, cat, 1, 1, 7);
@@ -194,9 +194,9 @@ test "set of int: adding an existing member is a no-op" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "setint_addexist.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .set, .elem = .int } });
     cat = (try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .set_int = &.{ 5, 7, 9, 12 } } })).cat;
     try testing.expectEqual(@as(?u64, 4), try setCountInt(&w, cat, 1, 1));
@@ -210,9 +210,9 @@ test "set of int: remove drops a member" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "setint_remove.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .set, .elem = .int } });
     cat = (try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .set_int = &.{ 5, 7, 9, 12 } } })).cat;
     cat = try setRemoveInt(&w, cat, 1, 1, 9);
@@ -226,9 +226,9 @@ test "set of int: collect returns ascending members" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "setint_collect.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .set, .elem = .int } });
     cat = (try insertTyped(&w, cat, &.{ .{ .int = 1 }, .{ .set_int = &.{ 12, 5, 7 } } })).cat;
     var members = std.ArrayList(u64).empty;
@@ -247,9 +247,9 @@ test "collections persist across commit and reopen" {
     const path = try objTmpPath(testing.allocator, &tmp, "collpersist.airdb");
     defer testing.allocator.free(path);
     {
-        var db = try Db.create(testing.allocator, path);
-        defer db.deinit();
-        var w = try db.beginWrite();
+        var database = try Database.create(testing.allocator, path);
+        defer database.deinit();
+        var w = try database.beginWrite();
         var cat = try catalog.createDefs(&w, &.{
             .{ .kind = .int },
             .{ .kind = .list, .elem = .int },
@@ -268,9 +268,9 @@ test "collections persist across commit and reopen" {
         _ = try w.commit();
     }
     {
-        var db = try Db.open(testing.allocator, path);
-        defer db.deinit();
-        var r = try db.beginRead();
+        var database = try Database.open(testing.allocator, path);
+        defer database.deinit();
+        var r = try database.beginRead();
         const cat = r.root();
         try testing.expectEqual(@as(?u64, 4), try listLen(&r, cat, 42, 1));
         try testing.expectEqual(@as(u64, 4), try listGetInt(&r, cat, 42, 1, 3));
@@ -287,9 +287,9 @@ test "large list and set: 50k elements each, append and membership" {
     const path = try objTmpPath(testing.allocator, &tmp, "collscale.airdb");
     defer testing.allocator.free(path);
     const N: u64 = 50_000;
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     var cat = try catalog.createDefs(&w, &.{
         .{ .kind = .int },
         .{ .kind = .list, .elem = .int },
@@ -314,9 +314,9 @@ test "dict: insert, get, put, remove, count, collect" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "dict_ops.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .dict } });
     cat = (try insertTyped(&w, cat, &.{
         .{ .int = 1 },
@@ -357,9 +357,9 @@ test "set of blob: insert, membership, add(dedup), remove, count, collect" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "setblob_ops.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     var cat = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .set, .elem = .blob } });
     cat = (try insertTyped(&w, cat, &.{
         .{ .int = 1 },
@@ -396,9 +396,9 @@ test "dict and set-of-blob persist across reopen" {
     const path = try objTmpPath(testing.allocator, &tmp, "dictsetblob_persist.airdb");
     defer testing.allocator.free(path);
     {
-        var db = try Db.create(testing.allocator, path);
-        defer db.deinit();
-        var w = try db.beginWrite();
+        var database = try Database.create(testing.allocator, path);
+        defer database.deinit();
+        var w = try database.beginWrite();
         var cat = try catalog.createDefs(&w, &.{
             .{ .kind = .int },
             .{ .kind = .dict },
@@ -415,9 +415,9 @@ test "dict and set-of-blob persist across reopen" {
         _ = try w.commit();
     }
     {
-        var db = try Db.open(testing.allocator, path);
-        defer db.deinit();
-        var r = try db.beginRead();
+        var database = try Database.open(testing.allocator, path);
+        defer database.deinit();
+        var r = try database.beginRead();
         const cat = r.root();
         try testing.expectEqual(@as(?u64, 1), try dictGet(&r, cat, 42, 1, "one"));
         try testing.expectEqual(@as(?u64, 3), try dictGet(&r, cat, 42, 1, "three"));

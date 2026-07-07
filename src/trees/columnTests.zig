@@ -18,7 +18,7 @@ const encodeInner = node.encodeInner;
 
 const testing = std.testing;
 
-const Db = @import("../database.zig").Db;
+const Database = @import("../database.zig").Database;
 const WriteTransaction = @import("../database.zig").WriteTransaction;
 
 fn colTmpPath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const u8) ![]const u8 {
@@ -48,9 +48,9 @@ test "a column ref cycle fails with error.Corrupt" {
     defer tmp.cleanup();
     const path = try colTmpPath(testing.allocator, &tmp, "col_cycle.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     defer w.deinit();
 
     // Inner node whose only child is itself with a nonzero claimed count:
@@ -67,9 +67,9 @@ test "single-leaf column: create, append, get, len, set" {
     defer tmp.cleanup();
     const path = try colTmpPath(testing.allocator, &tmp, "col1.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     var root = try create(&w);
     try testing.expectEqual(@as(u64, 0), try len(&w, root));
     root = try append(&w, root, 100);
@@ -88,9 +88,9 @@ test "append grows the tree across many leaves and reads back correctly" {
     defer tmp.cleanup();
     const path = try colTmpPath(testing.allocator, &tmp, "col4.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     var root = try create(&w);
     const N: u64 = 5000; // > LEAF_CAP and > LEAF_CAP*FANOUT (4096): forces >= 3 levels
     var i: u64 = 0;
@@ -110,9 +110,9 @@ test "get and len traverse an inner node over two leaves" {
     defer tmp.cleanup();
     const path = try colTmpPath(testing.allocator, &tmp, "col3.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     var l0 = try create(&w);
     l0 = try append(&w, l0, 0);
     l0 = try append(&w, l0, 1);
@@ -133,9 +133,9 @@ test "set on a multi-level column leaves the old root snapshot unchanged" {
     defer tmp.cleanup();
     const path = try colTmpPath(testing.allocator, &tmp, "col5.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     var root = try create(&w);
     var i: u64 = 0;
     while (i < 1000) : (i += 1) root = try append(&w, root, i);
@@ -155,9 +155,9 @@ test "Column.truncate shrinks length and preserves head values" {
     defer tmp.cleanup();
     const path = try colTmpPath(testing.allocator, &tmp, "coltrunc1.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     var root = try create(&w);
     const N: u64 = 1000;
     var i: u64 = 0;
@@ -176,9 +176,9 @@ test "Column.truncate to zero empties the column" {
     defer tmp.cleanup();
     const path = try colTmpPath(testing.allocator, &tmp, "coltrunc0.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     var root = try create(&w);
     var i: u64 = 0;
     while (i < 1000) : (i += 1) root = try append(&w, root, i);
@@ -197,9 +197,9 @@ test "a column persisted as the root survives commit and reopen" {
     const path = try colTmpPath(testing.allocator, &tmp, "col6.airdb");
     defer testing.allocator.free(path);
     {
-        var db = try Db.create(testing.allocator, path);
-        defer db.deinit();
-        var w = try db.beginWrite();
+        var database = try Database.create(testing.allocator, path);
+        defer database.deinit();
+        var w = try database.beginWrite();
         var root = try create(&w);
         var i: u64 = 0;
         while (i < 2000) : (i += 1) root = try append(&w, root, i * 3);
@@ -207,9 +207,9 @@ test "a column persisted as the root survives commit and reopen" {
         _ = try w.commit();
     }
     {
-        var db = try Db.open(testing.allocator, path);
-        defer db.deinit();
-        var r = try db.beginRead();
+        var database = try Database.open(testing.allocator, path);
+        defer database.deinit();
+        var r = try database.beginRead();
         try testing.expectEqual(@as(u64, 2000), try len(&r, r.root()));
         try testing.expectEqual(@as(u64, 1999 * 3), try get(&r, r.root(), 1999));
         try testing.expectEqual(@as(u64, 0), try get(&r, r.root(), 0));
@@ -227,12 +227,12 @@ test "two million element column builds, persists, and reads back" {
     const batch: u64 = 16384; // commit periodically so freed COW nodes are reclaimed between batches
 
     {
-        var db = try Db.create(testing.allocator, path);
-        defer db.deinit();
+        var database = try Database.create(testing.allocator, path);
+        defer database.deinit();
         // Commit an empty column as the root first.
         var root: Reference = undefined;
         {
-            var w = try db.beginWrite();
+            var w = try database.beginWrite();
             root = try create(&w);
             w.setRoot(root);
             _ = try w.commit();
@@ -240,7 +240,7 @@ test "two million element column builds, persists, and reads back" {
         // Build in batches; value at index i is i.
         var v: u64 = 0;
         while (v < N) {
-            var w = try db.beginWrite();
+            var w = try database.beginWrite();
             const end = @min(v + batch, N);
             while (v < end) : (v += 1) root = try append(&w, root, v);
             w.setRoot(root);
@@ -248,9 +248,9 @@ test "two million element column builds, persists, and reads back" {
         }
     }
     {
-        var db = try Db.open(testing.allocator, path);
-        defer db.deinit();
-        var r = try db.beginRead();
+        var database = try Database.open(testing.allocator, path);
+        defer database.deinit();
+        var r = try database.beginRead();
         try testing.expectEqual(N, try len(&r, r.root()));
         // Strided spot-checks across the whole 2M range: get(i) must equal i.
         var i: u64 = 0;
@@ -273,9 +273,9 @@ test "two million element column built in a single transaction" {
     defer testing.allocator.free(path);
     const N: u64 = 2_000_000;
     {
-        var db = try Db.create(testing.allocator, path);
-        defer db.deinit();
-        var w = try db.beginWrite();
+        var database = try Database.create(testing.allocator, path);
+        defer database.deinit();
+        var w = try database.beginWrite();
         var root = try create(&w);
         var v: u64 = 0;
         while (v < N) : (v += 1) root = try append(&w, root, v);
@@ -283,9 +283,9 @@ test "two million element column built in a single transaction" {
         _ = try w.commit();
     }
     {
-        var db = try Db.open(testing.allocator, path);
-        defer db.deinit();
-        var r = try db.beginRead();
+        var database = try Database.open(testing.allocator, path);
+        defer database.deinit();
+        var r = try database.beginRead();
         try testing.expectEqual(N, try len(&r, r.root()));
         var i: u64 = 0;
         while (i < N) : (i += 50_000) try testing.expectEqual(i, try get(&r, r.root(), i));
@@ -298,10 +298,10 @@ fn appendColVal(i: u64) u64 {
     return i *% 11 +% 5;
 }
 
-fn appendTmpDb(tmp: *testing.TmpDir, name: []const u8) !Db {
+fn appendTmpDatabase(tmp: *testing.TmpDir, name: []const u8) !Database {
     const path = try colTmpPath(testing.allocator, tmp, name);
     defer testing.allocator.free(path);
-    return Db.create(testing.allocator, path);
+    return Database.create(testing.allocator, path);
 }
 
 // Build a base column of `base` values via sequential append, append `run` more
@@ -338,9 +338,9 @@ fn checkColAppendEquiv(w: *WriteTransaction, base: u64, run: u64) !void {
 test "appendRun partial last leaf then new leaves" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try appendTmpDb(&tmp, "colappend1.airdb");
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try appendTmpDatabase(&tmp, "colappend1.airdb");
+    defer database.deinit();
+    var w = try database.beginWrite();
     try checkColAppendEquiv(&w, 100, 200); // 100 % 64 == 36 in the last leaf
     w.deinit();
 }
@@ -348,9 +348,9 @@ test "appendRun partial last leaf then new leaves" {
 test "appendRun grows height" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try appendTmpDb(&tmp, "colappend2.airdb");
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try appendTmpDatabase(&tmp, "colappend2.airdb");
+    defer database.deinit();
+    var w = try database.beginWrite();
     // Single-leaf base, run crossing FANOUT*LEAF_CAP (== 4096) so the result
     // must be three levels tall.
     try checkColAppendEquiv(&w, 50, 4200);
@@ -360,9 +360,9 @@ test "appendRun grows height" {
 test "appendRun single-leaf base" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try appendTmpDb(&tmp, "colappend3.airdb");
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try appendTmpDatabase(&tmp, "colappend3.airdb");
+    defer database.deinit();
+    var w = try database.beginWrite();
     try checkColAppendEquiv(&w, 40, 50); // base < LEAF_CAP
     w.deinit();
 }
@@ -370,9 +370,9 @@ test "appendRun single-leaf base" {
 test "appendRun run far larger than base" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try appendTmpDb(&tmp, "colappend4.airdb");
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try appendTmpDatabase(&tmp, "colappend4.airdb");
+    defer database.deinit();
+    var w = try database.beginWrite();
     try checkColAppendEquiv(&w, 10, 5000);
     w.deinit();
 }
@@ -380,9 +380,9 @@ test "appendRun run far larger than base" {
 test "appendRun empty run is a no-op" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try appendTmpDb(&tmp, "colappend5.airdb");
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try appendTmpDatabase(&tmp, "colappend5.airdb");
+    defer database.deinit();
+    var w = try database.beginWrite();
     var base_root = try create(&w);
     var k: u64 = 0;
     while (k < 100) : (k += 1) base_root = try append(&w, base_root, appendColVal(k));

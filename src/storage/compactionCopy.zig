@@ -39,7 +39,7 @@ pub fn collectKeyRowPairs(
     return pairs;
 }
 
-// Deep-copy a single property value from the source db into the destination db.
+// Deep-copy a single property value from the source database into the destination database.
 // kind/elem describe the property. Returns the destination-local raw u64.
 fn copyValue(src: anytype, dst: *WriteTransaction, kind: catalog.PropKind, elem: catalog.ElemKind, src_raw: u64) !u64 {
     return switch (kind) {
@@ -110,8 +110,8 @@ fn viAddInto(dst: *WriteTransaction, vi_ref: Reference, value: u64, okey: u64) !
 }
 
 // Re-point every ref field of the snapshot at fresh structures created in the
-// DESTINATION db. Backlink and value indexes are created empty in the
-// destination (the source refs live in the source db's address space) and
+// DESTINATION database. Backlink and value indexes are created empty in the
+// destination (the source refs live in the source database's address space) and
 // repopulated separately; the indexed flag carries through.
 fn createDestinationStructures(dst: *WriteTransaction, s: *catalog.CatalogSnapshot) !void {
     var j: usize = 0;
@@ -126,14 +126,14 @@ fn createDestinationStructures(dst: *WriteTransaction, s: *catalog.CatalogSnapsh
     s.pk_index_ref = try Index.create(dst);
 }
 
-/// Copy all live rows of `src_cat` (in the source db) into a fresh catalog in the
-/// destination db, preserving object keys, primary keys, and next_key. Backlink
+/// Copy all live rows of `src_cat` (in the source database) into a fresh catalog in the
+/// destination database, preserving object keys, primary keys, and next_key. Backlink
 /// indexes are created empty (rebuild with rebuildBacklinks afterward); value
 /// indexes are repopulated inline. Returns the new destination catalog ref.
 /// O(live rows x properties), plus the deep copies' own costs.
 pub fn copyTypeRows(src: anytype, src_cat: Reference, dst: *WriteTransaction) !Reference {
     // Load the source snapshot, then re-point every ref field at structures
-    // created in the DESTINATION db before writing. Kinds, elem kinds, targets,
+    // created in the DESTINATION database before writing. Kinds, elem kinds, targets,
     // rules, and indexed flags carry over as plain values.
     var s = try catalog.CatalogSnapshot.load(src, src_cat);
     const pc = s.prop_count;
@@ -148,7 +148,7 @@ pub fn copyTypeRows(src: anytype, src_cat: Reference, dst: *WriteTransaction) !R
     const s_keyrow = s.keyrow_index_ref;
 
     // Collect live (okey, src_row) pairs, then re-point at fresh dst structures.
-    const alloc = dst.db.store.allocator;
+    const alloc = dst.database.store.allocator;
     var pairs = try collectKeyRowPairs(alloc, src, s_keyrow);
     defer pairs.deinit(alloc);
     try createDestinationStructures(dst, &s);
@@ -188,7 +188,7 @@ pub fn rebuildBacklinks(dst: *WriteTransaction, cat: Reference) !Reference {
     var cur = cat;
     const v0 = try catalog.loadCatalog(dst, cat);
     const pc = v0.prop_count;
-    const alloc = dst.db.store.allocator;
+    const alloc = dst.database.store.allocator;
     var p: usize = 0;
     while (p < pc) : (p += 1) {
         const k = (try catalog.loadCatalog(dst, cur)).kind(p);

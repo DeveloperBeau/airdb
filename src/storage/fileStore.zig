@@ -66,7 +66,7 @@ pub const FileStore = struct {
     header_checksum_ok: bool,
     /// Measurement-only counters accumulated since open. Total nanoseconds spent in
     /// blocking file.setLength (file growth) and the number of such calls. Read via
-    /// Db.metrics(); never affect behavior.
+    /// Database.metrics(); never affect behavior.
     setlength_ns: u64 = 0,
     setlength_calls: u64 = 0,
 
@@ -304,7 +304,7 @@ pub const FileStore = struct {
 /// Delete an absolute path, treating a missing file as success. Used to remove
 /// coordination files during the publish step of in-place compaction. Any other
 /// failure is swallowed best-effort: the data file is already published by the
-/// atomic rename, and a leftover/stale coord is recreated fresh by Db.open
+/// atomic rename, and a leftover/stale coord is recreated fresh by Database.open
 /// (openOrCreate), so it cannot corrupt the published data. Does I/O.
 pub fn deleteAbsoluteIgnoreMissing(io: Io, abs_path: []const u8) void {
     Io.Dir.deleteFileAbsolute(io, abs_path) catch {};

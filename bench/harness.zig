@@ -3,8 +3,8 @@
 // Responsibilities split:
 //   - This file owns argument parsing, the scratch-directory lifecycle, latency
 //     bookkeeping, the result table, and JSON output.
-//   - Individual scenarios (added in later tasks) own opening a Db, inserting
-//     rows, and measuring. The harness never opens a Db itself; it only hands a
+//   - Individual scenarios (added in later tasks) own opening a Database, inserting
+//     rows, and measuring. The harness never opens a Database itself; it only hands a
 //     `Ctx` (allocator, row count, scratch dir) to each scenario.
 //
 // Zig 0.16 idioms used here (mirrors src/fileStore.zig):
@@ -51,7 +51,7 @@ pub const Opts = struct {
     }
 };
 
-/// Per-scenario context. Scenarios open their own Db under `tmp_dir`.
+/// Per-scenario context. Scenarios open their own Database under `tmp_dir`.
 pub const Ctx = struct {
     alloc: Allocator,
     n: usize,

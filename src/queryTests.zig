@@ -5,7 +5,7 @@ const catalog = @import("schema/catalog.zig");
 const rows = @import("records/rows.zig");
 const index = @import("trees/index.zig");
 const Reference = @import("storage/reference.zig").Reference;
-const Db = @import("database.zig").Db;
+const Database = @import("database.zig").Database;
 const Predicate = query.Predicate;
 const where = query.where;
 const countWhere = query.countWhere;
@@ -45,9 +45,9 @@ test "where filters live rows by ANDed predicates" {
     defer tmp.cleanup();
     const path = try qTmpPath(testing.allocator, &tmp, "q1.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     var cat = try seed(&w, &.{ .{ 1, 20 }, .{ 2, 30 }, .{ 3, 40 }, .{ 4, 30 } });
     // age == 30
     var r1 = std.ArrayList(u64).empty;
@@ -78,9 +78,9 @@ test "out-of-range property indices are rejected up front" {
     defer tmp.cleanup();
     const path = try qTmpPath(testing.allocator, &tmp, "qbadprop.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     defer w.deinit();
     const cat = try seed(&w, &.{.{ 1, 20 }});
     var hits = std.ArrayList(u64).empty;
@@ -98,9 +98,9 @@ test "streamed full scan agrees with where on count and aggregate" {
     defer tmp.cleanup();
     const path = try qTmpPath(testing.allocator, &tmp, "qstream.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     defer w.deinit();
     var cat = try seed(&w, &.{ .{ 1, 20 }, .{ 2, 30 }, .{ 3, 40 }, .{ 4, 30 }, .{ 5, 25 } });
     // Tombstone one matching row so the live filter is exercised mid-stream.
@@ -126,9 +126,9 @@ test "countWhere and aggregateInt" {
     defer tmp.cleanup();
     const path = try qTmpPath(testing.allocator, &tmp, "q2.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     const cat = try seed(&w, &.{ .{ 1, 10 }, .{ 2, 20 }, .{ 3, 30 }, .{ 4, 40 } });
     try testing.expectEqual(@as(u64, 4), try countWhere(&w, cat, &.{}, testing.allocator));
     try testing.expectEqual(@as(u64, 2), try countWhere(&w, cat, &.{.{ .prop = 1, .op = .ge, .value = 30 }}, testing.allocator));
@@ -148,9 +148,9 @@ test "rangeInclusive and sortByPropAsc" {
     defer tmp.cleanup();
     const path = try qTmpPath(testing.allocator, &tmp, "q3.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     const cat = try seed(&w, &.{ .{ 5, 1 }, .{ 1, 1 }, .{ 9, 1 }, .{ 3, 1 }, .{ 7, 1 } });
     var rng = std.ArrayList(u64).empty;
     defer rng.deinit(testing.allocator);
@@ -174,9 +174,9 @@ test "scan over 100k rows finds the matching slice" {
     defer tmp.cleanup();
     const path = try qTmpPath(testing.allocator, &tmp, "q4.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     var cat = try catalog.create(&w, 2);
     var i: u64 = 0;
     while (i < 100_000) : (i += 1) cat = (try rows.insert(&w, cat, &.{ i, i % 100 })).cat;
@@ -190,9 +190,9 @@ test "query returns stable object keys after relocation" {
     defer tmp.cleanup();
     const path = try qTmpPath(testing.allocator, &tmp, "q5.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
 
     // pk + age. Insert a throwaway first to open up a dead slot, then the target.
     var cat = try catalog.create(&w, 2);
@@ -250,9 +250,9 @@ test "indexed eq equals full scan" {
     defer tmp.cleanup();
     const path = try qTmpPath(testing.allocator, &tmp, "plan_eq.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     const cat_idx = try seedPlannerCat(&w, true, 5000);
     const cat_scan = try seedPlannerCat(&w, false, 5000);
     try expectSameWhere(&w, cat_idx, cat_scan, &.{.{ .prop = 1, .op = .eq, .value = 42 }});
@@ -264,9 +264,9 @@ test "indexed range equals full scan for each of lt le gt ge with boundary corre
     defer tmp.cleanup();
     const path = try qTmpPath(testing.allocator, &tmp, "plan_range.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     const cat_idx = try seedPlannerCat(&w, true, 5000);
     const cat_scan = try seedPlannerCat(&w, false, 5000);
     // Combined range [40,45].
@@ -289,9 +289,9 @@ test "indexed predicate plus non-indexed predicate equals full scan" {
     defer tmp.cleanup();
     const path = try qTmpPath(testing.allocator, &tmp, "plan_mixed.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     const cat_idx = try seedPlannerCat(&w, true, 5000);
     const cat_scan = try seedPlannerCat(&w, false, 5000);
     // prop1 (indexed) drives; prop2 (not indexed) is a remaining predicate.
@@ -312,9 +312,9 @@ test "ne falls back to the scan and still equals full scan" {
     defer tmp.cleanup();
     const path = try qTmpPath(testing.allocator, &tmp, "plan_ne.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     const cat_idx = try seedPlannerCat(&w, true, 2000);
     const cat_scan = try seedPlannerCat(&w, false, 2000);
     try expectSameWhere(&w, cat_idx, cat_scan, &.{.{ .prop = 1, .op = .ne, .value = 42 }});
@@ -326,9 +326,9 @@ test "non-indexed query is unchanged" {
     defer tmp.cleanup();
     const path = try qTmpPath(testing.allocator, &tmp, "plan_noidx.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     const cat_idx = try seedPlannerCat(&w, true, 2000);
     const cat_scan = try seedPlannerCat(&w, false, 2000);
     // Query a non-indexed prop on both: both run the full scan.
@@ -342,9 +342,9 @@ test "countWhere rangeInclusive aggregateInt match between index path and full s
     defer tmp.cleanup();
     const path = try qTmpPath(testing.allocator, &tmp, "plan_aggs.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     const cat_idx = try seedPlannerCat(&w, true, 5000);
     const cat_scan = try seedPlannerCat(&w, false, 5000);
 
@@ -385,9 +385,9 @@ test "empty result and all-match edge cases match full scan" {
     defer tmp.cleanup();
     const path = try qTmpPath(testing.allocator, &tmp, "plan_edges.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     const cat_idx = try seedPlannerCat(&w, true, 1000);
     const cat_scan = try seedPlannerCat(&w, false, 1000);
 
@@ -411,9 +411,9 @@ test "index path equals full scan after deletes" {
     defer tmp.cleanup();
     const path = try qTmpPath(testing.allocator, &tmp, "plan_del.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     var cat_idx = try seedPlannerCat(&w, true, 2000);
     var cat_scan = try seedPlannerCat(&w, false, 2000);
     // Delete every 7th pk from both catalogs.

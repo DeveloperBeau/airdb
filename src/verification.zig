@@ -9,7 +9,7 @@ const testing = std.testing;
 const platform = @import("platform.zig");
 const Slot = @import("storage/slots.zig").Slot;
 const Reference = @import("storage/reference.zig").Reference;
-const Db = @import("database.zig").Db;
+const Database = @import("database.zig").Database;
 const ReadTransaction = @import("transactions/readTransaction.zig").ReadTransaction;
 const slot_a_off = @import("database.zig").slot_a_off;
 const slot_b_off = @import("database.zig").slot_b_off;
@@ -42,26 +42,26 @@ pub const VerifyError = error{
 /// Audit the database's structural invariants and every value/backlink index.
 /// O(total entries) across all indexed and link-bearing types; reads the whole
 /// live data set.
-pub fn verifyIntegrity(db: *Db) VerifyError!void {
-    if (!db.store.header_checksum_ok) return error.HeaderCorrupt;
+pub fn verifyIntegrity(database: *Database) VerifyError!void {
+    if (!database.store.header_checksum_ok) return error.HeaderCorrupt;
 
-    const a_ok = Slot.decode(db.store.map[slot_a_off .. slot_a_off + Slot.size]) catch null;
-    const b_ok = Slot.decode(db.store.map[slot_b_off .. slot_b_off + Slot.size]) catch null;
+    const a_ok = Slot.decode(database.store.map[slot_a_off .. slot_a_off + Slot.size]) catch null;
+    const b_ok = Slot.decode(database.store.map[slot_b_off .. slot_b_off + Slot.size]) catch null;
     if (a_ok == null and b_ok == null) return error.SlotCorrupt;
 
-    const limit = db.store.sectionsView().len * platform.section_size;
+    const limit = database.store.sectionsView().len * platform.section_size;
 
-    if (db.active_root != 0) {
-        const r: usize = @intCast(db.active_root);
+    if (database.active_root != 0) {
+        const r: usize = @intCast(database.active_root);
         if (r % 8 != 0 or r >= limit) return error.RootRefOutOfBounds;
     }
 
-    if (db.free_list_node_ref != 0) {
-        const n: usize = @intCast(db.free_list_node_ref);
-        if (n % 8 != 0 or n + db.free_list_node_len > limit) return error.FreeListCorrupt;
+    if (database.free_list_node_ref != 0) {
+        const n: usize = @intCast(database.free_list_node_ref);
+        if (n % 8 != 0 or n + database.free_list_node_len > limit) return error.FreeListCorrupt;
     }
 
-    for (db.free_list.extents.items) |e| {
+    for (database.free_list.extents.items) |e| {
         const eoff: usize = @intCast(e.offset);
         if (e.len == 0) return error.FreeExtentOutOfBounds;
         if (eoff % 8 != 0) return error.FreeExtentOutOfBounds;
@@ -69,7 +69,7 @@ pub fn verifyIntegrity(db: *Db) VerifyError!void {
         if (eoff > limit or elen > limit - eoff) return error.FreeExtentOutOfBounds;
     }
 
-    try auditValueIndexes(db);
+    try auditValueIndexes(database);
 }
 
 // Audit every value index against the live base rows. For each indexed
@@ -84,14 +84,14 @@ pub fn verifyIntegrity(db: *Db) VerifyError!void {
 // commit raw blobs). A valid directory holds at most 256 types, so an
 // implausible type count -- or any catalog that fails to load -- means the
 // root is not a typed directory and there is nothing to audit.
-fn auditValueIndexes(db: *Db) VerifyError!void {
-    if (db.active_root == 0) return;
-    var r = ReadTransaction{ .db = db, .root_ref = db.active_root, .version = db.active_version };
-    const tc = typedir.typeCount(&r, db.active_root) catch return;
+fn auditValueIndexes(database: *Database) VerifyError!void {
+    if (database.active_root == 0) return;
+    var r = ReadTransaction{ .database = database, .root_ref = database.active_root, .version = database.active_version };
+    const tc = typedir.typeCount(&r, database.active_root) catch return;
     if (tc > 256) return;
     var t: u16 = 0;
     while (t < tc) : (t += 1) {
-        const cat = typedir.catalogRef(&r, db.active_root, t) catch return;
+        const cat = typedir.catalogRef(&r, database.active_root, t) catch return;
         const cv = catalog.loadCatalog(&r, cat) catch return;
         var p: usize = 0;
         while (p < cv.prop_count) : (p += 1) {
@@ -272,15 +272,15 @@ test "verifyIntegrity detects both slots corrupt" {
     defer tmp.cleanup();
     const path = try tmpFilePath(testing.allocator, &tmp, "vi_slot.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     const a = try w.alloc(8);
     @memcpy(a.bytes, "INTEGER_");
     w.setRoot(a.ref);
     _ = try w.commit();
     // Corrupt the checksum bytes of BOTH slot regions so neither decodes. Header stays valid.
-    db.store.map[slot_a_off + 4] ^= 0xFF;
-    db.store.map[slot_b_off + 4] ^= 0xFF;
-    try testing.expectError(error.SlotCorrupt, verifyIntegrity(&db));
+    database.store.map[slot_a_off + 4] ^= 0xFF;
+    database.store.map[slot_b_off + 4] ^= 0xFF;
+    try testing.expectError(error.SlotCorrupt, verifyIntegrity(&database));
 }

@@ -42,8 +42,8 @@ fn nowNs(io: Io) i96 {
 // Seed a fresh two-int type with `base` rows (pks 0..base-1, value = pk) using
 // bulkImport in one transaction, so both databases start from an identical,
 // already-populated base. Returns nothing; the committed catalog is the root.
-fn seedBase(db: *airdb.Db, base_rows: []const []const u64) !void {
-    var w = try db.beginWrite();
+fn seedBase(database: *airdb.Database, base_rows: []const []const u64) !void {
+    var w = try database.beginWrite();
     const c = try catalog.create(&w, 2);
     const seeded = try bulk.bulkImport(&w, c, base_rows, .{ .presorted = true });
     w.setRoot(seeded);
@@ -89,20 +89,20 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     }
 
     // --- Seed both databases identically with the populated base. ----------
-    var db_a = try airdb.Db.create(alloc, path_a);
-    errdefer db_a.deinit();
-    try seedBase(&db_a, base_rows);
+    var databaseA = try airdb.Database.create(alloc, path_a);
+    errdefer databaseA.deinit();
+    try seedBase(&databaseA, base_rows);
 
-    var db_b = try airdb.Db.create(alloc, path_b);
-    errdefer db_b.deinit();
-    try seedBase(&db_b, base_rows);
+    var databaseB = try airdb.Database.create(alloc, path_b);
+    errdefer databaseB.deinit();
+    try seedBase(&databaseB, base_rows);
 
     // --- Path A: bulk append the batch in one write transaction. -----------
-    const a_commits_before = db_a.metrics().commit_count;
+    const a_commits_before = databaseA.metrics().commit_count;
     const a_pf_before = airdb.pageFaults();
     const bulk_start = nowNs(io);
     {
-        var w = try db_a.beginWrite();
+        var w = try databaseA.beginWrite();
         const new_cat = try bulk.bulkAppendOrInsert(&w, w.new_root, batch);
         w.setRoot(new_cat);
         _ = try w.commit();
@@ -110,20 +110,20 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     const bulk_ns: u64 = @intCast(nowNs(io) - bulk_start);
     const a_pf_after = airdb.pageFaults();
     const bulk_faults = (a_pf_after.minor - a_pf_before.minor) + (a_pf_after.major - a_pf_before.major);
-    const bulk_commits = db_a.metrics().commit_count - a_commits_before;
+    const bulk_commits = databaseA.metrics().commit_count - a_commits_before;
 
-    const file_bytes = try db_a.fileSize();
-    const logical_bytes = db_a.logicalSize();
+    const file_bytes = try databaseA.fileSize();
+    const logical_bytes = databaseA.logicalSize();
 
     // --- Path B: row-by-row inserts of the same batch in batched commits. --
-    const b_commits_before = db_b.metrics().commit_count;
+    const b_commits_before = databaseB.metrics().commit_count;
     const b_pf_before = airdb.pageFaults();
     const rowwise_start = nowNs(io);
     var inserted: usize = 0;
     while (inserted < m) {
         const this_batch = @min(batch_size, m - inserted);
-        var w = try db_b.beginWrite();
-        var cat: Reference = db_b.active_root; // reload the committed catalog ref
+        var w = try databaseB.beginWrite();
+        var cat: Reference = databaseB.active_root; // reload the committed catalog ref
         var j: usize = 0;
         while (j < this_batch) : (j += 1) {
             const pk: u64 = base + inserted + j;
@@ -137,25 +137,25 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     const rowwise_ns: u64 = @intCast(nowNs(io) - rowwise_start);
     const b_pf_after = airdb.pageFaults();
     const rowwise_faults = (b_pf_after.minor - b_pf_before.minor) + (b_pf_after.major - b_pf_before.major);
-    const rowwise_commits = db_b.metrics().commit_count - b_commits_before;
+    const rowwise_commits = databaseB.metrics().commit_count - b_commits_before;
 
     // --- Fallback smoke: a scattered (non-ascending) batch must be rejected
     // with NotAppendable and nothing written. Kept cheap: a tiny seeded type.
     var fallback_ok = false;
     {
-        var db_c = try airdb.Db.create(alloc, path_c);
-        defer db_c.deinit();
+        var databaseC = try airdb.Database.create(alloc, path_c);
+        defer databaseC.deinit();
         var small_storage: [4][2]u64 = undefined;
         var small_rows: [4][]const u64 = undefined;
         for (&small_storage, &small_rows, 0..) |*cells, *row, i| {
             cells.* = .{ @intCast(i), @intCast(i) };
             row.* = &cells.*;
         }
-        try seedBase(&db_c, &small_rows);
+        try seedBase(&databaseC, &small_rows);
 
         // pks 100, 102, 101: above the max but NOT strictly ascending.
         const scattered = [_][]const u64{ &.{ 100, 100 }, &.{ 102, 102 }, &.{ 101, 101 } };
-        var w = try db_c.beginWrite();
+        var w = try databaseC.beginWrite();
         if (bulk.bulkAppend(&w, w.new_root, &scattered)) |_| {
             // Unexpectedly appendable: leave fallback_ok false.
         } else |e| switch (e) {
@@ -187,8 +187,8 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         },
     );
 
-    db_a.deinit();
-    db_b.deinit();
+    databaseA.deinit();
+    databaseB.deinit();
 
     return .{
         .name = name,

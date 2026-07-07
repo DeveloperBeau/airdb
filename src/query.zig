@@ -369,7 +369,7 @@ pub fn sortByPropAsc(
 // Tests of file-private invariants; the main suite lives in queryTests.zig.
 
 const testing = std.testing;
-const Db = @import("database.zig").Db;
+const Database = @import("database.zig").Database;
 
 fn qTmpPath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const u8) ![]const u8 {
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
@@ -407,9 +407,9 @@ test "planner picks an indexed eq predicate as the driver, prefers eq over range
     defer tmp.cleanup();
     const path = try qTmpPath(testing.allocator, &tmp, "plan_pick.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     const cat = try seedPlannerCat(&w, true, 10);
 
     // prop 1 is indexed; prop 0 and prop 2 are not.

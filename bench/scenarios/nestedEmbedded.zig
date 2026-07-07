@@ -15,7 +15,7 @@
 // embedded child; depth 2 = child + grandchild; depth 3 = + great-grandchild).
 // Every type owns an independent pk space, so each depth uses key = d*stride + i
 // across all its levels to keep rows disjoint across the three depth passes
-// while sharing one directory and one Db.
+// while sharing one directory and one Database.
 //
 // Phase honesty:
 //   CREATE  insert the root row + chain insertEmbedded down d levels (timed as
@@ -81,11 +81,11 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     defer alloc.free(path);
     defer harness.removeScratch(ctx.*, path);
 
-    var db = try airdb.Db.create(alloc, path);
-    errdefer db.deinit();
+    var database = try airdb.Database.create(alloc, path);
+    errdefer database.deinit();
 
     {
-        var w = try db.beginWrite();
+        var w = try database.beginWrite();
         const dir = try typedir.createTypes(&w, &chain_schema, &chain_embedded);
         w.setRoot(dir);
         _ = try w.commit();
@@ -116,7 +116,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
             var inserted: usize = 0;
             while (inserted < rows) {
                 const this_batch = @min(batch_size, rows - inserted);
-                var w = try db.beginWrite();
+                var w = try database.beginWrite();
                 var dir = w.new_root;
                 var j: usize = 0;
                 while (j < this_batch) : (j += 1) {
@@ -148,7 +148,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         // --- READ: full descent through all d levels via getLinked ------------
         {
             const phase_start = nowNs(io);
-            var r = try db.beginRead();
+            var r = try database.beginRead();
             const dir = r.root();
             var out: [2]Value = undefined;
             var i: usize = 0;
@@ -172,8 +172,8 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         total_built += rows;
     }
 
-    const file_bytes = try db.fileSize();
-    const logical_bytes = db.logicalSize();
+    const file_bytes = try database.fileSize();
+    const logical_bytes = database.logicalSize();
 
     const note = try std.fmt.allocPrint(
         alloc,
@@ -199,6 +199,6 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         .note = note,
     };
 
-    db.deinit();
+    database.deinit();
     return result;
 }
