@@ -1,7 +1,7 @@
 const std = @import("std");
 const Column = @import("column.zig");
 const node = @import("columnNode.zig");
-const Ref = @import("../storage/reference.zig").Ref;
+const Reference = @import("../storage/reference.zig").Reference;
 const create = Column.create;
 const len = Column.len;
 const get = Column.get;
@@ -19,7 +19,7 @@ const encodeInner = node.encodeInner;
 const testing = std.testing;
 
 const Db = @import("../database.zig").Db;
-const WriteTxn = @import("../database.zig").WriteTxn;
+const WriteTransaction = @import("../database.zig").WriteTransaction;
 
 fn colTmpPath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const u8) ![]const u8 {
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
@@ -185,7 +185,7 @@ test "Column.truncate to zero empties the column" {
     root = try truncate(&w, root, 0);
     try testing.expectEqual(@as(u64, 0), try len(&w, root));
     // Reclamation note: truncate frees every dropped node via txn.free, which routes
-    // them onto the transaction-private pool / committed free list (see WriteTxn.free).
+    // them onto the transaction-private pool / committed free list (see WriteTransaction.free).
     // column.zig exposes no in-transaction free-list hook, so reclamation is covered by
     // that mechanism rather than asserted here.
     w.deinit();
@@ -230,7 +230,7 @@ test "two million element column builds, persists, and reads back" {
         var db = try Db.create(testing.allocator, path);
         defer db.deinit();
         // Commit an empty column as the root first.
-        var root: Ref = undefined;
+        var root: Reference = undefined;
         {
             var w = try db.beginWrite();
             root = try create(&w);
@@ -308,7 +308,7 @@ fn appendTmpDb(tmp: *testing.TmpDir, name: []const u8) !Db {
 // values via appendRun, and assert the result is logically identical to
 // appending all base+run values sequentially: same length, and get(i) matches
 // the sequential twin at every index.
-fn checkColAppendEquiv(w: *WriteTxn, base: u64, run: u64) !void {
+fn checkColAppendEquiv(w: *WriteTransaction, base: u64, run: u64) !void {
     var base_root = try create(w);
     var k: u64 = 0;
     while (k < base) : (k += 1) base_root = try append(w, base_root, appendColVal(k));

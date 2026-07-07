@@ -2,7 +2,7 @@ const std = @import("std");
 const objects = @import("objects.zig");
 const rows = @import("rows.zig");
 const Db = @import("../database.zig").Db;
-const Ref = @import("../storage/reference.zig").Ref;
+const Reference = @import("../storage/reference.zig").Reference;
 const catalog = @import("../schema/catalog.zig");
 const collections = @import("collections.zig");
 const links = @import("links.zig");
@@ -97,7 +97,7 @@ test "update applies on a matching version" {
     defer testing.allocator.free(path);
     var db = try Db.create(testing.allocator, path);
     defer db.deinit();
-    var cat: Ref = undefined;
+    var cat: Reference = undefined;
     var fetched_version: u64 = undefined;
     {
         var w = try db.beginWrite();
@@ -170,7 +170,7 @@ test "update conflicts on a stale version" {
     defer testing.allocator.free(path);
     var db = try Db.create(testing.allocator, path);
     defer db.deinit();
-    var cat: Ref = undefined;
+    var cat: Reference = undefined;
     var fetched_version: u64 = undefined;
     {
         var w = try db.beginWrite();
@@ -543,7 +543,7 @@ test "getByObjectKey resolves through the key-to-row index" {
 // set for (cat, prop, value). Empty/absent yields an empty list.
 fn collectIndexOkeys(
     txn: anytype,
-    cat: Ref,
+    cat: Reference,
     prop: usize,
     value: u64,
     out: *std.ArrayList(u64),
@@ -564,7 +564,7 @@ fn collectIndexOkeys(
 
 fn expectIndexOkeys(
     txn: anytype,
-    cat: Ref,
+    cat: Reference,
     prop: usize,
     value: u64,
     expected: []const u64,
@@ -826,7 +826,7 @@ test "non-indexed prop has no index" {
     cat = (try delete(&w, cat, 1, ver2)).ok;
     const v = try loadCatalog(&w, cat);
     var i: usize = 0;
-    while (i < v.prop_count) : (i += 1) try testing.expectEqual(@as(Ref, 0), v.valueIndexRef(i));
+    while (i < v.prop_count) : (i += 1) try testing.expectEqual(@as(Reference, 0), v.valueIndexRef(i));
     w.deinit();
 }
 

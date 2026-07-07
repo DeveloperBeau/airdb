@@ -14,7 +14,7 @@ const airdb = @import("airdb");
 const harness = @import("../harness.zig");
 
 const Io = std.Io;
-const Ref = airdb.Ref;
+const Reference = airdb.Reference;
 const catalog = airdb.catalog;
 const rawRows = airdb.rows;
 const bulk = airdb.bulk;
@@ -89,7 +89,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     // --- Path B: row-by-row inserts in batched commits ----------------------
     var db_b = try airdb.Db.create(alloc, path_b);
     errdefer db_b.deinit();
-    var cat: Ref = blk: {
+    var cat: Reference = blk: {
         var w = try db_b.beginWrite();
         const c = try catalog.create(&w, 2);
         w.setRoot(c);

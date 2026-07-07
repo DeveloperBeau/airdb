@@ -6,8 +6,8 @@
 // below this in rows.zig.
 
 const std = @import("std");
-const WriteTxn = @import("../transactions/writeTransaction.zig").WriteTxn;
-const Ref = @import("../storage/reference.zig").Ref;
+const WriteTransaction = @import("../transactions/writeTransaction.zig").WriteTransaction;
+const Reference = @import("../storage/reference.zig").Reference;
 const Column = @import("../trees/column.zig");
 const Index = @import("../trees/index.zig");
 const blob = @import("blob.zig");
@@ -31,7 +31,7 @@ pub const DeleteResult = rows.DeleteResult;
 
 // insertTyped encodes a []Value row into raw u64 storage, allocating a blob
 // node for each .blob property, then delegates to rows.insert.
-pub fn insertTyped(txn: *WriteTxn, cat: Ref, values: []const Value) !struct { cat: Ref, row: u64 } {
+pub fn insertTyped(txn: *WriteTransaction, cat: Reference, values: []const Value) !struct { cat: Reference, row: u64 } {
     const v = try loadCatalog(txn, cat);
     const pc = v.prop_count;
     std.debug.assert(values.len == pc);
@@ -95,7 +95,7 @@ pub fn insertTyped(txn: *WriteTxn, cat: Ref, values: []const Value) !struct { ca
 // storage; a blob larger than the inline cap (stored chunked) decodes to a
 // .blob_ref the caller materializes with blob.getAlloc.
 // Returns the row version, or null when the key is not found.
-pub fn getTyped(txn: anytype, cat: Ref, pk: u64, out: []Value) !?u64 {
+pub fn getTyped(txn: anytype, cat: Reference, pk: u64, out: []Value) !?u64 {
     const v = try loadCatalog(txn, cat);
     const pc = v.prop_count;
     std.debug.assert(out.len == pc);
@@ -124,7 +124,7 @@ pub fn getTyped(txn: anytype, cat: Ref, pk: u64, out: []Value) !?u64 {
 }
 
 // getTypedByOkey decodes a row addressed by stable object key into Values.
-pub fn getTypedByOkey(txn: anytype, cat: Ref, okey: u64, out: []Value) !?u64 {
+pub fn getTypedByOkey(txn: anytype, cat: Reference, okey: u64, out: []Value) !?u64 {
     const v = try loadCatalog(txn, cat);
     const pc = v.prop_count;
     std.debug.assert(out.len == pc);
@@ -153,7 +153,7 @@ pub fn getTypedByOkey(txn: anytype, cat: Ref, okey: u64, out: []Value) !?u64 {
 
 // Delete an object and keep the graph consistent: nullify inbound links and
 // clean the deleted object's outbound backlink entries.
-pub fn deleteAndNullify(txn: *WriteTxn, cat: Ref, pk: u64, expected_version: u64) !DeleteResult {
+pub fn deleteAndNullify(txn: *WriteTransaction, cat: Reference, pk: u64, expected_version: u64) !DeleteResult {
     const v = try loadCatalog(txn, cat);
     const okey = (try Index.get(txn, v.pk_index_ref, pk)) orelse return .not_found;
     const row = (try catalog.okeyToRow(txn, cat, okey)) orelse return .not_found;
@@ -170,8 +170,8 @@ pub fn deleteAndNullify(txn: *WriteTxn, cat: Ref, pk: u64, expected_version: u64
 // is one irreducible MVCC step -- splitting it would scatter the frees from
 // the version check that alone makes them safe.
 pub fn updateTyped(
-    txn: *WriteTxn,
-    cat: Ref,
+    txn: *WriteTransaction,
+    cat: Reference,
     pk: u64,
     values: []const Value,
     expected_version: u64,
@@ -240,8 +240,8 @@ pub fn updateTyped(
 // deleteTyped is MVCC-safe: blobs are freed only on the apply path, never on
 // conflict or not_found.
 pub fn deleteTyped(
-    txn: *WriteTxn,
-    cat: Ref,
+    txn: *WriteTransaction,
+    cat: Reference,
     pk: u64,
     expected_version: u64,
 ) !DeleteResult {

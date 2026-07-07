@@ -11,7 +11,7 @@ const airdb = @import("airdb");
 const harness = @import("../harness.zig");
 
 const Io = std.Io;
-const Ref = airdb.Ref;
+const Reference = airdb.Reference;
 const catalog = airdb.catalog;
 const rows = airdb.rows;
 
@@ -45,7 +45,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     errdefer db.deinit();
 
     // Simple two-int type: {pk, value}. The first value is the primary key.
-    var cat: Ref = blk: {
+    var cat: Reference = blk: {
         var w = try db.beginWrite();
         const c = try catalog.create(&w, 2);
         w.setRoot(c);

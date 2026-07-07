@@ -8,7 +8,7 @@ Code pointers use `module.function` names under `src/`.
   (`writeTransaction.commit`, `slots.Slot`). A commit either fully happens or leaves
   the previous version live — verified by flush-failure injection tests.
 - Full durability barrier per commit: `F_FULLFSYNC` on Apple platforms (drive
-  write cache included), `fsync` elsewhere (`syncer.RealSyncer`).
+  write cache included), `fsync` elsewhere (`syncer.FileSyncer`).
 - Crash recovery follows the committed slot pointer, with CRC fallback to the
   previous version surfaced via `Db.metrics().recovered_fallback`.
 - `Db.verifyIntegrity`: header/slot/root/free-list validation plus
@@ -20,7 +20,7 @@ Code pointers use `module.function` names under `src/`.
 ## Transactions
 
 - Single writer (cross-process lock), many readers, no blocking between them.
-- `Db.beginRead` — snapshot at the latest version; `ReadTxn.end` unpins.
+- `Db.beginRead` — snapshot at the latest version; `ReadTransaction.end` unpins.
 - `Db.beginWrite` / `beginWriteTry` — exclusive write transaction; `commit`
   is the durable point, `deinit` aborts and rolls back the bump allocator so
   aborted work costs no file space.

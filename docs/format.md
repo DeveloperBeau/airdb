@@ -6,7 +6,7 @@ little-endian; the store refuses to open big-endian-tagged files.
 ## File layout
 
 The data file is a sequence of 16 MiB sections (`platform.section_size`),
-mapped individually and never moved. A `Ref` is an absolute byte offset,
+mapped individually and never moved. A `Reference` is an absolute byte offset,
 8-aligned, `0` meaning null. Offset 0 starts the reserved header page
 (4096 bytes); the allocation arena begins at 4096.
 

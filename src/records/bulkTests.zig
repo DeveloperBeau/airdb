@@ -1,8 +1,8 @@
 const std = @import("std");
 const verification = @import("../verification.zig");
 const bulk = @import("bulk.zig");
-const WriteTxn = @import("../database.zig").WriteTxn;
-const Ref = @import("../storage/reference.zig").Ref;
+const WriteTransaction = @import("../database.zig").WriteTransaction;
+const Reference = @import("../storage/reference.zig").Reference;
 const Column = @import("../trees/column.zig");
 const Index = @import("../trees/index.zig");
 const cnode = @import("../trees/columnNode.zig");
@@ -153,7 +153,7 @@ test "bulk append frees the replaced right-edge nodes" {
     try testing.expect(w.in_flight_frees.items.len > 0);
 }
 
-fn checkColumnSize(w: *WriteTxn, n: usize) !void {
+fn checkColumnSize(w: *WriteTransaction, n: usize) !void {
     const values = try testing.allocator.alloc(u64, n);
     defer testing.allocator.free(values);
     for (values, 0..) |*v, i| v.* = @as(u64, i) * 7;
@@ -207,7 +207,7 @@ const IdxCollector = struct {
     }
 };
 
-fn checkIndexSize(w: *WriteTxn, n: usize) !void {
+fn checkIndexSize(w: *WriteTransaction, n: usize) !void {
     const keys = try testing.allocator.alloc(u64, n);
     defer testing.allocator.free(keys);
     const vals = try testing.allocator.alloc(u64, n);
@@ -276,7 +276,7 @@ const SetCollector = struct {
     }
 };
 
-fn collectSet(w: *WriteTxn, set_root: Ref, out: *std.ArrayList(u64)) !void {
+fn collectSet(w: *WriteTransaction, set_root: Reference, out: *std.ArrayList(u64)) !void {
     out.clearRetainingCapacity();
     try Index.forEachKey(w, set_root, SetCollector{ .keys = out }, SetCollector.onKey);
 }

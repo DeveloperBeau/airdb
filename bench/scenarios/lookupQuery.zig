@@ -18,7 +18,7 @@ const airdb = @import("airdb");
 const harness = @import("../harness.zig");
 
 const Io = std.Io;
-const Ref = airdb.Ref;
+const Reference = airdb.Reference;
 const catalog = airdb.catalog;
 const rows = airdb.rows;
 const query = airdb.query;
@@ -65,7 +65,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     // Two-int type: {pk, category}. Property 0 is the primary key, property 1
     // is the low-cardinality category, declared indexed so the equality query
     // is served by its value index rather than a full scan.
-    var cat: Ref = blk: {
+    var cat: Reference = blk: {
         var w = try db.beginWrite();
         const c = try catalog.createDefs(&w, &.{
             .{ .kind = .int },

@@ -2,11 +2,11 @@
 // instantiated with inline numeric keys. The u64 stored in each key slot IS
 // the key, ordered numerically, so key duplication is identity and key
 // freeing is a no-op. See bTreeCore.zig for the transaction capability the
-// `txn` parameters must satisfy (WriteTxn in production; ReadTxn for the
+// `txn` parameters must satisfy (WriteTransaction in production; ReadTransaction for the
 // read-only subset).
 
 const std = @import("std");
-const Ref = @import("../storage/reference.zig").Ref;
+const Reference = @import("../storage/reference.zig").Reference;
 const node = @import("indexNode.zig");
 const bTreeCore = @import("bTreeCore.zig");
 
@@ -53,20 +53,20 @@ pub const max_depth = bTreeCore.maxDepth;
 /// Deref a node, sizing the read by its kind byte (leaf vs inner).
 pub const derefNode = Tree.derefNode;
 
-/// Create a new empty leaf node and return its Ref.
+/// Create a new empty leaf node and return its Reference.
 pub const create = Tree.create;
 
 /// Look up key in the tree rooted at root. Returns the associated value or null.
 pub const get = Tree.get;
 
 /// Insert or update key->val in the tree rooted at root.
-/// Returns the (possibly new) root Ref. Grows the tree height on root split.
-pub fn insert(txn: anytype, root: Ref, key: u64, val: u64) !Ref {
+/// Returns the (possibly new) root Reference. Grows the tree height on root split.
+pub fn insert(txn: anytype, root: Reference, key: u64, val: u64) !Reference {
     return Tree.insert(txn, root, key, key, val);
 }
 
 /// Remove key from the tree rooted at root.
-/// Returns the (possibly new) root Ref. No-op if key is absent.
+/// Returns the (possibly new) root Reference. No-op if key is absent.
 pub const remove = Tree.remove;
 
 /// Recursively free every node of the tree rooted at node_ref so the space
@@ -95,8 +95,8 @@ pub const forEachEntry = Tree.forEachEntry;
 /// path would report a non-empty tree as empty, and bulkAppend would then
 /// admit a batch whose keys do not clear the true maximum, corrupting the pk
 /// index with duplicates and broken ordering.
-pub fn maxKey(txn: anytype, root: Ref) !?u64 {
-    var cur: Ref = root;
+pub fn maxKey(txn: anytype, root: Reference) !?u64 {
+    var cur: Reference = root;
     var depth: usize = 0;
     while (depth < max_depth) : (depth += 1) {
         const bytes = try derefNode(txn, cur);
@@ -146,7 +146,7 @@ pub const appendRun = bulkBuild.appendRun;
 // no leaf outside the range is visited. Read-only: no COW.
 pub fn forEachEntryInRange(
     txn: anytype,
-    root: Ref,
+    root: Reference,
     lo: u64,
     hi: u64,
     ctx: anytype,
@@ -157,7 +157,7 @@ pub fn forEachEntryInRange(
 
 fn forEachEntryInRangeAt(
     txn: anytype,
-    root: Ref,
+    root: Reference,
     lo: u64,
     hi: u64,
     ctx: anytype,
@@ -181,13 +181,13 @@ fn forEachEntryInRangeAt(
     var i: usize = try Tree.childIndexForKey(txn, inner, lo);
     while (i < inner.child_count) : (i += 1) {
         if (inner.lowKey(i) > hi) return;
-        const child_ref: Ref = inner.childRef(i);
+        const child_ref: Reference = inner.childRef(i);
         try forEachEntryInRangeAt(txn, child_ref, lo, hi, ctx, onEntry, depth + 1);
     }
 }
 
 // Test-only helper: build an inner node from a slice of (ref, low, count) triples.
-pub fn makeInnerForTest(txn: anytype, children: []const struct { ref: u64, low: u64, count: u64 }) !Ref {
+pub fn makeInnerForTest(txn: anytype, children: []const struct { ref: u64, low: u64, count: u64 }) !Reference {
     var refs: [FANOUT]u64 = undefined;
     var lows: [FANOUT]u64 = undefined;
     var counts: [FANOUT]u64 = undefined;

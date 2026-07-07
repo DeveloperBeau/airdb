@@ -1,4 +1,4 @@
-// writeTransaction.zig -- WriteTxn and the two-slot atomic durable commit.
+// writeTransaction.zig -- WriteTransaction and the two-slot atomic durable commit.
 //
 // Slot A byte range in the header page: [64, 64+Slot.size).
 // Slot B byte range in the header page: [128, 128+Slot.size).
@@ -7,7 +7,7 @@ const std = @import("std");
 const testing = std.testing;
 const Io = std.Io;
 const Allocation = @import("../storage/arena.zig").Allocation;
-const Ref = @import("../storage/reference.zig").Ref;
+const Reference = @import("../storage/reference.zig").Reference;
 const Slot = @import("../storage/slots.zig").Slot;
 const FreeExtent = @import("../storage/freeList.zig").FreeExtent;
 const FreeList = @import("../storage/freeList.zig").FreeList;
@@ -19,9 +19,9 @@ const ring_capacity = @import("../database.zig").ring_capacity;
 const slot_a_off: usize = 64;
 const slot_b_off: usize = 128;
 
-pub const WriteTxn = struct {
+pub const WriteTransaction = struct {
     db: *Db,
-    new_root: Ref,
+    new_root: Reference,
     new_version: u64,
     in_flight_frees: std.ArrayList(FreeExtent),
     work_freelist: FreeList,
@@ -48,11 +48,11 @@ pub const WriteTxn = struct {
     /// bookkeeping lists or double-unlocking the cross-process write lock.
     done: bool = false,
 
-    pub fn deref(self: *WriteTxn, ref: Ref, len: usize) ![]const u8 {
+    pub fn deref(self: *WriteTransaction, ref: Reference, len: usize) ![]const u8 {
         return self.db.arena.deref(ref, len);
     }
 
-    fn reclaimHorizon(self: *WriteTxn) u64 {
+    fn reclaimHorizon(self: *WriteTransaction) u64 {
         const h = self.cached_horizon orelse blk: {
             // Horizon-gated reuse is only safe when no reader in ANY live
             // process pins a version below the extent's freeing version.
@@ -73,7 +73,7 @@ pub const WriteTxn = struct {
         return @min(h, self.db.active_version -| self.db.retainVersions());
     }
 
-    pub fn alloc(self: *WriteTxn, size: usize) !Allocation {
+    pub fn alloc(self: *WriteTransaction, size: usize) !Allocation {
         // 1. Reuse a transaction-private node first (allocated and freed within this same
         //    uncommitted transaction; no committed version or reader can reference it, so
         //    reusing it is always safe and keeps single-transaction bulk writes space-bounded).
@@ -85,11 +85,11 @@ pub const WriteTxn = struct {
         return self.db.bumpGrowing(size);
     }
 
-    pub fn setRoot(self: *WriteTxn, ref: Ref) void {
+    pub fn setRoot(self: *WriteTransaction, ref: Reference) void {
         self.new_root = ref;
     }
 
-    pub fn free(self: *WriteTxn, ref: Ref, len: usize) !void {
+    pub fn free(self: *WriteTransaction, ref: Reference, len: usize) !void {
         if (ref >= self.txn_start_top) {
             // Allocated within this uncommitted transaction: private, immediately reusable.
             // (freed_version is irrelevant for the txn-private pool; allocFromPool ignores it.)
@@ -105,7 +105,7 @@ pub const WriteTxn = struct {
         }
     }
 
-    pub fn writableCopy(self: *WriteTxn, ref: Ref, len: usize) !Allocation {
+    pub fn writableCopy(self: *WriteTransaction, ref: Reference, len: usize) !Allocation {
         const old = try self.db.arena.deref(ref, len);
         const fresh = try self.alloc(len);
         @memcpy(fresh.bytes, old);
@@ -113,7 +113,7 @@ pub const WriteTxn = struct {
         return fresh;
     }
 
-    pub fn deinit(self: *WriteTxn) void {
+    pub fn deinit(self: *WriteTransaction) void {
         if (self.done) return; // already committed, commit-failed, or aborted
         self.conclude();
     }
@@ -126,7 +126,7 @@ pub const WriteTxn = struct {
     // commit's logical_size as permanently unreclaimable garbage. Extents this
     // txn reused from the committed pool stay recorded in db.free_list
     // (untouched during the txn), so they remain free as before.
-    fn conclude(self: *WriteTxn) void {
+    fn conclude(self: *WriteTransaction) void {
         self.done = true;
         self.db.arena.top = @intCast(self.txn_start_top);
         self.in_flight_frees.deinit(self.db.store.allocator);
@@ -158,7 +158,7 @@ pub const WriteTxn = struct {
     /// the success return (return self.new_version) since that is not an error,
     /// so transferring ownership to db.free_list before returning is safe and
     /// cannot double-free.
-    pub fn commit(self: *WriteTxn) !u64 {
+    pub fn commit(self: *WriteTransaction) !u64 {
         // EVERY error exit -- allocation failure, disk-full growth, and both
         // durability-barrier failures -- concludes the transaction uniformly:
         // lists freed, uncommitted bump bytes rolled back, write lock
@@ -211,7 +211,7 @@ pub const WriteTxn = struct {
     /// free-list chain's own chunks, and any leftover transaction-private
     /// nodes. The caller owns the returned list (register errdefer deinit
     /// immediately). O(extent count).
-    fn buildNewFreeList(self: *WriteTxn) !FreeList {
+    fn buildNewFreeList(self: *WriteTransaction) !FreeList {
         const db = self.db;
         var new_fl = FreeList.init(db.store.allocator);
         errdefer new_fl.deinit();
@@ -273,7 +273,7 @@ pub const WriteTxn = struct {
     /// with the extent count, and past the section cap its allocation failed
     /// the commit outright with error.AllocTooLarge. Chunks are written
     /// back-to-front so each knows its successor. O(extent count) plus I/O.
-    fn encodeFreeListChain(self: *WriteTxn, new_fl: *const FreeList) !FreeListChain {
+    fn encodeFreeListChain(self: *WriteTransaction, new_fl: *const FreeList) !FreeListChain {
         const db = self.db;
         const enc_io = std.Io.Threaded.global_single_threaded.io();
         const enc_start = Io.Clock.now(.awake, enc_io).nanoseconds;
@@ -306,7 +306,7 @@ pub const WriteTxn = struct {
     /// version->root ring. Mapped-memory writes only -- nothing is durable
     /// until the step-3 flush. Returns the inactive slot index for the
     /// commit-point flip.
-    fn writeSlotAndRing(self: *WriteTxn, prev_active_slot: u8, free_list_head_ref: u64) u8 {
+    fn writeSlotAndRing(self: *WriteTransaction, prev_active_slot: u8, free_list_head_ref: u64) u8 {
         const db = self.db;
 
         // Determine the inactive slot and its byte offset.
@@ -344,7 +344,7 @@ pub const WriteTxn = struct {
     /// revert every in-memory header change so the old version stays live,
     /// poison the instance (the commit's on-disk fate is indeterminate), and
     /// return error.Durability.
-    fn flipCommitPointer(self: *WriteTxn, inactive_idx: u8, prev_active_slot: u8, prev_logical_size: u64) !void {
+    fn flipCommitPointer(self: *WriteTransaction, inactive_idx: u8, prev_active_slot: u8, prev_logical_size: u64) !void {
         const db = self.db;
         db.store.header.active_slot = inactive_idx;
         db.store.header.logical_size = @intCast(db.arena.top);

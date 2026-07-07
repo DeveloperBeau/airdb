@@ -13,11 +13,11 @@
 // and mutating operations additionally require
 //   alloc(size) !Allocation, writableCopy(ref, len) !Allocation,
 //   free(ref, len) !void
-// where Allocation is arena.Allocation. WriteTxn is the production
-// implementation; ReadTxn satisfies the read-only subset.
+// where Allocation is arena.Allocation. WriteTransaction is the production
+// implementation; ReadTransaction satisfies the read-only subset.
 
 const std = @import("std");
-const Ref = @import("../storage/reference.zig").Ref;
+const Reference = @import("../storage/reference.zig").Reference;
 const indexNode = @import("indexNode.zig");
 
 // Local aliases for the on-disk node format, which lives in indexNode.zig.
@@ -45,9 +45,9 @@ pub const maxDepth: usize = 16;
 // A split's right sibling and an insert's resulting node both carry their
 // subtree entry count so the parent can maintain the per-child counts that
 // make count a single-node read.
-const Split = struct { ref: Ref, low: u64, count: u64 };
-const InsertResult = struct { ref: Ref, count: u64, split: ?Split };
-const RemoveResult = struct { ref: Ref, count: u64 };
+const Split = struct { ref: Reference, low: u64, count: u64 };
+const InsertResult = struct { ref: Reference, count: u64, split: ?Split };
+const RemoveResult = struct { ref: Reference, count: u64 };
 
 /// Shared B+tree operations over the indexNode.zig layout, specialized by a
 /// comptime `Keying` capability that decides how the u64 stored in each key
@@ -66,15 +66,15 @@ const RemoveResult = struct { ref: Ref, count: u64 };
 /// release the referenced bytes.
 pub fn BTreeCore(comptime Keying: type) type {
     return struct {
-        /// Create a new empty leaf node and return its Ref.
-        pub fn create(transaction: anytype) !Ref {
+        /// Create a new empty leaf node and return its Reference.
+        pub fn create(transaction: anytype) !Reference {
             const allocation = try transaction.alloc(leafNodeSize);
             _ = encodeLeaf(allocation.bytes, &.{}, &.{});
             return allocation.ref;
         }
 
         /// Deref a node, sizing the read by its kind byte (leaf vs inner).
-        pub fn derefNode(transaction: anytype, ref: Ref) ![]const u8 {
+        pub fn derefNode(transaction: anytype, ref: Reference) ![]const u8 {
             const kindBytes = try transaction.deref(ref, 1);
             return switch (kindBytes[0]) {
                 kindLeaf => transaction.deref(ref, leafNodeSize),
@@ -117,11 +117,11 @@ pub fn BTreeCore(comptime Keying: type) type {
 
         /// Look up probeKey in the tree rooted at root. Returns the value on
         /// an exactly-equal stored key, else null. O(height) with I/O.
-        pub fn get(transaction: anytype, root: Ref, probeKey: Keying.ProbeKey) !?u64 {
+        pub fn get(transaction: anytype, root: Reference, probeKey: Keying.ProbeKey) !?u64 {
             return getAt(transaction, root, probeKey, 0);
         }
 
-        fn getAt(transaction: anytype, root: Ref, probeKey: Keying.ProbeKey, depth: usize) !?u64 {
+        fn getAt(transaction: anytype, root: Reference, probeKey: Keying.ProbeKey, depth: usize) !?u64 {
             if (depth >= maxDepth) return error.Corrupt;
             const bytes = try derefNode(transaction, root);
             if (bytes[0] == kindLeaf) {
@@ -140,8 +140,8 @@ pub fn BTreeCore(comptime Keying: type) type {
 
         /// Descend the leftmost spine to the leftmost leaf and return its
         /// first (smallest) stored key. O(height) with I/O.
-        fn minKey(transaction: anytype, ref: Ref) !u64 {
-            var current: Ref = ref;
+        fn minKey(transaction: anytype, ref: Reference) !u64 {
+            var current: Reference = ref;
             var depth: usize = 0;
             while (depth < maxDepth) : (depth += 1) {
                 const bytes = try derefNode(transaction, current);
@@ -161,7 +161,7 @@ pub fn BTreeCore(comptime Keying: type) type {
         /// leaf/inner upsert, shift, and midpoint-split cases all share the
         /// split-propagation state -- one irreducible algorithm rather than
         /// separable steps.
-        fn insertInto(transaction: anytype, nodeRef: Ref, probeKey: Keying.ProbeKey, storedKey: u64, value: u64, depth: usize) !InsertResult {
+        fn insertInto(transaction: anytype, nodeRef: Reference, probeKey: Keying.ProbeKey, storedKey: u64, value: u64, depth: usize) !InsertResult {
             if (depth >= maxDepth) return error.Corrupt;
             const kind = (try transaction.deref(nodeRef, 1))[0];
 
@@ -336,10 +336,10 @@ pub fn BTreeCore(comptime Keying: type) type {
 
         /// Insert or update probeKey->value in the tree rooted at root,
         /// storing storedKey in the new key slot. Returns the (possibly new)
-        /// root Ref and grows the tree height on a root split. On an upsert
+        /// root Reference and grows the tree height on a root split. On an upsert
         /// the value is overwritten in place and storedKey's key material is
         /// released via Keying.freeKey.
-        pub fn insert(transaction: anytype, root: Ref, probeKey: Keying.ProbeKey, storedKey: u64, value: u64) !Ref {
+        pub fn insert(transaction: anytype, root: Reference, probeKey: Keying.ProbeKey, storedKey: u64, value: u64) !Reference {
             const result = try insertInto(transaction, root, probeKey, storedKey, value, 0);
             if (result.split == null) return result.ref;
             // Root was split: build a new two-child inner root. The left low
@@ -357,15 +357,15 @@ pub fn BTreeCore(comptime Keying: type) type {
 
         /// Remove probeKey from the tree rooted at root, releasing the
         /// matched slot's key material via Keying.freeKey. Returns the
-        /// (possibly new) root Ref; unchanged if the key is absent.
-        pub fn remove(transaction: anytype, root: Ref, probeKey: Keying.ProbeKey) !Ref {
+        /// (possibly new) root Reference; unchanged if the key is absent.
+        pub fn remove(transaction: anytype, root: Reference, probeKey: Keying.ProbeKey) !Reference {
             return (try removeInto(transaction, root, probeKey, 0)).ref;
         }
 
         /// Recursive remove. Returns the (possibly new) node ref and its
         /// subtree count. Returns nodeRef unchanged when the key is absent
         /// (no COW on the path).
-        fn removeInto(transaction: anytype, nodeRef: Ref, probeKey: Keying.ProbeKey, depth: usize) !RemoveResult {
+        fn removeInto(transaction: anytype, nodeRef: Reference, probeKey: Keying.ProbeKey, depth: usize) !RemoveResult {
             if (depth >= maxDepth) return error.Corrupt;
             const kind = (try transaction.deref(nodeRef, 1))[0];
 
@@ -397,7 +397,7 @@ pub fn BTreeCore(comptime Keying: type) type {
             const innerBytes = try transaction.deref(nodeRef, innerNodeSize);
             const inner = try parseInner(innerBytes);
             const childIndex = try childIndexForKey(transaction, inner, probeKey);
-            const oldChildRef: Ref = inner.childRef(childIndex);
+            const oldChildRef: Reference = inner.childRef(childIndex);
             // Capture BEFORE writableCopy: it frees nodeRef into the reuse
             // pool, so inner's bytes must not be read after it (the node can
             // be reallocated).
@@ -418,11 +418,11 @@ pub fn BTreeCore(comptime Keying: type) type {
         /// -- a no-op for inline keys. Values are NOT freed; for trees whose
         /// leaf values are refs to other structures the caller owns those
         /// separately. O(nodes) with I/O.
-        pub fn freeTree(transaction: anytype, root: Ref) !void {
+        pub fn freeTree(transaction: anytype, root: Reference) !void {
             return freeTreeAt(transaction, root, 0);
         }
 
-        fn freeTreeAt(transaction: anytype, nodeRef: Ref, depth: usize) !void {
+        fn freeTreeAt(transaction: anytype, nodeRef: Reference, depth: usize) !void {
             if (depth >= maxDepth) return error.Corrupt;
             const bytes = try derefNode(transaction, nodeRef);
             if (bytes[0] == kindLeaf) {
@@ -444,7 +444,7 @@ pub fn BTreeCore(comptime Keying: type) type {
         /// Return the number of keys in the tree rooted at root. A
         /// single-node read: leaves know their own count and inner nodes
         /// store per-child subtree counts.
-        pub fn count(transaction: anytype, root: Ref) !u64 {
+        pub fn count(transaction: anytype, root: Reference) !u64 {
             const bytes = try derefNode(transaction, root);
             if (bytes[0] == kindLeaf) {
                 const leaf = try parseLeaf(bytes);
@@ -459,7 +459,7 @@ pub fn BTreeCore(comptime Keying: type) type {
         /// to right; leaf keys are already sorted. O(nodes) with I/O.
         pub fn forEachKey(
             transaction: anytype,
-            root: Ref,
+            root: Reference,
             context: anytype,
             comptime onKey: fn (@TypeOf(context), u64) anyerror!void,
         ) !void {
@@ -468,7 +468,7 @@ pub fn BTreeCore(comptime Keying: type) type {
 
         fn forEachKeyAt(
             transaction: anytype,
-            root: Ref,
+            root: Reference,
             context: anytype,
             comptime onKey: fn (@TypeOf(context), u64) anyerror!void,
             depth: usize,
@@ -494,7 +494,7 @@ pub fn BTreeCore(comptime Keying: type) type {
         /// alongside each key in the leaf. O(nodes) with I/O.
         pub fn forEachEntry(
             transaction: anytype,
-            root: Ref,
+            root: Reference,
             context: anytype,
             comptime onEntry: fn (@TypeOf(context), u64, u64) anyerror!void,
         ) !void {
@@ -503,7 +503,7 @@ pub fn BTreeCore(comptime Keying: type) type {
 
         fn forEachEntryAt(
             transaction: anytype,
-            root: Ref,
+            root: Reference,
             context: anytype,
             comptime onEntry: fn (@TypeOf(context), u64, u64) anyerror!void,
             depth: usize,

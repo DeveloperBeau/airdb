@@ -1,8 +1,8 @@
 // syncer.zig -- injectable durability-barrier interface and its implementations.
 //
-// The Syncer abstraction lets the storage layer depend on "flush this file to
+// The Syncing abstraction lets the storage layer depend on "flush this file to
 // stable storage" without knowing how: production uses the platform barrier
-// (RealSyncer), tests inject a controllable one (FailingSyncer) to simulate a
+// (FileSyncer), tests inject a controllable one (FailingSyncer) to simulate a
 // crash at a precise commit step.
 
 const std = @import("std");
@@ -10,11 +10,11 @@ const builtin = @import("builtin");
 const Io = std.Io;
 
 /// Injectable flush interface.
-pub const Syncer = struct {
+pub const Syncing = struct {
     ptr: *anyopaque,
     flushFn: *const fn (ptr: *anyopaque, file: Io.File) anyerror!void,
 
-    pub fn flush(self: Syncer, file: Io.File) !void {
+    pub fn flush(self: Syncing, file: Io.File) !void {
         return self.flushFn(self.ptr, file);
     }
 };
@@ -39,15 +39,15 @@ fn fullSync(file: Io.File) !void {
 }
 
 /// Production syncer that calls the platform durability barrier.
-pub const RealSyncer = struct {
-    var instance: RealSyncer = .{};
+pub const FileSyncer = struct {
+    var instance: FileSyncer = .{};
 
     fn flushImpl(ptr: *anyopaque, file: Io.File) anyerror!void {
         _ = ptr;
         try fullSync(file);
     }
 
-    pub fn any() Syncer {
+    pub fn any() Syncing {
         return .{
             .ptr = &instance,
             .flushFn = flushImpl,
@@ -68,7 +68,7 @@ pub const FailingSyncer = struct {
         try fullSync(file);
     }
 
-    pub fn any(self: *FailingSyncer) Syncer {
+    pub fn any(self: *FailingSyncer) Syncing {
         return .{ .ptr = self, .flushFn = &FailingSyncer.flushImpl };
     }
 };

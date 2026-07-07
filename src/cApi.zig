@@ -12,8 +12,8 @@
 
 const std = @import("std");
 const Db = @import("database.zig").Db;
-const WriteTxn = @import("database.zig").WriteTxn;
-const Ref = @import("storage/reference.zig").Ref;
+const WriteTransaction = @import("database.zig").WriteTransaction;
+const Reference = @import("storage/reference.zig").Reference;
 const rows = @import("records/rows.zig");
 const catalog = @import("schema/catalog.zig");
 const bulk = @import("records/bulk.zig");
@@ -320,7 +320,7 @@ export fn airdb_bulk_append(handle: ?*Database, rows_flat: [*]const u64, row_cou
 // ---------------------------------------------------------------------------
 // Explicit multi-operation write transactions.
 //
-// A Txn holds one open WriteTxn and threads the catalog ref across operations,
+// A Txn holds one open WriteTransaction and threads the catalog ref across operations,
 // so a burst of writes commits as a SINGLE durable barrier instead of one
 // commit per call. The auto-commit functions above are unchanged.
 //
@@ -330,8 +330,8 @@ export fn airdb_bulk_append(handle: ?*Database, rows_flat: [*]const u64, row_cou
 // behavior. A handle is single-threaded: do not drive one Txn from two threads.
 //
 // The write lock is acquired in airdb_begin and released exactly once: by
-// airdb_commit (via WriteTxn.commit, which unlocks on both its success and its
-// own error/revert paths) or by airdb_abort (via WriteTxn.deinit).
+// airdb_commit (via WriteTransaction.commit, which unlocks on both its success and its
+// own error/revert paths) or by airdb_abort (via WriteTransaction.deinit).
 //
 // BENIGN op results (duplicate, not-found, conflict) are decided before any
 // mutation and leave the txn fully usable. A STRUCTURAL op failure (generic
@@ -343,8 +343,8 @@ export fn airdb_bulk_append(handle: ?*Database, rows_flat: [*]const u64, row_cou
 
 const Txn = struct {
     dbh: *Database,
-    w: WriteTxn,
-    cat: Ref, // current catalog ref, threaded across operations
+    w: WriteTransaction,
+    cat: Reference, // current catalog ref, threaded across operations
     poisoned: bool = false, // structural op failure: commit must not proceed
 };
 
@@ -439,7 +439,7 @@ export fn airdb_txn_delete(txn: ?*Txn, pk: u64) i64 {
 
 // Commit the open transaction: make the entire batch durable in one barrier and
 // release the write lock, then free the handle. Returns AIRDB_OK on success or
-// AIRDB_E_GENERIC if the durable commit failed. WriteTxn.commit already releases
+// AIRDB_E_GENERIC if the durable commit failed. WriteTransaction.commit already releases
 // the lock on BOTH its success and its error/revert paths, so this must NOT
 // unlock again; it only frees the handle. Safe with null (returns
 // AIRDB_E_GENERIC).
@@ -455,7 +455,7 @@ export fn airdb_commit(txn: ?*Txn) i64 {
     }
     t.w.setRoot(t.cat);
     _ = t.w.commit() catch {
-        // commit already released the lock per WriteTxn.commit's contract; just
+        // commit already released the lock per WriteTransaction.commit's contract; just
         // free the handle. Do NOT double-unlock.
         const code = commitErrCode(t.dbh);
         alloc.destroy(t);

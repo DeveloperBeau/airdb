@@ -1,6 +1,6 @@
 const std = @import("std");
-const WriteTxn = @import("../database.zig").WriteTxn;
-const Ref = @import("../storage/reference.zig").Ref;
+const WriteTransaction = @import("../database.zig").WriteTransaction;
+const Reference = @import("../storage/reference.zig").Reference;
 const Column = @import("../trees/column.zig");
 const Index = @import("../trees/index.zig");
 const bindex = @import("../trees/byteKeyIndex.zig");
@@ -27,7 +27,7 @@ const max_prop_count = catalog.max_prop_count;
 // Append a new property to the type. The new column is filled with
 // `default_value` for every existing row (live or tombstoned). For a link or
 // link_set property a fresh backlink index is created. Returns the new catalog.
-pub fn addProperty(txn: *WriteTxn, cat: Ref, def: PropDef, default_value: u64) !Ref {
+pub fn addProperty(txn: *WriteTransaction, cat: Reference, def: PropDef, default_value: u64) !Reference {
     var s = try catalog.CatalogSnapshot.load(txn, cat);
     const pc = s.prop_count;
     std.debug.assert(pc + 1 <= max_prop_count);
@@ -41,7 +41,7 @@ pub fn addProperty(txn: *WriteTxn, cat: Ref, def: PropDef, default_value: u64) !
     if (def.indexed and is_collection) return error.Unsupported;
 
     const new_col = try buildBackfilledColumn(txn, &s, def, default_value, is_collection);
-    const vi: Ref = if (def.indexed) try backfillValueIndex(txn, s.keyrow_index_ref, new_col) else 0;
+    const vi: Reference = if (def.indexed) try backfillValueIndex(txn, s.keyrow_index_ref, new_col) else 0;
 
     s.props[pc] = .{
         .col = new_col,
@@ -69,12 +69,12 @@ pub fn addProperty(txn: *WriteTxn, cat: Ref, def: PropDef, default_value: u64) !
 // the default bytes (the caller keeps ownership of the passed-in ref). Dead
 // rows get 0 for both; nothing ever dereferences a tombstoned row's columns.
 fn buildBackfilledColumn(
-    txn: *WriteTxn,
+    txn: *WriteTransaction,
     s: *const catalog.CatalogSnapshot,
     def: PropDef,
     default_value: u64,
     is_collection: bool,
-) !Ref {
+) !Reference {
     var new_col = try Column.create(txn);
     var i: u64 = 0;
     while (i < s.next_row) : (i += 1) {
@@ -106,12 +106,12 @@ fn buildBackfilledColumn(
 // audit). Each row is indexed under its OWN raw column value (mirroring the
 // insert path) -- blob backfills give every row a distinct ref, so a single
 // shared key would diverge from what reads and audits expect.
-fn backfillValueIndex(txn: *WriteTxn, keyrow_ref: Ref, new_col: Ref) !Ref {
+fn backfillValueIndex(txn: *WriteTransaction, keyrow_ref: Reference, new_col: Reference) !Reference {
     var vi = try Index.create(txn);
     const Sink = struct {
-        txn: *WriteTxn,
-        vi: *Ref,
-        col: Ref,
+        txn: *WriteTransaction,
+        vi: *Reference,
+        col: Reference,
         fn onEntry(self: @This(), okey: u64, row: u64) anyerror!void {
             const raw = try Column.get(self.txn, self.col, row);
             self.vi.* = try rows.viAdd(self.txn, self.vi.*, raw, okey);
@@ -123,7 +123,7 @@ fn backfillValueIndex(txn: *WriteTxn, keyrow_ref: Ref, new_col: Ref) !Ref {
 
 // Copy a blob's bytes into a fresh node, returning the new ref. Used by the
 // blob-default backfill so no two rows share one node.
-fn blobDup(txn: *WriteTxn, ref: u64) !u64 {
+fn blobDup(txn: *WriteTransaction, ref: u64) !u64 {
     if (blob.get(txn, ref)) |bytes| {
         return blob.put(txn, bytes);
     } else |err| switch (err) {
@@ -139,7 +139,7 @@ fn blobDup(txn: *WriteTxn, ref: u64) !u64 {
 
 // Remove property `prop` (must be >= 1; the primary key at 0 cannot be removed).
 // The dropped column is left for compaction to reclaim. Returns the new catalog.
-pub fn removeProperty(txn: *WriteTxn, cat: Ref, prop: usize) !Ref {
+pub fn removeProperty(txn: *WriteTransaction, cat: Reference, prop: usize) !Reference {
     std.debug.assert(prop >= 1);
     var s = try catalog.CatalogSnapshot.load(txn, cat);
     std.debug.assert(prop < s.prop_count);

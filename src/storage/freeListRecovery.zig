@@ -9,13 +9,13 @@
 const std = @import("std");
 const platform = @import("../platform.zig");
 const Db = @import("../database.zig").Db;
-const Ref = @import("reference.zig").Ref;
+const Reference = @import("reference.zig").Reference;
 const FreeList = @import("freeList.zig").FreeList;
 
 /// Decode the persisted free-list chain headed at free_list_ref into `out`,
 /// returning the HEAD chunk's byte length. `out` must already be initialized;
 /// its previous contents are discarded. O(chain length + extent count).
-pub fn decodeFreeListNode(db: *Db, free_list_ref: Ref, out: *FreeList) !usize {
+pub fn decodeFreeListNode(db: *Db, free_list_ref: Reference, out: *FreeList) !usize {
     out.reset();
     const limit: u64 = @intCast(db.store.sectionsView().len * platform.section_size);
     var head_len: usize = 0;
@@ -52,7 +52,7 @@ pub fn decodeFreeListNode(db: *Db, free_list_ref: Ref, out: *FreeList) !usize {
 /// Decode the persisted free-list node at free_list_ref into db.free_list.
 /// Sets db.free_list_node_ref and db.free_list_node_len. db.free_list must
 /// already be initialized (possibly empty).
-pub fn loadFreeList(db: *Db, free_list_ref: Ref) !void {
+pub fn loadFreeList(db: *Db, free_list_ref: Reference) !void {
     const node_len = try decodeFreeListNode(db, free_list_ref, &db.free_list);
     db.free_list_node_ref = free_list_ref;
     db.free_list_node_len = node_len;

@@ -1,2 +1,2 @@
-pub const Ref = u64;
-pub const null_ref: Ref = 0;
+pub const Reference = u64;
+pub const nullReference: Reference = 0;

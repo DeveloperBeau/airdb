@@ -6,7 +6,7 @@ const Io = std.Io;
 const db_mod = @import("database.zig");
 const Db = db_mod.Db;
 const ring_capacity = db_mod.ring_capacity;
-const Ref = @import("storage/reference.zig").Ref;
+const Reference = @import("storage/reference.zig").Reference;
 const FreeList = @import("storage/freeList.zig").FreeList;
 const coord_mod = @import("transactions/coordination.zig");
 const typedir = @import("schema/typeDirectory.zig");
@@ -499,7 +499,7 @@ test "allocations beyond the initial mapping grow the file and data survives reo
     defer tmp.cleanup();
     const path = try tmpFilePath(testing.allocator, &tmp, "biggrow.airdb");
     defer testing.allocator.free(path);
-    var last_ref: Ref = 0;
+    var last_ref: Reference = 0;
     {
         var db = try Db.create(testing.allocator, path);
         defer db.deinit();
@@ -1170,7 +1170,7 @@ test "a corrupt persisted free-list extent fails open instead of poisoning reuse
     defer tmp.cleanup();
     const path = try tmpFilePath(testing.allocator, &tmp, "flcorrupt.airdb");
     defer testing.allocator.free(path);
-    var node_ref: Ref = 0;
+    var node_ref: Reference = 0;
     {
         var db = try Db.create(testing.allocator, path);
         defer db.deinit();

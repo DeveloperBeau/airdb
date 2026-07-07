@@ -10,7 +10,7 @@ maintenance (compaction) is driven explicitly by the caller.
 
 | Layer | Files | Responsibility |
 |---|---|---|
-| Platform | `platform.zig`, `storage/syncer.zig` | mmap sections, file locks, pid/incarnation checks, durability barrier (`F_FULLFSYNC` on Darwin, `fsync` elsewhere), injectable `Syncer` for crash tests |
+| Platform | `platform.zig`, `storage/syncer.zig` | mmap sections, file locks, pid/incarnation checks, durability barrier (`F_FULLFSYNC` on Darwin, `fsync` elsewhere), injectable `Syncing` for crash tests |
 | Store | `storage/fileStore.zig`, `storage/slots.zig`, `storage/arena.zig`, `storage/freeList.zig` | CRC-checked header, two CRC-checked commit slots, bump-allocating arena over the mapping, persisted free list with size-class buckets |
 | Transactions | `database.zig`, `transactions/writeTransaction.zig`, `transactions/readTransaction.zig`, `transactions/coordination.zig` | MVCC snapshots and pins, the commit protocol, version→root ring for point-in-time reads, cross-process coordination |
 | Trees | `trees/index.zig`/`trees/indexNode.zig`, `trees/column.zig`/`trees/columnNode.zig`, `trees/byteKeyIndex.zig`, `records/blob.zig` | copy-on-write B+trees (u64-keyed index with subtree counts, row-indexed column, byte-keyed bindex), chunked blob heap |
@@ -22,7 +22,7 @@ maintenance (compaction) is driven explicitly by the caller.
 
 The file is mapped in fixed 16 MiB sections. Growth only appends new
 sections; an existing section is never remapped or moved, so every live
-pointer into the mapping stays valid for the life of the process. A `Ref` is
+pointer into the mapping stays valid for the life of the process. A `Reference` is
 an absolute byte offset; `arena.deref` is the single bounds-checked chokepoint
 every read goes through (null, alignment, section bounds, no cross-section
 spans). No allocation may cross a section boundary, which caps a single

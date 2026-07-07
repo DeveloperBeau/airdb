@@ -1,4 +1,4 @@
-// database.zig -- Db, ReadTxn, WriteTxn, and the two-slot atomic durable commit.
+// database.zig -- Db, ReadTransaction, WriteTransaction, and the two-slot atomic durable commit.
 //
 // Slot A byte range in the header page: [64, 64+Slot.size).
 // Slot B byte range in the header page: [128, 128+Slot.size).
@@ -9,12 +9,12 @@ const testing = std.testing;
 const Io = std.Io;
 const platform = @import("platform.zig");
 const FileStore = @import("storage/fileStore.zig").FileStore;
-const RealSyncer = @import("storage/syncer.zig").RealSyncer;
-const Syncer = @import("storage/syncer.zig").Syncer;
+const FileSyncer = @import("storage/syncer.zig").FileSyncer;
+const Syncing = @import("storage/syncer.zig").Syncing;
 const default_page_size = @import("storage/fileStore.zig").default_page_size;
 const Arena = @import("storage/arena.zig").Arena;
 const Allocation = @import("storage/arena.zig").Allocation;
-const Ref = @import("storage/reference.zig").Ref;
+const Reference = @import("storage/reference.zig").Reference;
 const Slot = @import("storage/slots.zig").Slot;
 const FreeList = @import("storage/freeList.zig").FreeList;
 const Coord = @import("transactions/coordination.zig").Coord;
@@ -69,7 +69,7 @@ pub const CompactCursor = struct {
     /// a foreign cursor would leave rows unexamined ahead of the tail
     /// truncate -- silent live-row loss in release builds.
     type_id: u16,
-    cat: Ref,
+    cat: Reference,
     live_count: u64,
     next_row: u64,
     hole_lo: u64,
@@ -80,12 +80,12 @@ pub const Db = struct {
     store: FileStore,
     arena: Arena,
     active_version: u64,
-    active_root: Ref,
+    active_root: Reference,
     pins: std.AutoHashMap(u64, u32),
     /// Currently-committed free list. Owns its memory; deinit'd in Db.deinit.
     free_list: FreeList,
     /// Offset of the live free-list node on disk (0 if none).
-    free_list_node_ref: Ref,
+    free_list_node_ref: Reference,
     /// Byte length of the live free-list node on disk (0 if none).
     free_list_node_len: usize,
     /// Coordination file for multi-process attach count and latest-version signal.
@@ -135,11 +135,11 @@ pub const Db = struct {
 
     /// Create a new database file at the given absolute path.
     pub fn create(allocator: std.mem.Allocator, path: []const u8) !Db {
-        return createWith(allocator, path, RealSyncer.any());
+        return createWith(allocator, path, FileSyncer.any());
     }
 
-    /// Like create, but with an injectable Syncer (used for testing).
-    pub fn createWith(allocator: std.mem.Allocator, path: []const u8, syncer: Syncer) !Db {
+    /// Like create, but with an injectable Syncing (used for testing).
+    pub fn createWith(allocator: std.mem.Allocator, path: []const u8, syncer: Syncing) !Db {
         var store = try FileStore.create(allocator, path, syncer);
         errdefer store.deinit();
 
@@ -193,11 +193,11 @@ pub const Db = struct {
 
     /// Open an existing database file at the given absolute path.
     pub fn open(allocator: std.mem.Allocator, path: []const u8) !Db {
-        return openWith(allocator, path, RealSyncer.any());
+        return openWith(allocator, path, FileSyncer.any());
     }
 
-    /// Like open, but with an injectable Syncer (used for testing).
-    pub fn openWith(allocator: std.mem.Allocator, path: []const u8, syncer: Syncer) !Db {
+    /// Like open, but with an injectable Syncing (used for testing).
+    pub fn openWith(allocator: std.mem.Allocator, path: []const u8, syncer: Syncing) !Db {
         var store = try FileStore.open(allocator, path, syncer);
         errdefer store.deinit();
         // Capture the section table before store is copied into the partial Db below.
@@ -266,7 +266,7 @@ pub const Db = struct {
         versioning.publishPins(self);
     }
 
-    pub fn beginRead(self: *Db) !ReadTxn {
+    pub fn beginRead(self: *Db) !ReadTransaction {
         // Pin-then-validate loop. Between refreshing to the latest published
         // version and this process's pin becoming visible in the coord slot, a
         // writer in another process may commit a NEWER version and compute a
@@ -297,10 +297,10 @@ pub const Db = struct {
             const retain = self.retainVersions();
             const floor = if (retain == coord_mod.sentinel_max) 0 else lv -| retain;
             if (v >= floor) {
-                return ReadTxn{ .db = self, .root_ref = root, .version = v };
+                return ReadTransaction{ .db = self, .root_ref = root, .version = v };
             }
             // The pin landed too late; release it and pin the newer version.
-            var stale = ReadTxn{ .db = self, .root_ref = root, .version = v };
+            var stale = ReadTransaction{ .db = self, .root_ref = root, .version = v };
             stale.end();
         }
     }
@@ -309,7 +309,7 @@ pub const Db = struct {
     /// error.VersionUnavailable if the version is not in the durable ring or has
     /// aged out of the retention window (its nodes may have been reclaimed).
     /// Pins the version so its nodes are held for the life of the read.
-    pub fn beginReadAt(self: *Db, version: u64) !ReadTxn {
+    pub fn beginReadAt(self: *Db, version: u64) !ReadTransaction {
         try versioning.refreshToLatest(self);
         if (version > self.active_version) return error.VersionUnavailable;
         // Must be inside the retention window: older versions' nodes may already
@@ -339,12 +339,12 @@ pub const Db = struct {
         if (retain != coord_mod.sentinel_max) {
             const lv = self.coord.latestVersion();
             if (version < lv -| retain) {
-                var txn = ReadTxn{ .db = self, .root_ref = root, .version = version };
+                var txn = ReadTransaction{ .db = self, .root_ref = root, .version = version };
                 txn.end(); // unpin
                 return error.VersionUnavailable;
             }
         }
-        return ReadTxn{ .db = self, .root_ref = root, .version = version };
+        return ReadTransaction{ .db = self, .root_ref = root, .version = version };
     }
 
     /// The minimum version pinned by a live reader in this process, or the
@@ -407,7 +407,7 @@ pub const Db = struct {
     /// Shared body for beginWrite and beginWriteTry. Caller must hold the coord
     /// lock before calling; an errdefer in the caller releases the lock if this
     /// function returns an error.
-    fn beginWriteLocked(self: *Db) !WriteTxn {
+    fn beginWriteLocked(self: *Db) !WriteTransaction {
         // A failed commit-point flush left the on-disk header indeterminate;
         // writing further could corrupt the version that may in fact have been
         // published. Reopen to resolve.
@@ -427,7 +427,7 @@ pub const Db = struct {
             try work_freelist.add(e);
         }
         self.fl_clone_ns += @intCast(Io.Clock.now(.awake, clone_io).nanoseconds - clone_start);
-        return WriteTxn{
+        return WriteTransaction{
             .db = self,
             .new_root = self.active_root,
             .new_version = self.active_version + 1,
@@ -439,9 +439,9 @@ pub const Db = struct {
     }
 
     /// Begin a write transaction, blocking until the cross-process write lock is
-    /// acquired. The lock is released when the returned WriteTxn is committed or
+    /// acquired. The lock is released when the returned WriteTransaction is committed or
     /// abandoned via deinit.
-    pub fn beginWrite(self: *Db) !WriteTxn {
+    pub fn beginWrite(self: *Db) !WriteTransaction {
         try self.coord.lockExclusive();
         errdefer self.coord.unlock(); // release if refresh or setup fails
         return self.beginWriteLocked();
@@ -449,7 +449,7 @@ pub const Db = struct {
 
     /// Like beginWrite but returns error.WouldBlock immediately if another writer
     /// currently holds the lock.
-    pub fn beginWriteTry(self: *Db) !WriteTxn {
+    pub fn beginWriteTry(self: *Db) !WriteTransaction {
         try self.coord.tryLockExclusive();
         errdefer self.coord.unlock(); // release if refresh or setup fails
         return self.beginWriteLocked();
@@ -525,11 +525,11 @@ pub const Db = struct {
 
 // ---------------------------------------------------------------------------
 // Transaction types (defined in their own modules; re-exported here so existing
-// call sites that do @import("database.zig").ReadTxn / .WriteTxn keep working).
+// call sites that do @import("database.zig").ReadTransaction / .WriteTransaction keep working).
 // ---------------------------------------------------------------------------
 
-pub const ReadTxn = @import("transactions/readTransaction.zig").ReadTxn;
-pub const WriteTxn = @import("transactions/writeTransaction.zig").WriteTxn;
+pub const ReadTransaction = @import("transactions/readTransaction.zig").ReadTransaction;
+pub const WriteTransaction = @import("transactions/writeTransaction.zig").WriteTransaction;
 
 test {
     _ = @import("databaseTests.zig");

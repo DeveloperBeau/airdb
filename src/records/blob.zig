@@ -17,8 +17,8 @@
 // is allocated for it.
 
 const std = @import("std");
-const Ref = @import("../storage/reference.zig").Ref;
-const WriteTxn = @import("../database.zig").WriteTxn;
+const Reference = @import("../storage/reference.zig").Reference;
+const WriteTransaction = @import("../database.zig").WriteTransaction;
 const section_size = @import("../platform.zig").section_size;
 
 /// Largest blob stored as a single inline node. The +5 node header (tag + len)
@@ -51,7 +51,7 @@ const ChunkedHeader = struct { total_len: usize, chunk_count: u32, node_size: us
 /// (poisoning the free list with garbage extents -- corruption that spreads
 /// after commit), underflows `total_len - start`, and on 32-bit hosts can
 /// overflow indexNodeSize into a too-short deref. Sizes are computed in u64.
-fn chunkedHeader(txn: anytype, ref: Ref) !ChunkedHeader {
+fn chunkedHeader(txn: anytype, ref: Reference) !ChunkedHeader {
     const hdr = try txn.deref(ref, idx_refs_off);
     if (hdr[0] != tag_chunked) return error.Corrupt;
     const total_len = std.mem.readInt(u64, hdr[idx_total_off..][0..8], .little);
@@ -63,11 +63,11 @@ fn chunkedHeader(txn: anytype, ref: Ref) !ChunkedHeader {
     return .{ .total_len = @intCast(total_len), .chunk_count = chunk_count, .node_size = @intCast(node_size) };
 }
 
-/// Write `bytes` into the blob heap and return its Ref.
+/// Write `bytes` into the blob heap and return its Reference.
 /// Returns the null ref (0) when `bytes` is empty -- no node is allocated.
 /// Small blobs become a single inline node; blobs over `inline_max` are split
 /// into chunk nodes referenced by an index node.
-pub fn put(txn: *WriteTxn, bytes: []const u8) !Ref {
+pub fn put(txn: *WriteTransaction, bytes: []const u8) !Reference {
     if (bytes.len == 0) return 0;
 
     if (bytes.len <= inline_max) {
@@ -104,7 +104,7 @@ pub fn put(txn: *WriteTxn, bytes: []const u8) !Ref {
 
 /// Number of bytes stored at `ref`. Null ref -> 0.
 /// Accepts any transaction type exposing `deref(ref, len) ![]const u8`.
-pub fn size(txn: anytype, ref: Ref) !usize {
+pub fn size(txn: anytype, ref: Reference) !usize {
     if (ref == 0) return 0;
     const tag = (try txn.deref(ref, 1))[0];
     if (tag == tag_inline) {
@@ -118,7 +118,7 @@ pub fn size(txn: anytype, ref: Ref) !usize {
 /// Returns `error.BlobChunked` for a chunked blob (it has no single contiguous
 /// slice); callers use `readInto`/`getAlloc` for those.
 /// Accepts any transaction type exposing `deref(ref, len) ![]const u8`.
-pub fn get(txn: anytype, ref: Ref) ![]const u8 {
+pub fn get(txn: anytype, ref: Reference) ![]const u8 {
     if (ref == 0) return &.{};
     const tag = (try txn.deref(ref, 1))[0];
     if (tag == tag_chunked) return error.BlobChunked;
@@ -132,7 +132,7 @@ pub fn get(txn: anytype, ref: Ref) ![]const u8 {
 /// Copy the blob at `ref` into `out`, which must be exactly `size(ref)` bytes.
 /// No allocation; the caller owns `out`. Works for both inline and chunked blobs.
 /// Accepts any transaction type exposing `deref(ref, len) ![]const u8`.
-pub fn readInto(txn: anytype, ref: Ref, out: []u8) !void {
+pub fn readInto(txn: anytype, ref: Reference, out: []u8) !void {
     std.debug.assert(out.len == try size(txn, ref));
     if (ref == 0) return;
 
@@ -161,7 +161,7 @@ pub fn readInto(txn: anytype, ref: Ref, out: []u8) !void {
 }
 
 /// Allocate a buffer, copy the blob at `ref` into it, and return it. Caller frees.
-pub fn getAlloc(txn: anytype, ref: Ref, allocator: std.mem.Allocator) ![]u8 {
+pub fn getAlloc(txn: anytype, ref: Reference, allocator: std.mem.Allocator) ![]u8 {
     const n = try size(txn, ref);
     const buf = try allocator.alloc(u8, n);
     errdefer allocator.free(buf);
@@ -170,11 +170,11 @@ pub fn getAlloc(txn: anytype, ref: Ref, allocator: std.mem.Allocator) ![]u8 {
 }
 
 /// Copy the blob at `src_ref` (inline OR chunked) from a source db into `dst`,
-/// returning its new Ref in the destination. The null ref (0) copies to 0.
+/// returning its new Reference in the destination. The null ref (0) copies to 0.
 /// Materializes the blob in RAM during the copy (acceptable for a maintenance
 /// op); a future optimization could stream chunks without buffering the whole
 /// blob. Accepts any source transaction exposing `deref(ref, len) ![]const u8`.
-pub fn copyInto(src: anytype, dst: *WriteTxn, src_ref: Ref) !Ref {
+pub fn copyInto(src: anytype, dst: *WriteTransaction, src_ref: Reference) !Reference {
     if (src_ref == 0) return 0;
     const buf = try getAlloc(src, src_ref, dst.db.store.allocator);
     defer dst.db.store.allocator.free(buf);
@@ -184,7 +184,7 @@ pub fn copyInto(src: anytype, dst: *WriteTxn, src_ref: Ref) !Ref {
 /// Release the blob at `ref` back to the storage engine.
 /// Freeing the null ref (0) is a no-op. For a chunked blob, frees every chunk
 /// node and then the index node.
-pub fn free(txn: *WriteTxn, ref: Ref) !void {
+pub fn free(txn: *WriteTransaction, ref: Reference) !void {
     if (ref == 0) return;
     const tag = (try txn.deref(ref, 1))[0];
     if (tag == tag_inline) {
@@ -238,7 +238,7 @@ test "blob put then get round-trips bytes; empty is the null ref" {
     try testing.expectEqualStrings("hello world", try get(&w, ref));
     try testing.expectEqual(@as(usize, 11), try size(&w, ref));
     const empty = try put(&w, "");
-    try testing.expectEqual(@as(Ref, 0), empty);
+    try testing.expectEqual(@as(Reference, 0), empty);
     try testing.expectEqualStrings("", try get(&w, empty));
     try testing.expectEqual(@as(usize, 0), try size(&w, empty));
     w.deinit();

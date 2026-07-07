@@ -1,6 +1,6 @@
 const std = @import("std");
-const WriteTxn = @import("../database.zig").WriteTxn;
-const Ref = @import("reference.zig").Ref;
+const WriteTransaction = @import("../database.zig").WriteTransaction;
+const Reference = @import("reference.zig").Reference;
 const Column = @import("../trees/column.zig");
 const Index = @import("../trees/index.zig");
 const catalog = @import("../schema/catalog.zig");
@@ -20,12 +20,12 @@ const collectKeyRowPairs = compactionCopy.collectKeyRowPairs;
 pub const copyTypeRows = compactionCopy.copyTypeRows;
 pub const rebuildBacklinks = compactionCopy.rebuildBacklinks;
 
-pub fn liveCount(txn: anytype, cat: Ref) !u64 {
+pub fn liveCount(txn: anytype, cat: Reference) !u64 {
     const v = try catalog.loadCatalog(txn, cat);
     return Index.count(txn, v.keyrow_index_ref);
 }
 
-pub fn shouldCompact(txn: anytype, cat: Ref) !bool {
+pub fn shouldCompact(txn: anytype, cat: Reference) !bool {
     const v = try catalog.loadCatalog(txn, cat);
     const n = v.next_row;
     if (n == 0) return false;
@@ -36,12 +36,12 @@ pub fn shouldCompact(txn: anytype, cat: Ref) !bool {
 // Rebuild the type's columns to contain only live rows, packed densely, and
 // remap the key->row index. Object keys, pk index, and backlink indexes are
 // preserved (keyed by object key). Returns the new catalog ref.
-pub fn compactType(txn: *WriteTxn, cat: Ref) !Ref {
+pub fn compactType(txn: *WriteTransaction, cat: Reference) !Reference {
     var s = try catalog.CatalogSnapshot.load(txn, cat);
     const pc = s.prop_count;
     // Keep the old column/index roots to read from while the snapshot's fields
     // are re-pointed at the fresh dense structures.
-    var old_prop: [max_prop_count]Ref = undefined;
+    var old_prop: [max_prop_count]Reference = undefined;
     {
         var j: usize = 0;
         while (j < pc) : (j += 1) old_prop[j] = s.props[j].col;
@@ -100,7 +100,7 @@ pub fn compactType(txn: *WriteTxn, cat: Ref) !Ref {
 // catalog with next_row == new_len. All live rows must already lie in
 // [0, new_len); the dead tail is dropped. Object key/pk/backlink indexes are
 // preserved unchanged. Returns the new catalog ref.
-fn truncatePacked(txn: *WriteTxn, cat: Ref, new_len: u64) !Ref {
+fn truncatePacked(txn: *WriteTransaction, cat: Reference, new_len: u64) !Reference {
     var s = try catalog.CatalogSnapshot.load(txn, cat);
     {
         var j: usize = 0;
@@ -139,7 +139,7 @@ fn rowToOkey(txn: anytype, v: catalog.CatalogView, row: u64) !u64 {
 // Hard safety check before truncating a packed type's dead tail: no live row
 // may survive in [live_count, next_row). Bounded, debug-only, and runs once
 // per pack at the final step.
-fn assertTailDead(txn: *WriteTxn, cat: Ref, live_count: u64, next_row: u64) !void {
+fn assertTailDead(txn: *WriteTransaction, cat: Reference, live_count: u64, next_row: u64) !void {
     if (!std.debug.runtime_safety) return;
     const v = try catalog.loadCatalog(txn, cat);
     var r: u64 = live_count;
@@ -150,14 +150,14 @@ fn assertTailDead(txn: *WriteTxn, cat: Ref, live_count: u64, next_row: u64) !voi
 
 // Advance cursor.hole_lo upward to the next dead slot (relocation target) in
 // [0, live_count).
-fn advanceHoleCursor(txn: *WriteTxn, cat: Ref, live_count: u64, cursor: *CompactCursor) !void {
+fn advanceHoleCursor(txn: *WriteTransaction, cat: Reference, live_count: u64, cursor: *CompactCursor) !void {
     const v = try catalog.loadCatalog(txn, cat);
     while (cursor.hole_lo < live_count and (try Column.get(txn, v.live_col_ref, cursor.hole_lo)) == 1) : (cursor.hole_lo += 1) {}
 }
 
 // Advance cursor.high_hi down past dead rows to the next live row at
 // >= live_count.
-fn advanceHighCursor(txn: *WriteTxn, cat: Ref, live_count: u64, cursor: *CompactCursor) !void {
+fn advanceHighCursor(txn: *WriteTransaction, cat: Reference, live_count: u64, cursor: *CompactCursor) !void {
     const v = try catalog.loadCatalog(txn, cat);
     while (cursor.high_hi > live_count and (try Column.get(txn, v.live_col_ref, cursor.high_hi - 1)) == 0) : (cursor.high_hi -= 1) {}
 }
@@ -187,7 +187,7 @@ fn advanceHighCursor(txn: *WriteTxn, cat: Ref, live_count: u64, cursor: *Compact
 // in [live_count, next_row) before the truncate. A debug-only bounded scan
 // asserts exactly that immediately before truncating. Returns the updated
 // catalog ref, the rows moved this call, and whether packing finished.
-pub fn compactStep(txn: *WriteTxn, cat: Ref, type_id: u16, budget: usize) !struct { cat: Ref, moved: usize, done: bool } {
+pub fn compactStep(txn: *WriteTransaction, cat: Reference, type_id: u16, budget: usize) !struct { cat: Reference, moved: usize, done: bool } {
     var cur = cat;
     const lc = try liveCount(txn, cur);
     const next_row = (try catalog.loadCatalog(txn, cur)).next_row;
@@ -258,7 +258,7 @@ inline fn mixPk(pk: u64) u64 {
 // Walk a catalog's key->row index, reading each live row's primary key (prop 0),
 // and fold the pk set into `fold` (XOR of mixed pks) while counting rows. The
 // fold is identity-preserving and order-independent.
-fn foldPks(allocator: std.mem.Allocator, txn: anytype, cat: Ref, fold: *u64, count: *u64) !void {
+fn foldPks(allocator: std.mem.Allocator, txn: anytype, cat: Reference, fold: *u64, count: *u64) !void {
     const v = try catalog.loadCatalog(txn, cat);
     const prop0 = v.propColRef(0);
     var pairs = try collectKeyRowPairs(allocator, txn, v.keyrow_index_ref);
@@ -274,15 +274,15 @@ fn foldPks(allocator: std.mem.Allocator, txn: anytype, cat: Ref, fold: *u64, cou
 // the destination preserves it: (a) the object is readable in dst by its
 // original object key, and (b) every to-one link property holds the same raw
 // target in dst as in src. Returns error.CompactionMismatch on any failure.
-fn foldPksAndCheck(allocator: std.mem.Allocator, src: anytype, sc: Ref, dst: anytype, dc: Ref, fold: *u64, count: *u64) !void {
+fn foldPksAndCheck(allocator: std.mem.Allocator, src: anytype, sc: Reference, dst: anytype, dc: Reference, fold: *u64, count: *u64) !void {
     const sv = try catalog.loadCatalog(src, sc);
     const dv = try catalog.loadCatalog(dst, dc);
     const pc = sv.prop_count;
     if (dv.prop_count != pc) return error.CompactionMismatch;
 
     // Snapshot column refs and per-prop kinds for both sides up front.
-    var s_prop: [max_prop_count]Ref = undefined;
-    var d_prop: [max_prop_count]Ref = undefined;
+    var s_prop: [max_prop_count]Reference = undefined;
+    var d_prop: [max_prop_count]Reference = undefined;
     var kinds: [max_prop_count]catalog.PropKind = undefined;
     {
         var j: usize = 0;
@@ -324,8 +324,8 @@ fn checkRowProperties(
     dst: anytype,
     dv: catalog.CatalogView,
     kinds: []const catalog.PropKind,
-    s_prop: []const Ref,
-    d_prop: []const Ref,
+    s_prop: []const Reference,
+    d_prop: []const Reference,
     pr: Pair,
     drow: u64,
 ) !void {
@@ -348,7 +348,7 @@ fn checkRowProperties(
 // Proves, per type: identical type count, identical live count, identical pk set
 // (order-independent fold), every source object readable in dst by its original
 // key, and identical to-one forward links. Any divergence aborts the compaction.
-fn verifyEquivalent(allocator: std.mem.Allocator, src: anytype, src_dir: Ref, dst: anytype, dst_dir: Ref) !void {
+fn verifyEquivalent(allocator: std.mem.Allocator, src: anytype, src_dir: Reference, dst: anytype, dst_dir: Reference) !void {
     const tc = try typedir.typeCount(src, src_dir);
     if ((try typedir.typeCount(dst, dst_dir)) != tc) return error.CompactionMismatch;
     var t: u16 = 0;

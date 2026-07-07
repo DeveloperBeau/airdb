@@ -29,7 +29,7 @@ const airdb = @import("airdb");
 const harness = @import("../harness.zig");
 
 const Io = std.Io;
-const Ref = airdb.Ref;
+const Reference = airdb.Reference;
 const catalog = airdb.catalog;
 const objects = airdb.objects;
 const rawRows = airdb.rows;

@@ -1,4 +1,4 @@
-// fileStore.zig -- header, mmap, and injectable Syncer for airdb.
+// fileStore.zig -- header, mmap, and injectable Syncing for airdb.
 //
 // Zig 0.16 adaptations from the task spec:
 //   - std.fs.File           -> std.Io.File  (std.fs.File removed in 0.16)
@@ -19,8 +19,8 @@ const std = @import("std");
 const testing = std.testing;
 const Io = std.Io;
 const platform = @import("../platform.zig");
-const Syncer = @import("syncer.zig").Syncer;
-const RealSyncer = @import("syncer.zig").RealSyncer;
+const Syncing = @import("syncer.zig").Syncing;
+const FileSyncer = @import("syncer.zig").FileSyncer;
 
 // ---------------------------------------------------------------------------
 // Public constants
@@ -59,7 +59,7 @@ pub const FileStore = struct {
     /// never remapped or moved on growth; growth only appends. Unmapped in deinit.
     sections: std.ArrayList(platform.Section),
     header: Header,
-    syncer: Syncer,
+    syncer: Syncing,
     /// True when the header CRC32 matches the stored checksum at [28..32].
     /// Set by readHeader (open path) or to true after writeHeader (create/persistHeader path).
     /// Recovery in database.zig openWith reads this to decide whether to trust active_slot.
@@ -87,7 +87,7 @@ pub const FileStore = struct {
     pub fn create(
         allocator: std.mem.Allocator,
         path: []const u8,
-        syncer: Syncer,
+        syncer: Syncing,
     ) !FileStore {
         const io = sysIo();
         const file = try Io.Dir.createFileAbsolute(io, path, .{
@@ -130,7 +130,7 @@ pub const FileStore = struct {
     pub fn open(
         allocator: std.mem.Allocator,
         path: []const u8,
-        syncer: Syncer,
+        syncer: Syncing,
     ) !FileStore {
         const io = sysIo();
         const file = try Io.Dir.openFileAbsolute(io, path, .{ .mode = .read_write });
@@ -284,7 +284,7 @@ pub const FileStore = struct {
     }
 
     /// Re-encode header fields into the mmap'd page (does not flush).
-    // Writes the in-memory header into the mmap'd buffer. Durability requires a subsequent Syncer.flush.
+    // Writes the in-memory header into the mmap'd buffer. Durability requires a subsequent Syncing.flush.
     pub fn persistHeader(self: *FileStore) void {
         self.writeHeader();
         self.header_checksum_ok = true;
@@ -335,7 +335,7 @@ test "real syncer flush succeeds (exercises the platform durability path)" {
     const dir_path = path_buf[0..path_len];
     const file_path = try std.fs.path.join(testing.allocator, &.{ dir_path, "fsync.airdb" });
     defer testing.allocator.free(file_path);
-    var fs = try FileStore.create(testing.allocator, file_path, RealSyncer.any());
+    var fs = try FileStore.create(testing.allocator, file_path, FileSyncer.any());
     defer fs.deinit();
     try fs.syncer.flush(fs.file); // explicit second flush must also succeed
 }
@@ -348,12 +348,12 @@ test "header checksum validates on a clean file and fails when the header is tam
     const file_path = try std.fs.path.join(testing.allocator, &.{ path_buf[0..path_len], "hcrc.airdb" });
     defer testing.allocator.free(file_path);
     {
-        var fs = try FileStore.create(testing.allocator, file_path, RealSyncer.any());
+        var fs = try FileStore.create(testing.allocator, file_path, FileSyncer.any());
         defer fs.deinit();
         try testing.expect(fs.header_checksum_ok);
     }
     {
-        var fs = try FileStore.open(testing.allocator, file_path, RealSyncer.any());
+        var fs = try FileStore.open(testing.allocator, file_path, FileSyncer.any());
         defer fs.deinit();
         try testing.expect(fs.header_checksum_ok);
         fs.map[13] ^= 0xFF; // scramble active_slot byte
@@ -376,13 +376,13 @@ test "create writes a header that reopen reads back" {
     defer testing.allocator.free(file_path);
 
     {
-        var fs = try FileStore.create(testing.allocator, file_path, RealSyncer.any());
+        var fs = try FileStore.create(testing.allocator, file_path, FileSyncer.any());
         defer fs.deinit();
         try testing.expectEqual(@as(u32, default_page_size), fs.header.page_size);
         try testing.expectEqual(Endianness.little, fs.header.endianness);
     }
     {
-        var fs = try FileStore.open(testing.allocator, file_path, RealSyncer.any());
+        var fs = try FileStore.open(testing.allocator, file_path, FileSyncer.any());
         defer fs.deinit();
         try testing.expectEqual(airdb_magic, fs.header.magic);
     }
@@ -395,7 +395,7 @@ test "grow adds sections, section 0 base stable, existing bytes preserved" {
     const dlen = try tmp.dir.realPath(testing.io, &path_buf);
     const fpath = try std.fs.path.join(testing.allocator, &.{ path_buf[0..dlen], "grow.airdb" });
     defer testing.allocator.free(fpath);
-    var fs = try FileStore.create(testing.allocator, fpath, RealSyncer.any());
+    var fs = try FileStore.create(testing.allocator, fpath, FileSyncer.any());
     defer fs.deinit();
     const sections_before = fs.sections.items.len;
     const base_before = @intFromPtr(fs.map.ptr);
@@ -415,7 +415,7 @@ test "grow beyond the reservation fails cleanly" {
     const dlen = try tmp.dir.realPath(testing.io, &path_buf);
     const fpath = try std.fs.path.join(testing.allocator, &.{ path_buf[0..dlen], "toobig.airdb" });
     defer testing.allocator.free(fpath);
-    var fs = try FileStore.create(testing.allocator, fpath, RealSyncer.any());
+    var fs = try FileStore.create(testing.allocator, fpath, FileSyncer.any());
     defer fs.deinit();
     // The check rejects before any setLength, so no oversized file is created.
     try testing.expectError(error.FileTooLarge, fs.grow(FileStore.max_reserved + default_page_size));

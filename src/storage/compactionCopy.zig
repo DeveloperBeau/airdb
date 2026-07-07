@@ -7,8 +7,8 @@
 // destination's backlink indexes from its copied forward links.
 
 const std = @import("std");
-const WriteTxn = @import("../database.zig").WriteTxn;
-const Ref = @import("reference.zig").Ref;
+const WriteTransaction = @import("../database.zig").WriteTransaction;
+const Reference = @import("reference.zig").Reference;
 const Column = @import("../trees/column.zig");
 const Index = @import("../trees/index.zig");
 const catalog = @import("../schema/catalog.zig");
@@ -24,7 +24,7 @@ pub const Pair = struct { okey: u64, row: u64 };
 pub fn collectKeyRowPairs(
     allocator: std.mem.Allocator,
     txn: anytype,
-    keyrow_ref: Ref,
+    keyrow_ref: Reference,
 ) !std.ArrayList(Pair) {
     var pairs = std.ArrayList(Pair).empty;
     errdefer pairs.deinit(allocator);
@@ -41,7 +41,7 @@ pub fn collectKeyRowPairs(
 
 // Deep-copy a single property value from the source db into the destination db.
 // kind/elem describe the property. Returns the destination-local raw u64.
-fn copyValue(src: anytype, dst: *WriteTxn, kind: catalog.PropKind, elem: catalog.ElemKind, src_raw: u64) !u64 {
+fn copyValue(src: anytype, dst: *WriteTransaction, kind: catalog.PropKind, elem: catalog.ElemKind, src_raw: u64) !u64 {
     return switch (kind) {
         .int, .link => src_raw, // verbatim (a link stores an object key, preserved)
         .blob => try blob.copyInto(src, dst, src_raw),
@@ -67,11 +67,11 @@ fn copyValue(src: anytype, dst: *WriteTxn, kind: catalog.PropKind, elem: catalog
 
 // Deep-copy a u64-keyed set (Index mapping key -> 1) from `src` into `dst` by
 // iterating the source keys and re-inserting each into a fresh destination set.
-fn copyKeySet(src: anytype, dst: *WriteTxn, src_root: u64) !u64 {
+fn copyKeySet(src: anytype, dst: *WriteTransaction, src_root: u64) !u64 {
     var newi = try Index.create(dst);
     const Sink = struct {
-        idx: *Ref,
-        dstp: *WriteTxn,
+        idx: *Reference,
+        dstp: *WriteTransaction,
         fn onKey(self: @This(), key: u64) !void {
             self.idx.* = try Index.insert(self.dstp, self.idx.*, key, 1);
         }
@@ -86,10 +86,10 @@ fn copyKeySet(src: anytype, dst: *WriteTxn, src_root: u64) !u64 {
 // deep-copy. forEachEntry hands the callback a key slice into the SOURCE mapping;
 // bindex.insert grows only the DST arena (a different mapping), so the source key
 // stays valid for the duration of the insert -- keep the insert inside onEntry.
-fn copyBindex(src: anytype, dst: *WriteTxn, src_root: u64) !u64 {
+fn copyBindex(src: anytype, dst: *WriteTransaction, src_root: u64) !u64 {
     var newr = try bindex.create(dst);
     const Sink = struct {
-        dstp: *WriteTxn,
+        dstp: *WriteTransaction,
         root: *u64,
         fn onEntry(self: @This(), key: []const u8, val: u64) !void {
             self.root.* = try bindex.insert(self.dstp, self.root.*, key, val);
@@ -102,7 +102,7 @@ fn copyBindex(src: anytype, dst: *WriteTxn, src_root: u64) !u64 {
 // Add okey under `value` in a value index (value -> {okey -> 1}), mirroring the
 // shape the object layer's maintenance keeps. Local to the copy path, which
 // must rebuild value indexes in the destination database.
-fn viAddInto(dst: *WriteTxn, vi_ref: Ref, value: u64, okey: u64) !Ref {
+fn viAddInto(dst: *WriteTransaction, vi_ref: Reference, value: u64, okey: u64) !Reference {
     const existing = try Index.get(dst, vi_ref, value);
     var set_root = existing orelse try Index.create(dst);
     set_root = try Index.insert(dst, set_root, okey, 1);
@@ -113,7 +113,7 @@ fn viAddInto(dst: *WriteTxn, vi_ref: Ref, value: u64, okey: u64) !Ref {
 // DESTINATION db. Backlink and value indexes are created empty in the
 // destination (the source refs live in the source db's address space) and
 // repopulated separately; the indexed flag carries through.
-fn createDestinationStructures(dst: *WriteTxn, s: *catalog.CatalogSnapshot) !void {
+fn createDestinationStructures(dst: *WriteTransaction, s: *catalog.CatalogSnapshot) !void {
     var j: usize = 0;
     while (j < s.prop_count) : (j += 1) {
         s.props[j].col = try Column.create(dst);
@@ -131,14 +131,14 @@ fn createDestinationStructures(dst: *WriteTxn, s: *catalog.CatalogSnapshot) !voi
 /// indexes are created empty (rebuild with rebuildBacklinks afterward); value
 /// indexes are repopulated inline. Returns the new destination catalog ref.
 /// O(live rows x properties), plus the deep copies' own costs.
-pub fn copyTypeRows(src: anytype, src_cat: Ref, dst: *WriteTxn) !Ref {
+pub fn copyTypeRows(src: anytype, src_cat: Reference, dst: *WriteTransaction) !Reference {
     // Load the source snapshot, then re-point every ref field at structures
     // created in the DESTINATION db before writing. Kinds, elem kinds, targets,
     // rules, and indexed flags carry over as plain values.
     var s = try catalog.CatalogSnapshot.load(src, src_cat);
     const pc = s.prop_count;
     // Keep the source refs to read from.
-    var s_prop: [catalog.max_prop_count]Ref = undefined;
+    var s_prop: [catalog.max_prop_count]Reference = undefined;
     {
         var j: usize = 0;
         while (j < pc) : (j += 1) s_prop[j] = s.props[j].col;
@@ -184,7 +184,7 @@ pub fn copyTypeRows(src: anytype, src_cat: Ref, dst: *WriteTxn) !Ref {
 
 /// Rebuild backlink indexes for `cat` (in dst) from its copied forward links.
 /// O(live rows x link properties x link fan-out).
-pub fn rebuildBacklinks(dst: *WriteTxn, cat: Ref) !Ref {
+pub fn rebuildBacklinks(dst: *WriteTransaction, cat: Reference) !Reference {
     var cur = cat;
     const v0 = try catalog.loadCatalog(dst, cat);
     const pc = v0.prop_count;

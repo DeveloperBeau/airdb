@@ -1,5 +1,5 @@
 const std = @import("std");
-const Ref = @import("reference.zig").Ref;
+const Reference = @import("reference.zig").Reference;
 const FreeList = @import("freeList.zig").FreeList;
 const platform = @import("../platform.zig");
 
@@ -7,7 +7,7 @@ const section_shift = platform.section_shift;
 const section_size = platform.section_size;
 const section_mask = platform.section_mask;
 
-pub const Allocation = struct { ref: Ref, bytes: []u8 };
+pub const Allocation = struct { ref: Reference, bytes: []u8 };
 
 pub const Arena = struct {
     /// Append-only list of fixed-size sections owned by the FileStore. Never moved or
@@ -40,7 +40,7 @@ pub const Arena = struct {
         }
         const s = aligned >> section_shift;
         if (s >= self.sections.len) return error.OutOfSpace; // caller grows + maps, then retries
-        const ref: Ref = @intCast(aligned);
+        const ref: Reference = @intCast(aligned);
         self.top = aligned + size;
         return .{ .ref = ref, .bytes = self.translate(aligned, size) };
     }
@@ -58,7 +58,7 @@ pub const Arena = struct {
     }
 
     // The single bounds-checked chokepoint. All reads go through here.
-    pub fn deref(self: *Arena, ref: Ref, len: usize) error{BadRef}![]const u8 {
+    pub fn deref(self: *Arena, ref: Reference, len: usize) error{BadRef}![]const u8 {
         const off: usize = @intCast(ref);
         if (off == 0) return error.BadRef; // null ref
         if (off % 8 != 0) return error.BadRef; // misaligned
@@ -130,7 +130,7 @@ test "alloc pads across a section boundary and AllocTooLarge on oversize" {
     // to section 1's base.
     arena.top = section_size - 16;
     const a = try arena.alloc(32);
-    try testing.expectEqual(@as(Ref, @intCast(section_size)), a.ref); // landed at section 1 base
+    try testing.expectEqual(@as(Reference, @intCast(section_size)), a.ref); // landed at section 1 base
     @memcpy(a.bytes, "0123456789ABCDEF0123456789ABCDEF");
     const got = try arena.deref(a.ref, 32);
     try testing.expectEqualStrings("0123456789ABCDEF0123456789ABCDEF", got);

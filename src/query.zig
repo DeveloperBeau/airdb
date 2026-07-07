@@ -3,7 +3,7 @@ const rows = @import("records/rows.zig");
 const catalog = @import("schema/catalog.zig");
 const index = @import("trees/index.zig");
 const Column = @import("trees/column.zig");
-const Ref = @import("storage/reference.zig").Ref;
+const Reference = @import("storage/reference.zig").Reference;
 
 // Query engine over an object catalog. Operates on the stable object key (okey)
 // space: a scan walks the per-type key->row index, so each entry maps an okey to
@@ -41,19 +41,19 @@ fn cmp(op: Op, lhs: u64, rhs: u64) bool {
 // column, and the key->row index. Captured into locals so no catalog deref slice
 // is held across reads.
 const Scan = struct {
-    prop_refs: [MAX_PROPS]Ref,
+    prop_refs: [MAX_PROPS]Reference,
     // Per-property: whether the property has a value index, and the ref of that
     // index. Captured so the planner can drive a query off the index without a
     // second catalog deref.
     indexed: [MAX_PROPS]bool,
-    value_index_refs: [MAX_PROPS]Ref,
+    value_index_refs: [MAX_PROPS]Reference,
     prop_count: usize,
-    live_ref: Ref,
-    keyrow_index_ref: Ref,
+    live_ref: Reference,
+    keyrow_index_ref: Reference,
     next_row: u64,
 };
 
-fn openScan(txn: anytype, cat: Ref) !Scan {
+fn openScan(txn: anytype, cat: Reference) !Scan {
     const v = try catalog.loadCatalog(txn, cat);
     var s: Scan = undefined;
     s.prop_count = v.prop_count;
@@ -250,7 +250,7 @@ fn runQuery(
 
 // Test-only: expose the driving-predicate choice so equivalence tests can assert
 // which path the planner takes.
-fn drivingPredicateIndex(txn: anytype, cat: Ref, preds: []const Predicate) !?usize {
+fn drivingPredicateIndex(txn: anytype, cat: Reference, preds: []const Predicate) !?usize {
     const s = try openScan(txn, cat);
     return pickDriving(&s, preds);
 }
@@ -259,7 +259,7 @@ fn drivingPredicateIndex(txn: anytype, cat: Ref, preds: []const Predicate) !?usi
 // AND). An empty predicate list matches every live row.
 pub fn where(
     txn: anytype,
-    cat: Ref,
+    cat: Reference,
     preds: []const Predicate,
     out: *std.ArrayList(u64),
     allocator: std.mem.Allocator,
@@ -278,7 +278,7 @@ pub fn where(
 
 // Number of live rows satisfying all predicates. The full-scan path streams,
 // so this allocates nothing proportional to the table.
-pub fn countWhere(txn: anytype, cat: Ref, preds: []const Predicate, allocator: std.mem.Allocator) !u64 {
+pub fn countWhere(txn: anytype, cat: Reference, preds: []const Predicate, allocator: std.mem.Allocator) !u64 {
     const s = try openScan(txn, cat);
     try validateProps(&s, preds);
     var n: u64 = 0;
@@ -296,7 +296,7 @@ pub const Aggregate = struct { count: u64, sum: u64, min: ?u64, max: ?u64 };
 
 // Aggregate an int property over the live rows satisfying all predicates.
 // `sum` wraps on overflow (wrapping add); min/max are null when no row matches.
-pub fn aggregateInt(txn: anytype, cat: Ref, prop: usize, preds: []const Predicate, allocator: std.mem.Allocator) !Aggregate {
+pub fn aggregateInt(txn: anytype, cat: Reference, prop: usize, preds: []const Predicate, allocator: std.mem.Allocator) !Aggregate {
     const s = try openScan(txn, cat);
     try validateProps(&s, preds);
     if (prop >= s.prop_count) return error.BadProp;
@@ -323,7 +323,7 @@ pub fn aggregateInt(txn: anytype, cat: Ref, prop: usize, preds: []const Predicat
 // is a later optimization.
 pub fn rangeInclusive(
     txn: anytype,
-    cat: Ref,
+    cat: Reference,
     prop: usize,
     lo: u64,
     hi: u64,
@@ -341,7 +341,7 @@ pub fn rangeInclusive(
 // row's value once into a temporary pair array, then sorts.
 pub fn sortByPropAsc(
     txn: anytype,
-    cat: Ref,
+    cat: Reference,
     okeys: []u64,
     prop: usize,
     allocator: std.mem.Allocator,
@@ -390,7 +390,7 @@ fn qTmpPath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const u8
 
 // Build a 3-prop type: prop0 = pk, prop1 = value (indexed iff `idx`), prop2 =
 // secondary. Inserts n rows with pk=i, prop1=i%100, prop2=i.
-fn seedPlannerCat(w: *@import("database.zig").WriteTxn, idx: bool, n: u64) !Ref {
+fn seedPlannerCat(w: *@import("database.zig").WriteTransaction, idx: bool, n: u64) !Reference {
     const defs = [_]catalog.PropDef{
         .{ .kind = .int },
         .{ .kind = .int, .indexed = idx },

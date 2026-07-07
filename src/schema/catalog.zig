@@ -1,6 +1,6 @@
 const std = @import("std");
-const WriteTxn = @import("../database.zig").WriteTxn;
-const Ref = @import("../storage/reference.zig").Ref;
+const WriteTransaction = @import("../database.zig").WriteTransaction;
+const Reference = @import("../storage/reference.zig").Reference;
 const Column = @import("../trees/column.zig");
 const Index = @import("../trees/index.zig");
 
@@ -26,13 +26,13 @@ pub const Value = union(enum) {
     //                it with `blob.getAlloc(txn, ref, allocator)` and frees the
     //                returned buffer.
     bytes: []const u8,
-    blob_ref: Ref,
+    blob_ref: Reference,
     list_int: []const u64,
     list_blob: []const []const u8,
     set_int: []const u64,
     set_blob: []const []const u8,
     dict_int: []const DictEntry,
-    coll_root: Ref, // read side: getTyped returns this for list/set/dict/link_set properties
+    coll_root: Reference, // read side: getTyped returns this for list/set/dict/link_set properties
     link: ?u64,
     link_set: []const u64, // to-many: initial set of target okeys
 };
@@ -90,23 +90,23 @@ fn indexedFlagsOffset(pc: PropCount) usize {
 
 // Allocate and encode a fresh catalog node; return its ref.
 pub fn writeCatalog(
-    txn: *WriteTxn,
+    txn: *WriteTransaction,
     prop_count: PropCount,
     next_row: u64,
-    keyrow_index_ref: Ref,
+    keyrow_index_ref: Reference,
     next_key: u64,
-    pk_index_ref: Ref,
-    version_col_ref: Ref,
-    live_col_ref: Ref,
-    prop_col_refs: []const Ref,
+    pk_index_ref: Reference,
+    version_col_ref: Reference,
+    live_col_ref: Reference,
+    prop_col_refs: []const Reference,
     kinds: []const PropKind,
     elems: []const ElemKind,
-    backlinks: []const Ref,
+    backlinks: []const Reference,
     targets: []const u16,
     rules: []const DeletionRule,
-    value_index_refs: []const Ref,
+    value_index_refs: []const Reference,
     indexed_flags: []const bool,
-) !Ref {
+) !Reference {
     const a = try txn.alloc(catalogSize(prop_count));
     std.mem.writeInt(u16, a.bytes[off_prop_count..][0..2], prop_count, .little);
     std.mem.writeInt(u64, a.bytes[off_next_row..][0..8], next_row, .little);
@@ -141,17 +141,17 @@ pub fn writeCatalog(
 
 // createDefs allocates columns, a pk index, version/live columns, and a catalog
 // node from explicit per-property definitions. defs[0].kind must be .int (the pk).
-pub fn createDefs(txn: *WriteTxn, defs: []const PropDef) !Ref {
+pub fn createDefs(txn: *WriteTransaction, defs: []const PropDef) !Reference {
     std.debug.assert(defs.len >= 1 and defs[0].kind == .int);
     const prop_count: PropCount = @intCast(defs.len);
     std.debug.assert(prop_count <= max_prop_count);
-    var prop_col_refs: [max_prop_count]Ref = undefined;
+    var prop_col_refs: [max_prop_count]Reference = undefined;
     var kinds: [max_prop_count]PropKind = undefined;
     var elems: [max_prop_count]ElemKind = undefined;
-    var backlinks: [max_prop_count]Ref = undefined;
+    var backlinks: [max_prop_count]Reference = undefined;
     var targets: [max_prop_count]u16 = undefined;
     var rules: [max_prop_count]DeletionRule = undefined;
-    var value_index_refs: [max_prop_count]Ref = undefined;
+    var value_index_refs: [max_prop_count]Reference = undefined;
     var indexed_flags: [max_prop_count]bool = undefined;
     var i: usize = 0;
     while (i < prop_count) : (i += 1) {
@@ -189,7 +189,7 @@ pub fn createDefs(txn: *WriteTxn, defs: []const PropDef) !Ref {
 }
 
 // createTyped keeps its scalar-only signature; every property gets elem = int.
-pub fn createTyped(txn: *WriteTxn, kinds: []const PropKind) !Ref {
+pub fn createTyped(txn: *WriteTransaction, kinds: []const PropKind) !Reference {
     std.debug.assert(kinds.len >= 1 and kinds[0] == .int);
     const pc: PropCount = @intCast(kinds.len);
     std.debug.assert(pc <= max_prop_count);
@@ -201,7 +201,7 @@ pub fn createTyped(txn: *WriteTxn, kinds: []const PropKind) !Ref {
 
 // Create prop_count property columns, a version column, a live column, and an
 // empty pk index. All property kinds default to .int.
-pub fn create(txn: *WriteTxn, prop_count: PropCount) !Ref {
+pub fn create(txn: *WriteTransaction, prop_count: PropCount) !Reference {
     std.debug.assert(prop_count <= max_prop_count);
     var all_int: [max_prop_count]PropKind = undefined;
     var i: usize = 0;
@@ -212,14 +212,14 @@ pub fn create(txn: *WriteTxn, prop_count: PropCount) !Ref {
 pub const CatalogView = struct {
     prop_count: PropCount,
     next_row: u64,
-    keyrow_index_ref: Ref,
+    keyrow_index_ref: Reference,
     next_key: u64,
-    pk_index_ref: Ref,
-    version_col_ref: Ref,
-    live_col_ref: Ref,
+    pk_index_ref: Reference,
+    version_col_ref: Reference,
+    live_col_ref: Reference,
     bytes: []const u8,
 
-    pub fn propColRef(self: CatalogView, i: usize) Ref {
+    pub fn propColRef(self: CatalogView, i: usize) Reference {
         return std.mem.readInt(u64, self.bytes[off_prop_cols + i * 8 ..][0..8], .little);
     }
 
@@ -233,7 +233,7 @@ pub const CatalogView = struct {
         return @enumFromInt(self.bytes[eo + i]);
     }
 
-    pub fn backlinkRef(self: CatalogView, i: usize) Ref {
+    pub fn backlinkRef(self: CatalogView, i: usize) Reference {
         const blo = off_prop_cols + @as(usize, self.prop_count) * 8 + @as(usize, self.prop_count) * 2;
         return std.mem.readInt(u64, self.bytes[blo + i * 8 ..][0..8], .little);
     }
@@ -248,7 +248,7 @@ pub const CatalogView = struct {
         return @enumFromInt(self.bytes[ro + i]);
     }
 
-    pub fn valueIndexRef(self: CatalogView, i: usize) Ref {
+    pub fn valueIndexRef(self: CatalogView, i: usize) Reference {
         const vio = valueIndexRefsOffset(self.prop_count);
         return std.mem.readInt(u64, self.bytes[vio + i * 8 ..][0..8], .little);
     }
@@ -268,7 +268,7 @@ pub const CatalogView = struct {
 // come straight from the mapped file: a corrupted value must surface as
 // error.Corrupt, never as a panic (ReleaseSafe) or undefined behavior
 // (ReleaseFast) from an unchecked @enumFromInt.
-pub fn loadCatalog(txn: anytype, cat: Ref) !CatalogView {
+pub fn loadCatalog(txn: anytype, cat: Reference) !CatalogView {
     const pc_bytes = try txn.deref(cat, 2);
     const prop_count = std.mem.readInt(u16, pc_bytes[0..2], .little);
     if (prop_count > max_prop_count) return error.Corrupt;
@@ -298,13 +298,13 @@ pub fn loadCatalog(txn: anytype, cat: Ref) !CatalogView {
 
 /// One property's full catalog record, as carried by CatalogSnapshot.
 pub const PropSnap = struct {
-    col: Ref,
+    col: Reference,
     kind: PropKind,
     elem: ElemKind,
-    backlink: Ref,
+    backlink: Reference,
     target: u16,
     rule: DeletionRule,
-    value_index: Ref,
+    value_index: Reference,
     indexed: bool,
 };
 
@@ -312,25 +312,25 @@ pub const PropSnap = struct {
 /// catalog: load, mutate the fields that change, write. It replaces the
 /// hand-rolled eight-parallel-arrays snapshot ritual (and the 15-positional-
 /// argument writeCatalog call) that was previously duplicated at every mutation
-/// site -- a pattern where transposing two Ref arguments compiles fine and
+/// site -- a pattern where transposing two Reference arguments compiles fine and
 /// corrupts data. Because the snapshot owns plain values, it is also immune to
 /// the CatalogView invalidation hazard: file growth cannot invalidate it.
 pub const CatalogSnapshot = struct {
     prop_count: PropCount,
     next_row: u64,
-    keyrow_index_ref: Ref,
+    keyrow_index_ref: Reference,
     next_key: u64,
-    pk_index_ref: Ref,
-    version_col_ref: Ref,
-    live_col_ref: Ref,
+    pk_index_ref: Reference,
+    version_col_ref: Reference,
+    live_col_ref: Reference,
     props: [max_prop_count]PropSnap,
     /// The node this snapshot was loaded from and its on-disk size, so
     /// replace() can free it. prop_count may change after load (migrations),
     /// so the size is captured here, not recomputed.
-    source: Ref,
+    source: Reference,
     source_len: usize,
 
-    pub fn load(txn: anytype, cat: Ref) !CatalogSnapshot {
+    pub fn load(txn: anytype, cat: Reference) !CatalogSnapshot {
         const v = try loadCatalog(txn, cat);
         var s: CatalogSnapshot = undefined;
         s.source = cat;
@@ -359,14 +359,14 @@ pub const CatalogSnapshot = struct {
     }
 
     /// Allocate and encode a fresh catalog node from this snapshot.
-    pub fn write(self: *const CatalogSnapshot, txn: *WriteTxn) !Ref {
-        var cols: [max_prop_count]Ref = undefined;
+    pub fn write(self: *const CatalogSnapshot, txn: *WriteTransaction) !Reference {
+        var cols: [max_prop_count]Reference = undefined;
         var kinds: [max_prop_count]PropKind = undefined;
         var elems: [max_prop_count]ElemKind = undefined;
-        var backlinks: [max_prop_count]Ref = undefined;
+        var backlinks: [max_prop_count]Reference = undefined;
         var targets: [max_prop_count]u16 = undefined;
         var rules: [max_prop_count]DeletionRule = undefined;
-        var vidx: [max_prop_count]Ref = undefined;
+        var vidx: [max_prop_count]Reference = undefined;
         var idxf: [max_prop_count]bool = undefined;
         const pc = self.prop_count;
         var j: usize = 0;
@@ -407,34 +407,34 @@ pub const CatalogSnapshot = struct {
     /// txn-private old node is reused by the very next same-size catalog write,
     /// so catalog churn stops growing the file. Do NOT use when the source
     /// lives in a different database (copyTypeRows) or must stay readable.
-    pub fn replace(self: *const CatalogSnapshot, txn: *WriteTxn) !Ref {
+    pub fn replace(self: *const CatalogSnapshot, txn: *WriteTransaction) !Reference {
         const new_ref = try self.write(txn);
         try txn.free(self.source, self.source_len);
         return new_ref;
     }
 };
 
-pub fn propCount(txn: anytype, cat: Ref) !PropCount {
+pub fn propCount(txn: anytype, cat: Reference) !PropCount {
     const view = try loadCatalog(txn, cat);
     return view.prop_count;
 }
 
 // liveCount returns the number of live rows tracked by the pk index.
-pub fn liveCount(txn: anytype, cat: Ref) !u64 {
+pub fn liveCount(txn: anytype, cat: Reference) !u64 {
     const view = try loadCatalog(txn, cat);
     return Index.count(txn, view.pk_index_ref);
 }
 
 // Resolve an object key to its physical row via the key-to-row index.
 // Returns null if the okey has no mapping.
-pub fn okeyToRow(txn: anytype, cat: Ref, okey: u64) !?u64 {
+pub fn okeyToRow(txn: anytype, cat: Reference, okey: u64) !?u64 {
     const v = try loadCatalog(txn, cat);
     return Index.get(txn, v.keyrow_index_ref, okey);
 }
 
 // Resolve a primary key to its stable object key via the pk index.
 // Returns null if the pk has no mapping.
-pub fn pkToOkey(txn: anytype, cat: Ref, pk: u64) !?u64 {
+pub fn pkToOkey(txn: anytype, cat: Reference, pk: u64) !?u64 {
     const v = try loadCatalog(txn, cat);
     return Index.get(txn, v.pk_index_ref, pk);
 }
@@ -442,7 +442,7 @@ pub fn pkToOkey(txn: anytype, cat: Ref, pk: u64) !?u64 {
 // Resolve (cat, pk, prop) to the property column ref and the row;
 // null if pk absent or row tombstoned. The pk index maps pk -> okey, and the
 // keyrow index maps okey -> physical row.
-pub fn resolveProp(txn: anytype, cat: Ref, pk: u64, prop: usize) !?struct { row: u64, prop_col: Ref } {
+pub fn resolveProp(txn: anytype, cat: Reference, pk: u64, prop: usize) !?struct { row: u64, prop_col: Reference } {
     const v = try loadCatalog(txn, cat);
     const okey = (try Index.get(txn, v.pk_index_ref, pk)) orelse return null;
     const row = (try Index.get(txn, v.keyrow_index_ref, okey)) orelse return null;
@@ -452,7 +452,7 @@ pub fn resolveProp(txn: anytype, cat: Ref, pk: u64, prop: usize) !?struct { row:
 
 // Write new_root into property `prop` at `row`, bump that row's version stamp,
 // return the new catalog ref.
-pub fn replaceCollRoot(txn: *WriteTxn, cat: Ref, row: u64, prop: usize, new_root: Ref) !Ref {
+pub fn replaceCollRoot(txn: *WriteTransaction, cat: Reference, row: u64, prop: usize, new_root: Reference) !Reference {
     var s = try CatalogSnapshot.load(txn, cat);
     s.props[prop].col = try Column.set(txn, s.props[prop].col, row, new_root);
     s.version_col_ref = try Column.set(txn, s.version_col_ref, row, txn.new_version);
@@ -460,21 +460,21 @@ pub fn replaceCollRoot(txn: *WriteTxn, cat: Ref, row: u64, prop: usize, new_root
 }
 
 // Write a new backlink ref into property `p`, preserving everything else.
-pub fn setBacklinkRef(txn: *WriteTxn, cat: Ref, p: usize, new_bl: Ref) !Ref {
+pub fn setBacklinkRef(txn: *WriteTransaction, cat: Reference, p: usize, new_bl: Reference) !Reference {
     var s = try CatalogSnapshot.load(txn, cat);
     s.props[p].backlink = new_bl;
     return s.replace(txn);
 }
 
 // Write a new value-index ref into property `p`, preserving everything else.
-pub fn setValueIndexRef(txn: *WriteTxn, cat: Ref, p: usize, new_vi: Ref) !Ref {
+pub fn setValueIndexRef(txn: *WriteTransaction, cat: Reference, p: usize, new_vi: Reference) !Reference {
     var s = try CatalogSnapshot.load(txn, cat);
     s.props[p].value_index = new_vi;
     return s.replace(txn);
 }
 
 // Write a new column ref into property `p`, preserving everything else.
-pub fn setPropColRef(txn: *WriteTxn, cat: Ref, p: usize, new_col: Ref) !Ref {
+pub fn setPropColRef(txn: *WriteTransaction, cat: Reference, p: usize, new_col: Reference) !Reference {
     var s = try CatalogSnapshot.load(txn, cat);
     s.props[p].col = new_col;
     return s.replace(txn);
@@ -638,8 +638,8 @@ test "createDefs builds a backlink index for each link property" {
     const v = try loadCatalog(&w, cat);
     try testing.expectEqual(PropKind.link, v.kind(2));
     try testing.expect(v.backlinkRef(2) != 0);
-    try testing.expectEqual(@as(Ref, 0), v.backlinkRef(0));
-    try testing.expectEqual(@as(Ref, 0), v.backlinkRef(1));
+    try testing.expectEqual(@as(Reference, 0), v.backlinkRef(0));
+    try testing.expectEqual(@as(Reference, 0), v.backlinkRef(1));
     w.deinit();
 }
 
@@ -696,8 +696,8 @@ test "catalog persists indexed flag and value index ref" {
     try testing.expect(!v.indexed(0));
     try testing.expect(!v.indexed(2));
     try testing.expect(v.valueIndexRef(1) != 0);
-    try testing.expectEqual(@as(Ref, 0), v.valueIndexRef(0));
-    try testing.expectEqual(@as(Ref, 0), v.valueIndexRef(2));
+    try testing.expectEqual(@as(Reference, 0), v.valueIndexRef(0));
+    try testing.expectEqual(@as(Reference, 0), v.valueIndexRef(2));
     const vidx1 = v.valueIndexRef(1);
     // Round-trip through a full catalog rebuild (setPropColRef rewrites every
     // field) and assert both the flag and the value-index ref survive.
@@ -707,8 +707,8 @@ test "catalog persists indexed flag and value index ref" {
     try testing.expect(!v2.indexed(0));
     try testing.expect(!v2.indexed(2));
     try testing.expectEqual(vidx1, v2.valueIndexRef(1));
-    try testing.expectEqual(@as(Ref, 0), v2.valueIndexRef(0));
-    try testing.expectEqual(@as(Ref, 0), v2.valueIndexRef(2));
+    try testing.expectEqual(@as(Reference, 0), v2.valueIndexRef(0));
+    try testing.expectEqual(@as(Reference, 0), v2.valueIndexRef(2));
     w.deinit();
 }
 
@@ -729,7 +729,7 @@ test "non-indexed catalog: value index refs zero and existing fields intact" {
     var i: usize = 0;
     while (i < v.prop_count) : (i += 1) {
         try testing.expect(!v.indexed(i));
-        try testing.expectEqual(@as(Ref, 0), v.valueIndexRef(i));
+        try testing.expectEqual(@as(Reference, 0), v.valueIndexRef(i));
     }
     // Every pre-existing accessor must still read the right field: this guards
     // that appending the new arrays did not disturb the earlier offset math.
@@ -740,8 +740,8 @@ test "non-indexed catalog: value index refs zero and existing fields intact" {
     try testing.expect(v.propColRef(0) != 0);
     try testing.expect(v.propColRef(1) != 0);
     try testing.expect(v.backlinkRef(2) != 0); // link prop got a backlink index
-    try testing.expectEqual(@as(Ref, 0), v.backlinkRef(0));
-    try testing.expectEqual(@as(Ref, 0), v.backlinkRef(1));
+    try testing.expectEqual(@as(Reference, 0), v.backlinkRef(0));
+    try testing.expectEqual(@as(Reference, 0), v.backlinkRef(1));
     try testing.expectEqual(@as(u16, 4), v.linkTarget(2));
     try testing.expectEqual(@as(u16, 0), v.linkTarget(0));
     try testing.expectEqual(DeletionRule.cascade, v.delRule(2));

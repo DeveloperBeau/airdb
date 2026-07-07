@@ -2,7 +2,7 @@ const std = @import("std");
 const testing = std.testing;
 const Io = std.Io;
 const Db = @import("../database.zig").Db;
-const Ref = @import("../storage/reference.zig").Ref;
+const Reference = @import("../storage/reference.zig").Reference;
 
 const catalog = @import("../schema/catalog.zig");
 
@@ -23,7 +23,7 @@ fn churnLogicalSize(path: []const u8, retain: u64, n: u64) !u64 {
     defer db.deinit();
     db.setRetainVersions(retain);
 
-    var cat: Ref = blk: {
+    var cat: Reference = blk: {
         var w = try db.beginWrite();
         const c = try catalog.create(&w, 1);
         w.setRoot(c);

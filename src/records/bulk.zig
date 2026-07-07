@@ -1,6 +1,6 @@
 const std = @import("std");
-const WriteTxn = @import("../database.zig").WriteTxn;
-const Ref = @import("../storage/reference.zig").Ref;
+const WriteTransaction = @import("../database.zig").WriteTransaction;
+const Reference = @import("../storage/reference.zig").Reference;
 const Column = @import("../trees/column.zig");
 const Index = @import("../trees/index.zig");
 const inode = @import("../trees/indexNode.zig");
@@ -25,8 +25,8 @@ const max_prop_count = catalog.max_prop_count;
 pub const ValueOkeys = struct { value: u64, okeys: []const u64 };
 
 /// Build a column tree holding `values` at row indices 0..values.len. Returns
-/// the root Ref. Equivalent to Column.create followed by an append per value.
-pub fn bulkColumn(txn: *WriteTxn, values: []const u64) !Ref {
+/// the root Reference. Equivalent to Column.create followed by an append per value.
+pub fn bulkColumn(txn: *WriteTransaction, values: []const u64) !Reference {
     if (values.len == 0) return Column.create(txn);
     const al = txn.db.store.allocator;
 
@@ -38,7 +38,7 @@ pub fn bulkColumn(txn: *WriteTxn, values: []const u64) !Ref {
 }
 
 // Deref an index node, sizing the read by its kind byte (leaf vs inner).
-fn derefIdxNode(txn: *WriteTxn, ref: Ref) ![]const u8 {
+fn derefIdxNode(txn: *WriteTransaction, ref: Reference) ![]const u8 {
     const kb = try txn.deref(ref, 1);
     return switch (kb[0]) {
         inode.kind_leaf => txn.deref(ref, inode.leaf_node_size),
@@ -52,8 +52,8 @@ fn derefIdxNode(txn: *WriteTxn, ref: Ref) ![]const u8 {
 // empty ROOT leaf, which has no recorded low). The recorded low propagates
 // identically up every level of the rightmost path, so it is the single value
 // an appended run's first key must clear (see the qualification in bulkAppend).
-fn emptyRightmostLow(txn: *WriteTxn, root: Ref) !?u64 {
-    var cur: Ref = root;
+fn emptyRightmostLow(txn: *WriteTransaction, root: Reference) !?u64 {
+    var cur: Reference = root;
     var recorded_low: ?u64 = null;
     var hops: usize = 0;
     while (true) : (hops += 1) {
@@ -70,8 +70,8 @@ fn emptyRightmostLow(txn: *WriteTxn, root: Ref) !?u64 {
 }
 
 /// Build a u64 index over strictly-ascending `keys` with parallel `vals`.
-/// Returns the root Ref. Equivalent to Index.create plus an insert per pair.
-pub fn bulkIndex(txn: *WriteTxn, keys: []const u64, vals: []const u64) !Ref {
+/// Returns the root Reference. Equivalent to Index.create plus an insert per pair.
+pub fn bulkIndex(txn: *WriteTransaction, keys: []const u64, vals: []const u64) !Reference {
     std.debug.assert(keys.len == vals.len);
     if (std.debug.runtime_safety) {
         var p: usize = 1;
@@ -90,7 +90,7 @@ pub fn bulkIndex(txn: *WriteTxn, keys: []const u64, vals: []const u64) !Ref {
 /// Build a value index (value -> inner okey-set) from `entries`, sorted by
 /// value, each with ascending okeys. Each inner set maps okey -> 1, matching
 /// the shape rows.viAdd maintains (value -> Index{okey -> 1}).
-pub fn bulkValueIndex(txn: *WriteTxn, entries: []const ValueOkeys) !Ref {
+pub fn bulkValueIndex(txn: *WriteTransaction, entries: []const ValueOkeys) !Reference {
     if (entries.len == 0) return Index.create(txn);
     const al = txn.db.store.allocator;
 
@@ -135,11 +135,11 @@ pub fn bulkValueIndex(txn: *WriteTxn, entries: []const ValueOkeys) !Ref {
 // All rejections happen BEFORE any node is written, so a bad input can never
 // half-commit. Phase 1 excludes link/link_set properties. The CALLER commits.
 pub fn bulkImport(
-    txn: *WriteTxn,
-    cat: Ref,
+    txn: *WriteTransaction,
+    cat: Reference,
     rows: []const []const u64,
     opts: struct { presorted: bool = false },
-) !Ref {
+) !Reference {
     var s = try catalog.CatalogSnapshot.load(txn, cat);
     if (s.next_row != 0) return error.TypeNotEmpty;
     const old_next_key = s.next_key;
@@ -208,7 +208,7 @@ fn primaryKeySortOrder(
 // The type is empty, but its creation pre-allocated empty columns and indexes
 // that the bulk-built roots replace; free them so the import leaves no orphan
 // nodes behind.
-fn freePreallocatedTrees(txn: *WriteTxn, s: *const catalog.CatalogSnapshot) !void {
+fn freePreallocatedTrees(txn: *WriteTransaction, s: *const catalog.CatalogSnapshot) !void {
     var p: usize = 0;
     while (p < s.prop_count) : (p += 1) {
         try Column.freeTree(txn, s.props[p].col);
@@ -223,7 +223,7 @@ fn freePreallocatedTrees(txn: *WriteTxn, s: *const catalog.CatalogSnapshot) !voi
 // Build the property columns, version/live columns, and pk/key->row indexes
 // bottom-up from the sorted input, storing the new roots into the snapshot.
 fn buildImportTrees(
-    txn: *WriteTxn,
+    txn: *WriteTransaction,
     s: *catalog.CatalogSnapshot,
     rows: []const []const u64,
     perm: []const usize,
@@ -274,7 +274,7 @@ fn buildImportTrees(
 // Value indexes: for each indexed property, group its okeys by value and store
 // the built index root into the snapshot.
 fn buildValueIndexes(
-    txn: *WriteTxn,
+    txn: *WriteTransaction,
     s: *catalog.CatalogSnapshot,
     rows: []const []const u64,
     perm: []const usize,
@@ -295,13 +295,13 @@ fn buildValueIndexes(
 // old_next_key + r), so sorting (value, okey) pairs yields ascending okeys
 // within each value group.
 fn buildPropValueIndex(
-    txn: *WriteTxn,
+    txn: *WriteTransaction,
     rows: []const []const u64,
     perm: []const usize,
     p: usize,
     old_next_key: u64,
     al: std.mem.Allocator,
-) !Ref {
+) !Reference {
     const n = perm.len;
     const Pair = struct { value: u64, okey: u64 };
     const pairs = try al.alloc(Pair, n);
@@ -353,7 +353,7 @@ fn buildPropValueIndex(
 // Crucially, every qualification check is read-only and runs BEFORE the first
 // node is allocated, so a NotAppendable return leaves the catalog and all trees
 // untouched. The CALLER commits.
-pub fn bulkAppend(txn: *WriteTxn, cat: Ref, rows: []const []const u64) !Ref {
+pub fn bulkAppend(txn: *WriteTransaction, cat: Reference, rows: []const []const u64) !Reference {
     var s = try catalog.CatalogSnapshot.load(txn, cat);
 
     // Validate row widths first: a single malformed row aborts before any work.
@@ -403,7 +403,7 @@ pub fn bulkAppend(txn: *WriteTxn, cat: Ref, rows: []const []const u64) !Ref {
 // matches rows.insert, txn.new_version; live = 1), storing the new column
 // roots into the snapshot.
 fn appendColumnRuns(
-    txn: *WriteTxn,
+    txn: *WriteTransaction,
     s: *catalog.CatalogSnapshot,
     rows: []const []const u64,
 ) !void {
@@ -435,7 +435,7 @@ fn appendColumnRuns(
 // first node is allocated, so a NotAppendable return leaves the catalog and
 // all trees untouched and the caller's fallback can replay row-by-row.
 fn qualifyRightEdgeAppend(
-    txn: *WriteTxn,
+    txn: *WriteTransaction,
     s: *const catalog.CatalogSnapshot,
     rows: []const []const u64,
 ) !void {
@@ -481,7 +481,7 @@ fn qualifyRightEdgeAppend(
 
 // Try the right-edge fast path; on NotAppendable, fall back to row-by-row
 // rows.insert, which handles any schema and detects duplicate keys per row.
-pub fn bulkAppendOrInsert(txn: *WriteTxn, cat: Ref, rows: []const []const u64) !Ref {
+pub fn bulkAppendOrInsert(txn: *WriteTransaction, cat: Reference, rows: []const []const u64) !Reference {
     return bulkAppend(txn, cat, rows) catch |e| switch (e) {
         error.NotAppendable => fallbackInsert(txn, cat, rows),
         else => e,
@@ -495,7 +495,7 @@ pub fn bulkAppendOrInsert(txn: *WriteTxn, cat: Ref, rows: []const []const u64) !
 // values without backlink maintenance (that is insertTyped's job), so silently
 // accepting them here would corrupt the link graph -- the same reason
 // bulkImport refuses them.
-fn fallbackInsert(txn: *WriteTxn, cat: Ref, rows: []const []const u64) !Ref {
+fn fallbackInsert(txn: *WriteTransaction, cat: Reference, rows: []const []const u64) !Reference {
     if (rows.len == 0) return cat;
     {
         const v = try catalog.loadCatalog(txn, cat);

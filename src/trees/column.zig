@@ -5,11 +5,11 @@
 // and mutating operations additionally require
 //   alloc(size) !Allocation, writableCopy(ref, len) !Allocation,
 //   free(ref, len) !void
-// where Allocation is arena.Allocation. WriteTxn is the production
-// implementation; ReadTxn satisfies the read-only subset.
+// where Allocation is arena.Allocation. WriteTransaction is the production
+// implementation; ReadTransaction satisfies the read-only subset.
 
 const std = @import("std");
-const Ref = @import("../storage/reference.zig").Ref;
+const Reference = @import("../storage/reference.zig").Reference;
 const node = @import("columnNode.zig");
 
 // Local aliases for the on-disk node format, which lives in columnNode.zig.
@@ -33,8 +33,8 @@ const InnerView = node.InnerView;
 // Task 4 will add leaf splitting.
 // ---------------------------------------------------------------------------
 
-/// Allocate an empty leaf column node and return its Ref.
-pub fn create(txn: anytype) !Ref {
+/// Allocate an empty leaf column node and return its Reference.
+pub fn create(txn: anytype) !Reference {
     const a = try txn.alloc(leaf_node_size);
     _ = encodeLeaf(a.bytes, &.{});
     return a.ref;
@@ -47,7 +47,7 @@ pub fn create(txn: anytype) !Ref {
 pub const max_depth: usize = 16;
 
 /// Deref a node by first reading its kind byte, then dereffing the full node.
-fn derefNode(txn: anytype, ref: Ref) ![]const u8 {
+fn derefNode(txn: anytype, ref: Reference) ![]const u8 {
     const kind_buf = try txn.deref(ref, 1);
     return switch (kind_buf[0]) {
         kind_leaf => txn.deref(ref, leaf_node_size),
@@ -57,7 +57,7 @@ fn derefNode(txn: anytype, ref: Ref) ![]const u8 {
 }
 
 /// Return the number of values stored in the column rooted at root.
-pub fn len(txn: anytype, root: Ref) !u64 {
+pub fn len(txn: anytype, root: Reference) !u64 {
     const bytes = try derefNode(txn, root);
     if (bytes[0] == kind_leaf) {
         const count = std.mem.readInt(u16, bytes[1..3], .little);
@@ -74,11 +74,11 @@ pub fn len(txn: anytype, root: Ref) !u64 {
 }
 
 /// Return the value at index. Returns error.IndexOutOfBounds if out of range.
-pub fn get(txn: anytype, root: Ref, index: u64) !u64 {
+pub fn get(txn: anytype, root: Reference, index: u64) !u64 {
     return getAt(txn, root, index, 0);
 }
 
-fn getAt(txn: anytype, root: Ref, index: u64, depth: usize) !u64 {
+fn getAt(txn: anytype, root: Reference, index: u64, depth: usize) !u64 {
     if (depth >= max_depth) return error.Corrupt;
     const bytes = try derefNode(txn, root);
     if (bytes[0] == kind_leaf) {
@@ -100,9 +100,9 @@ fn getAt(txn: anytype, root: Ref, index: u64, depth: usize) !u64 {
     }
 }
 
-const AppendResult = struct { ref: Ref, count: u64, split: ?Ref, split_count: u64 };
+const AppendResult = struct { ref: Reference, count: u64, split: ?Reference, split_count: u64 };
 
-fn appendInto(txn: anytype, node_ref: Ref, value: u64, depth: usize) !AppendResult {
+fn appendInto(txn: anytype, node_ref: Reference, value: u64, depth: usize) !AppendResult {
     if (depth >= max_depth) return error.Corrupt;
     const bytes = try derefNode(txn, node_ref);
     if (bytes[0] == kind_leaf) {
@@ -157,9 +157,9 @@ fn appendInto(txn: anytype, node_ref: Ref, value: u64, depth: usize) !AppendResu
     }
 }
 
-/// Append value to the column. Returns the new root Ref (copy-on-write).
+/// Append value to the column. Returns the new root Reference (copy-on-write).
 /// Grows the tree through leaf splits and height increases as needed.
-pub fn append(txn: anytype, root: Ref, value: u64) !Ref {
+pub fn append(txn: anytype, root: Reference, value: u64) !Reference {
     const r = try appendInto(txn, root, value, 0);
     if (r.split == null) return r.ref;
     // Split propagated to the root: grow height by one.
@@ -259,12 +259,12 @@ pub fn collapseToRoot(
 /// bytes stay valid for the duration of each iteration.
 fn descendRightEdge(
     txn: anytype,
-    root: Ref,
-    path_refs: *std.ArrayList(Ref),
+    root: Reference,
+    path_refs: *std.ArrayList(Reference),
     path_ridx: *std.ArrayList(usize),
     allocator: std.mem.Allocator,
-) !Ref {
-    var cur: Ref = root;
+) !Reference {
+    var cur: Reference = root;
     var hops: usize = 0;
     while (true) : (hops += 1) {
         if (hops >= max_depth) return error.Corrupt; // ref cycle guard
@@ -284,7 +284,7 @@ fn descendRightEdge(
 /// valid while they are copied out). The caller owns the returned slice.
 fn combineLeafAndRun(
     txn: anytype,
-    leaf_ref: Ref,
+    leaf_ref: Reference,
     values: []const u64,
     allocator: std.mem.Allocator,
 ) ![]u64 {
@@ -308,7 +308,7 @@ fn combineLeafAndRun(
 /// up as additional children of the next level. Replaces `level` in place.
 fn rebuildRightSpine(
     txn: anytype,
-    path_refs: []const Ref,
+    path_refs: []const Reference,
     path_ridx: []const usize,
     level: *std.ArrayList(Child),
     allocator: std.mem.Allocator,
@@ -332,21 +332,21 @@ fn rebuildRightSpine(
 }
 
 /// Append a run of `values` to the RIGHT EDGE of the column rooted at `root`,
-/// returning the new root Ref. Columns are keyed by row index, so a run always
+/// returning the new root Reference. Columns are keyed by row index, so a run always
 /// lands at the end. Only the rightmost root-to-leaf path is rebuilt; every
 /// left subtree is shared unchanged (copy-on-write: shared nodes are never
 /// mutated). The result is logically identical to appending every value via
 /// append. An empty run returns `root` unchanged.
 pub fn appendRun(
     txn: anytype,
-    root: Ref,
+    root: Reference,
     values: []const u64,
     allocator: std.mem.Allocator,
-) !Ref {
+) !Reference {
     if (values.len == 0) return root;
 
     // 1. Record the rightmost path: it is the only part of the tree rebuilt.
-    var path_refs = std.ArrayList(Ref).empty;
+    var path_refs = std.ArrayList(Reference).empty;
     defer path_refs.deinit(allocator);
     var path_ridx = std.ArrayList(usize).empty;
     defer path_ridx.deinit(allocator);
@@ -384,7 +384,7 @@ pub fn appendRun(
 /// Recursive copy-on-write set: copies only the nodes on the path from root to
 /// the target leaf. Sibling subtrees are shared by reference, so the old root
 /// remains a valid, unchanged snapshot after the call returns.
-fn setInto(txn: anytype, node_ref: Ref, index: u64, value: u64, depth: usize) !Ref {
+fn setInto(txn: anytype, node_ref: Reference, index: u64, value: u64, depth: usize) !Reference {
     if (depth >= max_depth) return error.Corrupt;
     const bytes = try derefNode(txn, node_ref);
     if (bytes[0] == kind_leaf) {
@@ -424,19 +424,19 @@ fn setInto(txn: anytype, node_ref: Ref, index: u64, value: u64, depth: usize) !R
     }
 }
 
-/// Overwrite the value at index. Returns the new root Ref (copy-on-write).
+/// Overwrite the value at index. Returns the new root Reference (copy-on-write).
 /// Returns error.IndexOutOfBounds if out of range. Works on trees of any depth.
-pub fn set(txn: anytype, root: Ref, index: u64, value: u64) !Ref {
+pub fn set(txn: anytype, root: Reference, index: u64, value: u64) !Reference {
     return setInto(txn, root, index, value, 0);
 }
 
 /// Recursively free every node in the subtree rooted at node_ref. Leaves and inner
 /// nodes are freed at their respective on-disk sizes so the space becomes reclaimable.
-pub fn freeTree(txn: anytype, node_ref: Ref) !void {
+pub fn freeTree(txn: anytype, node_ref: Reference) !void {
     return freeTreeAt(txn, node_ref, 0);
 }
 
-fn freeTreeAt(txn: anytype, node_ref: Ref, depth: usize) !void {
+fn freeTreeAt(txn: anytype, node_ref: Reference, depth: usize) !void {
     if (depth >= max_depth) return error.Corrupt;
     const bytes = try derefNode(txn, node_ref);
     if (bytes[0] == kind_leaf) {
@@ -453,12 +453,12 @@ fn freeTreeAt(txn: anytype, node_ref: Ref, depth: usize) !void {
 
 /// Shrink the column to new_len entries, dropping all trailing entries and freeing
 /// every node of the old tree so the space becomes reclaimable. Returns the new root
-/// Ref. new_len must be <= the current length.
+/// Reference. new_len must be <= the current length.
 ///
 /// Implemented by rebuilding: a fresh empty column is appended with entries 0..new_len
 /// copied from the old column, then the old tree is freed. O(new_len); trimming only the
 /// trailing nodes in place (instead of a full rebuild) is a deferred optimization.
-pub fn truncate(txn: anytype, root: Ref, new_len: u64) !Ref {
+pub fn truncate(txn: anytype, root: Reference, new_len: u64) !Reference {
     std.debug.assert(new_len <= try len(txn, root));
     var new_root = try create(txn);
     var i: u64 = 0;
@@ -470,8 +470,8 @@ pub fn truncate(txn: anytype, root: Ref, new_len: u64) !Ref {
     return new_root;
 }
 
-/// Test-only helper: allocate an inner node over the given children and return its Ref.
-pub fn makeInnerForTest(txn: anytype, children: []const struct { ref: u64, count: u64 }) !Ref {
+/// Test-only helper: allocate an inner node over the given children and return its Reference.
+pub fn makeInnerForTest(txn: anytype, children: []const struct { ref: u64, count: u64 }) !Reference {
     std.debug.assert(children.len <= FANOUT);
     var refs: [FANOUT]u64 = undefined;
     var counts: [FANOUT]u64 = undefined;

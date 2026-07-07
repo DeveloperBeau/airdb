@@ -1,10 +1,10 @@
 const std = @import("std");
-const Ref = @import("reference.zig").Ref;
+const Reference = @import("reference.zig").Reference;
 
 pub const Slot = struct {
     version: u64,
-    root_ref: Ref,
-    free_list_ref: Ref,
+    root_ref: Reference,
+    free_list_ref: Reference,
     logical_size: u64,
     pub const size: usize = 36;
 

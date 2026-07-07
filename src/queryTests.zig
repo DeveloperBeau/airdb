@@ -4,7 +4,7 @@ const query = @import("query.zig");
 const catalog = @import("schema/catalog.zig");
 const rows = @import("records/rows.zig");
 const index = @import("trees/index.zig");
-const Ref = @import("storage/reference.zig").Ref;
+const Reference = @import("storage/reference.zig").Reference;
 const Db = @import("database.zig").Db;
 const Predicate = query.Predicate;
 const where = query.where;
@@ -21,7 +21,7 @@ fn qTmpPath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const u8
 
 // Build a 3-prop type: prop0 = pk, prop1 = value (indexed iff `idx`), prop2 =
 // secondary. Inserts n rows with pk=i, prop1=i%100, prop2=i.
-fn seedPlannerCat(w: *@import("database.zig").WriteTxn, idx: bool, n: u64) !Ref {
+fn seedPlannerCat(w: *@import("database.zig").WriteTransaction, idx: bool, n: u64) !Reference {
     const defs = [_]catalog.PropDef{
         .{ .kind = .int },
         .{ .kind = .int, .indexed = idx },
@@ -34,7 +34,7 @@ fn seedPlannerCat(w: *@import("database.zig").WriteTxn, idx: bool, n: u64) !Ref 
 }
 
 // Build a type with pk(int) + age(int) and insert (pk, age) rows.
-fn seed(w: anytype, pairs: []const [2]u64) !Ref {
+fn seed(w: anytype, pairs: []const [2]u64) !Reference {
     var cat = try catalog.create(w, 2);
     for (pairs) |p| cat = (try rows.insert(w, cat, &.{ p[0], p[1] })).cat;
     return cat;
@@ -228,14 +228,14 @@ test "query returns stable object keys after relocation" {
 
 const relocation = @import("storage/relocation.zig");
 
-fn whereSorted(txn: anytype, cat: Ref, preds: []const Predicate, out: *std.ArrayList(u64)) !void {
+fn whereSorted(txn: anytype, cat: Reference, preds: []const Predicate, out: *std.ArrayList(u64)) !void {
     try where(txn, cat, preds, out, testing.allocator);
     std.mem.sort(u64, out.items, {}, std.sort.asc(u64));
 }
 
 // Assert the index path (on cat_idx) yields the exact same sorted okey set as
 // the full scan (on cat_scan) for the given predicates.
-fn expectSameWhere(txn: anytype, cat_idx: Ref, cat_scan: Ref, preds: []const Predicate) !void {
+fn expectSameWhere(txn: anytype, cat_idx: Reference, cat_scan: Reference, preds: []const Predicate) !void {
     var a = std.ArrayList(u64).empty;
     defer a.deinit(testing.allocator);
     var b = std.ArrayList(u64).empty;

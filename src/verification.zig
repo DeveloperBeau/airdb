@@ -8,9 +8,9 @@ const std = @import("std");
 const testing = std.testing;
 const platform = @import("platform.zig");
 const Slot = @import("storage/slots.zig").Slot;
-const Ref = @import("storage/reference.zig").Ref;
+const Reference = @import("storage/reference.zig").Reference;
 const Db = @import("database.zig").Db;
-const ReadTxn = @import("transactions/readTransaction.zig").ReadTxn;
+const ReadTransaction = @import("transactions/readTransaction.zig").ReadTransaction;
 const slot_a_off = @import("database.zig").slot_a_off;
 const slot_b_off = @import("database.zig").slot_b_off;
 const typedir = @import("schema/typeDirectory.zig");
@@ -86,7 +86,7 @@ pub fn verifyIntegrity(db: *Db) VerifyError!void {
 // root is not a typed directory and there is nothing to audit.
 fn auditValueIndexes(db: *Db) VerifyError!void {
     if (db.active_root == 0) return;
-    var r = ReadTxn{ .db = db, .root_ref = db.active_root, .version = db.active_version };
+    var r = ReadTransaction{ .db = db, .root_ref = db.active_root, .version = db.active_version };
     const tc = typedir.typeCount(&r, db.active_root) catch return;
     if (tc > 256) return;
     var t: u16 = 0;
@@ -115,12 +115,12 @@ fn auditValueIndexes(db: *Db) VerifyError!void {
 // index does not cover is error.ValueIndexMissingEntry. Any structural failure
 // reading the index/columns of an established typed catalog is itself a
 // divergence and reported the same way.
-fn auditValueIndexForward(r: *ReadTxn, keyrow_ref: Ref, vi_ref: Ref, prop_col: Ref, live_col: Ref) VerifyError!void {
+fn auditValueIndexForward(r: *ReadTransaction, keyrow_ref: Reference, vi_ref: Reference, prop_col: Reference, live_col: Reference) VerifyError!void {
     const Ctx = struct {
-        r: *ReadTxn,
-        vi_ref: Ref,
-        prop_col: Ref,
-        live_col: Ref,
+        r: *ReadTransaction,
+        vi_ref: Reference,
+        prop_col: Reference,
+        live_col: Reference,
         fn onEntry(self: @This(), okey: u64, row: u64) anyerror!void {
             if ((try Column.get(self.r, self.live_col, row)) == 0) return; // defensive: skip dead
             const value = try Column.get(self.r, self.prop_col, row);
@@ -138,19 +138,19 @@ fn auditValueIndexForward(r: *ReadTxn, keyrow_ref: Ref, vi_ref: Ref, prop_col: R
 // error.ValueIndexStaleEntry. Empty inner sets are skipped defensively: current
 // maintenance removes an entry the moment its set empties, but tolerating one
 // keeps the audit usable on files written before that pruning existed.
-fn auditValueIndexBackward(r: *ReadTxn, vi_ref: Ref, keyrow_ref: Ref, prop_col: Ref, live_col: Ref) VerifyError!void {
+fn auditValueIndexBackward(r: *ReadTransaction, vi_ref: Reference, keyrow_ref: Reference, prop_col: Reference, live_col: Reference) VerifyError!void {
     const Ctx = struct {
-        r: *ReadTxn,
-        keyrow_ref: Ref,
-        prop_col: Ref,
-        live_col: Ref,
+        r: *ReadTransaction,
+        keyrow_ref: Reference,
+        prop_col: Reference,
+        live_col: Reference,
         fn onEntry(self: @This(), value: u64, inner_root: u64) anyerror!void {
             if ((try Index.count(self.r, inner_root)) == 0) return; // empty set left by delete
             const Inner = struct {
-                r: *ReadTxn,
-                keyrow_ref: Ref,
-                prop_col: Ref,
-                live_col: Ref,
+                r: *ReadTransaction,
+                keyrow_ref: Reference,
+                prop_col: Reference,
+                live_col: Reference,
                 value: u64,
                 fn onKey(inner: @This(), okey: u64) anyerror!void {
                     const row = (try Index.get(inner.r, inner.keyrow_ref, okey)) orelse return error.ValueIndexStaleEntry;
@@ -167,12 +167,12 @@ fn auditValueIndexBackward(r: *ReadTxn, vi_ref: Ref, keyrow_ref: Ref, prop_col: 
 // Forward direction of the backlink invariant: every live row's outbound
 // link/link_set target must carry that row's okey in the target's backlink set.
 // Any structural failure while walking is itself a divergence.
-fn auditBacklinksForward(r: *ReadTxn, cv: catalog.CatalogView, p: usize, kind: catalog.PropKind) VerifyError!void {
+fn auditBacklinksForward(r: *ReadTransaction, cv: catalog.CatalogView, p: usize, kind: catalog.PropKind) VerifyError!void {
     const Ctx = struct {
-        r: *ReadTxn,
-        bl: Ref,
-        prop_col: Ref,
-        live_col: Ref,
+        r: *ReadTransaction,
+        bl: Reference,
+        prop_col: Reference,
+        live_col: Reference,
         kind: catalog.PropKind,
         fn checkOne(self: @This(), target: u64, source_okey: u64) anyerror!void {
             const inner = (try Index.get(self.r, self.bl, target)) orelse return error.BacklinkMissingEntry;
@@ -188,8 +188,8 @@ fn auditBacklinksForward(r: *ReadTxn, cv: catalog.CatalogView, p: usize, kind: c
             }
             // link_set: every member of the row's set must backlink to this row.
             const Walk = struct {
-                r: *ReadTxn,
-                bl: Ref,
+                r: *ReadTransaction,
+                bl: Reference,
                 okey: u64,
                 fn onKey(m: @This(), target: u64) anyerror!void {
                     const inner = (try Index.get(m.r, m.bl, target)) orelse return error.BacklinkMissingEntry;
@@ -211,20 +211,20 @@ fn auditBacklinksForward(r: *ReadTxn, cv: catalog.CatalogView, p: usize, kind: c
 // Backward direction of the backlink invariant: every backlink entry's source
 // must be a live row whose link column actually points at the entry's target.
 // Empty inner sets are tolerated defensively (maintenance prunes them now).
-fn auditBacklinksBackward(r: *ReadTxn, cv: catalog.CatalogView, p: usize, kind: catalog.PropKind) VerifyError!void {
+fn auditBacklinksBackward(r: *ReadTransaction, cv: catalog.CatalogView, p: usize, kind: catalog.PropKind) VerifyError!void {
     const Ctx = struct {
-        r: *ReadTxn,
-        keyrow: Ref,
-        prop_col: Ref,
-        live_col: Ref,
+        r: *ReadTransaction,
+        keyrow: Reference,
+        prop_col: Reference,
+        live_col: Reference,
         kind: catalog.PropKind,
         fn onEntry(self: @This(), target: u64, inner_root: u64) anyerror!void {
             if ((try Index.count(self.r, inner_root)) == 0) return;
             const Inner = struct {
-                r: *ReadTxn,
-                keyrow: Ref,
-                prop_col: Ref,
-                live_col: Ref,
+                r: *ReadTransaction,
+                keyrow: Reference,
+                prop_col: Reference,
+                live_col: Reference,
                 kind: catalog.PropKind,
                 target: u64,
                 fn onKey(inner: @This(), src_okey: u64) anyerror!void {

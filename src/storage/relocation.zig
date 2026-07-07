@@ -1,6 +1,6 @@
 const std = @import("std");
-const WriteTxn = @import("../database.zig").WriteTxn;
-const Ref = @import("reference.zig").Ref;
+const WriteTransaction = @import("../database.zig").WriteTransaction;
+const Reference = @import("reference.zig").Reference;
 const Column = @import("../trees/column.zig");
 const Index = @import("../trees/index.zig");
 const catalog = @import("../schema/catalog.zig");
@@ -10,7 +10,7 @@ const max_prop_count: usize = 256;
 // Move object `okey`'s live row to physical slot `new_row` (which must be a dead
 // slot), updating the key->row index so the key and all links stay valid. Does
 // not shrink columns. Returns the new catalog ref.
-pub fn relocateRow(txn: *WriteTxn, cat: Ref, okey: u64, new_row: u64) !Ref {
+pub fn relocateRow(txn: *WriteTransaction, cat: Reference, okey: u64, new_row: u64) !Reference {
     var s = try catalog.CatalogSnapshot.load(txn, cat);
     const old_row = (try Index.get(txn, s.keyrow_index_ref, okey)) orelse return cat;
     if (old_row == new_row) return cat;

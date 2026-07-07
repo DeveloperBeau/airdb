@@ -20,7 +20,7 @@ pub const bulk = @import("records/bulk.zig");
 pub const bindex = @import("trees/byteKeyIndex.zig");
 pub const coord = @import("transactions/coordination.zig");
 pub const freelist = @import("storage/freeList.zig");
-pub const Ref = @import("storage/reference.zig").Ref;
+pub const Reference = @import("storage/reference.zig").Reference;
 pub const node = @import("storage/node.zig");
 pub const file_store = @import("storage/fileStore.zig");
 pub const platform = @import("platform.zig");
@@ -37,9 +37,9 @@ pub const maintenance = @import("maintenance.zig");
 pub const read_txn = @import("transactions/readTransaction.zig");
 pub const write_txn = @import("transactions/writeTransaction.zig");
 pub const Db = db.Db;
-pub const ReadTxn = db.ReadTxn;
-pub const WriteTxn = db.WriteTxn;
-pub const Syncer = @import("storage/syncer.zig").Syncer;
+pub const ReadTransaction = db.ReadTransaction;
+pub const WriteTransaction = db.WriteTransaction;
+pub const Syncing = @import("storage/syncer.zig").Syncing;
 pub const FailingSyncer = @import("storage/syncer.zig").FailingSyncer;
 
 test {

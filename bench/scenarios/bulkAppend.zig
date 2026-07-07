@@ -20,7 +20,7 @@ const airdb = @import("airdb");
 const harness = @import("../harness.zig");
 
 const Io = std.Io;
-const Ref = airdb.Ref;
+const Reference = airdb.Reference;
 const catalog = airdb.catalog;
 const rows = airdb.rows;
 const bulk = airdb.bulk;
@@ -123,7 +123,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     while (inserted < m) {
         const this_batch = @min(batch_size, m - inserted);
         var w = try db_b.beginWrite();
-        var cat: Ref = db_b.active_root; // reload the committed catalog ref
+        var cat: Reference = db_b.active_root; // reload the committed catalog ref
         var j: usize = 0;
         while (j < this_batch) : (j += 1) {
             const pk: u64 = base + inserted + j;

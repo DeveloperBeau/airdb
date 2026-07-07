@@ -7,8 +7,8 @@
 // lives above this in objects.zig.
 
 const std = @import("std");
-const WriteTxn = @import("../transactions/writeTransaction.zig").WriteTxn;
-const Ref = @import("../storage/reference.zig").Ref;
+const WriteTransaction = @import("../transactions/writeTransaction.zig").WriteTransaction;
+const Reference = @import("../storage/reference.zig").Reference;
 const Column = @import("../trees/column.zig");
 const Index = @import("../trees/index.zig");
 const bindex = @import("../trees/byteKeyIndex.zig");
@@ -33,7 +33,7 @@ const loadCatalog = catalog.loadCatalog;
 
 /// Add `okey` to the value-index inner set for `value`, returning the new index ref.
 /// Pub: the migration backfill reuses it to index pre-migration rows.
-pub fn viAdd(txn: *WriteTxn, vi_ref: Ref, value: u64, okey: u64) !Ref {
+pub fn viAdd(txn: *WriteTransaction, vi_ref: Reference, value: u64, okey: u64) !Reference {
     const existing = try Index.get(txn, vi_ref, value);
     var set_root = existing orelse try Index.create(txn);
     set_root = try Index.insert(txn, set_root, okey, 1);
@@ -44,7 +44,7 @@ pub fn viAdd(txn: *WriteTxn, vi_ref: Ref, value: u64, okey: u64) !Ref {
 // When the inner set empties, its outer entry is removed and the set's nodes
 // freed: high-churn workloads would otherwise accumulate one empty set per
 // distinct value ever indexed, reclaimable only by a full file copy.
-fn viRemove(txn: *WriteTxn, vi_ref: Ref, value: u64, okey: u64) !Ref {
+fn viRemove(txn: *WriteTransaction, vi_ref: Reference, value: u64, okey: u64) !Reference {
     const existing = try Index.get(txn, vi_ref, value);
     const set_root = existing orelse return vi_ref;
     const new_set = try Index.remove(txn, set_root, okey);
@@ -57,14 +57,14 @@ fn viRemove(txn: *WriteTxn, vi_ref: Ref, value: u64, okey: u64) !Ref {
 }
 
 // Add okey->value to indexed property p's value index. Returns the new catalog.
-fn addValueIndex(txn: *WriteTxn, cat: Ref, p: usize, value: u64, okey: u64) !Ref {
+fn addValueIndex(txn: *WriteTransaction, cat: Reference, p: usize, value: u64, okey: u64) !Reference {
     const v = try loadCatalog(txn, cat);
     const new_vi = try viAdd(txn, v.valueIndexRef(p), value, okey);
     return try catalog.setValueIndexRef(txn, cat, p, new_vi);
 }
 
 // Remove okey from indexed property p's value-index set for `value`.
-fn removeValueIndex(txn: *WriteTxn, cat: Ref, p: usize, value: u64, okey: u64) !Ref {
+fn removeValueIndex(txn: *WriteTransaction, cat: Reference, p: usize, value: u64, okey: u64) !Reference {
     const v = try loadCatalog(txn, cat);
     const new_vi = try viRemove(txn, v.valueIndexRef(p), value, okey);
     return try catalog.setValueIndexRef(txn, cat, p, new_vi);
@@ -73,7 +73,7 @@ fn removeValueIndex(txn: *WriteTxn, cat: Ref, p: usize, value: u64, okey: u64) !
 /// Append a new row to all columns and update the pk index.
 /// values.len must equal the prop_count stored in the catalog.
 /// Returns error.DuplicateKey if values[0] (the primary key) already exists.
-pub fn insert(txn: *WriteTxn, cat: Ref, values: []const u64) !struct { cat: Ref, row: u64 } {
+pub fn insert(txn: *WriteTransaction, cat: Reference, values: []const u64) !struct { cat: Reference, row: u64 } {
     var s = try catalog.CatalogSnapshot.load(txn, cat);
     std.debug.assert(values.len == s.prop_count);
     const prop_count = s.prop_count;
@@ -115,14 +115,14 @@ pub fn insert(txn: *WriteTxn, cat: Ref, values: []const u64) !struct { cat: Ref,
 pub const Conflict = struct { current_version: u64 };
 /// Outcome of a raw or typed update: new catalog + version, conflict, or absent.
 pub const UpdateResult = union(enum) {
-    ok: struct { cat: Ref, version: u64 },
+    ok: struct { cat: Reference, version: u64 },
     conflict: Conflict,
     not_found,
 };
 
 /// Outcome of a raw or typed delete: new catalog, conflict, or absent.
 pub const DeleteResult = union(enum) {
-    ok: Ref, // new catalog
+    ok: Reference, // new catalog
     conflict: Conflict,
     not_found,
 };
@@ -130,7 +130,7 @@ pub const DeleteResult = union(enum) {
 /// Overwrite the row identified by `pk` with `values`, guarded by the row's
 /// expected version. Copy-on-writes only the columns whose value changed and
 /// keeps every indexed property's value index in sync.
-pub fn update(txn: *WriteTxn, cat: Ref, pk: u64, values: []const u64, expected_version: u64) !UpdateResult {
+pub fn update(txn: *WriteTransaction, cat: Reference, pk: u64, values: []const u64, expected_version: u64) !UpdateResult {
     var s = try catalog.CatalogSnapshot.load(txn, cat);
     std.debug.assert(values.len == s.prop_count);
     std.debug.assert(values[0] == pk); // pk is identity, must not change
@@ -180,7 +180,7 @@ pub fn update(txn: *WriteTxn, cat: Ref, pk: u64, values: []const u64, expected_v
 /// Tombstone the row identified by `pk`, guarded by the row's expected version.
 /// Drops the pk and key->row index entries and every value-index entry, but
 /// leaves the physical column cells intact for pinned readers.
-pub fn delete(txn: *WriteTxn, cat: Ref, pk: u64, expected_version: u64) !DeleteResult {
+pub fn delete(txn: *WriteTransaction, cat: Reference, pk: u64, expected_version: u64) !DeleteResult {
     var s = try catalog.CatalogSnapshot.load(txn, cat);
     const okey = (try Index.get(txn, s.pk_index_ref, pk)) orelse return .not_found;
     const row = (try Index.get(txn, s.keyrow_index_ref, okey)) orelse return .not_found;
@@ -222,7 +222,7 @@ pub fn delete(txn: *WriteTxn, cat: Ref, pk: u64, expected_version: u64) !DeleteR
 
 /// Read a row by primary key into `out` (raw u64 cells). Returns the row
 /// version, or null when the key is not found or the row is tombstoned.
-pub fn getByPk(txn: anytype, cat: Ref, pk: u64, out: []u64) !?u64 {
+pub fn getByPk(txn: anytype, cat: Reference, pk: u64, out: []u64) !?u64 {
     const v = try loadCatalog(txn, cat);
     std.debug.assert(out.len == v.prop_count);
     const okey = (try Index.get(txn, v.pk_index_ref, pk)) orelse return null;
@@ -232,13 +232,13 @@ pub fn getByPk(txn: anytype, cat: Ref, pk: u64, out: []u64) !?u64 {
 /// Read a row by its stable object key. Resolves the okey to a physical row via
 /// the key-to-row index. Returns the row version, or null if the okey is unknown
 /// or the row is tombstoned.
-pub fn getByObjectKey(txn: anytype, cat: Ref, okey: u64, out: []u64) !?u64 {
+pub fn getByObjectKey(txn: anytype, cat: Reference, okey: u64, out: []u64) !?u64 {
     const v = try loadCatalog(txn, cat);
     std.debug.assert(out.len == v.prop_count);
     const row = (try catalog.okeyToRow(txn, cat, okey)) orelse return null;
     const live_col_ref = v.live_col_ref;
     const version_col_ref = v.version_col_ref;
-    var prop_refs: [max_prop_count]Ref = undefined;
+    var prop_refs: [max_prop_count]Reference = undefined;
     {
         var j: usize = 0;
         while (j < v.prop_count) : (j += 1) prop_refs[j] = v.propColRef(j);
@@ -259,7 +259,7 @@ pub fn getByObjectKey(txn: anytype, cat: Ref, okey: u64, out: []u64) !?u64 {
 /// and list/set/dict trees permanently. A raw of 0 (no storage, e.g. a row
 /// written with caller-supplied raws or a dead-row migration backfill) frees
 /// nothing rather than erroring mid-delete.
-pub fn freeRowStorage(txn: *WriteTxn, kinds: []const PropKind, elems: []const ElemKind, raw: []const u64) !void {
+pub fn freeRowStorage(txn: *WriteTransaction, kinds: []const PropKind, elems: []const ElemKind, raw: []const u64) !void {
     var i: usize = 0;
     while (i < kinds.len) : (i += 1) {
         if (raw[i] == 0) continue;

@@ -21,7 +21,7 @@ const airdb = @import("airdb");
 const harness = @import("../harness.zig");
 
 const Io = std.Io;
-const Ref = airdb.Ref;
+const Reference = airdb.Reference;
 const blob = airdb.blob;
 const catalog = airdb.catalog;
 const rows = airdb.rows;
@@ -75,7 +75,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     var db = try airdb.Db.create(alloc, blob_path);
     errdefer db.deinit();
 
-    var refs: [blob_count]Ref = undefined;
+    var refs: [blob_count]Reference = undefined;
 
     // PUT: one blob per write transaction.
     var put_bytes: u64 = 0;

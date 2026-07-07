@@ -5,11 +5,11 @@
 // the "low_key" of an inner pair is a blob ref to the smallest key in that
 // subtree. All ordering compares the dereferenced bytes with std.mem.order;
 // keys live in the blob heap. See bTreeCore.zig for the transaction
-// capability the `txn` parameters must satisfy (WriteTxn in production;
-// ReadTxn for the read-only subset).
+// capability the `txn` parameters must satisfy (WriteTransaction in production;
+// ReadTransaction for the read-only subset).
 
 const std = @import("std");
-const Ref = @import("../storage/reference.zig").Ref;
+const Reference = @import("../storage/reference.zig").Reference;
 const blob = @import("../records/blob.zig");
 const bTreeCore = @import("bTreeCore.zig");
 
@@ -47,7 +47,7 @@ const BlobKeying = struct {
 
 const Tree = bTreeCore.BTreeCore(BlobKeying);
 
-/// Create a new empty leaf node and return its Ref.
+/// Create a new empty leaf node and return its Reference.
 pub const create = Tree.create;
 
 /// Look up `key` in the tree rooted at `root`. Returns the value on exact
@@ -58,7 +58,7 @@ pub const get = Tree.get;
 /// exists (exact bytes), its value is overwritten in place and no duplicate is
 /// added; otherwise the key bytes are stored in the blob heap and a new entry
 /// is inserted in byte-sorted order. Returns the (possibly new) root.
-pub fn insert(txn: anytype, root: Ref, key: []const u8, val: u64) !Ref {
+pub fn insert(txn: anytype, root: Reference, key: []const u8, val: u64) !Reference {
     const key_ref = try blob.put(txn, key);
     return Tree.insert(txn, root, key, key_ref, val);
 }
@@ -83,7 +83,7 @@ pub const count = Tree.count;
 /// of the callback; copy it if it must outlive the call.
 pub fn forEachEntry(
     txn: anytype,
-    root: Ref,
+    root: Reference,
     ctx: anytype,
     comptime onEntry: fn (@TypeOf(ctx), key: []const u8, val: u64) anyerror!void,
 ) !void {

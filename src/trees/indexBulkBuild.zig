@@ -12,7 +12,7 @@
 // writableCopy(ref, len), and free(ref, len).
 
 const std = @import("std");
-const Ref = @import("../storage/reference.zig").Ref;
+const Reference = @import("../storage/reference.zig").Reference;
 const node = @import("indexNode.zig");
 const index = @import("index.zig");
 
@@ -111,12 +111,12 @@ pub fn collapseToRoot(
 /// duration of each iteration.
 fn descendRightEdge(
     txn: anytype,
-    root: Ref,
-    path_refs: *std.ArrayList(Ref),
+    root: Reference,
+    path_refs: *std.ArrayList(Reference),
     path_ridx: *std.ArrayList(usize),
     allocator: std.mem.Allocator,
-) !Ref {
-    var cur: Ref = root;
+) !Reference {
+    var cur: Reference = root;
     var hops: usize = 0;
     while (true) : (hops += 1) {
         if (hops >= max_depth) return error.Corrupt; // ref cycle guard
@@ -141,7 +141,7 @@ const CombinedRun = struct { keys: []u64, values: []u64 };
 /// run's first key clears the leaf's current max.
 fn combineLeafAndRun(
     txn: anytype,
-    leaf_ref: Ref,
+    leaf_ref: Reference,
     keys: []const u64,
     values: []const u64,
     allocator: std.mem.Allocator,
@@ -175,7 +175,7 @@ fn combineLeafAndRun(
 /// as additional children of the next level. Replaces `level` in place.
 fn rebuildRightSpine(
     txn: anytype,
-    path_refs: []const Ref,
+    path_refs: []const Reference,
     path_ridx: []const usize,
     level: *std.ArrayList(Child),
     allocator: std.mem.Allocator,
@@ -200,7 +200,7 @@ fn rebuildRightSpine(
 
 /// Append a sorted run of (keys, values) whose keys ALL exceed the tree's
 /// current max key to the RIGHT EDGE of the tree rooted at `root`, returning
-/// the new root Ref. Only the rightmost root-to-leaf path is rebuilt; every
+/// the new root Reference. Only the rightmost root-to-leaf path is rebuilt; every
 /// left subtree is shared unchanged (copy-on-write: shared nodes are never
 /// mutated). The result is logically identical to inserting every pair via
 /// insert.
@@ -210,11 +210,11 @@ fn rebuildRightSpine(
 /// key. An empty run returns `root` unchanged.
 pub fn appendRun(
     txn: anytype,
-    root: Ref,
+    root: Reference,
     keys: []const u64,
     values: []const u64,
     allocator: std.mem.Allocator,
-) !Ref {
+) !Reference {
     std.debug.assert(keys.len == values.len);
     if (keys.len == 0) return root;
     if (std.debug.runtime_safety) {
@@ -223,7 +223,7 @@ pub fn appendRun(
     }
 
     // 1. Record the rightmost path: it is the only part of the tree rebuilt.
-    var path_refs = std.ArrayList(Ref).empty;
+    var path_refs = std.ArrayList(Reference).empty;
     defer path_refs.deinit(allocator);
     var path_ridx = std.ArrayList(usize).empty;
     defer path_ridx.deinit(allocator);

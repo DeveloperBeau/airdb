@@ -3,8 +3,8 @@
 const std = @import("std");
 const testing = std.testing;
 const Db = @import("../database.zig").Db;
-const WriteTxn = @import("../database.zig").WriteTxn;
-const Ref = @import("../storage/reference.zig").Ref;
+const WriteTransaction = @import("../database.zig").WriteTransaction;
+const Reference = @import("../storage/reference.zig").Reference;
 const index = @import("index.zig");
 const node = @import("indexNode.zig");
 
@@ -338,7 +338,7 @@ test "forEachEntry visits key/value pairs in ascending key order" {
 // Build a tree holding keys 0..=1000 (each once) inserted in scrambled order,
 // with value == key*10. 397 is coprime to 1001 (=7*11*13), so (i*397)%1001
 // visits every residue exactly once.
-fn buildScrambled0to1000(w: *WriteTxn) !Ref {
+fn buildScrambled0to1000(w: *WriteTransaction) !Reference {
     var root = try create(w);
     var i: u64 = 0;
     while (i <= 1000) : (i += 1) {
@@ -539,7 +539,7 @@ fn appendTmpDb(tmp: *testing.TmpDir, name: []const u8) !Db {
 // Build a base tree of keys 0..base via sequential insert, append the run
 // base..base+run via appendRun, and assert the result is logically identical
 // to inserting all keys 0..base+run sequentially.
-fn checkAppendEquiv(w: *WriteTxn, base: u64, run: u64) !void {
+fn checkAppendEquiv(w: *WriteTransaction, base: u64, run: u64) !void {
     var base_root = try create(w);
     var k: u64 = 0;
     while (k < base) : (k += 1) base_root = try insert(w, base_root, k, appendRunVal(k));
