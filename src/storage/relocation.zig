@@ -5,7 +5,7 @@ const Column = @import("../trees/column.zig");
 const Index = @import("../trees/index.zig");
 const catalog = @import("../schema/catalog.zig");
 
-const max_prop_count: usize = 256;
+const maxPropertyCount: usize = 256;
 
 // Move object `objectKey`'s live row to physical slot `new_row` (which must be a dead
 // slot), updating the key->row index so the key and all links stay valid. Does
@@ -20,9 +20,9 @@ pub fn relocateRow(transaction: *WriteTransaction, catalogRef: Reference, object
 
     // Copy each property cell + the version cell from old_row to new_row.
     var i: usize = 0;
-    while (i < s.prop_count) : (i += 1) {
-        const cell = try Column.get(transaction, s.props[i].col, old_row);
-        s.props[i].col = try Column.set(transaction, s.props[i].col, new_row, cell);
+    while (i < s.propertyCount) : (i += 1) {
+        const cell = try Column.get(transaction, s.properties[i].col, old_row);
+        s.properties[i].col = try Column.set(transaction, s.properties[i].col, new_row, cell);
     }
     const oldver = try Column.get(transaction, s.version_col_ref, old_row);
     s.version_col_ref = try Column.set(transaction, s.version_col_ref, new_row, oldver);
@@ -158,7 +158,7 @@ test "a same-type link to a relocated object still resolves" {
     defer database.deinit();
     var w = try database.beginWrite();
 
-    // primaryKey + a single .link prop (prop index 1).
+    // primaryKey + a single .link property (property index 1).
     var catalogRef = try catalog.createDefs(&w, &.{
         .{ .kind = .int },
         .{ .kind = .link },

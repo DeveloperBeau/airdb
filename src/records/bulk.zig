@@ -7,10 +7,10 @@ const inode = @import("../trees/indexNode.zig");
 const catalog = @import("../schema/catalog.zig");
 const rawRows = @import("rows.zig");
 
-const PropKind = catalog.PropKind;
+const PropertyKind = catalog.PropertyKind;
 const ElemKind = catalog.ElemKind;
 const DeletionRule = catalog.DeletionRule;
-const max_prop_count = catalog.max_prop_count;
+const maxPropertyCount = catalog.maxPropertyCount;
 
 // ---------------------------------------------------------------------------
 // Bottom-up bulk tree builders.
@@ -89,7 +89,7 @@ pub fn bulkIndex(transaction: *WriteTransaction, keys: []const u64, vals: []cons
 
 /// Build a value index (value -> inner objectKey-set) from `entries`, sorted by
 /// value, each with ascending objectKeys. Each inner set maps objectKey -> 1, matching
-/// the shape rows.viAdd maintains (value -> Index{objectKey -> 1}).
+/// the shape rows.valueIndexAdd maintains (value -> Index{objectKey -> 1}).
 pub fn bulkValueIndex(transaction: *WriteTransaction, entries: []const ValueObjectKeys) !Reference {
     if (entries.len == 0) return Index.create(transaction);
     const al = transaction.database.store.allocator;
@@ -163,12 +163,12 @@ pub fn bulkImport(
 // node is written.
 fn validateImportInput(s: *const catalog.CatalogSnapshot, rows: []const []const u64) !void {
     var j: usize = 0;
-    while (j < s.prop_count) : (j += 1) {
-        const k = s.props[j].kind;
+    while (j < s.propertyCount) : (j += 1) {
+        const k = s.properties[j].kind;
         if (k == .link or k == .link_set) return error.UnsupportedForBulk;
     }
     for (rows) |row| {
-        if (row.len != s.prop_count) return error.BadRow;
+        if (row.len != s.propertyCount) return error.BadRow;
     }
 }
 
@@ -210,9 +210,9 @@ fn primaryKeySortOrder(
 // nodes behind.
 fn freePreallocatedTrees(transaction: *WriteTransaction, s: *const catalog.CatalogSnapshot) !void {
     var p: usize = 0;
-    while (p < s.prop_count) : (p += 1) {
-        try Column.freeTree(transaction, s.props[p].col);
-        if (s.props[p].indexed) try Index.freeTree(transaction, s.props[p].value_index);
+    while (p < s.propertyCount) : (p += 1) {
+        try Column.freeTree(transaction, s.properties[p].col);
+        if (s.properties[p].indexed) try Index.freeTree(transaction, s.properties[p].value_index);
     }
     try Column.freeTree(transaction, s.version_col_ref);
     try Column.freeTree(transaction, s.live_col_ref);
@@ -237,9 +237,9 @@ fn buildImportTrees(
         const col_vals = try al.alloc(u64, n);
         defer al.free(col_vals);
         var p: usize = 0;
-        while (p < s.prop_count) : (p += 1) {
+        while (p < s.propertyCount) : (p += 1) {
             for (perm, 0..) |src, r| col_vals[r] = rows[src][p];
-            s.props[p].col = try bulkColumn(transaction, col_vals[0..n]);
+            s.properties[p].col = try bulkColumn(transaction, col_vals[0..n]);
         }
     }
 
@@ -282,19 +282,19 @@ fn buildValueIndexes(
 ) !void {
     const al = transaction.database.store.allocator;
     var p: usize = 0;
-    while (p < s.prop_count) : (p += 1) {
-        if (s.props[p].indexed) {
-            s.props[p].value_index = try buildPropValueIndex(transaction, rows, perm, p, old_next_key, al);
+    while (p < s.propertyCount) : (p += 1) {
+        if (s.properties[p].indexed) {
+            s.properties[p].value_index = try buildPropertyValueIndex(transaction, rows, perm, p, old_next_key, al);
         }
     }
 }
 
 // Build the value index for indexed property `p`: emit (value -> {objectKey -> 1})
 // with values ascending and each inner objectKey set ascending, matching the shape
-// rows.viAdd maintains. objectKeys are assigned in sorted-primaryKey order (objectKeyR =
+// rows.valueIndexAdd maintains. objectKeys are assigned in sorted-primaryKey order (objectKeyR =
 // old_next_key + r), so sorting (value, objectKey) pairs yields ascending objectKeys
 // within each value group.
-fn buildPropValueIndex(
+fn buildPropertyValueIndex(
     transaction: *WriteTransaction,
     rows: []const []const u64,
     perm: []const usize,
@@ -358,7 +358,7 @@ pub fn bulkAppend(transaction: *WriteTransaction, catalogRef: Reference, rows: [
 
     // Validate row widths first: a single malformed row aborts before any work.
     for (rows) |row| {
-        if (row.len != s.prop_count) return error.BadRow;
+        if (row.len != s.propertyCount) return error.BadRow;
     }
     if (rows.len == 0) return catalogRef;
 
@@ -415,9 +415,9 @@ fn appendColumnRuns(
         const col_vals = try al.alloc(u64, n);
         defer al.free(col_vals);
         var p: usize = 0;
-        while (p < s.prop_count) : (p += 1) {
+        while (p < s.propertyCount) : (p += 1) {
             for (rows, 0..) |row, j| col_vals[j] = row[p];
-            s.props[p].col = try Column.appendRun(transaction, s.props[p].col, col_vals[0..n], al);
+            s.properties[p].col = try Column.appendRun(transaction, s.properties[p].col, col_vals[0..n], al);
         }
     }
 
@@ -443,10 +443,10 @@ fn qualifyRightEdgeAppend(
     // keep secondary structures that a pure right-edge append cannot maintain.
     {
         var j: usize = 0;
-        while (j < s.prop_count) : (j += 1) {
-            const k = s.props[j].kind;
+        while (j < s.propertyCount) : (j += 1) {
+            const k = s.properties[j].kind;
             if (k == .link or k == .link_set) return error.NotAppendable;
-            if (s.props[j].indexed) return error.NotAppendable;
+            if (s.properties[j].indexed) return error.NotAppendable;
         }
     }
 
@@ -500,7 +500,7 @@ fn fallbackInsert(transaction: *WriteTransaction, catalogRef: Reference, rows: [
     {
         const v = try catalog.loadCatalog(transaction, catalogRef);
         var j: usize = 0;
-        while (j < v.prop_count) : (j += 1) {
+        while (j < v.propertyCount) : (j += 1) {
             const k = v.kind(j);
             if (k == .link or k == .link_set) return error.UnsupportedForBulk;
         }

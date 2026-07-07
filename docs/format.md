@@ -65,7 +65,7 @@ The empty blob is the null ref; no node is written.
 
 ## Catalog node
 
-Per type: `prop_count u16, next_row u64, primaryKeyIndexRef u64,
+Per type: `propertyCount u16, next_row u64, primaryKeyIndexRef u64,
 version_col_ref u64, live_col_ref u64, keyrow_index_ref u64, next_key u64`,
 then per-property parallel arrays in this order: column refs (u64), kinds
 (u8), element kinds (u8), backlink refs (u64), link targets (u16), delete

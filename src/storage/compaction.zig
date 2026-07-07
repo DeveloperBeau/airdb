@@ -10,7 +10,7 @@ const relocateRow = @import("relocation.zig").relocateRow;
 const file_store = @import("fileStore.zig");
 const compactionCopy = @import("compactionCopy.zig");
 
-const max_prop_count = catalog.max_prop_count;
+const maxPropertyCount = catalog.maxPropertyCount;
 
 const Pair = compactionCopy.Pair;
 const collectKeyRowPairs = compactionCopy.collectKeyRowPairs;
@@ -38,13 +38,13 @@ pub fn shouldCompact(transaction: anytype, catalogRef: Reference) !bool {
 // preserved (keyed by object key). Returns the new catalog ref.
 pub fn compactType(transaction: *WriteTransaction, catalogRef: Reference) !Reference {
     var s = try catalog.CatalogSnapshot.load(transaction, catalogRef);
-    const pc = s.prop_count;
+    const propertyCount = s.propertyCount;
     // Keep the old column/index roots to read from while the snapshot's fields
     // are re-pointed at the fresh dense structures.
-    var old_prop: [max_prop_count]Reference = undefined;
+    var oldPropertyColumns: [maxPropertyCount]Reference = undefined;
     {
         var j: usize = 0;
-        while (j < pc) : (j += 1) old_prop[j] = s.props[j].col;
+        while (j < propertyCount) : (j += 1) oldPropertyColumns[j] = s.properties[j].col;
     }
     const old_ver = s.version_col_ref;
     const old_live = s.live_col_ref;
@@ -57,7 +57,7 @@ pub fn compactType(transaction: *WriteTransaction, catalogRef: Reference) !Refer
     // Build fresh dense columns.
     {
         var j: usize = 0;
-        while (j < pc) : (j += 1) s.props[j].col = try Column.create(transaction);
+        while (j < propertyCount) : (j += 1) s.properties[j].col = try Column.create(transaction);
     }
     s.version_col_ref = try Column.create(transaction);
     s.live_col_ref = try Column.create(transaction);
@@ -68,9 +68,9 @@ pub fn compactType(transaction: *WriteTransaction, catalogRef: Reference) !Refer
         // defensive live check (delete already drops dead keys from keyrow)
         if ((try Column.get(transaction, old_live, pr.row)) == 0) continue;
         var j: usize = 0;
-        while (j < pc) : (j += 1) {
-            const cell = try Column.get(transaction, old_prop[j], pr.row);
-            s.props[j].col = try Column.append(transaction, s.props[j].col, cell);
+        while (j < propertyCount) : (j += 1) {
+            const cell = try Column.get(transaction, oldPropertyColumns[j], pr.row);
+            s.properties[j].col = try Column.append(transaction, s.properties[j].col, cell);
         }
         const ver = try Column.get(transaction, old_ver, pr.row);
         s.version_col_ref = try Column.append(transaction, s.version_col_ref, ver);
@@ -86,7 +86,7 @@ pub fn compactType(transaction: *WriteTransaction, catalogRef: Reference) !Refer
     // backlinks, and value indexes are carried over, not rebuilt.)
     {
         var j: usize = 0;
-        while (j < pc) : (j += 1) try Column.freeTree(transaction, old_prop[j]);
+        while (j < propertyCount) : (j += 1) try Column.freeTree(transaction, oldPropertyColumns[j]);
     }
     try Column.freeTree(transaction, old_ver);
     try Column.freeTree(transaction, old_live);
@@ -104,7 +104,7 @@ fn truncatePacked(transaction: *WriteTransaction, catalogRef: Reference, new_len
     var s = try catalog.CatalogSnapshot.load(transaction, catalogRef);
     {
         var j: usize = 0;
-        while (j < s.prop_count) : (j += 1) s.props[j].col = try Column.truncate(transaction, s.props[j].col, new_len);
+        while (j < s.propertyCount) : (j += 1) s.properties[j].col = try Column.truncate(transaction, s.properties[j].col, new_len);
     }
     s.version_col_ref = try Column.truncate(transaction, s.version_col_ref, new_len);
     s.live_col_ref = try Column.truncate(transaction, s.live_col_ref, new_len);
@@ -127,10 +127,10 @@ pub const CompactCursor = @import("../database.zig").CompactCursor;
 // Map a physical row to its stable object key. There is no reverse key->row
 // index, so we go through the primary key: property 0 holds the primaryKey, and the primaryKey
 // index maps primaryKey -> objectKey (the same association objects.insert builds and
-// resolveProp reads). Valid for any live row; the row's primaryKey cell is preserved by
+// resolveProperty reads). Valid for any live row; the row's primaryKey cell is preserved by
 // relocateRow, so this holds even after earlier relocations in the same run.
 fn rowToObjectKey(transaction: anytype, v: catalog.CatalogView, row: u64) !u64 {
-    const primaryKey = try Column.get(transaction, v.propColRef(0), row);
+    const primaryKey = try Column.get(transaction, v.propertyColumnRef(0), row);
     // A live row whose primaryKey does not resolve means the primaryKey index diverged from the
     // columns: surface corruption instead of crashing mid-compaction.
     return (try Index.get(transaction, v.primaryKeyIndexRef, primaryKey)) orelse error.Corrupt;
@@ -255,16 +255,16 @@ inline fn mixPrimaryKey(primaryKey: u64) u64 {
     return std.hash.Wyhash.hash(0, std.mem.asBytes(&primaryKey));
 }
 
-// Walk a catalog's key->row index, reading each live row's primary key (prop 0),
+// Walk a catalog's key->row index, reading each live row's primary key (property 0),
 // and fold the primaryKey set into `fold` (XOR of mixed primaryKeys) while counting rows. The
 // fold is identity-preserving and order-independent.
 fn foldPrimaryKeys(allocator: std.mem.Allocator, transaction: anytype, catalogRef: Reference, fold: *u64, count: *u64) !void {
     const v = try catalog.loadCatalog(transaction, catalogRef);
-    const prop0 = v.propColRef(0);
+    const property0 = v.propertyColumnRef(0);
     var pairs = try collectKeyRowPairs(allocator, transaction, v.keyrow_index_ref);
     defer pairs.deinit(allocator);
     for (pairs.items) |pr| {
-        const primaryKey = try Column.get(transaction, prop0, pr.row);
+        const primaryKey = try Column.get(transaction, property0, pr.row);
         fold.* ^= mixPrimaryKey(primaryKey);
         count.* += 1;
     }
@@ -277,40 +277,40 @@ fn foldPrimaryKeys(allocator: std.mem.Allocator, transaction: anytype, catalogRe
 fn foldPrimaryKeysAndCheck(allocator: std.mem.Allocator, src: anytype, sc: Reference, dst: anytype, dc: Reference, fold: *u64, count: *u64) !void {
     const sv = try catalog.loadCatalog(src, sc);
     const dv = try catalog.loadCatalog(dst, dc);
-    const pc = sv.prop_count;
-    if (dv.prop_count != pc) return error.CompactionMismatch;
+    const propertyCount = sv.propertyCount;
+    if (dv.propertyCount != propertyCount) return error.CompactionMismatch;
 
-    // Snapshot column refs and per-prop kinds for both sides up front.
-    var s_prop: [max_prop_count]Reference = undefined;
-    var d_prop: [max_prop_count]Reference = undefined;
-    var kinds: [max_prop_count]catalog.PropKind = undefined;
+    // Snapshot column refs and per-property kinds for both sides up front.
+    var sourcePropertyColumns: [maxPropertyCount]Reference = undefined;
+    var destinationPropertyColumns: [maxPropertyCount]Reference = undefined;
+    var kinds: [maxPropertyCount]catalog.PropertyKind = undefined;
     {
         var j: usize = 0;
-        while (j < pc) : (j += 1) {
-            s_prop[j] = sv.propColRef(j);
-            d_prop[j] = dv.propColRef(j);
+        while (j < propertyCount) : (j += 1) {
+            sourcePropertyColumns[j] = sv.propertyColumnRef(j);
+            destinationPropertyColumns[j] = dv.propertyColumnRef(j);
             kinds[j] = sv.kind(j);
             if (dv.kind(j) != kinds[j]) return error.CompactionMismatch;
         }
     }
-    const s_prop0 = s_prop[0];
+    const sourcePropertyColumn0 = sourcePropertyColumns[0];
 
     // Collect SRC's live (objectKey, row) pairs.
     var pairs = try collectKeyRowPairs(allocator, src, sv.keyrow_index_ref);
     defer pairs.deinit(allocator);
 
-    var out: [max_prop_count]catalog.Value = undefined;
+    var out: [maxPropertyCount]catalog.Value = undefined;
     for (pairs.items) |pr| {
         // primaryKey fold over the source.
-        const primaryKey = try Column.get(src, s_prop0, pr.row);
+        const primaryKey = try Column.get(src, sourcePropertyColumn0, pr.row);
         fold.* ^= mixPrimaryKey(primaryKey);
         count.* += 1;
 
         // (a) readability: the same object key must decode in dst.
-        if ((try objects.getTypedByObjectKey(dst, dc, pr.objectKey, out[0..pc])) == null) return error.CompactionMismatch;
+        if ((try objects.getTypedByObjectKey(dst, dc, pr.objectKey, out[0..propertyCount])) == null) return error.CompactionMismatch;
 
         const drow = (try catalog.objectKeyToRow(dst, dc, pr.objectKey)) orelse return error.CompactionMismatch;
-        try checkRowProperties(src, dst, dv, kinds[0..pc], s_prop[0..pc], d_prop[0..pc], pr, drow);
+        try checkRowProperties(src, dst, dv, kinds[0..propertyCount], sourcePropertyColumns[0..propertyCount], destinationPropertyColumns[0..propertyCount], pr, drow);
     }
 }
 
@@ -323,21 +323,21 @@ fn checkRowProperties(
     src: anytype,
     dst: anytype,
     dv: catalog.CatalogView,
-    kinds: []const catalog.PropKind,
-    s_prop: []const Reference,
-    d_prop: []const Reference,
+    kinds: []const catalog.PropertyKind,
+    sourcePropertyColumns: []const Reference,
+    destinationPropertyColumns: []const Reference,
     pr: Pair,
     drow: u64,
 ) !void {
     var p: usize = 0;
     while (p < kinds.len) : (p += 1) {
         if (kinds[p] == .link) {
-            const s_raw = try Column.get(src, s_prop[p], pr.row);
-            const d_raw = try Column.get(dst, d_prop[p], drow);
+            const s_raw = try Column.get(src, sourcePropertyColumns[p], pr.row);
+            const d_raw = try Column.get(dst, destinationPropertyColumns[p], drow);
             if (s_raw != d_raw) return error.CompactionMismatch;
         }
         if (dv.indexed(p)) {
-            const d_raw = try Column.get(dst, d_prop[p], drow);
+            const d_raw = try Column.get(dst, destinationPropertyColumns[p], drow);
             const inner = (try Index.get(dst, dv.valueIndexRef(p), d_raw)) orelse return error.CompactionMismatch;
             if ((try Index.get(dst, inner, pr.objectKey)) == null) return error.CompactionMismatch;
         }
@@ -389,8 +389,8 @@ pub fn compactToNewFile(allocator: std.mem.Allocator, src_path: []const u8, dst_
     var dst_committed = false;
     defer if (!dst_committed) dst_w.deinit();
 
-    // Reconstruct the schema (PropDefs per type) + embedded flags from the source.
-    var schema = std.ArrayList([]catalog.PropDef).empty;
+    // Reconstruct the schema (PropertyDefinitions per type) + embedded flags from the source.
+    var schema = std.ArrayList([]catalog.PropertyDefinition).empty;
     defer {
         for (schema.items) |s| allocator.free(s);
         schema.deinit(allocator);
@@ -402,9 +402,9 @@ pub fn compactToNewFile(allocator: std.mem.Allocator, src_path: []const u8, dst_
         while (t < tc) : (t += 1) {
             const sc = try typedir.catalogRef(&src_r, src_dir, t);
             const v = try catalog.loadCatalog(&src_r, sc);
-            const defs = try allocator.alloc(catalog.PropDef, v.prop_count);
+            const defs = try allocator.alloc(catalog.PropertyDefinition, v.propertyCount);
             var j: usize = 0;
-            while (j < v.prop_count) : (j += 1) {
+            while (j < v.propertyCount) : (j += 1) {
                 defs[j] = .{ .kind = v.kind(j), .elem = v.elemKind(j), .link_target = v.linkTarget(j), .del_rule = v.delRule(j), .indexed = v.indexed(j) };
             }
             try schema.append(allocator, defs);

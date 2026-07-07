@@ -335,7 +335,7 @@ test "compactToNewFile produces a verified, smaller, equivalent file" {
     const dst_path = try cmpTmpPath(testing.allocator, &tmp, "fulldst.airdb");
     defer testing.allocator.free(dst_path);
 
-    const PD = catalog.PropDef;
+    const PD = catalog.PropertyDefinition;
     var authorObjectKeys: [300]u64 = undefined;
 
     // Build the source: two types, ~300 authors + ~300 books, delete ~100 books.
@@ -431,7 +431,7 @@ test "compaction preserves dict and set-of-blob" {
     const dst_path = try cmpTmpPath(testing.allocator, &tmp, "bindexdst.airdb");
     defer testing.allocator.free(dst_path);
 
-    const PD = catalog.PropDef;
+    const PD = catalog.PropertyDefinition;
 
     // Build the source: a type with {int primaryKey, dict, set(elem=blob)}, two rows with
     // dict entries + blob-set members, then delete one row to leave a gap.
@@ -507,7 +507,7 @@ test "compaction preserves a large (chunked) blob" {
     const dst_path = try cmpTmpPath(testing.allocator, &tmp, "bigblobdst.airdb");
     defer testing.allocator.free(dst_path);
 
-    const PD = catalog.PropDef;
+    const PD = catalog.PropertyDefinition;
 
     // A blob well past the inline cap (section_size is 16 MiB) is stored chunked.
     const n: usize = 20 * 1024 * 1024;
@@ -915,7 +915,7 @@ test "compactInPlace preserves value indexes and passes verifyIntegrity" {
     const catalogRef = try typedir.catalogRef(&r, r.root(), 0);
     var hits = std.ArrayList(u64).empty;
     defer hits.deinit(testing.allocator);
-    try query.where(&r, catalogRef, &.{.{ .prop = 1, .op = .eq, .value = 3 }}, &hits, testing.allocator);
+    try query.where(&r, catalogRef, &.{.{ .property = 1, .op = .eq, .value = 3 }}, &hits, testing.allocator);
     try testing.expectEqual(@as(usize, 10), hits.items.len);
 }
 
@@ -925,7 +925,7 @@ test "compactInPlace shrinks and preserves data" {
     const path = try cmpTmpPath(testing.allocator, &tmp, "inplace.airdb");
     defer testing.allocator.free(path);
 
-    const PD = catalog.PropDef;
+    const PD = catalog.PropertyDefinition;
 
     // Build a churned database (two types) at `path`, then CLOSE it so no handle
     // remains while compactInPlace replaces the file. Capture the logical size

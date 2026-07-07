@@ -8,13 +8,13 @@ const catalog = @import("catalog.zig");
 const blob = @import("../records/blob.zig");
 const rows = @import("../records/rows.zig");
 
-const PropKind = catalog.PropKind;
+const PropertyKind = catalog.PropertyKind;
 const ElemKind = catalog.ElemKind;
-const PropDef = catalog.PropDef;
+const PropertyDefinition = catalog.PropertyDefinition;
 const Value = catalog.Value;
-const PropCount = catalog.PropCount;
+const PropertyCount = catalog.PropertyCount;
 const CatalogView = catalog.CatalogView;
-const max_prop_count = catalog.max_prop_count;
+const maxPropertyCount = catalog.maxPropertyCount;
 
 // ---------------------------------------------------------------------------
 // Migrations (structural schema evolution)
@@ -27,10 +27,10 @@ const max_prop_count = catalog.max_prop_count;
 // Append a new property to the type. The new column is filled with
 // `default_value` for every existing row (live or tombstoned). For a link or
 // link_set property a fresh backlink index is created. Returns the new catalog.
-pub fn addProperty(transaction: *WriteTransaction, catalogRef: Reference, def: PropDef, default_value: u64) !Reference {
+pub fn addProperty(transaction: *WriteTransaction, catalogRef: Reference, def: PropertyDefinition, default_value: u64) !Reference {
     var s = try catalog.CatalogSnapshot.load(transaction, catalogRef);
-    const pc = s.prop_count;
-    std.debug.assert(pc + 1 <= max_prop_count);
+    const propertyCount = s.propertyCount;
+    std.debug.assert(propertyCount + 1 <= maxPropertyCount);
 
     const is_collection = switch (def.kind) {
         .list, .set, .dict, .link_set => true,
@@ -41,19 +41,19 @@ pub fn addProperty(transaction: *WriteTransaction, catalogRef: Reference, def: P
     if (def.indexed and is_collection) return error.Unsupported;
 
     const new_col = try buildBackfilledColumn(transaction, &s, def, default_value, is_collection);
-    const vi: Reference = if (def.indexed) try backfillValueIndex(transaction, s.keyrow_index_ref, new_col) else 0;
+    const valueIndexRef: Reference = if (def.indexed) try backfillValueIndex(transaction, s.keyrow_index_ref, new_col) else 0;
 
-    s.props[pc] = .{
+    s.properties[propertyCount] = .{
         .col = new_col,
         .kind = def.kind,
         .elem = def.elem,
         .backlink = if (def.kind == .link or def.kind == .link_set) try Index.create(transaction) else 0,
         .target = def.link_target,
         .rule = def.del_rule,
-        .value_index = vi,
+        .value_index = valueIndexRef,
         .indexed = def.indexed,
     };
-    s.prop_count = pc + 1;
+    s.propertyCount = propertyCount + 1;
     return s.replace(transaction);
 }
 
@@ -71,7 +71,7 @@ pub fn addProperty(transaction: *WriteTransaction, catalogRef: Reference, def: P
 fn buildBackfilledColumn(
     transaction: *WriteTransaction,
     s: *const catalog.CatalogSnapshot,
-    def: PropDef,
+    def: PropertyDefinition,
     default_value: u64,
     is_collection: bool,
 ) !Reference {
@@ -107,18 +107,18 @@ fn buildBackfilledColumn(
 // insert path) -- blob backfills give every row a distinct ref, so a single
 // shared key would diverge from what reads and audits expect.
 fn backfillValueIndex(transaction: *WriteTransaction, keyrow_ref: Reference, new_col: Reference) !Reference {
-    var vi = try Index.create(transaction);
+    var valueIndexRef = try Index.create(transaction);
     const Sink = struct {
         transaction: *WriteTransaction,
-        vi: *Reference,
+        valueIndexRef: *Reference,
         col: Reference,
         fn onEntry(self: @This(), objectKey: u64, row: u64) anyerror!void {
             const raw = try Column.get(self.transaction, self.col, row);
-            self.vi.* = try rows.viAdd(self.transaction, self.vi.*, raw, objectKey);
+            self.valueIndexRef.* = try rows.valueIndexAdd(self.transaction, self.valueIndexRef.*, raw, objectKey);
         }
     };
-    try Index.forEachEntry(transaction, keyrow_ref, Sink{ .transaction = transaction, .vi = &vi, .col = new_col }, Sink.onEntry);
-    return vi;
+    try Index.forEachEntry(transaction, keyrow_ref, Sink{ .transaction = transaction, .valueIndexRef = &valueIndexRef, .col = new_col }, Sink.onEntry);
+    return valueIndexRef;
 }
 
 // Copy a blob's bytes into a fresh node, returning the new ref. Used by the
@@ -137,15 +137,15 @@ fn blobDup(transaction: *WriteTransaction, ref: u64) !u64 {
     }
 }
 
-// Remove property `prop` (must be >= 1; the primary key at 0 cannot be removed).
+// Remove property `property` (must be >= 1; the primary key at 0 cannot be removed).
 // The dropped column is left for compaction to reclaim. Returns the new catalog.
-pub fn removeProperty(transaction: *WriteTransaction, catalogRef: Reference, prop: usize) !Reference {
-    std.debug.assert(prop >= 1);
+pub fn removeProperty(transaction: *WriteTransaction, catalogRef: Reference, property: usize) !Reference {
+    std.debug.assert(property >= 1);
     var s = try catalog.CatalogSnapshot.load(transaction, catalogRef);
-    std.debug.assert(prop < s.prop_count);
-    var j: usize = prop;
-    while (j + 1 < s.prop_count) : (j += 1) s.props[j] = s.props[j + 1];
-    s.prop_count -= 1;
+    std.debug.assert(property < s.propertyCount);
+    var j: usize = property;
+    while (j + 1 < s.propertyCount) : (j += 1) s.properties[j] = s.properties[j + 1];
+    s.propertyCount -= 1;
     return s.replace(transaction);
 }
 

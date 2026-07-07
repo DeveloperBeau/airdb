@@ -30,11 +30,11 @@ pub const AIRDB_E_UNSUPPORTED: i64 = -7;
 /// the handle refuses further writes. Close and reopen the database to resolve.
 pub const AIRDB_E_INDETERMINATE: i64 = -8;
 
-const MAX_PROPS: usize = catalog.max_prop_count;
+const MAX_PROPS: usize = catalog.maxPropertyCount;
 
 const DatabaseHandle = struct {
     database: Database,
-    prop_count: u16,
+    propertyCount: u16,
 };
 
 const alloc = std.heap.c_allocator;
@@ -46,18 +46,18 @@ fn commitErrCode(self: *DatabaseHandle) i64 {
 }
 
 // Open the database at `path`, creating it with an int-property object type of
-// `prop_count` properties (property 0 is the primary key) if it does not exist.
+// `propertyCount` properties (property 0 is the primary key) if it does not exist.
 // On an existing database the stored property count is used. Returns null on
 // failure.
-export fn airdb_open(path_ptr: [*:0]const u8, prop_count: u16) ?*DatabaseHandle {
+export fn airdb_open(path_ptr: [*:0]const u8, propertyCount: u16) ?*DatabaseHandle {
     const path = std.mem.span(path_ptr);
     // The storage layer requires an absolute path. Reject anything else here so
     // a relative path returns a clean error instead of aborting the host.
     if (!std.fs.path.isAbsolute(path)) return null;
-    // A C ABI must not trust its arguments: prop_count 0 trips an internal
+    // A C ABI must not trust its arguments: propertyCount 0 trips an internal
     // assert (abort in safe builds), and > 256 would overflow fixed-size
     // per-property buffers in release builds. Reject both cleanly.
-    if (prop_count == 0 or prop_count > MAX_PROPS) return null;
+    if (propertyCount == 0 or propertyCount > MAX_PROPS) return null;
     const self = alloc.create(DatabaseHandle) catch return null;
 
     if (Database.open(alloc, path)) |opened| {
@@ -71,7 +71,7 @@ export fn airdb_open(path_ptr: [*:0]const u8, prop_count: u16) ?*DatabaseHandle 
             alloc.destroy(self);
             return null;
         }
-        return createFresh(self, path, prop_count);
+        return createFresh(self, path, propertyCount);
     }
 }
 
@@ -89,31 +89,31 @@ fn abandonHandle(self: *DatabaseHandle) ?*DatabaseHandle {
 fn adoptExisting(self: *DatabaseHandle, opened: Database) ?*DatabaseHandle {
     self.database = opened;
     var r = self.database.beginRead() catch return abandonHandle(self);
-    const pc = catalog.propCount(&r, r.root()) catch {
+    const propertyCount = catalog.loadPropertyCount(&r, r.root()) catch {
         r.end();
         return abandonHandle(self);
     };
     r.end();
-    self.prop_count = pc;
+    self.propertyCount = propertyCount;
     return self;
 }
 
 // airdb_open, fresh-file path: create the database and commit an int-property
-// object type of `prop_count` properties. Any failure tears the handle down
+// object type of `propertyCount` properties. Any failure tears the handle down
 // and returns null.
-fn createFresh(self: *DatabaseHandle, path: []const u8, prop_count: u16) ?*DatabaseHandle {
+fn createFresh(self: *DatabaseHandle, path: []const u8, propertyCount: u16) ?*DatabaseHandle {
     self.database = Database.create(alloc, path) catch {
         alloc.destroy(self);
         return null;
     };
     var w = self.database.beginWrite() catch return abandonHandle(self);
-    const catalogRef = catalog.create(&w, prop_count) catch {
+    const catalogRef = catalog.create(&w, propertyCount) catch {
         w.deinit();
         return abandonHandle(self);
     };
     w.setRoot(catalogRef);
     _ = w.commit() catch return abandonHandle(self);
-    self.prop_count = prop_count;
+    self.propertyCount = propertyCount;
     return self;
 }
 
@@ -127,14 +127,14 @@ export fn airdb_close(handle: ?*DatabaseHandle) void {
 // Number of properties of the object type (property 0 is the primary key).
 export fn airdb_prop_count(handle: ?*DatabaseHandle) i64 {
     const self = handle orelse return AIRDB_E_GENERIC;
-    return @intCast(self.prop_count);
+    return @intCast(self.propertyCount);
 }
 
-// Insert a row of `len` u64 values (must equal prop_count; vals[0] is the
+// Insert a row of `len` u64 values (must equal propertyCount; vals[0] is the
 // primary key). Returns the new object key on success.
 export fn airdb_insert(handle: ?*DatabaseHandle, vals: [*]const u64, len: usize) i64 {
     const self = handle orelse return AIRDB_E_GENERIC;
-    if (len != self.prop_count) return AIRDB_E_BAD_ARGS;
+    if (len != self.propertyCount) return AIRDB_E_BAD_ARGS;
     var w = self.database.beginWrite() catch return commitErrCode(self);
     const r = rows.insert(&w, w.new_root, vals[0..len]) catch |e| {
         w.deinit();
@@ -145,11 +145,11 @@ export fn airdb_insert(handle: ?*DatabaseHandle, vals: [*]const u64, len: usize)
     return @intCast(r.row);
 }
 
-// Read the row with primary key `primaryKey` into `out` (len must equal prop_count).
+// Read the row with primary key `primaryKey` into `out` (len must equal propertyCount).
 // Returns the row version (>= 1) on success, AIRDB_E_NOT_FOUND if absent.
 export fn airdb_get(handle: ?*DatabaseHandle, primaryKey: u64, out: [*]u64, len: usize) i64 {
     const self = handle orelse return AIRDB_E_GENERIC;
-    if (len != self.prop_count) return AIRDB_E_BAD_ARGS;
+    if (len != self.propertyCount) return AIRDB_E_BAD_ARGS;
     var r = self.database.beginRead() catch return AIRDB_E_GENERIC;
     defer r.end();
     const ver = rows.getByPrimaryKey(&r, r.root(), primaryKey, out[0..len]) catch return AIRDB_E_GENERIC;
@@ -165,12 +165,12 @@ export fn airdb_count(handle: ?*DatabaseHandle) i64 {
     return @intCast(c);
 }
 
-// Update the row with primary key `primaryKey` to `vals` (len must equal prop_count,
+// Update the row with primary key `primaryKey` to `vals` (len must equal propertyCount,
 // vals[0] must equal primaryKey). Auto-reads the current version, so it always applies
 // (no optimistic check at this layer). Returns AIRDB_OK or an error code.
 export fn airdb_update(handle: ?*DatabaseHandle, vals: [*]const u64, len: usize) i64 {
     const self = handle orelse return AIRDB_E_GENERIC;
-    if (len != self.prop_count) return AIRDB_E_BAD_ARGS;
+    if (len != self.propertyCount) return AIRDB_E_BAD_ARGS;
     const primaryKey = vals[0];
     var w = self.database.beginWrite() catch return commitErrCode(self);
     var cur: [MAX_PROPS]u64 = undefined;
@@ -208,7 +208,7 @@ export fn airdb_delete(handle: ?*DatabaseHandle, primaryKey: u64) i64 {
     const self = handle orelse return AIRDB_E_GENERIC;
     var w = self.database.beginWrite() catch return commitErrCode(self);
     var cur: [MAX_PROPS]u64 = undefined;
-    const ver = rows.getByPrimaryKey(&w, w.new_root, primaryKey, cur[0..self.prop_count]) catch {
+    const ver = rows.getByPrimaryKey(&w, w.new_root, primaryKey, cur[0..self.propertyCount]) catch {
         w.deinit();
         return AIRDB_E_GENERIC;
     };
@@ -237,26 +237,26 @@ export fn airdb_delete(handle: ?*DatabaseHandle, primaryKey: u64) i64 {
     }
 }
 
-// Bulk-load `row_count` rows of `prop_count` u64 values each from the flat,
-// row-major buffer `rows_flat` (row i occupies rows_flat[i*prop_count ..][0..
-// prop_count]; element 0 of each row is the primary key) into an EMPTY type, in
+// Bulk-load `row_count` rows of `propertyCount` u64 values each from the flat,
+// row-major buffer `rows_flat` (row i occupies rows_flat[i*propertyCount ..][0..
+// propertyCount]; element 0 of each row is the primary key) into an EMPTY type, in
 // a single durable commit. The whole import succeeds atomically or nothing
 // becomes durable. Returns the number of rows loaded on success, or a negative
 // error code: AIRDB_E_NOT_EMPTY if the type already holds rows, AIRDB_E_DUPLICATE
 // on a repeated primary key, AIRDB_E_UNSUPPORTED for a type bulk import cannot
-// build (e.g. links), AIRDB_E_BAD_ARGS on a prop_count mismatch. On every error
+// build (e.g. links), AIRDB_E_BAD_ARGS on a propertyCount mismatch. On every error
 // the write lock is released and nothing is made durable.
-export fn airdb_bulk_insert(handle: ?*DatabaseHandle, rows_flat: [*]const u64, row_count: usize, prop_count: usize) i64 {
+export fn airdb_bulk_insert(handle: ?*DatabaseHandle, rows_flat: [*]const u64, row_count: usize, propertyCount: usize) i64 {
     const self = handle orelse return AIRDB_E_GENERIC;
-    if (prop_count != self.prop_count) return AIRDB_E_BAD_ARGS;
+    if (propertyCount != self.propertyCount) return AIRDB_E_BAD_ARGS;
     if (row_count > std.math.maxInt(i64)) return AIRDB_E_BAD_ARGS; // return value is i64
 
     // Build a []const []const u64 view over the flat buffer: each row slice
-    // points at its prop_count-wide window. Freed regardless of outcome.
+    // points at its propertyCount-wide window. Freed regardless of outcome.
     const rows_slices = alloc.alloc([]const u64, row_count) catch return AIRDB_E_GENERIC;
     defer alloc.free(rows_slices);
     for (rows_slices, 0..) |*row, i| {
-        row.* = rows_flat[i * prop_count ..][0..prop_count];
+        row.* = rows_flat[i * propertyCount ..][0..propertyCount];
     }
 
     var w = self.database.beginWrite() catch return commitErrCode(self);
@@ -277,28 +277,28 @@ export fn airdb_bulk_insert(handle: ?*DatabaseHandle, rows_flat: [*]const u64, r
     return @intCast(row_count);
 }
 
-// Append `row_count` rows of `prop_count` u64 values each from the flat,
-// row-major buffer `rows_flat` (row i occupies rows_flat[i*prop_count ..][0..
-// prop_count]; element 0 of each row is the primary key) to a POPULATED type in
+// Append `row_count` rows of `propertyCount` u64 values each from the flat,
+// row-major buffer `rows_flat` (row i occupies rows_flat[i*propertyCount ..][0..
+// propertyCount]; element 0 of each row is the primary key) to a POPULATED type in
 // a single durable commit. A batch whose primary keys are strictly ascending and
 // all clear the type's current max key lands on the right edge via the fast path;
 // any other shape falls back to a row-by-row insert. The whole batch becomes
 // durable atomically or nothing does. Returns the number of rows appended on
 // success, or a negative error code: AIRDB_E_DUPLICATE on a repeated primary key
-// (from the fallback), AIRDB_E_BAD_ARGS on a prop_count mismatch. On every error
+// (from the fallback), AIRDB_E_BAD_ARGS on a propertyCount mismatch. On every error
 // the write lock is released and nothing is made durable. A row_count of 0 is a
 // no-op that commits no change and returns 0.
-export fn airdb_bulk_append(handle: ?*DatabaseHandle, rows_flat: [*]const u64, row_count: usize, prop_count: usize) i64 {
+export fn airdb_bulk_append(handle: ?*DatabaseHandle, rows_flat: [*]const u64, row_count: usize, propertyCount: usize) i64 {
     const self = handle orelse return AIRDB_E_GENERIC;
-    if (prop_count != self.prop_count) return AIRDB_E_BAD_ARGS;
+    if (propertyCount != self.propertyCount) return AIRDB_E_BAD_ARGS;
     if (row_count > std.math.maxInt(i64)) return AIRDB_E_BAD_ARGS; // return value is i64
 
     // Build a []const []const u64 view over the flat buffer: each row slice
-    // points at its prop_count-wide window. Freed regardless of outcome.
+    // points at its propertyCount-wide window. Freed regardless of outcome.
     const rows_slices = alloc.alloc([]const u64, row_count) catch return AIRDB_E_GENERIC;
     defer alloc.free(rows_slices);
     for (rows_slices, 0..) |*row, i| {
-        row.* = rows_flat[i * prop_count ..][0..prop_count];
+        row.* = rows_flat[i * propertyCount ..][0..propertyCount];
     }
 
     var w = self.database.beginWrite() catch return commitErrCode(self);
@@ -373,13 +373,13 @@ export fn airdb_abort(transaction: ?*Transaction) void {
 }
 
 // Stage an insert in the open transaction (no commit). vals has `len` u64
-// values (must equal prop_count; vals[0] is the primary key). Returns the new
+// values (must equal propertyCount; vals[0] is the primary key). Returns the new
 // object key on success. On error the transaction stays open and the catalog ref is not
 // advanced, so the batch remains consistent.
 export fn airdb_txn_insert(transaction: ?*Transaction, vals: [*]const u64, len: usize) i64 {
     const t = transaction orelse return AIRDB_E_GENERIC;
     if (t.poisoned) return AIRDB_E_GENERIC;
-    if (len != t.databaseHandle.prop_count) return AIRDB_E_BAD_ARGS;
+    if (len != t.databaseHandle.propertyCount) return AIRDB_E_BAD_ARGS;
     const r = rows.insert(&t.w, t.catalogRef, vals[0..len]) catch |e| {
         if (e == error.DuplicateKey) return AIRDB_E_DUPLICATE; // pre-mutation check: transaction stays usable
         t.poisoned = true; // mid-mutation failure: the batch may reference freed nodes
@@ -395,7 +395,7 @@ export fn airdb_txn_insert(transaction: ?*Transaction, vals: [*]const u64, len: 
 export fn airdb_txn_update(transaction: ?*Transaction, vals: [*]const u64, len: usize) i64 {
     const t = transaction orelse return AIRDB_E_GENERIC;
     if (t.poisoned) return AIRDB_E_GENERIC;
-    if (len != t.databaseHandle.prop_count) return AIRDB_E_BAD_ARGS;
+    if (len != t.databaseHandle.propertyCount) return AIRDB_E_BAD_ARGS;
     const primaryKey = vals[0];
     var cur: [MAX_PROPS]u64 = undefined;
     const ver = rows.getByPrimaryKey(&t.w, t.catalogRef, primaryKey, cur[0..len]) catch return AIRDB_E_GENERIC;
@@ -421,7 +421,7 @@ export fn airdb_txn_delete(transaction: ?*Transaction, primaryKey: u64) i64 {
     const t = transaction orelse return AIRDB_E_GENERIC;
     if (t.poisoned) return AIRDB_E_GENERIC;
     var cur: [MAX_PROPS]u64 = undefined;
-    const ver = rows.getByPrimaryKey(&t.w, t.catalogRef, primaryKey, cur[0..t.databaseHandle.prop_count]) catch return AIRDB_E_GENERIC;
+    const ver = rows.getByPrimaryKey(&t.w, t.catalogRef, primaryKey, cur[0..t.databaseHandle.propertyCount]) catch return AIRDB_E_GENERIC;
     if (ver == null) return AIRDB_E_NOT_FOUND;
     const res = rows.delete(&t.w, t.catalogRef, primaryKey, ver.?) catch {
         t.poisoned = true; // mid-mutation failure
@@ -518,7 +518,7 @@ test "ffi: open, insert, get, count, update, delete, reopen" {
 
     airdb_close(h);
 
-    // reopen: data persisted, prop count adopted from catalog
+    // reopen: data persisted, property count adopted from catalog
     const h2 = airdb_open(path.ptr, 3) orelse return error.OpenFailed;
     defer airdb_close(h2);
     try testing.expectEqual(@as(i64, 3), airdb_prop_count(h2));
@@ -537,7 +537,7 @@ test "ffi: relative path is rejected without aborting" {
     try testing.expect(airdb_open("relative/path.airdb", 2) == null);
 }
 
-test "ffi: hostile prop_count is rejected without aborting" {
+test "ffi: hostile propertyCount is rejected without aborting" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try ffiTmpPathZ(testing.allocator, &tmp, "badpc.airdb");
@@ -762,7 +762,7 @@ test "airdb_bulk_insert on a non-empty type returns AIRDB_E_NOT_EMPTY" {
     try testing.expectEqual(@as(i64, 2), airdb_count(h));
 }
 
-test "airdb_bulk_insert wrong prop_count returns AIRDB_E_BAD_ARGS" {
+test "airdb_bulk_insert wrong propertyCount returns AIRDB_E_BAD_ARGS" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try ffiTmpPathZ(testing.allocator, &tmp, "bulk_badargs.airdb");
@@ -865,7 +865,7 @@ test "airdb_bulk_append falls back for a scattered batch" {
     try testing.expectEqual(@as(i64, 6), airdb_count(h));
 }
 
-test "airdb_bulk_append wrong prop_count returns AIRDB_E_BAD_ARGS" {
+test "airdb_bulk_append wrong propertyCount returns AIRDB_E_BAD_ARGS" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try ffiTmpPathZ(testing.allocator, &tmp, "bulk_append_badargs.airdb");

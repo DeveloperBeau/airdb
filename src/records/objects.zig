@@ -16,10 +16,10 @@ const collections = @import("collections.zig");
 const links = @import("links.zig");
 const rows = @import("rows.zig");
 
-const PropKind = catalog.PropKind;
+const PropertyKind = catalog.PropertyKind;
 const ElemKind = catalog.ElemKind;
 const Value = catalog.Value;
-const max_prop_count = catalog.max_prop_count;
+const maxPropertyCount = catalog.maxPropertyCount;
 
 const loadCatalog = catalog.loadCatalog;
 
@@ -33,23 +33,23 @@ pub const DeleteResult = rows.DeleteResult;
 // node for each .blob property, then delegates to rows.insert.
 pub fn insertTyped(transaction: *WriteTransaction, catalogRef: Reference, values: []const Value) !struct { catalogRef: Reference, row: u64 } {
     const v = try loadCatalog(transaction, catalogRef);
-    const pc = v.prop_count;
-    std.debug.assert(values.len == pc);
-    std.debug.assert(pc <= max_prop_count);
+    const propertyCount = v.propertyCount;
+    std.debug.assert(values.len == propertyCount);
+    std.debug.assert(propertyCount <= maxPropertyCount);
     // Capture kinds and elems into local buffers before any mutation that could
     // invalidate the deref slice backing CatalogView.
-    var kinds: [max_prop_count]PropKind = undefined;
-    var elems: [max_prop_count]ElemKind = undefined;
+    var kinds: [maxPropertyCount]PropertyKind = undefined;
+    var elems: [maxPropertyCount]ElemKind = undefined;
     {
         var j: usize = 0;
-        while (j < pc) : (j += 1) {
+        while (j < propertyCount) : (j += 1) {
             kinds[j] = v.kind(j);
             elems[j] = v.elemKind(j);
         }
     }
-    var raw: [max_prop_count]u64 = undefined;
+    var raw: [maxPropertyCount]u64 = undefined;
     var i: usize = 0;
-    while (i < pc) : (i += 1) {
+    while (i < propertyCount) : (i += 1) {
         raw[i] = switch (kinds[i]) {
             .int => values[i].int,
             .blob => try blob.put(transaction, values[i].bytes),
@@ -66,12 +66,12 @@ pub fn insertTyped(transaction: *WriteTransaction, catalogRef: Reference, values
             .link_set => try collections.buildSetInt(transaction, values[i].link_set),
         };
     }
-    const r = try rows.insert(transaction, catalogRef, raw[0..pc]);
+    const r = try rows.insert(transaction, catalogRef, raw[0..propertyCount]);
     // Maintain backlinks for any links the new row carries.
     var updatedCatalog = r.catalogRef;
     {
         var p: usize = 0;
-        while (p < pc) : (p += 1) {
+        while (p < propertyCount) : (p += 1) {
             switch (kinds[p]) {
                 .link => {
                     if (values[p].link) |target| {
@@ -97,19 +97,19 @@ pub fn insertTyped(transaction: *WriteTransaction, catalogRef: Reference, values
 // Returns the row version, or null when the key is not found.
 pub fn getTyped(transaction: anytype, catalogRef: Reference, primaryKey: u64, out: []Value) !?u64 {
     const v = try loadCatalog(transaction, catalogRef);
-    const pc = v.prop_count;
-    std.debug.assert(out.len == pc);
-    std.debug.assert(pc <= max_prop_count);
+    const propertyCount = v.propertyCount;
+    std.debug.assert(out.len == propertyCount);
+    std.debug.assert(propertyCount <= maxPropertyCount);
     // Capture kinds before the getByPrimaryKey call may touch other catalog nodes.
-    var kinds: [max_prop_count]PropKind = undefined;
+    var kinds: [maxPropertyCount]PropertyKind = undefined;
     {
         var j: usize = 0;
-        while (j < pc) : (j += 1) kinds[j] = v.kind(j);
+        while (j < propertyCount) : (j += 1) kinds[j] = v.kind(j);
     }
-    var raw: [max_prop_count]u64 = undefined;
-    const ver = (try rows.getByPrimaryKey(transaction, catalogRef, primaryKey, raw[0..pc])) orelse return null;
+    var raw: [maxPropertyCount]u64 = undefined;
+    const ver = (try rows.getByPrimaryKey(transaction, catalogRef, primaryKey, raw[0..propertyCount])) orelse return null;
     var i: usize = 0;
-    while (i < pc) : (i += 1) {
+    while (i < propertyCount) : (i += 1) {
         out[i] = switch (kinds[i]) {
             .int => .{ .int = raw[i] },
             .blob => if (blob.get(transaction, raw[i])) |slice| .{ .bytes = slice } else |err| switch (err) {
@@ -126,18 +126,18 @@ pub fn getTyped(transaction: anytype, catalogRef: Reference, primaryKey: u64, ou
 // getTypedByObjectKey decodes a row addressed by stable object key into Values.
 pub fn getTypedByObjectKey(transaction: anytype, catalogRef: Reference, objectKey: u64, out: []Value) !?u64 {
     const v = try loadCatalog(transaction, catalogRef);
-    const pc = v.prop_count;
-    std.debug.assert(out.len == pc);
-    std.debug.assert(pc <= max_prop_count);
-    var kinds: [max_prop_count]PropKind = undefined;
+    const propertyCount = v.propertyCount;
+    std.debug.assert(out.len == propertyCount);
+    std.debug.assert(propertyCount <= maxPropertyCount);
+    var kinds: [maxPropertyCount]PropertyKind = undefined;
     {
         var j: usize = 0;
-        while (j < pc) : (j += 1) kinds[j] = v.kind(j);
+        while (j < propertyCount) : (j += 1) kinds[j] = v.kind(j);
     }
-    var raw: [max_prop_count]u64 = undefined;
-    const ver = (try rows.getByObjectKey(transaction, catalogRef, objectKey, raw[0..pc])) orelse return null;
+    var raw: [maxPropertyCount]u64 = undefined;
+    const ver = (try rows.getByObjectKey(transaction, catalogRef, objectKey, raw[0..propertyCount])) orelse return null;
     var i: usize = 0;
-    while (i < pc) : (i += 1) {
+    while (i < propertyCount) : (i += 1) {
         out[i] = switch (kinds[i]) {
             .int => .{ .int = raw[i] },
             .blob => if (blob.get(transaction, raw[i])) |slice| .{ .bytes = slice } else |err| switch (err) {
@@ -177,18 +177,18 @@ pub fn updateTyped(
     expected_version: u64,
 ) !UpdateResult {
     const v = try loadCatalog(transaction, catalogRef);
-    const pc = v.prop_count;
-    std.debug.assert(values.len == pc);
-    std.debug.assert(pc <= max_prop_count);
+    const propertyCount = v.propertyCount;
+    std.debug.assert(values.len == propertyCount);
+    std.debug.assert(propertyCount <= maxPropertyCount);
     // Capture kinds before any mutation.
-    var kinds: [max_prop_count]PropKind = undefined;
+    var kinds: [maxPropertyCount]PropertyKind = undefined;
     {
         var j: usize = 0;
-        while (j < pc) : (j += 1) kinds[j] = v.kind(j);
+        while (j < propertyCount) : (j += 1) kinds[j] = v.kind(j);
     }
     // Step 1: read the current row into cur_raw.
-    var cur_raw: [max_prop_count]u64 = undefined;
-    const current_version = (try rows.getByPrimaryKey(transaction, catalogRef, primaryKey, cur_raw[0..pc])) orelse return .not_found;
+    var cur_raw: [maxPropertyCount]u64 = undefined;
+    const current_version = (try rows.getByPrimaryKey(transaction, catalogRef, primaryKey, cur_raw[0..propertyCount])) orelse return .not_found;
     // Step 2: version check BEFORE freeing or allocating any blob.
     if (current_version != expected_version)
         return .{ .conflict = .{ .current_version = current_version } };
@@ -196,9 +196,9 @@ pub fn updateTyped(
     // properties are CARRIED THROUGH unchanged (mutate them via their own
     // APIs): updating any row of a collection-bearing type must not require
     // the caller to re-supply roots, and must never crash.
-    var new_raw: [max_prop_count]u64 = undefined;
+    var new_raw: [maxPropertyCount]u64 = undefined;
     var i: usize = 0;
-    while (i < pc) : (i += 1) {
+    while (i < propertyCount) : (i += 1) {
         new_raw[i] = switch (kinds[i]) {
             .int => values[i].int,
             .blob => blk: {
@@ -210,7 +210,7 @@ pub fn updateTyped(
         };
     }
     // Step 4: delegate to the core update; it will re-check the version (match).
-    const result = try rows.update(transaction, catalogRef, primaryKey, new_raw[0..pc], expected_version);
+    const result = try rows.update(transaction, catalogRef, primaryKey, new_raw[0..propertyCount], expected_version);
     // Step 5: maintain backlinks for any changed to-one link, mirroring
     // setLink. Skipping this left the old target's backlink set naming this
     // source forever and the new target's set missing it -- corrupting
@@ -220,7 +220,7 @@ pub fn updateTyped(
             var updatedCatalog = ok.catalogRef;
             var changed = false;
             var p: usize = 0;
-            while (p < pc) : (p += 1) {
+            while (p < propertyCount) : (p += 1) {
                 if (kinds[p] != .link or cur_raw[p] == new_raw[p]) continue;
                 // The row was just updated successfully, so its primaryKey must
                 // resolve; anything else is index divergence, and bailing
@@ -246,21 +246,21 @@ pub fn deleteTyped(
     expected_version: u64,
 ) !DeleteResult {
     const v = try loadCatalog(transaction, catalogRef);
-    const pc = v.prop_count;
-    std.debug.assert(pc <= max_prop_count);
+    const propertyCount = v.propertyCount;
+    std.debug.assert(propertyCount <= maxPropertyCount);
     // Capture kinds/elems before any mutation.
-    var kinds: [max_prop_count]PropKind = undefined;
-    var elems: [max_prop_count]ElemKind = undefined;
+    var kinds: [maxPropertyCount]PropertyKind = undefined;
+    var elems: [maxPropertyCount]ElemKind = undefined;
     {
         var j: usize = 0;
-        while (j < pc) : (j += 1) {
+        while (j < propertyCount) : (j += 1) {
             kinds[j] = v.kind(j);
             elems[j] = v.elemKind(j);
         }
     }
     // Step 1: read the current row.
-    var cur_raw: [max_prop_count]u64 = undefined;
-    const current_version = (try rows.getByPrimaryKey(transaction, catalogRef, primaryKey, cur_raw[0..pc])) orelse return .not_found;
+    var cur_raw: [maxPropertyCount]u64 = undefined;
+    const current_version = (try rows.getByPrimaryKey(transaction, catalogRef, primaryKey, cur_raw[0..propertyCount])) orelse return .not_found;
     // Step 2: version check BEFORE freeing any blob.
     if (current_version != expected_version)
         return .{ .conflict = .{ .current_version = current_version } };
@@ -273,7 +273,7 @@ pub fn deleteTyped(
     // its blobs and list/set/dict trees (and their element/key blobs)
     // permanently. MVCC-safe: a conflict or not_found result frees nothing.
     switch (result) {
-        .ok => try rows.freeRowStorage(transaction, kinds[0..pc], elems[0..pc], cur_raw[0..pc]),
+        .ok => try rows.freeRowStorage(transaction, kinds[0..propertyCount], elems[0..propertyCount], cur_raw[0..propertyCount]),
         else => {},
     }
     return result;

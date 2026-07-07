@@ -27,7 +27,7 @@ const create = catalog.create;
 
 const createTyped = catalog.createTyped;
 
-const propCount = catalog.propCount;
+const loadPropertyCount = catalog.loadPropertyCount;
 
 const liveCount = catalog.liveCount;
 
@@ -141,9 +141,9 @@ test "update copies only the columns whose value changed" {
     catalogRef = (try insert(&w, catalogRef, &.{ 1, 10, 20 })).catalogRef;
 
     const before = try loadCatalog(&w, catalogRef);
-    const col0 = before.propColRef(0);
-    const col1 = before.propColRef(1);
-    const col2 = before.propColRef(2);
+    const col0 = before.propertyColumnRef(0);
+    const col1 = before.propertyColumnRef(1);
+    const col2 = before.propertyColumnRef(2);
 
     var out: [3]u64 = undefined;
     const ver = (try getByPrimaryKey(&w, catalogRef, 1, &out)).?;
@@ -153,10 +153,10 @@ test "update copies only the columns whose value changed" {
 
     const after = try loadCatalog(&w, catalogRef);
     // Unchanged columns keep their exact roots (no copy-on-write happened).
-    try testing.expectEqual(col0, after.propColRef(0));
-    try testing.expectEqual(col2, after.propColRef(2));
+    try testing.expectEqual(col0, after.propertyColumnRef(0));
+    try testing.expectEqual(col2, after.propertyColumnRef(2));
     // The changed column was rewritten.
-    try testing.expect(after.propColRef(1) != col1);
+    try testing.expect(after.propertyColumnRef(1) != col1);
     _ = (try getByPrimaryKey(&w, catalogRef, 1, &out)).?;
     try testing.expectEqual(@as(u64, 99), out[1]);
     try testing.expectEqual(@as(u64, 20), out[2]);
@@ -289,7 +289,7 @@ test "100k objects with updates and deletes match a reference map after reopen" 
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "obj7.airdb");
     defer testing.allocator.free(path);
-    var ref = std.AutoHashMap(u64, u64).init(testing.allocator); // primaryKey -> prop1 value, live only
+    var ref = std.AutoHashMap(u64, u64).init(testing.allocator); // primaryKey -> property1 value, live only
     defer ref.deinit();
     const N: u64 = 100_000;
     {
@@ -540,18 +540,18 @@ test "getByObjectKey resolves through the key-to-row index" {
 }
 
 // Collect, in ascending order, the object keys held in the value index's inner
-// set for (catalogRef, prop, value). Empty/absent yields an empty list.
+// set for (catalogRef, property, value). Empty/absent yields an empty list.
 fn collectIndexObjectKeys(
     transaction: anytype,
     catalogRef: Reference,
-    prop: usize,
+    property: usize,
     value: u64,
     out: *std.ArrayList(u64),
     allocator: std.mem.Allocator,
 ) !void {
     const v = try loadCatalog(transaction, catalogRef);
-    const vi = v.valueIndexRef(prop);
-    const inner = (try Index.get(transaction, vi, value)) orelse return;
+    const valueIndexRef = v.valueIndexRef(property);
+    const inner = (try Index.get(transaction, valueIndexRef, value)) orelse return;
     const Sink = struct {
         list: *std.ArrayList(u64),
         alloc: std.mem.Allocator,
@@ -565,13 +565,13 @@ fn collectIndexObjectKeys(
 fn expectIndexObjectKeys(
     transaction: anytype,
     catalogRef: Reference,
-    prop: usize,
+    property: usize,
     value: u64,
     expected: []const u64,
 ) !void {
     var got = std.ArrayList(u64).empty;
     defer got.deinit(testing.allocator);
-    try collectIndexObjectKeys(transaction, catalogRef, prop, value, &got, testing.allocator);
+    try collectIndexObjectKeys(transaction, catalogRef, property, value, &got, testing.allocator);
     try testing.expectEqualSlices(u64, expected, got.items);
 }
 
@@ -613,7 +613,7 @@ test "value index tracks updates" {
     catalogRef = o1.catalogRef;
     const o2 = try insert(&w, catalogRef, &.{ 3, 10 });
     catalogRef = o2.catalogRef;
-    // Move o1's indexed prop from 20 to 10.
+    // Move o1's indexed property from 20 to 10.
     var out: [2]u64 = undefined;
     const ver = (try getByPrimaryKey(&w, catalogRef, 2, &out)).?;
     const res = try update(&w, catalogRef, 2, &.{ 2, 10 }, ver);
@@ -808,7 +808,7 @@ test "an emptied value-index set is pruned from the outer index" {
     try testing.expectEqual(@as(u64, 0), try Index.count(&w, v.valueIndexRef(1)));
 }
 
-test "non-indexed prop has no index" {
+test "non-indexed property has no index" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "vidx_none.airdb");
@@ -826,7 +826,7 @@ test "non-indexed prop has no index" {
     catalogRef = (try delete(&w, catalogRef, 1, ver2)).ok;
     const v = try loadCatalog(&w, catalogRef);
     var i: usize = 0;
-    while (i < v.prop_count) : (i += 1) try testing.expectEqual(@as(Reference, 0), v.valueIndexRef(i));
+    while (i < v.propertyCount) : (i += 1) try testing.expectEqual(@as(Reference, 0), v.valueIndexRef(i));
     w.deinit();
 }
 

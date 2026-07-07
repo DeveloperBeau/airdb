@@ -130,7 +130,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         rows_eq = try query.countWhere(
             &rd,
             catalogRef,
-            &.{.{ .prop = 1, .op = .eq, .value = eq_category }},
+            &.{.{ .property = 1, .op = .eq, .value = eq_category }},
             alloc,
         );
     }

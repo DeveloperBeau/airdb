@@ -41,7 +41,7 @@ pub fn collectKeyRowPairs(
 
 // Deep-copy a single property value from the source database into the destination database.
 // kind/elem describe the property. Returns the destination-local raw u64.
-fn copyValue(src: anytype, dst: *WriteTransaction, kind: catalog.PropKind, elem: catalog.ElemKind, src_raw: u64) !u64 {
+fn copyValue(src: anytype, dst: *WriteTransaction, kind: catalog.PropertyKind, elem: catalog.ElemKind, src_raw: u64) !u64 {
     return switch (kind) {
         .int, .link => src_raw, // verbatim (a link stores an object key, preserved)
         .blob => try blob.copyInto(src, dst, src_raw),
@@ -102,11 +102,11 @@ fn copyBindex(src: anytype, dst: *WriteTransaction, src_root: u64) !u64 {
 // Add objectKey under `value` in a value index (value -> {objectKey -> 1}), mirroring the
 // shape the object layer's maintenance keeps. Local to the copy path, which
 // must rebuild value indexes in the destination database.
-fn viAddInto(dst: *WriteTransaction, vi_ref: Reference, value: u64, objectKey: u64) !Reference {
-    const existing = try Index.get(dst, vi_ref, value);
+fn viAddInto(dst: *WriteTransaction, valueIndexRef: Reference, value: u64, objectKey: u64) !Reference {
+    const existing = try Index.get(dst, valueIndexRef, value);
     var set_root = existing orelse try Index.create(dst);
     set_root = try Index.insert(dst, set_root, objectKey, 1);
-    return try Index.insert(dst, vi_ref, value, set_root);
+    return try Index.insert(dst, valueIndexRef, value, set_root);
 }
 
 // Re-point every ref field of the snapshot at fresh structures created in the
@@ -115,10 +115,10 @@ fn viAddInto(dst: *WriteTransaction, vi_ref: Reference, value: u64, objectKey: u
 // repopulated separately; the indexed flag carries through.
 fn createDestinationStructures(dst: *WriteTransaction, s: *catalog.CatalogSnapshot) !void {
     var j: usize = 0;
-    while (j < s.prop_count) : (j += 1) {
-        s.props[j].col = try Column.create(dst);
-        s.props[j].backlink = if (s.props[j].kind == .link or s.props[j].kind == .link_set) try Index.create(dst) else 0;
-        s.props[j].value_index = if (s.props[j].indexed) try Index.create(dst) else 0;
+    while (j < s.propertyCount) : (j += 1) {
+        s.properties[j].col = try Column.create(dst);
+        s.properties[j].backlink = if (s.properties[j].kind == .link or s.properties[j].kind == .link_set) try Index.create(dst) else 0;
+        s.properties[j].value_index = if (s.properties[j].indexed) try Index.create(dst) else 0;
     }
     s.version_col_ref = try Column.create(dst);
     s.live_col_ref = try Column.create(dst);
@@ -136,12 +136,12 @@ pub fn copyTypeRows(src: anytype, sourceCatalog: Reference, dst: *WriteTransacti
     // created in the DESTINATION database before writing. Kinds, elem kinds, targets,
     // rules, and indexed flags carry over as plain values.
     var s = try catalog.CatalogSnapshot.load(src, sourceCatalog);
-    const pc = s.prop_count;
+    const propertyCount = s.propertyCount;
     // Keep the source refs to read from.
-    var s_prop: [catalog.max_prop_count]Reference = undefined;
+    var sourcePropertyColumns: [catalog.maxPropertyCount]Reference = undefined;
     {
         var j: usize = 0;
-        while (j < pc) : (j += 1) s_prop[j] = s.props[j].col;
+        while (j < propertyCount) : (j += 1) sourcePropertyColumns[j] = s.properties[j].col;
     }
     const s_ver = s.version_col_ref;
     const s_live = s.live_col_ref;
@@ -157,23 +157,23 @@ pub fn copyTypeRows(src: anytype, sourceCatalog: Reference, dst: *WriteTransacti
     for (pairs.items) |pr| {
         if ((try Column.get(src, s_live, pr.row)) == 0) continue; // defensive
         var j: usize = 0;
-        while (j < pc) : (j += 1) {
-            const sraw = try Column.get(src, s_prop[j], pr.row);
-            const draw = try copyValue(src, dst, s.props[j].kind, s.props[j].elem, sraw);
-            s.props[j].col = try Column.append(dst, s.props[j].col, draw);
+        while (j < propertyCount) : (j += 1) {
+            const sraw = try Column.get(src, sourcePropertyColumns[j], pr.row);
+            const draw = try copyValue(src, dst, s.properties[j].kind, s.properties[j].elem, sraw);
+            s.properties[j].col = try Column.append(dst, s.properties[j].col, draw);
             // Repopulate the destination value index in the same pass. Leaving
             // it empty while the catalog still says indexed=true silently
             // empties every indexed query after a full-file compaction (the
             // planner trusts the flag) and fails the value-index audit.
-            if (s.props[j].indexed) {
-                s.props[j].value_index = try viAddInto(dst, s.props[j].value_index, draw, pr.objectKey);
+            if (s.properties[j].indexed) {
+                s.properties[j].value_index = try viAddInto(dst, s.properties[j].value_index, draw, pr.objectKey);
             }
         }
         const ver = try Column.get(src, s_ver, pr.row);
         s.version_col_ref = try Column.append(dst, s.version_col_ref, ver);
         s.live_col_ref = try Column.append(dst, s.live_col_ref, 1);
         s.keyrow_index_ref = try Index.insert(dst, s.keyrow_index_ref, pr.objectKey, d_row);
-        const primaryKey = try Column.get(src, s_prop[0], pr.row);
+        const primaryKey = try Column.get(src, sourcePropertyColumns[0], pr.row);
         s.primaryKeyIndexRef = try Index.insert(dst, s.primaryKeyIndexRef, primaryKey, pr.objectKey);
         d_row += 1;
     }
@@ -187,10 +187,10 @@ pub fn copyTypeRows(src: anytype, sourceCatalog: Reference, dst: *WriteTransacti
 pub fn rebuildBacklinks(dst: *WriteTransaction, catalogRef: Reference) !Reference {
     var cur = catalogRef;
     const v0 = try catalog.loadCatalog(dst, catalogRef);
-    const pc = v0.prop_count;
+    const propertyCount = v0.propertyCount;
     const alloc = dst.database.store.allocator;
     var p: usize = 0;
-    while (p < pc) : (p += 1) {
+    while (p < propertyCount) : (p += 1) {
         const k = (try catalog.loadCatalog(dst, cur)).kind(p);
         if (k != .link and k != .link_set) continue;
         // collect (objectKey,row) of cur
@@ -201,7 +201,7 @@ pub fn rebuildBacklinks(dst: *WriteTransaction, catalogRef: Reference) !Referenc
         defer pairs.deinit(alloc);
         for (pairs.items) |pr| {
             const vv = try catalog.loadCatalog(dst, cur);
-            const col = vv.propColRef(p);
+            const col = vv.propertyColumnRef(p);
             const raw = try Column.get(dst, col, pr.row);
             if (k == .link) {
                 if (raw != 0) cur = try links.addBacklink(dst, cur, p, raw - 1, pr.objectKey);

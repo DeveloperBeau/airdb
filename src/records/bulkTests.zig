@@ -310,7 +310,7 @@ test "bulkValueIndex equals sequential maintenance" {
     const built = try bulkValueIndex(&w, entries.items);
 
     // Sequential maintenance mirror: for each (value, objectKey) add objectKey to the inner
-    // set for value, exactly as rows.viAdd does.
+    // set for value, exactly as rows.valueIndexAdd does.
     var seq = try Index.create(&w);
     var i: u64 = 0;
     while (i < N) : (i += 1) {
@@ -339,7 +339,7 @@ test "bulkValueIndex equals sequential maintenance" {
 }
 
 // Schema shared by the orchestrator tests: int primaryKey, int value, int category (indexed).
-const import_defs = [_]catalog.PropDef{
+const import_defs = [_]catalog.PropertyDefinition{
     .{ .kind = .int },
     .{ .kind = .int },
     .{ .kind = .int, .indexed = true },
@@ -446,8 +446,8 @@ test "bulkImport equals row-by-row for a scalar indexed type" {
         defer sa.deinit(testing.allocator);
         var sb = std.ArrayList(u64).empty;
         defer sb.deinit(testing.allocator);
-        try query.where(&ra, catalogA, &.{.{ .prop = 2, .op = .eq, .value = 7 }}, &sa, testing.allocator);
-        try query.where(&rb, catalogB, &.{.{ .prop = 2, .op = .eq, .value = 7 }}, &sb, testing.allocator);
+        try query.where(&ra, catalogA, &.{.{ .property = 2, .op = .eq, .value = 7 }}, &sa, testing.allocator);
+        try query.where(&rb, catalogB, &.{.{ .property = 2, .op = .eq, .value = 7 }}, &sb, testing.allocator);
         std.mem.sort(u64, sa.items, {}, std.sort.asc(u64));
         std.mem.sort(u64, sb.items, {}, std.sort.asc(u64));
         try testing.expectEqualSlices(u64, sb.items, sa.items);
@@ -508,7 +508,7 @@ test "bulkImport rejects a link-bearing type" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    const link_defs = [_]catalog.PropDef{ .{ .kind = .int }, .{ .kind = .link, .link_target = 0 } };
+    const link_defs = [_]catalog.PropertyDefinition{ .{ .kind = .int }, .{ .kind = .link, .link_target = 0 } };
     const catalogRef = try catalog.createDefs(&w, &link_defs);
 
     const rws = [_][]const u64{&.{ 1, 0 }};
@@ -568,7 +568,7 @@ test "bulkImport edge sizes: empty, single, LEAF_CAP" {
 }
 
 // A no-index, no-link scalar schema: int primaryKey, int value. Qualifies for append.
-const append_defs = [_]catalog.PropDef{ .{ .kind = .int }, .{ .kind = .int } };
+const append_defs = [_]catalog.PropertyDefinition{ .{ .kind = .int }, .{ .kind = .int } };
 
 test "bulkAppend equals row-by-row for a contiguous monotonic batch" {
     var tmp = testing.tmpDir(.{});

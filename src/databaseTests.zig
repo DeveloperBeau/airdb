@@ -394,7 +394,7 @@ test "verifyIntegrity passes on a non-indexed type" {
         _ = try w.commit();
     }
 
-    try verification.verifyIntegrity(&database); // no indexed prop -> audit must not false-positive
+    try verification.verifyIntegrity(&database); // no indexed property -> audit must not false-positive
 }
 
 test "the 65th attach is refused rather than reading with invisible pins" {
@@ -940,7 +940,7 @@ fn churnNetZero(path: []const u8, live: u64, iters: u64, auto: bool) !struct { n
     database.auto_compact = auto;
     const tid: u16 = 0;
 
-    // Single type: int primaryKey + one int prop.
+    // Single type: int primaryKey + one int property.
     {
         var w = try database.beginWrite();
         const dir = try typedir.createTypes(&w, &.{&.{ .{ .kind = .int }, .{ .kind = .int } }}, &.{false});

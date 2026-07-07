@@ -35,10 +35,10 @@ typedef struct AirdbTxn AirdbTxn;
  * this handle refuses further writes. Close and reopen to resolve. */
 #define AIRDB_E_INDETERMINATE (-8)
 
-/* Open (creating if absent with `prop_count` int properties, property 0 is the
+/* Open (creating if absent with `propertyCount` int properties, property 0 is the
  * primary key). `path` must be absolute. Returns NULL on failure (including a
  * non-absolute path). */
-AirdbDatabase *airdb_open(const char *path, uint16_t prop_count);
+AirdbDatabase *airdb_open(const char *path, uint16_t propertyCount);
 
 /* Close and free the handle. Safe with NULL. */
 void airdb_close(AirdbDatabase *database);
@@ -46,33 +46,33 @@ void airdb_close(AirdbDatabase *database);
 /* Property count of the object type, or a negative error code. */
 int64_t airdb_prop_count(AirdbDatabase *database);
 
-/* Insert `len` u64 values (must equal prop_count; vals[0] is the primary key).
+/* Insert `len` u64 values (must equal propertyCount; vals[0] is the primary key).
  * Returns the new object key, or a negative error code. */
 int64_t airdb_insert(AirdbDatabase *database, const uint64_t *vals, size_t len);
 
-/* Read the row with primary key `primaryKey` into `out` (len must equal prop_count).
+/* Read the row with primary key `primaryKey` into `out` (len must equal propertyCount).
  * Returns the row version (>= 1), or AIRDB_E_NOT_FOUND. */
 int64_t airdb_get(AirdbDatabase *database, uint64_t primaryKey, uint64_t *out, size_t len);
 
 /* Number of live rows, or a negative error code. */
 int64_t airdb_count(AirdbDatabase *database);
 
-/* Update the row whose primary key is vals[0] (len must equal prop_count).
+/* Update the row whose primary key is vals[0] (len must equal propertyCount).
  * Returns AIRDB_OK or a negative error code. */
 int64_t airdb_update(AirdbDatabase *database, const uint64_t *vals, size_t len);
 
 /* Delete the row with primary key `primaryKey`. Returns AIRDB_OK or an error code. */
 int64_t airdb_delete(AirdbDatabase *database, uint64_t primaryKey);
 
-/* Bulk-load `row_count` rows of `prop_count` values each from the flat,
- * row-major buffer (row i occupies rows_flat[i*prop_count..]; element 0 of
+/* Bulk-load `row_count` rows of `propertyCount` values each from the flat,
+ * row-major buffer (row i occupies rows_flat[i*propertyCount..]; element 0 of
  * each row is the primary key) into an EMPTY type in one durable commit. The
  * whole import succeeds atomically or nothing becomes durable. Returns the
  * number of rows loaded, or: AIRDB_E_NOT_EMPTY if the type already holds rows,
  * AIRDB_E_DUPLICATE on a repeated primary key, AIRDB_E_UNSUPPORTED for a type
- * bulk import cannot build, AIRDB_E_BAD_ARGS on a prop_count mismatch. */
+ * bulk import cannot build, AIRDB_E_BAD_ARGS on a propertyCount mismatch. */
 int64_t airdb_bulk_insert(AirdbDatabase *database, const uint64_t *rows_flat,
-                          size_t row_count, size_t prop_count);
+                          size_t row_count, size_t propertyCount);
 
 /* Append `row_count` rows (same flat layout as airdb_bulk_insert) to a
  * populated type in one durable commit. Strictly-ascending primary keys above
@@ -81,7 +81,7 @@ int64_t airdb_bulk_insert(AirdbDatabase *database, const uint64_t *rows_flat,
  * AIRDB_E_DUPLICATE / AIRDB_E_BAD_ARGS / AIRDB_E_GENERIC. A row_count of 0 is
  * a no-op returning 0. */
 int64_t airdb_bulk_append(AirdbDatabase *database, const uint64_t *rows_flat,
-                          size_t row_count, size_t prop_count);
+                          size_t row_count, size_t propertyCount);
 
 /* Begin an explicit write transaction. Acquires the database write lock.
  * Returns NULL on failure. The handle must be passed to exactly one of

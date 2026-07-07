@@ -11,7 +11,7 @@ const where = query.where;
 const countWhere = query.countWhere;
 const aggregateInt = query.aggregateInt;
 const rangeInclusive = query.rangeInclusive;
-const sortByPropAsc = query.sortByPropAsc;
+const sortByPropertyAscending = query.sortByPropertyAscending;
 
 fn qTmpPath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const u8) ![]const u8 {
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
@@ -19,10 +19,10 @@ fn qTmpPath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const u8
     return std.fs.path.join(allocator, &.{ path_buf[0..path_len], name });
 }
 
-// Build a 3-prop type: prop0 = primaryKey, prop1 = value (indexed iff `idx`), prop2 =
-// secondary. Inserts n rows with primaryKey=i, prop1=i%100, prop2=i.
+// Build a 3-property type: property0 = primaryKey, property1 = value (indexed iff `idx`), property2 =
+// secondary. Inserts n rows with primaryKey=i, property1=i%100, property2=i.
 fn seedPlannerCatalog(w: *@import("database.zig").WriteTransaction, idx: bool, n: u64) !Reference {
-    const defs = [_]catalog.PropDef{
+    const defs = [_]catalog.PropertyDefinition{
         .{ .kind = .int },
         .{ .kind = .int, .indexed = idx },
         .{ .kind = .int },
@@ -52,14 +52,14 @@ test "where filters live rows by ANDed predicates" {
     // age == 30
     var r1 = std.ArrayList(u64).empty;
     defer r1.deinit(testing.allocator);
-    try where(&w, catalogRef, &.{.{ .prop = 1, .op = .eq, .value = 30 }}, &r1, testing.allocator);
+    try where(&w, catalogRef, &.{.{ .property = 1, .op = .eq, .value = 30 }}, &r1, testing.allocator);
     try testing.expectEqual(@as(usize, 2), r1.items.len);
     // age > 25 AND primaryKey < 4  -> primaryKey 2 (age30), primaryKey3 (age40) ; primaryKey4 excluded by primaryKey<4
     var r2 = std.ArrayList(u64).empty;
     defer r2.deinit(testing.allocator);
     try where(&w, catalogRef, &.{
-        .{ .prop = 1, .op = .gt, .value = 25 },
-        .{ .prop = 0, .op = .lt, .value = 4 },
+        .{ .property = 1, .op = .gt, .value = 25 },
+        .{ .property = 0, .op = .lt, .value = 4 },
     }, &r2, testing.allocator);
     try testing.expectEqual(@as(usize, 2), r2.items.len);
     // delete primaryKey 2, re-query age==30 -> only primaryKey4
@@ -68,7 +68,7 @@ test "where filters live rows by ANDed predicates" {
     catalogRef = (try rows.delete(&w, catalogRef, 2, vv)).ok;
     var r3 = std.ArrayList(u64).empty;
     defer r3.deinit(testing.allocator);
-    try where(&w, catalogRef, &.{.{ .prop = 1, .op = .eq, .value = 30 }}, &r3, testing.allocator);
+    try where(&w, catalogRef, &.{.{ .property = 1, .op = .eq, .value = 30 }}, &r3, testing.allocator);
     try testing.expectEqual(@as(usize, 1), r3.items.len);
     w.deinit();
 }
@@ -85,12 +85,12 @@ test "out-of-range property indices are rejected up front" {
     const catalogRef = try seed(&w, &.{.{ 1, 20 }});
     var hits = std.ArrayList(u64).empty;
     defer hits.deinit(testing.allocator);
-    const bad = [_]Predicate{.{ .prop = 2, .op = .eq, .value = 1 }};
-    try testing.expectError(error.BadProp, where(&w, catalogRef, &bad, &hits, testing.allocator));
-    try testing.expectError(error.BadProp, countWhere(&w, catalogRef, &bad, testing.allocator));
-    try testing.expectError(error.BadProp, aggregateInt(&w, catalogRef, 9, &.{}, testing.allocator));
+    const bad = [_]Predicate{.{ .property = 2, .op = .eq, .value = 1 }};
+    try testing.expectError(error.BadProperty, where(&w, catalogRef, &bad, &hits, testing.allocator));
+    try testing.expectError(error.BadProperty, countWhere(&w, catalogRef, &bad, testing.allocator));
+    try testing.expectError(error.BadProperty, aggregateInt(&w, catalogRef, 9, &.{}, testing.allocator));
     var objectKeys = [_]u64{};
-    try testing.expectError(error.BadProp, sortByPropAsc(&w, catalogRef, &objectKeys, 5, testing.allocator));
+    try testing.expectError(error.BadProperty, sortByPropertyAscending(&w, catalogRef, &objectKeys, 5, testing.allocator));
 }
 
 test "streamed full scan agrees with where on count and aggregate" {
@@ -108,7 +108,7 @@ test "streamed full scan agrees with where on count and aggregate" {
     const ver = (try rows.getByPrimaryKey(&w, catalogRef, 4, &out)).?;
     catalogRef = (try rows.delete(&w, catalogRef, 4, ver)).ok;
 
-    const preds = [_]Predicate{.{ .prop = 1, .op = .ge, .value = 25 }};
+    const preds = [_]Predicate{.{ .property = 1, .op = .ge, .value = 25 }};
     var objectKeys = std.ArrayList(u64).empty;
     defer objectKeys.deinit(testing.allocator);
     try where(&w, catalogRef, &preds, &objectKeys, testing.allocator);
@@ -131,19 +131,19 @@ test "countWhere and aggregateInt" {
     var w = try database.beginWrite();
     const catalogRef = try seed(&w, &.{ .{ 1, 10 }, .{ 2, 20 }, .{ 3, 30 }, .{ 4, 40 } });
     try testing.expectEqual(@as(u64, 4), try countWhere(&w, catalogRef, &.{}, testing.allocator));
-    try testing.expectEqual(@as(u64, 2), try countWhere(&w, catalogRef, &.{.{ .prop = 1, .op = .ge, .value = 30 }}, testing.allocator));
+    try testing.expectEqual(@as(u64, 2), try countWhere(&w, catalogRef, &.{.{ .property = 1, .op = .ge, .value = 30 }}, testing.allocator));
     const agg = try aggregateInt(&w, catalogRef, 1, &.{}, testing.allocator);
     try testing.expectEqual(@as(u64, 4), agg.count);
     try testing.expectEqual(@as(u64, 100), agg.sum);
     try testing.expectEqual(@as(?u64, 10), agg.min);
     try testing.expectEqual(@as(?u64, 40), agg.max);
-    const empty = try aggregateInt(&w, catalogRef, 1, &.{.{ .prop = 1, .op = .gt, .value = 1000 }}, testing.allocator);
+    const empty = try aggregateInt(&w, catalogRef, 1, &.{.{ .property = 1, .op = .gt, .value = 1000 }}, testing.allocator);
     try testing.expectEqual(@as(u64, 0), empty.count);
     try testing.expectEqual(@as(?u64, null), empty.min);
     w.deinit();
 }
 
-test "rangeInclusive and sortByPropAsc" {
+test "rangeInclusive and sortByPropertyAscending" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try qTmpPath(testing.allocator, &tmp, "q3.airdb");
@@ -158,7 +158,7 @@ test "rangeInclusive and sortByPropAsc" {
     try rangeInclusive(&w, catalogRef, 0, 3, 7, &rng, testing.allocator);
     try testing.expectEqual(@as(usize, 3), rng.items.len); // primaryKeys 5,3,7
     // sort the matching objectKeys by primaryKey ascending, then verify the primaryKey order is 3,5,7
-    try sortByPropAsc(&w, catalogRef, rng.items, 0, testing.allocator);
+    try sortByPropertyAscending(&w, catalogRef, rng.items, 0, testing.allocator);
     var out: [2]u64 = undefined;
     _ = try rows.getByObjectKey(&w, catalogRef, rng.items[0], &out);
     try testing.expectEqual(@as(u64, 3), out[0]);
@@ -181,7 +181,7 @@ test "scan over 100k rows finds the matching slice" {
     var i: u64 = 0;
     while (i < 100_000) : (i += 1) catalogRef = (try rows.insert(&w, catalogRef, &.{ i, i % 100 })).catalogRef;
     // 1000 rows have (i % 100 == 7)
-    try testing.expectEqual(@as(u64, 1000), try countWhere(&w, catalogRef, &.{.{ .prop = 1, .op = .eq, .value = 7 }}, testing.allocator));
+    try testing.expectEqual(@as(u64, 1000), try countWhere(&w, catalogRef, &.{.{ .property = 1, .op = .eq, .value = 7 }}, testing.allocator));
     w.deinit();
 }
 
@@ -215,7 +215,7 @@ test "query returns stable object keys after relocation" {
     // that objectKey must resolve to the right values.
     var hits = std.ArrayList(u64).empty;
     defer hits.deinit(testing.allocator);
-    try where(&w, catalogRef, &.{.{ .prop = 1, .op = .eq, .value = 30 }}, &hits, testing.allocator);
+    try where(&w, catalogRef, &.{.{ .property = 1, .op = .eq, .value = 30 }}, &hits, testing.allocator);
     try testing.expectEqual(@as(usize, 1), hits.items.len);
     try testing.expectEqual(targetObjectKey, hits.items[0]);
 
@@ -255,7 +255,7 @@ test "indexed eq equals full scan" {
     var w = try database.beginWrite();
     const indexedCatalog = try seedPlannerCatalog(&w, true, 5000);
     const scanCatalog = try seedPlannerCatalog(&w, false, 5000);
-    try expectSameWhere(&w, indexedCatalog, scanCatalog, &.{.{ .prop = 1, .op = .eq, .value = 42 }});
+    try expectSameWhere(&w, indexedCatalog, scanCatalog, &.{.{ .property = 1, .op = .eq, .value = 42 }});
     w.deinit();
 }
 
@@ -271,15 +271,15 @@ test "indexed range equals full scan for each of lt le gt ge with boundary corre
     const scanCatalog = try seedPlannerCatalog(&w, false, 5000);
     // Combined range [40,45].
     try expectSameWhere(&w, indexedCatalog, scanCatalog, &.{
-        .{ .prop = 1, .op = .ge, .value = 40 },
-        .{ .prop = 1, .op = .le, .value = 45 },
+        .{ .property = 1, .op = .ge, .value = 40 },
+        .{ .property = 1, .op = .le, .value = 45 },
     });
     // Each operator individually, at and around the bound (off-by-one guards).
     for ([_]u64{ 0, 1, 42, 99 }) |b| {
-        try expectSameWhere(&w, indexedCatalog, scanCatalog, &.{.{ .prop = 1, .op = .lt, .value = b }});
-        try expectSameWhere(&w, indexedCatalog, scanCatalog, &.{.{ .prop = 1, .op = .le, .value = b }});
-        try expectSameWhere(&w, indexedCatalog, scanCatalog, &.{.{ .prop = 1, .op = .gt, .value = b }});
-        try expectSameWhere(&w, indexedCatalog, scanCatalog, &.{.{ .prop = 1, .op = .ge, .value = b }});
+        try expectSameWhere(&w, indexedCatalog, scanCatalog, &.{.{ .property = 1, .op = .lt, .value = b }});
+        try expectSameWhere(&w, indexedCatalog, scanCatalog, &.{.{ .property = 1, .op = .le, .value = b }});
+        try expectSameWhere(&w, indexedCatalog, scanCatalog, &.{.{ .property = 1, .op = .gt, .value = b }});
+        try expectSameWhere(&w, indexedCatalog, scanCatalog, &.{.{ .property = 1, .op = .ge, .value = b }});
     }
     w.deinit();
 }
@@ -294,15 +294,15 @@ test "indexed predicate plus non-indexed predicate equals full scan" {
     var w = try database.beginWrite();
     const indexedCatalog = try seedPlannerCatalog(&w, true, 5000);
     const scanCatalog = try seedPlannerCatalog(&w, false, 5000);
-    // prop1 (indexed) drives; prop2 (not indexed) is a remaining predicate.
+    // property1 (indexed) drives; property2 (not indexed) is a remaining predicate.
     try expectSameWhere(&w, indexedCatalog, scanCatalog, &.{
-        .{ .prop = 1, .op = .eq, .value = 42 },
-        .{ .prop = 2, .op = .ge, .value = 2500 },
+        .{ .property = 1, .op = .eq, .value = 42 },
+        .{ .property = 2, .op = .ge, .value = 2500 },
     });
     // Range driver plus a remaining predicate.
     try expectSameWhere(&w, indexedCatalog, scanCatalog, &.{
-        .{ .prop = 1, .op = .ge, .value = 30 },
-        .{ .prop = 2, .op = .lt, .value = 1000 },
+        .{ .property = 1, .op = .ge, .value = 30 },
+        .{ .property = 2, .op = .lt, .value = 1000 },
     });
     w.deinit();
 }
@@ -317,7 +317,7 @@ test "ne falls back to the scan and still equals full scan" {
     var w = try database.beginWrite();
     const indexedCatalog = try seedPlannerCatalog(&w, true, 2000);
     const scanCatalog = try seedPlannerCatalog(&w, false, 2000);
-    try expectSameWhere(&w, indexedCatalog, scanCatalog, &.{.{ .prop = 1, .op = .ne, .value = 42 }});
+    try expectSameWhere(&w, indexedCatalog, scanCatalog, &.{.{ .property = 1, .op = .ne, .value = 42 }});
     w.deinit();
 }
 
@@ -331,9 +331,9 @@ test "non-indexed query is unchanged" {
     var w = try database.beginWrite();
     const indexedCatalog = try seedPlannerCatalog(&w, true, 2000);
     const scanCatalog = try seedPlannerCatalog(&w, false, 2000);
-    // Query a non-indexed prop on both: both run the full scan.
-    try expectSameWhere(&w, indexedCatalog, scanCatalog, &.{.{ .prop = 2, .op = .eq, .value = 1234 }});
-    try expectSameWhere(&w, indexedCatalog, scanCatalog, &.{.{ .prop = 0, .op = .ge, .value = 1000 }});
+    // Query a non-indexed property on both: both run the full scan.
+    try expectSameWhere(&w, indexedCatalog, scanCatalog, &.{.{ .property = 2, .op = .eq, .value = 1234 }});
+    try expectSameWhere(&w, indexedCatalog, scanCatalog, &.{.{ .property = 0, .op = .ge, .value = 1000 }});
     w.deinit();
 }
 
@@ -350,16 +350,16 @@ test "countWhere rangeInclusive aggregateInt match between index path and full s
 
     // countWhere on an indexed eq predicate.
     try testing.expectEqual(
-        try countWhere(&w, scanCatalog, &.{.{ .prop = 1, .op = .eq, .value = 7 }}, testing.allocator),
-        try countWhere(&w, indexedCatalog, &.{.{ .prop = 1, .op = .eq, .value = 7 }}, testing.allocator),
+        try countWhere(&w, scanCatalog, &.{.{ .property = 1, .op = .eq, .value = 7 }}, testing.allocator),
+        try countWhere(&w, indexedCatalog, &.{.{ .property = 1, .op = .eq, .value = 7 }}, testing.allocator),
     );
     // countWhere on an indexed range predicate.
     try testing.expectEqual(
-        try countWhere(&w, scanCatalog, &.{.{ .prop = 1, .op = .ge, .value = 90 }}, testing.allocator),
-        try countWhere(&w, indexedCatalog, &.{.{ .prop = 1, .op = .ge, .value = 90 }}, testing.allocator),
+        try countWhere(&w, scanCatalog, &.{.{ .property = 1, .op = .ge, .value = 90 }}, testing.allocator),
+        try countWhere(&w, indexedCatalog, &.{.{ .property = 1, .op = .ge, .value = 90 }}, testing.allocator),
     );
 
-    // rangeInclusive over the indexed prop.
+    // rangeInclusive over the indexed property.
     var ri_idx = std.ArrayList(u64).empty;
     defer ri_idx.deinit(testing.allocator);
     var ri_scan = std.ArrayList(u64).empty;
@@ -370,9 +370,9 @@ test "countWhere rangeInclusive aggregateInt match between index path and full s
     std.mem.sort(u64, ri_scan.items, {}, std.sort.asc(u64));
     try testing.expectEqualSlices(u64, ri_scan.items, ri_idx.items);
 
-    // aggregateInt over the indexed prop with an indexed driver.
-    const a = try aggregateInt(&w, indexedCatalog, 1, &.{.{ .prop = 1, .op = .eq, .value = 50 }}, testing.allocator);
-    const b = try aggregateInt(&w, scanCatalog, 1, &.{.{ .prop = 1, .op = .eq, .value = 50 }}, testing.allocator);
+    // aggregateInt over the indexed property with an indexed driver.
+    const a = try aggregateInt(&w, indexedCatalog, 1, &.{.{ .property = 1, .op = .eq, .value = 50 }}, testing.allocator);
+    const b = try aggregateInt(&w, scanCatalog, 1, &.{.{ .property = 1, .op = .eq, .value = 50 }}, testing.allocator);
     try testing.expectEqual(b.count, a.count);
     try testing.expectEqual(b.sum, a.sum);
     try testing.expectEqual(b.min, a.min);
@@ -392,17 +392,17 @@ test "empty result and all-match edge cases match full scan" {
     const scanCatalog = try seedPlannerCatalog(&w, false, 1000);
 
     // Empty: eq on a value no row holds (values are i%100, so 100 never appears).
-    try expectSameWhere(&w, indexedCatalog, scanCatalog, &.{.{ .prop = 1, .op = .eq, .value = 100 }});
+    try expectSameWhere(&w, indexedCatalog, scanCatalog, &.{.{ .property = 1, .op = .eq, .value = 100 }});
     // Empty: range entirely above the populated values.
-    try expectSameWhere(&w, indexedCatalog, scanCatalog, &.{.{ .prop = 1, .op = .gt, .value = 99 }});
+    try expectSameWhere(&w, indexedCatalog, scanCatalog, &.{.{ .property = 1, .op = .gt, .value = 99 }});
     // Empty: lt 0 underflow guard.
-    try expectSameWhere(&w, indexedCatalog, scanCatalog, &.{.{ .prop = 1, .op = .lt, .value = 0 }});
+    try expectSameWhere(&w, indexedCatalog, scanCatalog, &.{.{ .property = 1, .op = .lt, .value = 0 }});
     // Empty: gt maxInt overflow guard.
-    try expectSameWhere(&w, indexedCatalog, scanCatalog, &.{.{ .prop = 1, .op = .gt, .value = std.math.maxInt(u64) }});
+    try expectSameWhere(&w, indexedCatalog, scanCatalog, &.{.{ .property = 1, .op = .gt, .value = std.math.maxInt(u64) }});
     // All-match: ge 0 selects every row.
-    try expectSameWhere(&w, indexedCatalog, scanCatalog, &.{.{ .prop = 1, .op = .ge, .value = 0 }});
+    try expectSameWhere(&w, indexedCatalog, scanCatalog, &.{.{ .property = 1, .op = .ge, .value = 0 }});
     // All-match: le maxInt selects every row.
-    try expectSameWhere(&w, indexedCatalog, scanCatalog, &.{.{ .prop = 1, .op = .le, .value = std.math.maxInt(u64) }});
+    try expectSameWhere(&w, indexedCatalog, scanCatalog, &.{.{ .property = 1, .op = .le, .value = std.math.maxInt(u64) }});
     w.deinit();
 }
 
@@ -420,12 +420,12 @@ test "index path equals full scan after deletes" {
     var out: [3]u64 = undefined;
     var primaryKey: u64 = 0;
     while (primaryKey < 2000) : (primaryKey += 7) {
-        const vi = (try rows.getByPrimaryKey(&w, indexedCatalog, primaryKey, &out)).?;
-        indexedCatalog = (try rows.delete(&w, indexedCatalog, primaryKey, vi)).ok;
+        const rowVersion = (try rows.getByPrimaryKey(&w, indexedCatalog, primaryKey, &out)).?;
+        indexedCatalog = (try rows.delete(&w, indexedCatalog, primaryKey, rowVersion)).ok;
         const vs = (try rows.getByPrimaryKey(&w, scanCatalog, primaryKey, &out)).?;
         scanCatalog = (try rows.delete(&w, scanCatalog, primaryKey, vs)).ok;
     }
-    try expectSameWhere(&w, indexedCatalog, scanCatalog, &.{.{ .prop = 1, .op = .eq, .value = 42 }});
-    try expectSameWhere(&w, indexedCatalog, scanCatalog, &.{ .{ .prop = 1, .op = .ge, .value = 40 }, .{ .prop = 1, .op = .le, .value = 45 } });
+    try expectSameWhere(&w, indexedCatalog, scanCatalog, &.{.{ .property = 1, .op = .eq, .value = 42 }});
+    try expectSameWhere(&w, indexedCatalog, scanCatalog, &.{ .{ .property = 1, .op = .ge, .value = 40 }, .{ .property = 1, .op = .le, .value = 45 } });
     w.deinit();
 }

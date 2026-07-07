@@ -4,8 +4,8 @@ const migrations = @import("migrations.zig");
 const catalog = @import("catalog.zig");
 const objects = @import("../records/objects.zig");
 const blob = @import("../records/blob.zig");
-const PropKind = catalog.PropKind;
-const PropCount = catalog.PropCount;
+const PropertyKind = catalog.PropertyKind;
+const PropertyCount = catalog.PropertyCount;
 const addProperty = migrations.addProperty;
 const removeProperty = migrations.removeProperty;
 
@@ -15,7 +15,7 @@ const Database = @import("../database.zig").Database;
 
 const create = catalog.create;
 
-const propCount = catalog.propCount;
+const loadPropertyCount = catalog.loadPropertyCount;
 
 const insert = @import("../records/rows.zig").insert;
 
@@ -43,7 +43,7 @@ test "addProperty backfills the default for existing rows" {
     catalogRef = (try insert(&w, catalogRef, &.{ 2, 20 })).catalogRef;
     // add a third int property defaulting to 7
     catalogRef = try addProperty(&w, catalogRef, .{ .kind = .int }, 7);
-    try testing.expectEqual(@as(PropCount, 3), try propCount(&w, catalogRef));
+    try testing.expectEqual(@as(PropertyCount, 3), try loadPropertyCount(&w, catalogRef));
     var out: [3]u64 = undefined;
     _ = (try getByPrimaryKey(&w, catalogRef, 1, &out)).?;
     try testing.expectEqual(@as(u64, 10), out[1]);
@@ -83,13 +83,13 @@ test "removeProperty drops a property and shifts the rest" {
     catalogRef = (try insert(&w, catalogRef, &.{ 1, 10 })).catalogRef;
     catalogRef = try addProperty(&w, catalogRef, .{ .kind = .int }, 7);
     catalogRef = (try insert(&w, catalogRef, &.{ 3, 30, 99 })).catalogRef;
-    // remove the middle property (index 1); now primaryKey + the added prop
+    // remove the middle property (index 1); now primaryKey + the added property
     catalogRef = try removeProperty(&w, catalogRef, 1);
-    try testing.expectEqual(@as(PropCount, 2), try propCount(&w, catalogRef));
+    try testing.expectEqual(@as(PropertyCount, 2), try loadPropertyCount(&w, catalogRef));
     var out2: [2]u64 = undefined;
     _ = (try getByPrimaryKey(&w, catalogRef, 3, &out2)).?;
     try testing.expectEqual(@as(u64, 3), out2[0]); // primaryKey preserved
-    try testing.expectEqual(@as(u64, 99), out2[1]); // the formerly-third prop shifted to index 1
+    try testing.expectEqual(@as(u64, 99), out2[1]); // the formerly-third property shifted to index 1
     w.deinit();
 }
 
@@ -119,10 +119,10 @@ test "addProperty(indexed) backfills the value index for existing rows" {
     defer r.end();
     var hits = std.ArrayList(u64).empty;
     defer hits.deinit(testing.allocator);
-    try query.where(&r, r.root(), &.{.{ .prop = 2, .op = .eq, .value = 7 }}, &hits, testing.allocator);
+    try query.where(&r, r.root(), &.{.{ .property = 2, .op = .eq, .value = 7 }}, &hits, testing.allocator);
     try testing.expectEqual(@as(usize, 2), hits.items.len); // both pre-migration rows
     hits.clearRetainingCapacity();
-    try query.where(&r, r.root(), &.{.{ .prop = 2, .op = .eq, .value = 9 }}, &hits, testing.allocator);
+    try query.where(&r, r.root(), &.{.{ .property = 2, .op = .eq, .value = 9 }}, &hits, testing.allocator);
     try testing.expectEqual(@as(usize, 1), hits.items.len);
 }
 
@@ -187,7 +187,7 @@ test "addProperty link type gets a backlink index" {
     catalogRef = (try insert(&w, catalogRef, &.{1})).catalogRef;
     catalogRef = try addProperty(&w, catalogRef, .{ .kind = .link }, 0); // 0 == null link
     const v = try catalog.loadCatalog(&w, catalogRef);
-    try testing.expectEqual(PropKind.link, v.kind(1));
+    try testing.expectEqual(PropertyKind.link, v.kind(1));
     try testing.expect(v.backlinkRef(1) != 0);
     // a row created before the migration reads as a null link
     try testing.expectEqual(@as(?u64, null), try getLink(&w, catalogRef, 1, 1));

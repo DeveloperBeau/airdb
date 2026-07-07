@@ -52,7 +52,7 @@ const depth_stride: u64 = 1_000_000;
 
 // A 4-type chain: types 0..2 carry a cascade to-one link to the next type;
 // type 3 is the leaf. Type 0 is the non-embedded root, types 1..3 are embedded.
-const chain_schema = [_][]const catalog.PropDef{
+const chain_schema = [_][]const catalog.PropertyDefinition{
     &.{ .{ .kind = .int }, .{ .kind = .link, .link_target = 1, .del_rule = .cascade } },
     &.{ .{ .kind = .int }, .{ .kind = .link, .link_target = 2, .del_rule = .cascade } },
     &.{ .{ .kind = .int }, .{ .kind = .link, .link_target = 3, .del_rule = .cascade } },
@@ -60,8 +60,8 @@ const chain_schema = [_][]const catalog.PropDef{
 };
 const chain_embedded = [_]bool{ false, true, true, true };
 
-// The to-one link prop is index 1 on every chain type.
-const link_prop: usize = 1;
+// The to-one link property is index 1 on every chain type.
+const linkProperty: usize = 1;
 
 inline fn sysIo() Io {
     return std.Io.Threaded.global_single_threaded.io();
@@ -132,7 +132,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
                             .{ .{ .int = key }, .{ .int = key *% 2654435761 } }
                         else
                             .{ .{ .int = key }, .{ .link = null } };
-                        dir = try typedir.insertEmbedded(&w, dir, level, key, link_prop, &child_vals);
+                        dir = try typedir.insertEmbedded(&w, dir, level, key, linkProperty, &child_vals);
                     }
                     const dt: u64 = @intCast(nowNs(io) - t0);
                     try create_lat.add(alloc, dt);
@@ -157,7 +157,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
                 const t0 = nowNs(io);
                 var level: u16 = 0;
                 while (level < d) : (level += 1) {
-                    _ = try typeRouting.getLinked(&r, dir, level, key, link_prop, &out);
+                    _ = try typeRouting.getLinked(&r, dir, level, key, linkProperty, &out);
                 }
                 const dt: u64 = @intCast(nowNs(io) - t0);
                 try read_lat.add(alloc, dt);

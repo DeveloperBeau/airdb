@@ -65,7 +65,7 @@ Code pointers use `module.function` names under `src/`.
   predicates (logical AND). The planner drives off an indexed equality or
   range predicate when one exists; otherwise the scan streams the key→row
   index without materializing the table.
-- `query.rangeInclusive`, `query.sortByPropAsc`.
+- `query.rangeInclusive`, `query.sortByPropertyAscending`.
 
 ## Bulk operations
 
@@ -93,7 +93,7 @@ Code pointers use `module.function` names under `src/`.
 
 ## C ABI (`include/airdb.h`)
 
-- Auto-commit: `airdb_open/close/insert/get/update/delete/count/prop_count`.
+- Auto-commit: `airdb_open/close/insert/get/update/delete/count/propertyCount`.
 - Bulk: `airdb_bulk_insert` (empty type), `airdb_bulk_append`.
 - Explicit transactions: `airdb_begin` → `airdb_txn_insert/update/delete` →
   `airdb_commit` / `airdb_abort` — one durable barrier per batch.

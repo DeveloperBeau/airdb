@@ -3,7 +3,7 @@
 // each kind, then the four CRUD phases (create / read / update / delete) are run
 // over a capped dataset and their per-op latencies folded into a single mix.
 //
-// Prop layout (single catalog, type id 0 so the link can be a self-link):
+// Property layout (single catalog, type id 0 so the link can be a self-link):
 //   0  int   primary key
 //   1  int   a plain int value
 //   2  int   a bool stored as 0/1 (the engine has no distinct bool kind, so a
@@ -19,7 +19,7 @@
 // them, and every other supported kind is covered above, so nothing is faked.
 //
 // Update phase note: Objects.updateTyped is `unreachable` for collection-bearing
-// props, so a full-row typed update cannot run on this multi-kind type. The
+// properties, so a full-row typed update cannot run on this multi-kind type. The
 // update phase instead mutates through the per-property collection mutators and
 // the link setter (setAddInt + dictPut + setLink), which are the engine's real
 // update path for those kinds and each bump the row version.
@@ -57,7 +57,7 @@ const p_link = 4;
 const p_dict = 5;
 const p_set_int = 6;
 const p_set_blob = 7;
-const prop_count = 8;
+const propertyCount = 8;
 
 inline fn sysIo() Io {
     return std.Io.Threaded.global_single_threaded.io();
@@ -146,7 +146,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
                 const set_ints = [_]u64{ iv % 1000, (iv >> 10) % 1000, (iv >> 20) % 1000 };
                 const set_blobs = [_][]const u8{ "m0", "m1", "m2" };
 
-                const row = [prop_count]Value{
+                const row = [propertyCount]Value{
                     .{ .int = primaryKey },
                     .{ .int = iv },
                     .{ .int = primaryKey & 1 }, // bool
@@ -179,12 +179,12 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     const update_stride = @max(@as(usize, 1), rows / update_n);
     const delete_stride = @max(@as(usize, 1), rows / delete_n);
 
-    // --- READ phase: materialize every prop kind -----------------------------
+    // --- READ phase: materialize every property kind -----------------------------
     {
         const phase_start = nowNs(io);
         var r = try database.beginRead();
         const catalogRef = r.root();
-        var out: [prop_count]Value = undefined;
+        var out: [propertyCount]Value = undefined;
         var k: usize = 0;
         while (k < read_n) : (k += 1) {
             const primaryKey: u64 = (k * read_stride) % rows;
@@ -239,7 +239,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
             const this_batch = @min(batch_size, delete_n - done);
             var w = try database.beginWrite();
             var catalogRef = w.new_root;
-            var raw: [prop_count]u64 = undefined;
+            var raw: [propertyCount]u64 = undefined;
             var j: usize = 0;
             while (j < this_batch) : (j += 1) {
                 const primaryKey: u64 = ((done + j) * delete_stride) % rows;

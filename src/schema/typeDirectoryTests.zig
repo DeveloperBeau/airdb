@@ -8,7 +8,7 @@ const collections = @import("../records/collections.zig");
 const links = @import("../records/links.zig");
 const Objects = @import("../records/objects.zig");
 const rows = @import("../records/rows.zig");
-const PropKind = catalog.PropKind;
+const PropertyKind = catalog.PropertyKind;
 const Value = typedir.Value;
 const createTypes = typedir.createTypes;
 const createWithDefs = typedir.createWithDefs;
@@ -50,7 +50,7 @@ test "create builds a directory with one catalog per type" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    const schema = [_][]const catalog.PropKind{
+    const schema = [_][]const catalog.PropertyKind{
         &.{ .int, .blob },
         &.{ .int, .int, .int },
     };
@@ -59,8 +59,8 @@ test "create builds a directory with one catalog per type" {
     const c0 = try catalogRef(&w, dir, 0);
     const c1 = try catalogRef(&w, dir, 1);
     try testing.expect(c0 != 0 and c1 != 0 and c0 != c1);
-    try testing.expectEqual(@as(catalog.PropCount, 2), (try catalog.loadCatalog(&w, c0)).prop_count);
-    try testing.expectEqual(@as(catalog.PropCount, 3), (try catalog.loadCatalog(&w, c1)).prop_count);
+    try testing.expectEqual(@as(catalog.PropertyCount, 2), (try catalog.loadCatalog(&w, c0)).propertyCount);
+    try testing.expectEqual(@as(catalog.PropertyCount, 3), (try catalog.loadCatalog(&w, c1)).propertyCount);
     w.deinit();
 }
 
@@ -72,7 +72,7 @@ test "catalogRef rejects an out-of-range type id" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    const schema = [_][]const catalog.PropKind{&.{ .int, .int }};
+    const schema = [_][]const catalog.PropertyKind{&.{ .int, .int }};
     const dir = try create(&w, &schema);
     try testing.expectError(error.NoSuchType, catalogRef(&w, dir, 5));
     w.deinit();
@@ -83,7 +83,7 @@ test "validate accepts a matching schema and rejects a mismatch" {
     defer tmp.cleanup();
     const path = try tdTmpPath(testing.allocator, &tmp, "td2.airdb");
     defer testing.allocator.free(path);
-    const schema = [_][]const catalog.PropKind{ &.{ .int, .blob }, &.{ .int, .int, .int } };
+    const schema = [_][]const catalog.PropertyKind{ &.{ .int, .blob }, &.{ .int, .int, .int } };
     {
         var database = try Database.create(testing.allocator, path);
         defer database.deinit();
@@ -97,11 +97,11 @@ test "validate accepts a matching schema and rejects a mismatch" {
         defer database.deinit();
         var r = try database.beginRead();
         try validate(&r, r.root(), &schema); // matches
-        const fewer = [_][]const catalog.PropKind{&.{ .int, .blob }};
+        const fewer = [_][]const catalog.PropertyKind{&.{ .int, .blob }};
         try testing.expectError(error.SchemaMismatch, validate(&r, r.root(), &fewer));
-        const wrong_kind = [_][]const catalog.PropKind{ &.{ .int, .int }, &.{ .int, .int, .int } };
+        const wrong_kind = [_][]const catalog.PropertyKind{ &.{ .int, .int }, &.{ .int, .int, .int } };
         try testing.expectError(error.SchemaMismatch, validate(&r, r.root(), &wrong_kind));
-        const wrong_count = [_][]const catalog.PropKind{ &.{ .int, .blob }, &.{ .int, .int } };
+        const wrong_count = [_][]const catalog.PropertyKind{ &.{ .int, .blob }, &.{ .int, .int } };
         try testing.expectError(error.SchemaMismatch, validate(&r, r.root(), &wrong_count));
         r.end();
     }
@@ -115,7 +115,7 @@ test "two types route independently through the directory" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    const schema = [_][]const PropKind{ &.{ .int, .blob }, &.{ .int, .int } };
+    const schema = [_][]const PropertyKind{ &.{ .int, .blob }, &.{ .int, .int } };
     var dir = try create(&w, &schema);
 
     dir = (try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .bytes = "Ada" } })).dir;
@@ -150,7 +150,7 @@ test "multiple types persist across reopen and validate" {
     defer tmp.cleanup();
     const path = try tdTmpPath(testing.allocator, &tmp, "td4.airdb");
     defer testing.allocator.free(path);
-    const schema = [_][]const PropKind{ &.{ .int, .blob }, &.{ .int, .int } };
+    const schema = [_][]const PropertyKind{ &.{ .int, .blob }, &.{ .int, .int } };
     {
         var database = try Database.create(testing.allocator, path);
         defer database.deinit();
@@ -191,7 +191,7 @@ test "addType grows the directory and routes the new type" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    const schema = [_][]const PropKind{&.{ .int, .blob }};
+    const schema = [_][]const PropertyKind{&.{ .int, .blob }};
     var dir = try create(&w, &schema);
     try testing.expectEqual(@as(u16, 1), try typeCount(&w, dir));
     const added = try addType(&w, dir, &.{ .int, .int, .int });
@@ -217,7 +217,7 @@ test "multi-type directory carries links and collections via createWithDefs" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    const PD = catalog.PropDef;
+    const PD = catalog.PropertyDefinition;
     // type 0: scalar (int primaryKey, blob name); type 1: int primaryKey + a to-one link + a to-many link_set
     const schema = [_][]const PD{
         &.{ .{ .kind = .int }, .{ .kind = .blob } },
@@ -236,7 +236,7 @@ test "multi-type directory carries links and collections via createWithDefs" {
     dir = try linkSetAdd(&w, dir, 1, 20, 2, a.row); // already member -> no-op
     try testing.expect(try linkSetContains(&w, dir, 1, 20, 2, a.row));
     try testing.expectEqual(@as(?u64, a.row), try getLink(&w, dir, 1, 20, 1));
-    // a has 2 inbound to-one? no: only b's to-one links a -> backlink on prop 1 == 1
+    // a has 2 inbound to-one? no: only b's to-one links a -> backlink on property 1 == 1
     try testing.expectEqual(@as(u64, 1), try backlinkCount(&w, dir, 1, 1, a.row));
 
     // addTypeDefs: append a type with a list property
@@ -256,7 +256,7 @@ test "a cross-type link resolves to the target type's object" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    const PD = catalog.PropDef;
+    const PD = catalog.PropertyDefinition;
     const schema = [_][]const PD{
         &.{ .{ .kind = .int }, .{ .kind = .blob } }, // 0: Author
         &.{ .{ .kind = .int }, .{ .kind = .link, .link_target = 0 } }, // 1: Book.author -> Author
@@ -286,7 +286,7 @@ test "deleting a target nullifies inbound links from another type" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    const PD = catalog.PropDef;
+    const PD = catalog.PropertyDefinition;
     const schema = [_][]const PD{
         &.{ .{ .kind = .int }, .{ .kind = .blob } }, // 0: Author
         &.{ .{ .kind = .int }, .{ .kind = .link, .link_target = 0 } }, // 1: Book.author -> Author
@@ -317,7 +317,7 @@ test "cross-type links persist across reopen" {
     defer tmp.cleanup();
     const path = try tdTmpPath(testing.allocator, &tmp, "tdx3.airdb");
     defer testing.allocator.free(path);
-    const PD = catalog.PropDef;
+    const PD = catalog.PropertyDefinition;
     const schema = [_][]const PD{
         &.{ .{ .kind = .int }, .{ .kind = .blob } }, // 0: Author
         &.{ .{ .kind = .int }, .{ .kind = .link, .link_target = 0 } }, // 1: Book.author -> Author
@@ -361,7 +361,7 @@ test "block prevents deleting a referenced object" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    const PD = catalog.PropDef;
+    const PD = catalog.PropertyDefinition;
     const schema = [_][]const PD{
         &.{ .{ .kind = .int }, .{ .kind = .blob } }, // Author
         &.{ .{ .kind = .int }, .{ .kind = .link, .link_target = 0, .del_rule = .block } }, // Book.author (block)
@@ -399,7 +399,7 @@ test "cascade deletes owned children" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    const PD = catalog.PropDef;
+    const PD = catalog.PropertyDefinition;
     const schema = [_][]const PD{
         &.{ .{ .kind = .int }, .{ .kind = .link_set, .link_target = 1, .del_rule = .cascade } }, // Parent.children
         &.{.{ .kind = .int }}, // Child
@@ -432,7 +432,7 @@ test "directory records per-type embedded flags" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    const PD = catalog.PropDef;
+    const PD = catalog.PropertyDefinition;
     const schema = [_][]const PD{
         &.{ .{ .kind = .int }, .{ .kind = .blob } },
         &.{ .{ .kind = .int }, .{ .kind = .int } },
@@ -448,7 +448,7 @@ test "directory records per-type embedded flags" {
     w.deinit();
 }
 
-const embedded_owner_schema = [_][]const catalog.PropDef{
+const embedded_owner_schema = [_][]const catalog.PropertyDefinition{
     &.{ .{ .kind = .int }, .{ .kind = .link, .link_target = 1, .del_rule = .cascade } }, // 0: owner
     &.{ .{ .kind = .int }, .{ .kind = .blob } }, // 1: embedded child
 };
@@ -543,7 +543,7 @@ test "directory delete works after relocating the target" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    const PD = catalog.PropDef;
+    const PD = catalog.PropertyDefinition;
     const schema = [_][]const PD{
         &.{ .{ .kind = .int }, .{ .kind = .blob } }, // 0: Author
         &.{ .{ .kind = .int }, .{ .kind = .link, .link_target = 0 } }, // 1: Book.author -> Author
@@ -635,7 +635,7 @@ test "cascade is cycle-safe" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    const PD = catalog.PropDef;
+    const PD = catalog.PropertyDefinition;
     const schema = [_][]const PD{
         &.{ .{ .kind = .int }, .{ .kind = .link, .link_target = 0, .del_rule = .cascade } }, // Node.next (self type)
     };
@@ -778,7 +778,7 @@ test "a cascade delete frees the child's collection storage" {
     try testing.expect(freed_child_set);
 }
 
-const embedded_block_schema = [_][]const catalog.PropDef{
+const embedded_block_schema = [_][]const catalog.PropertyDefinition{
     &.{ .{ .kind = .int }, .{ .kind = .link, .link_target = 1, .del_rule = .cascade } }, // 0: owner
     &.{ .{ .kind = .int }, .{ .kind = .blob } }, // 1: embedded child
     &.{ .{ .kind = .int }, .{ .kind = .link, .link_target = 1, .del_rule = .block } }, // 2: blocker

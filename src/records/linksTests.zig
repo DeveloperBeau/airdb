@@ -227,13 +227,13 @@ test "nullifyInboundInCatalog clears only links whose target type matches the fi
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    // props: primaryKey(int), prop1(link -> type 5), prop2(link -> type 9)
+    // properties: primaryKey(int), property1(link -> type 5), property2(link -> type 9)
     var catalogRef = try catalog.createDefs(&w, &.{
         .{ .kind = .int },
         .{ .kind = .link, .link_target = 5 },
         .{ .kind = .link, .link_target = 9 },
     });
-    // Target row T, plus S1 (prop1 -> T) and S2 (prop2 -> T).
+    // Target row T, plus S1 (property1 -> T) and S2 (property2 -> T).
     const t = try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .link = null }, .{ .link = null } });
     catalogRef = t.catalogRef;
     const s1 = try insertTyped(&w, catalogRef, &.{ .{ .int = 2 }, .{ .link = t.row }, .{ .link = null } });
@@ -242,7 +242,7 @@ test "nullifyInboundInCatalog clears only links whose target type matches the fi
     catalogRef = s2.catalogRef;
     try testing.expectEqual(@as(?u64, t.row), try getLink(&w, catalogRef, 2, 1));
     try testing.expectEqual(@as(?u64, t.row), try getLink(&w, catalogRef, 3, 2));
-    // Filtered nullify on target type 5 clears only prop1's inbound link.
+    // Filtered nullify on target type 5 clears only property1's inbound link.
     catalogRef = try nullifyInboundInCatalog(&w, catalogRef, t.row, 5, false);
     try testing.expectEqual(@as(?u64, null), try getLink(&w, catalogRef, 2, 1));
     try testing.expectEqual(@as(?u64, t.row), try getLink(&w, catalogRef, 3, 2));
@@ -370,7 +370,7 @@ test "to-many link set: insert seeds members and backlinks" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    // props: primaryKey(int), tags(link_set -> same type)
+    // properties: primaryKey(int), tags(link_set -> same type)
     var catalogRef = try catalog.createDefs(&w, &.{ .{ .kind = .int }, .{ .kind = .link_set } });
     const a = try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .link_set = &.{} } });
     catalogRef = a.catalogRef;
