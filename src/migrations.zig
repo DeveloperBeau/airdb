@@ -40,17 +40,41 @@ pub fn addProperty(txn: *WriteTxn, cat: Ref, def: PropDef, default_value: u64) !
     // meaningless as values and impossible to backfill coherently.
     if (def.indexed and is_collection) return error.Unsupported;
 
-    // Build the new column. Storage-bearing kinds are backfilled PER LIVE
-    // ROW, never shared. Collections: a raw zero root breaks every collection
-    // accessor and made pre-migration rows undeletable through the graph-safe
-    // delete (its outbound cleanup walks link_set roots), while a SHARED root
-    // would be freed by the first row's delete underneath every other row.
-    // Blobs have the same aliasing hazard: writing the caller's single
-    // default ref into every row meant the first row's delete freed the node
-    // under all the others, planting a duplicate extent in the free list --
-    // so each live row gets its own copy of the default bytes (the caller
-    // keeps ownership of the passed-in ref). Dead rows get 0 for both;
-    // nothing ever dereferences a tombstoned row's columns.
+    const new_col = try buildBackfilledColumn(txn, &s, def, default_value, is_collection);
+    const vi: Ref = if (def.indexed) try backfillValueIndex(txn, s.keyrow_index_ref, new_col) else 0;
+
+    s.props[pc] = .{
+        .col = new_col,
+        .kind = def.kind,
+        .elem = def.elem,
+        .backlink = if (def.kind == .link or def.kind == .link_set) try Index.create(txn) else 0,
+        .target = def.link_target,
+        .rule = def.del_rule,
+        .value_index = vi,
+        .indexed = def.indexed,
+    };
+    s.prop_count = pc + 1;
+    return s.replace(txn);
+}
+
+// Build the new property's column, filled with the default for every existing
+// row. Storage-bearing kinds are backfilled PER LIVE ROW, never shared.
+// Collections: a raw zero root breaks every collection accessor and made
+// pre-migration rows undeletable through the graph-safe delete (its outbound
+// cleanup walks link_set roots), while a SHARED root would be freed by the
+// first row's delete underneath every other row. Blobs have the same aliasing
+// hazard: writing the caller's single default ref into every row meant the
+// first row's delete freed the node under all the others, planting a
+// duplicate extent in the free list -- so each live row gets its own copy of
+// the default bytes (the caller keeps ownership of the passed-in ref). Dead
+// rows get 0 for both; nothing ever dereferences a tombstoned row's columns.
+fn buildBackfilledColumn(
+    txn: *WriteTxn,
+    s: *const catalog.CatalogSnapshot,
+    def: PropDef,
+    default_value: u64,
+    is_collection: bool,
+) !Ref {
     var new_col = try Column.create(txn);
     var i: u64 = 0;
     while (i < s.next_row) : (i += 1) {
@@ -73,40 +97,28 @@ pub fn addProperty(txn: *WriteTxn, cat: Ref, def: PropDef, default_value: u64) !
         };
         new_col = try Column.append(txn, new_col, fill);
     }
+    return new_col;
+}
 
-    // Backfill the value index for existing LIVE rows: the query planner
-    // trusts the indexed flag, so an empty index would silently drop every
-    // pre-migration row from indexed queries (and fail the integrity audit).
-    // Each row is indexed under its OWN raw column value (mirroring the
-    // insert path) -- blob backfills give every row a distinct ref, so a
-    // single shared key would diverge from what reads and audits expect.
-    var vi: Ref = 0;
-    if (def.indexed) {
-        vi = try Index.create(txn);
-        const Sink = struct {
-            txn: *WriteTxn,
-            vi: *Ref,
-            col: Ref,
-            fn onEntry(self: @This(), okey: u64, row: u64) anyerror!void {
-                const raw = try Column.get(self.txn, self.col, row);
-                self.vi.* = try rows.viAdd(self.txn, self.vi.*, raw, okey);
-            }
-        };
-        try Index.forEachEntry(txn, s.keyrow_index_ref, Sink{ .txn = txn, .vi = &vi, .col = new_col }, Sink.onEntry);
-    }
-
-    s.props[pc] = .{
-        .col = new_col,
-        .kind = def.kind,
-        .elem = def.elem,
-        .backlink = if (def.kind == .link or def.kind == .link_set) try Index.create(txn) else 0,
-        .target = def.link_target,
-        .rule = def.del_rule,
-        .value_index = vi,
-        .indexed = def.indexed,
+// Backfill the new property's value index for existing LIVE rows: the query
+// planner trusts the indexed flag, so an empty index would silently drop
+// every pre-migration row from indexed queries (and fail the integrity
+// audit). Each row is indexed under its OWN raw column value (mirroring the
+// insert path) -- blob backfills give every row a distinct ref, so a single
+// shared key would diverge from what reads and audits expect.
+fn backfillValueIndex(txn: *WriteTxn, keyrow_ref: Ref, new_col: Ref) !Ref {
+    var vi = try Index.create(txn);
+    const Sink = struct {
+        txn: *WriteTxn,
+        vi: *Ref,
+        col: Ref,
+        fn onEntry(self: @This(), okey: u64, row: u64) anyerror!void {
+            const raw = try Column.get(self.txn, self.col, row);
+            self.vi.* = try rows.viAdd(self.txn, self.vi.*, raw, okey);
+        }
     };
-    s.prop_count = pc + 1;
-    return s.replace(txn);
+    try Index.forEachEntry(txn, keyrow_ref, Sink{ .txn = txn, .vi = &vi, .col = new_col }, Sink.onEntry);
+    return vi;
 }
 
 // Copy a blob's bytes into a fresh node, returning the new ref. Used by the

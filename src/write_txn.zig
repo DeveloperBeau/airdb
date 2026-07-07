@@ -168,11 +168,51 @@ pub const WriteTxn = struct {
         const prev_active_slot = db.store.header.active_slot;
         const prev_logical_size = db.store.header.logical_size;
 
-        // --- Build the new persistent free list ---
-        //
-        // errdefer fires on any error return (including the two explicit error.Durability
-        // returns below). It does NOT fire on the success return, so ownership transfer
-        // to db.free_list at the end of the success path is safe and double-free-free.
+        // Protocol steps 1-2: build + encode the new persistent free list,
+        // then write the new slot descriptor and ring entry. The errdefer
+        // fires on any error return (including the two explicit
+        // error.Durability returns below). It does NOT fire on the success
+        // return, so ownership transfer to db.free_list at the end of the
+        // success path is safe and double-free-free.
+        var new_fl = try self.buildNewFreeList();
+        errdefer new_fl.deinit();
+        const chain = try self.encodeFreeListChain(&new_fl);
+        const inactive_idx = self.writeSlotAndRing(prev_active_slot, chain.head_ref);
+
+        // Step 3: flush new data + inactive slot to durable storage.
+        // Failure here: old active slot is still valid; no in-memory state
+        // changed. Cleanup (including the unlock) is the errdefer's job.
+        db.store.syncer.flush(db.store.file) catch return error.Durability;
+
+        // Steps 4-5: flip the header commit pointer and flush (commit point).
+        try self.flipCommitPointer(inactive_idx, prev_active_slot, prev_logical_size);
+
+        // Step 6: publish the new version in memory only after both flushes succeed.
+        db.active_version = self.new_version;
+        db.active_root = self.new_root;
+        db.coord.setLatestVersion(self.new_version);
+        // Install the new free list. errdefer for new_fl will NOT fire here
+        // because we are on the success return path (return self.new_version below).
+        db.free_list.deinit();
+        db.free_list = new_fl; // ownership transferred; do not call new_fl.deinit()
+        db.free_list_node_ref = chain.head_ref;
+        db.free_list_node_len = chain.head_len;
+        self.done = true; // a later deinit must not roll back the committed state
+        self.in_flight_frees.deinit(self.db.store.allocator);
+        self.work_freelist.deinit();
+        self.txn_reuse.deinit();
+        self.db.coord.unlock();
+        return self.new_version;
+    }
+
+    /// Commit phase: build the new persistent free list from what this
+    /// transaction left reusable -- the surviving work_freelist extents, the
+    /// in-flight frees (tagged with new_version; not yet reusable), the OLD
+    /// free-list chain's own chunks, and any leftover transaction-private
+    /// nodes. The caller owns the returned list (register errdefer deinit
+    /// immediately). O(extent count).
+    fn buildNewFreeList(self: *WriteTxn) !FreeList {
+        const db = self.db;
         var new_fl = FreeList.init(db.store.allocator);
         errdefer new_fl.deinit();
 
@@ -218,14 +258,23 @@ pub const WriteTxn = struct {
             try new_fl.add(.{ .offset = e.offset, .len = e.len, .freed_version = self.new_version });
         }
         db.fl_rebuild_ns += @intCast(Io.Clock.now(.awake, rebuild_io).nanoseconds - rebuild_start);
+        return new_fl;
+    }
 
-        // 4. Encode the new free list onto the arena via BUMP allocations
-        //    (never reuse, to avoid recursion: the chunks must not reference
-        //    themselves), growing the file if the arena is full. The list is
-        //    persisted as a chain of bounded chunks -- a single node's size
-        //    grows with the extent count, and past the section cap its
-        //    allocation failed the commit outright with error.AllocTooLarge.
-        //    Chunks are written back-to-front so each knows its successor.
+    /// The on-disk location of an encoded free-list chain: the head chunk's
+    /// ref and byte length (0/0 for an empty chain of zero chunks -- never
+    /// produced, a single empty chunk is always written).
+    const FreeListChain = struct { head_ref: u64, head_len: usize };
+
+    /// Commit phase: encode the new free list onto the arena via BUMP
+    /// allocations (never reuse, to avoid recursion: the chunks must not
+    /// reference themselves), growing the file if the arena is full. The list
+    /// is persisted as a chain of bounded chunks -- a single node's size grows
+    /// with the extent count, and past the section cap its allocation failed
+    /// the commit outright with error.AllocTooLarge. Chunks are written
+    /// back-to-front so each knows its successor. O(extent count) plus I/O.
+    fn encodeFreeListChain(self: *WriteTxn, new_fl: *const FreeList) !FreeListChain {
+        const db = self.db;
         const enc_io = std.Io.Threaded.global_single_threaded.io();
         const enc_start = Io.Clock.now(.awake, enc_io).nanoseconds;
         const items = new_fl.extents.items;
@@ -249,19 +298,27 @@ pub const WriteTxn = struct {
         db.fl_encode_ns += @intCast(Io.Clock.now(.awake, enc_io).nanoseconds - enc_start);
         db.fl_extents_encoded += items.len;
         db.commit_count += 1;
+        return .{ .head_ref = head_ref, .head_len = head_len };
+    }
 
-        // --- Two-slot atomic durable commit ---
+    /// Commit phase (protocol step 2): write the new slot descriptor into
+    /// the INACTIVE slot region and record (new_version, new_root) in the
+    /// version->root ring. Mapped-memory writes only -- nothing is durable
+    /// until the step-3 flush. Returns the inactive slot index for the
+    /// commit-point flip.
+    fn writeSlotAndRing(self: *WriteTxn, prev_active_slot: u8, free_list_head_ref: u64) u8 {
+        const db = self.db;
 
-        // Step 1: determine the inactive slot and its byte offset.
+        // Determine the inactive slot and its byte offset.
         const inactive_idx: u8 = if (prev_active_slot == 0) 1 else 0;
         const inactive_off: usize = if (inactive_idx == 0) slot_a_off else slot_b_off;
 
-        // Step 2: write the new slot descriptor into the inactive region.
+        // Write the new slot descriptor into the inactive region.
         // logical_size is captured AFTER the node alloc so it covers the node bytes.
         const new_slot = Slot{
             .version = self.new_version,
             .root_ref = self.new_root,
-            .free_list_ref = head_ref,
+            .free_list_ref = free_list_head_ref,
             .logical_size = @intCast(db.arena.top),
         };
         new_slot.encode(db.store.map[inactive_off..][0..Slot.size]);
@@ -279,12 +336,16 @@ pub const WriteTxn = struct {
         std.mem.writeInt(u64, db.store.map[e + 8 ..][0..8], self.new_root, .little);
         std.mem.writeInt(u64, db.store.map[ring_head_off..][0..8], head + 1, .little);
 
-        // Step 3: flush new data + inactive slot to durable storage.
-        // Failure here: old active slot is still valid; no in-memory state
-        // changed. Cleanup (including the unlock) is the errdefer's job.
-        db.store.syncer.flush(db.store.file) catch return error.Durability;
+        return inactive_idx;
+    }
 
-        // Step 4: flip the header commit pointer and flush (commit point).
+    /// Commit phase (protocol steps 4-5): flip header.active_slot to the
+    /// newly-written slot and flush -- the commit point. On a failed flush,
+    /// revert every in-memory header change so the old version stays live,
+    /// poison the instance (the commit's on-disk fate is indeterminate), and
+    /// return error.Durability.
+    fn flipCommitPointer(self: *WriteTxn, inactive_idx: u8, prev_active_slot: u8, prev_logical_size: u64) !void {
+        const db = self.db;
         db.store.header.active_slot = inactive_idx;
         db.store.header.logical_size = @intCast(db.arena.top);
         db.store.persistHeader();
@@ -303,23 +364,6 @@ pub const WriteTxn = struct {
             db.poisoned = true;
             return error.Durability;
         };
-
-        // Step 5: publish the new version in memory only after both flushes succeed.
-        db.active_version = self.new_version;
-        db.active_root = self.new_root;
-        db.coord.setLatestVersion(self.new_version);
-        // Install the new free list. errdefer for new_fl will NOT fire here
-        // because we are on the success return path (return self.new_version below).
-        db.free_list.deinit();
-        db.free_list = new_fl; // ownership transferred; do not call new_fl.deinit()
-        db.free_list_node_ref = head_ref;
-        db.free_list_node_len = head_len;
-        self.done = true; // a later deinit must not roll back the committed state
-        self.in_flight_frees.deinit(self.db.store.allocator);
-        self.work_freelist.deinit();
-        self.txn_reuse.deinit();
-        self.db.coord.unlock();
-        return self.new_version;
     }
 };
 

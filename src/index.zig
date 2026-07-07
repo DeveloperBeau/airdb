@@ -190,7 +190,10 @@ fn minKey(txn: anytype, ref: Ref) !u64 {
 }
 
 /// Recursive insert. Returns the (possibly new) node ref and an optional right
-/// sibling produced by a midpoint split.
+/// sibling produced by a midpoint split. Deliberately one long function: it is
+/// a single-pass B+tree insert whose leaf/inner upsert, shift, and
+/// midpoint-split cases all share the split-propagation state -- one
+/// irreducible algorithm rather than separable steps.
 fn insertInto(txn: anytype, node_ref: Ref, key: u64, val: u64, depth: usize) !InsertResult {
     if (depth >= max_depth) return error.Corrupt;
     const node_bytes = try txn.deref(node_ref, 1);
