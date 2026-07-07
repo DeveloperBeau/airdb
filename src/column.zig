@@ -169,6 +169,218 @@ pub fn append(txn: anytype, root: Ref, value: u64) !Ref {
     return a.ref;
 }
 
+// ---------------------------------------------------------------------------
+// Bottom-up level builders and right-edge run append.
+//
+// These build complete tree levels directly from input values rather than
+// appending one value at a time. The produced nodes are byte-for-byte the same
+// on-disk format the sequential readers expect, so a bulk-built tree is
+// indistinguishable from one grown via the normal append path.
+// ---------------------------------------------------------------------------
+
+/// A node together with the value count of its subtree, which its parent
+/// records alongside the child ref. The per-level work item of the bottom-up
+/// builders (packLeaves, stackInner, appendRun). Unlike the index's Child
+/// (which carries a low key), a column inner node stores (child_ref,
+/// subtree_count) and a parent's own count is the SUM of its children's counts.
+pub const Child = struct { ref: u64, count: u64 };
+
+/// Pack `values` into leaves filled to LEAF_CAP in row order. Returns the leaf
+/// level: one Child per leaf, count == the number of values in that leaf.
+pub fn packLeaves(
+    txn: anytype,
+    values: []const u64,
+    allocator: std.mem.Allocator,
+) !std.ArrayList(Child) {
+    var out = std.ArrayList(Child).empty;
+    errdefer out.deinit(allocator);
+    const cap: usize = LEAF_CAP;
+    var i: usize = 0;
+    while (i < values.len) {
+        const end = @min(i + cap, values.len);
+        const a = try txn.alloc(leaf_node_size);
+        _ = encodeLeaf(a.bytes, values[i..end]);
+        try out.append(allocator, .{ .ref = a.ref, .count = @intCast(end - i) });
+        i = end;
+    }
+    return out;
+}
+
+/// Build one inner level over `children`, packed in runs of FANOUT. A column
+/// inner node stores (child_ref, subtree_count); a parent's count is the SUM
+/// of its children's counts, so each emitted node's count == the total of its
+/// run.
+pub fn stackInner(
+    txn: anytype,
+    children: []const Child,
+    allocator: std.mem.Allocator,
+) !std.ArrayList(Child) {
+    var out = std.ArrayList(Child).empty;
+    errdefer out.deinit(allocator);
+    const fan: usize = FANOUT;
+    var refs: [FANOUT]u64 = undefined;
+    var counts: [FANOUT]u64 = undefined;
+    var j: usize = 0;
+    while (j < children.len) {
+        const end = @min(j + fan, children.len);
+        var total: u64 = 0;
+        var k: usize = j;
+        while (k < end) : (k += 1) {
+            refs[k - j] = children[k].ref;
+            counts[k - j] = children[k].count;
+            total += children[k].count;
+        }
+        const cnt = end - j;
+        const a = try txn.alloc(inner_node_size);
+        _ = encodeInner(a.bytes, refs[0..cnt], counts[0..cnt]);
+        try out.append(allocator, .{ .ref = a.ref, .count = total });
+        j = end;
+    }
+    return out;
+}
+
+/// Stack inner levels over `level` until a single node remains, growing the
+/// tree height as needed. Replaces `level` in place; the survivor is the root.
+pub fn collapseToRoot(
+    txn: anytype,
+    level: *std.ArrayList(Child),
+    allocator: std.mem.Allocator,
+) !void {
+    while (level.items.len > 1) {
+        const next = try stackInner(txn, level.items, allocator);
+        level.deinit(allocator);
+        level.* = next;
+    }
+}
+
+/// Descend the rightmost root-to-leaf path (always the last child), recording
+/// each inner node and the index of its rightmost child, and return the
+/// rightmost leaf's ref. No arena allocation occurs here, so the deref'd node
+/// bytes stay valid for the duration of each iteration.
+fn descendRightEdge(
+    txn: anytype,
+    root: Ref,
+    path_refs: *std.ArrayList(Ref),
+    path_ridx: *std.ArrayList(usize),
+    allocator: std.mem.Allocator,
+) !Ref {
+    var cur: Ref = root;
+    var hops: usize = 0;
+    while (true) : (hops += 1) {
+        if (hops >= max_depth) return error.Corrupt; // ref cycle guard
+        const nb = try derefNode(txn, cur);
+        if (nb[0] == kind_leaf) return cur;
+        const iv = try parseInner(nb);
+        const ri: usize = @as(usize, iv.child_count) - 1;
+        const child = iv.childRef(ri);
+        try path_refs.append(allocator, cur);
+        try path_ridx.append(allocator, ri);
+        cur = child;
+    }
+}
+
+/// Gather the rightmost leaf's existing values followed by the run into a heap
+/// buffer (heap allocation never remaps the arena, so the leaf bytes stay
+/// valid while they are copied out). The caller owns the returned slice.
+fn combineLeafAndRun(
+    txn: anytype,
+    leaf_ref: Ref,
+    values: []const u64,
+    allocator: std.mem.Allocator,
+) ![]u64 {
+    const lv = try parseLeaf(try derefNode(txn, leaf_ref));
+    const total: usize = @as(usize, lv.count) + values.len;
+    const cvals = try allocator.alloc(u64, total);
+    var t: usize = 0;
+    while (t < lv.count) : (t += 1) cvals[t] = lv.value(t);
+    for (values) |v| {
+        cvals[t] = v;
+        t += 1;
+    }
+    return cvals;
+}
+
+/// Rebuild the rightmost inner spine bottom-up. At each recorded path level,
+/// the shared LEFT children (all but the rightmost) are re-emitted unchanged
+/// with their (ref, subtree_count), and the rightmost child is replaced by the
+/// level rebuilt below, which may have grown into several nodes. Packing in
+/// runs of FANOUT splits automatically on overflow; the extra nodes propagate
+/// up as additional children of the next level. Replaces `level` in place.
+fn rebuildRightSpine(
+    txn: anytype,
+    path_refs: []const Ref,
+    path_ridx: []const usize,
+    level: *std.ArrayList(Child),
+    allocator: std.mem.Allocator,
+) !void {
+    var i: usize = path_refs.len;
+    while (i > 0) {
+        i -= 1;
+        const iv = try parseInner(try derefNode(txn, path_refs[i]));
+        const ri = path_ridx[i];
+        var full = std.ArrayList(Child).empty;
+        defer full.deinit(allocator);
+        var j: usize = 0;
+        while (j < ri) : (j += 1) {
+            try full.append(allocator, .{ .ref = iv.childRef(j), .count = iv.childCount(j) });
+        }
+        for (level.items) |c| try full.append(allocator, c);
+        const next = try stackInner(txn, full.items, allocator);
+        level.deinit(allocator);
+        level.* = next;
+    }
+}
+
+/// Append a run of `values` to the RIGHT EDGE of the column rooted at `root`,
+/// returning the new root Ref. Columns are keyed by row index, so a run always
+/// lands at the end. Only the rightmost root-to-leaf path is rebuilt; every
+/// left subtree is shared unchanged (copy-on-write: shared nodes are never
+/// mutated). The result is logically identical to appending every value via
+/// append. An empty run returns `root` unchanged.
+pub fn appendRun(
+    txn: anytype,
+    root: Ref,
+    values: []const u64,
+    allocator: std.mem.Allocator,
+) !Ref {
+    if (values.len == 0) return root;
+
+    // 1. Record the rightmost path: it is the only part of the tree rebuilt.
+    var path_refs = std.ArrayList(Ref).empty;
+    defer path_refs.deinit(allocator);
+    var path_ridx = std.ArrayList(usize).empty;
+    defer path_ridx.deinit(allocator);
+    const leaf_ref = try descendRightEdge(txn, root, &path_refs, &path_ridx, allocator);
+
+    // 2. Combine the rightmost leaf's values with the run, then pack the
+    //    combined run into leaves filled to LEAF_CAP: the first new leaf reuses
+    //    the old leaf's content topped up from the front of the run, the rest
+    //    are full leaves.
+    const cvals = try combineLeafAndRun(txn, leaf_ref, values, allocator);
+    defer allocator.free(cvals);
+    var level = try packLeaves(txn, cvals, allocator);
+    errdefer level.deinit(allocator);
+
+    // 3. Rebuild the rightmost inner spine bottom-up, then stack further inner
+    //    levels until a single root remains (the rebuilt root level may have
+    //    overflowed FANOUT into several nodes), growing the tree height by one
+    //    or more as needed.
+    try rebuildRightSpine(txn, path_refs.items, path_ridx.items, &level, allocator);
+    try collapseToRoot(txn, &level, allocator);
+
+    const result = level.items[0].ref;
+
+    // 4. Free the replaced right-edge nodes (old rightmost leaf + old spine),
+    //    exactly as the index appendRun does: they are unreferenced by the new
+    //    tree. Frees run before the manual deinit so the errdefer never
+    //    double-frees.
+    try txn.free(leaf_ref, leaf_node_size);
+    for (path_refs.items) |old_ref| try txn.free(old_ref, inner_node_size);
+
+    level.deinit(allocator);
+    return result;
+}
+
 /// Recursive copy-on-write set: copies only the nodes on the path from root to
 /// the target leaf. Sibling subtrees are shared by reference, so the old root
 /// remains a valid, unchanged snapshot after the call returns.

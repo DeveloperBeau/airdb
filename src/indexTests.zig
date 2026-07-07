@@ -17,6 +17,7 @@ const maxKey = index.maxKey;
 const forEachKey = index.forEachKey;
 const forEachEntry = index.forEachEntry;
 const forEachEntryInRange = index.forEachEntryInRange;
+const appendRun = index.appendRun;
 const makeInnerForTest = index.makeInnerForTest;
 
 const leaf_node_size = node.leaf_node_size;
@@ -523,4 +524,150 @@ test "ordered index persists across reopen and matches a reference map under chu
         }
         r.end();
     }
+}
+
+fn appendRunVal(k: u64) u64 {
+    return k *% 7 +% 3;
+}
+
+fn appendTmpDb(tmp: *testing.TmpDir, name: []const u8) !Db {
+    const path = try idxTmpPath(testing.allocator, tmp, name);
+    defer testing.allocator.free(path);
+    return Db.create(testing.allocator, path);
+}
+
+// Build a base tree of keys 0..base via sequential insert, append the run
+// base..base+run via appendRun, and assert the result is logically identical
+// to inserting all keys 0..base+run sequentially.
+fn checkAppendEquiv(w: *WriteTxn, base: u64, run: u64) !void {
+    var base_root = try create(w);
+    var k: u64 = 0;
+    while (k < base) : (k += 1) base_root = try insert(w, base_root, k, appendRunVal(k));
+
+    const rk = try testing.allocator.alloc(u64, run);
+    defer testing.allocator.free(rk);
+    const rv = try testing.allocator.alloc(u64, run);
+    defer testing.allocator.free(rv);
+    var r: u64 = 0;
+    while (r < run) : (r += 1) {
+        rk[r] = base + r;
+        rv[r] = appendRunVal(base + r);
+    }
+
+    const appended = try appendRun(w, base_root, rk, rv, testing.allocator);
+
+    var expected = try create(w);
+    k = 0;
+    while (k < base + run) : (k += 1) expected = try insert(w, expected, k, appendRunVal(k));
+
+    const total = base + run;
+    try testing.expectEqual(total, try count(w, appended));
+    try testing.expectEqual(try count(w, expected), try count(w, appended));
+
+    // Boundary + sampled get checks (compared against the sequential twin).
+    var samples = std.ArrayList(u64).empty;
+    defer samples.deinit(testing.allocator);
+    if (total > 0) {
+        try samples.append(testing.allocator, 0); // first key
+        try samples.append(testing.allocator, total - 1); // last key
+    }
+    if (base > 0) {
+        try samples.append(testing.allocator, base - 1); // seam: last base key
+        try samples.append(testing.allocator, base); // seam: first run key (== total when run == 0)
+    }
+    if (total > 4) {
+        try samples.append(testing.allocator, total / 4);
+        try samples.append(testing.allocator, total / 2);
+        try samples.append(testing.allocator, (3 * total) / 4);
+    }
+    for (samples.items) |sk| {
+        try testing.expectEqual(try get(w, expected, sk), try get(w, appended, sk));
+    }
+    // Beyond the max key is absent in both.
+    try testing.expectEqual(@as(?u64, null), try get(w, appended, total));
+    try testing.expectEqual(try get(w, expected, total), try get(w, appended, total));
+
+    // Full ascending (key,val) sequence must match exactly.
+    var ak = std.ArrayList(u64).empty;
+    defer ak.deinit(testing.allocator);
+    var av = std.ArrayList(u64).empty;
+    defer av.deinit(testing.allocator);
+    var ek = std.ArrayList(u64).empty;
+    defer ek.deinit(testing.allocator);
+    var ev = std.ArrayList(u64).empty;
+    defer ev.deinit(testing.allocator);
+    try forEachEntry(w, appended, RangeCollector{ .keys = &ak, .vals = &av }, RangeCollector.onEntry);
+    try forEachEntry(w, expected, RangeCollector{ .keys = &ek, .vals = &ev }, RangeCollector.onEntry);
+    try testing.expectEqualSlices(u64, ek.items, ak.items);
+    try testing.expectEqualSlices(u64, ev.items, av.items);
+}
+
+test "appendRun partial last leaf then new leaves" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try appendTmpDb(&tmp, "append1.airdb");
+    defer db.deinit();
+    var w = try db.beginWrite();
+    try checkAppendEquiv(&w, 100, 200); // 100 % 64 == 36 in the last leaf
+    w.deinit();
+}
+
+test "appendRun overflow rightmost inner node" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try appendTmpDb(&tmp, "append2.airdb");
+    defer db.deinit();
+    var w = try db.beginWrite();
+    // A multi-level base plus a run large enough that the new leaves alone
+    // exceed FANOUT, forcing a split at the leaf-parent (non-root) inner level.
+    try checkAppendEquiv(&w, 3000, 5000);
+    w.deinit();
+}
+
+test "appendRun grows tree height by one" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try appendTmpDb(&tmp, "append3.airdb");
+    defer db.deinit();
+    var w = try db.beginWrite();
+    // Single-leaf base, run crossing FANOUT*LEAF_CAP (== 4096) so the result
+    // must be three levels tall.
+    try checkAppendEquiv(&w, 50, 4200);
+    w.deinit();
+}
+
+test "appendRun single-leaf base tree" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try appendTmpDb(&tmp, "append4.airdb");
+    defer db.deinit();
+    var w = try db.beginWrite();
+    try checkAppendEquiv(&w, 40, 50); // base < LEAF_CAP
+    w.deinit();
+}
+
+test "appendRun run far larger than base" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try appendTmpDb(&tmp, "append5.airdb");
+    defer db.deinit();
+    var w = try db.beginWrite();
+    try checkAppendEquiv(&w, 10, 5000);
+    w.deinit();
+}
+
+test "appendRun empty run is a no-op" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try appendTmpDb(&tmp, "append6.airdb");
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var base_root = try create(&w);
+    var k: u64 = 0;
+    while (k < 100) : (k += 1) base_root = try insert(&w, base_root, k, appendRunVal(k));
+    const before = try count(&w, base_root);
+    const appended = try appendRun(&w, base_root, &.{}, &.{}, testing.allocator);
+    try testing.expectEqual(base_root, appended); // same ref, unchanged
+    try testing.expectEqual(before, try count(&w, appended));
+    w.deinit();
 }

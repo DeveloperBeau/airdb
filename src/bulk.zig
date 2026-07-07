@@ -3,7 +3,6 @@ const WriteTxn = @import("db.zig").WriteTxn;
 const Ref = @import("ref.zig").Ref;
 const Column = @import("column.zig");
 const Index = @import("index.zig");
-const cnode = @import("column_node.zig");
 const inode = @import("index_node.zig");
 const catalog = @import("catalog.zig");
 const rawRows = @import("rows.zig");
@@ -19,82 +18,11 @@ const max_prop_count = catalog.max_prop_count;
 // These build a complete, balanced tree directly from sorted input rather than
 // inserting one element at a time. Leaves are packed to capacity in key order,
 // then inner levels are stacked on top in runs of FANOUT until a single root
-// remains. The produced nodes are byte-for-byte the same on-disk format the
-// sequential readers expect, so a bulk-built tree is indistinguishable from one
-// grown via the normal append/insert path.
+// remains (packLeaves/stackInner/collapseToRoot live with each tree's own
+// operations in column.zig and index.zig).
 // ---------------------------------------------------------------------------
 
 pub const ValueOkeys = struct { value: u64, okeys: []const u64 };
-
-// A column tree node together with the value count of its subtree, which its
-// parent records alongside the child ref. Used as the per-level work item by the
-// bottom-up column builders below. Unlike the index's SpineChild (which carries a
-// low key), a column inner node stores (child_ref, subtree_count) and a parent's
-// own count is the SUM of its children's counts.
-const ColChild = struct { ref: u64, count: u64 };
-
-// Deref a column node, sizing the read by its kind byte (leaf vs inner).
-fn derefColNode(txn: *WriteTxn, ref: Ref) ![]const u8 {
-    const kb = try txn.deref(ref, 1);
-    return switch (kb[0]) {
-        cnode.kind_leaf => txn.deref(ref, cnode.leaf_node_size),
-        cnode.kind_inner => txn.deref(ref, cnode.inner_node_size),
-        else => error.Corrupt,
-    };
-}
-
-// Pack `values` into leaves filled to LEAF_CAP in row order. Returns the leaf
-// level: one ColChild per leaf, count == the number of values in that leaf.
-fn packColumnLeaves(
-    txn: *WriteTxn,
-    values: []const u64,
-    al: std.mem.Allocator,
-) !std.ArrayList(ColChild) {
-    var out = std.ArrayList(ColChild).empty;
-    errdefer out.deinit(al);
-    const cap: usize = cnode.LEAF_CAP;
-    var i: usize = 0;
-    while (i < values.len) {
-        const end = @min(i + cap, values.len);
-        const a = try txn.alloc(cnode.leaf_node_size);
-        _ = cnode.encodeLeaf(a.bytes, values[i..end]);
-        try out.append(al, .{ .ref = a.ref, .count = @intCast(end - i) });
-        i = end;
-    }
-    return out;
-}
-
-// Build one inner level over `children`, packed in runs of FANOUT. A column
-// inner node stores (child_ref, subtree_count); a parent's count is the SUM of
-// its children's counts, so each emitted node's count == the total of its run.
-fn stackColumnInner(
-    txn: *WriteTxn,
-    children: []const ColChild,
-    al: std.mem.Allocator,
-) !std.ArrayList(ColChild) {
-    var out = std.ArrayList(ColChild).empty;
-    errdefer out.deinit(al);
-    const fan: usize = cnode.FANOUT;
-    var refs: [cnode.FANOUT]u64 = undefined;
-    var counts: [cnode.FANOUT]u64 = undefined;
-    var j: usize = 0;
-    while (j < children.len) {
-        const end = @min(j + fan, children.len);
-        var total: u64 = 0;
-        var k: usize = j;
-        while (k < end) : (k += 1) {
-            refs[k - j] = children[k].ref;
-            counts[k - j] = children[k].count;
-            total += children[k].count;
-        }
-        const cnt = end - j;
-        const a = try txn.alloc(cnode.inner_node_size);
-        _ = cnode.encodeInner(a.bytes, refs[0..cnt], counts[0..cnt]);
-        try out.append(al, .{ .ref = a.ref, .count = total });
-        j = end;
-    }
-    return out;
-}
 
 /// Build a column tree holding `values` at row indices 0..values.len. Returns
 /// the root Ref. Equivalent to Column.create followed by an append per value.
@@ -103,20 +31,11 @@ pub fn bulkColumn(txn: *WriteTxn, values: []const u64) !Ref {
     const al = txn.db.store.allocator;
 
     // Pack leaves, then stack inner levels until a single root remains.
-    var level = try packColumnLeaves(txn, values, al);
+    var level = try Column.packLeaves(txn, values, al);
     defer level.deinit(al);
-    while (level.items.len > 1) {
-        const next = try stackColumnInner(txn, level.items, al);
-        level.deinit(al);
-        level = next;
-    }
+    try Column.collapseToRoot(txn, &level, al);
     return level.items[0].ref;
 }
-
-// An index B+tree node together with the low key (smallest key in its subtree)
-// and its subtree entry count, both of which its parent records for it. Used as
-// the per-level work item by the bottom-up index builders below.
-const SpineChild = struct { ref: u64, low: u64, count: u64 };
 
 // Deref an index node, sizing the read by its kind byte (leaf vs inner).
 fn derefIdxNode(txn: *WriteTxn, ref: Ref) ![]const u8 {
@@ -150,63 +69,6 @@ fn emptyRightmostLow(txn: *WriteTxn, root: Ref) !?u64 {
     }
 }
 
-// Pack strictly-ascending (keys, vals) into leaves filled to LEAF_CAP in key
-// order. Returns the leaf level: one SpineChild per leaf, low == its first key.
-fn packIndexLeaves(
-    txn: *WriteTxn,
-    keys: []const u64,
-    vals: []const u64,
-    al: std.mem.Allocator,
-) !std.ArrayList(SpineChild) {
-    std.debug.assert(keys.len == vals.len);
-    var out = std.ArrayList(SpineChild).empty;
-    errdefer out.deinit(al);
-    const cap: usize = inode.LEAF_CAP;
-    var i: usize = 0;
-    while (i < keys.len) {
-        const end = @min(i + cap, keys.len);
-        const a = try txn.alloc(inode.leaf_node_size);
-        _ = inode.encodeLeaf(a.bytes, keys[i..end], vals[i..end]);
-        try out.append(al, .{ .ref = a.ref, .low = keys[i], .count = @intCast(end - i) });
-        i = end;
-    }
-    return out;
-}
-
-// Build one inner level over `children`, packed in runs of FANOUT. An index
-// inner node stores (child_ref, low_key, subtree_count); a parent's low key is
-// the low key of its first child and its count is the sum of its run.
-fn stackIndexInner(
-    txn: *WriteTxn,
-    children: []const SpineChild,
-    al: std.mem.Allocator,
-) !std.ArrayList(SpineChild) {
-    var out = std.ArrayList(SpineChild).empty;
-    errdefer out.deinit(al);
-    const fan: usize = inode.FANOUT;
-    var refs: [inode.FANOUT]u64 = undefined;
-    var lows: [inode.FANOUT]u64 = undefined;
-    var counts: [inode.FANOUT]u64 = undefined;
-    var j: usize = 0;
-    while (j < children.len) {
-        const end = @min(j + fan, children.len);
-        var total: u64 = 0;
-        var k: usize = j;
-        while (k < end) : (k += 1) {
-            refs[k - j] = children[k].ref;
-            lows[k - j] = children[k].low;
-            counts[k - j] = children[k].count;
-            total += children[k].count;
-        }
-        const cnt = end - j;
-        const a = try txn.alloc(inode.inner_node_size);
-        _ = inode.encodeInner(a.bytes, refs[0..cnt], lows[0..cnt], counts[0..cnt]);
-        try out.append(al, .{ .ref = a.ref, .low = children[j].low, .count = total });
-        j = end;
-    }
-    return out;
-}
-
 /// Build a u64 index over strictly-ascending `keys` with parallel `vals`.
 /// Returns the root Ref. Equivalent to Index.create plus an insert per pair.
 pub fn bulkIndex(txn: *WriteTxn, keys: []const u64, vals: []const u64) !Ref {
@@ -219,234 +81,10 @@ pub fn bulkIndex(txn: *WriteTxn, keys: []const u64, vals: []const u64) !Ref {
     const al = txn.db.store.allocator;
 
     // Pack leaves, then stack inner levels until a single root remains.
-    var level = try packIndexLeaves(txn, keys, vals, al);
+    var level = try Index.packLeaves(txn, keys, vals, al);
     defer level.deinit(al);
-    while (level.items.len > 1) {
-        const next = try stackIndexInner(txn, level.items, al);
-        level.deinit(al);
-        level = next;
-    }
+    try Index.collapseToRoot(txn, &level, al);
     return level.items[0].ref;
-}
-
-/// Append a sorted run of (keys, vals) whose keys ALL exceed the tree's current
-/// max key to the RIGHT EDGE of the index rooted at `root`, returning the new
-/// root Ref. Only the rightmost root-to-leaf path is rebuilt; every left
-/// subtree is shared unchanged (copy-on-write: shared nodes are never mutated).
-/// The result is logically identical to inserting every pair via Index.insert.
-///
-/// Preconditions (asserted under runtime safety): keys.len == vals.len, keys are
-/// strictly ascending, and keys[0] is greater than the tree's current max key.
-/// An empty run returns `root` unchanged.
-pub fn indexAppendRun(txn: *WriteTxn, root: Ref, keys: []const u64, vals: []const u64) !Ref {
-    std.debug.assert(keys.len == vals.len);
-    if (keys.len == 0) return root;
-    if (std.debug.runtime_safety) {
-        var q: usize = 1;
-        while (q < keys.len) : (q += 1) std.debug.assert(keys[q] > keys[q - 1]);
-    }
-    const al = txn.db.store.allocator;
-
-    // 1. Descend the rightmost path, recording each inner node and the index of
-    //    its rightmost child. No allocation from the arena occurs here, so the
-    //    deref'd node bytes stay valid for the duration of each iteration.
-    var path_refs = std.ArrayList(Ref).empty;
-    defer path_refs.deinit(al);
-    var path_ridx = std.ArrayList(usize).empty;
-    defer path_ridx.deinit(al);
-    var cur: Ref = root;
-    var leaf_ref: Ref = root;
-    var hops: usize = 0;
-    while (true) : (hops += 1) {
-        if (hops >= Index.max_depth) return error.Corrupt; // ref cycle guard
-        const nb = try derefIdxNode(txn, cur);
-        if (nb[0] == inode.kind_leaf) {
-            leaf_ref = cur;
-            break;
-        }
-        const iv = try inode.parseInner(nb);
-        const ri: usize = iv.child_count - 1;
-        const child = iv.childRef(ri);
-        try path_refs.append(al, cur);
-        try path_ridx.append(al, ri);
-        cur = child;
-    }
-
-    // 2. Gather the rightmost leaf's existing pairs followed by the run into a
-    //    heap buffer (heap allocation never remaps the arena, so the leaf bytes
-    //    stay valid while we copy them out). Then pack the combined run into
-    //    leaves filled to LEAF_CAP: the first new leaf reuses the old leaf's
-    //    content topped up from the front of the run, the rest are full leaves.
-    const lv = try inode.parseLeaf(try derefIdxNode(txn, leaf_ref));
-    if (std.debug.runtime_safety and lv.count > 0) {
-        std.debug.assert(keys[0] > lv.key(lv.count - 1));
-    }
-    const total: usize = @as(usize, lv.count) + keys.len;
-    const ck = try al.alloc(u64, total);
-    defer al.free(ck);
-    const cv = try al.alloc(u64, total);
-    defer al.free(cv);
-    {
-        var t: usize = 0;
-        while (t < lv.count) : (t += 1) {
-            ck[t] = lv.key(t);
-            cv[t] = lv.value(t);
-        }
-        for (keys, vals) |key, val| {
-            ck[t] = key;
-            cv[t] = val;
-            t += 1;
-        }
-    }
-
-    var level = try packIndexLeaves(txn, ck, cv, al);
-    errdefer level.deinit(al);
-
-    // 3. Rebuild the rightmost inner spine bottom-up. At each inner level, the
-    //    shared LEFT children (all but the rightmost) are re-emitted unchanged
-    //    and the rightmost child is replaced by the level rebuilt below, which
-    //    may have grown into several nodes. Packing in runs of FANOUT splits
-    //    automatically when the child list overflows; the extra nodes propagate
-    //    up as additional children of the next level.
-    var i: usize = path_refs.items.len;
-    while (i > 0) {
-        i -= 1;
-        const iv = try inode.parseInner(try derefIdxNode(txn, path_refs.items[i]));
-        const ri = path_ridx.items[i];
-        var full = std.ArrayList(SpineChild).empty;
-        defer full.deinit(al);
-        var j: usize = 0;
-        while (j < ri) : (j += 1) {
-            try full.append(al, .{ .ref = iv.childRef(j), .low = iv.lowKey(j), .count = iv.subtreeCount(j) });
-        }
-        for (level.items) |c| try full.append(al, c);
-        const next = try stackIndexInner(txn, full.items, al);
-        level.deinit(al);
-        level = next;
-    }
-
-    // 4. If the (rebuilt) root level overflowed FANOUT it is now several nodes;
-    //    stack further inner levels until a single root remains, growing the
-    //    tree height by one or more as needed.
-    while (level.items.len > 1) {
-        const next = try stackIndexInner(txn, level.items, al);
-        level.deinit(al);
-        level = next;
-    }
-
-    const result = level.items[0].ref;
-
-    // 5. Free the replaced right-edge nodes: the old rightmost leaf and every
-    //    inner node on the old rightmost path were rebuilt above and are no
-    //    longer referenced by the new tree. Committed nodes route to deferred
-    //    (MVCC-safe) reclaim; txn-private ones become immediately reusable.
-    //    These frees are fallible, so they run BEFORE the manual level.deinit:
-    //    the errdefer must never fire on an already-deinitialized list.
-    try txn.free(leaf_ref, inode.leaf_node_size);
-    for (path_refs.items) |old_ref| try txn.free(old_ref, inode.inner_node_size);
-
-    level.deinit(al);
-    return result;
-}
-
-/// Append a run of `values` to the RIGHT EDGE of the column rooted at `root`,
-/// returning the new root Ref. Columns are keyed by row index, so a run always
-/// lands at the end. Only the rightmost root-to-leaf path is rebuilt; every left
-/// subtree is shared unchanged (copy-on-write: shared nodes are never mutated).
-/// The result is logically identical to appending every value via Column.append.
-/// An empty run returns `root` unchanged.
-pub fn columnAppendRun(txn: *WriteTxn, root: Ref, values: []const u64) !Ref {
-    if (values.len == 0) return root;
-    const al = txn.db.store.allocator;
-
-    // 1. Descend the rightmost path (always the last child), recording each inner
-    //    node and the index of its rightmost child. No allocation from the arena
-    //    occurs here, so the deref'd node bytes stay valid for each iteration.
-    var path_refs = std.ArrayList(Ref).empty;
-    defer path_refs.deinit(al);
-    var path_ridx = std.ArrayList(usize).empty;
-    defer path_ridx.deinit(al);
-    var cur: Ref = root;
-    var leaf_ref: Ref = root;
-    var hops: usize = 0;
-    while (true) : (hops += 1) {
-        if (hops >= Column.max_depth) return error.Corrupt; // ref cycle guard
-        const nb = try derefColNode(txn, cur);
-        if (nb[0] == cnode.kind_leaf) {
-            leaf_ref = cur;
-            break;
-        }
-        const iv = try cnode.parseInner(nb);
-        const ri: usize = @as(usize, iv.child_count) - 1;
-        const child = iv.childRef(ri);
-        try path_refs.append(al, cur);
-        try path_ridx.append(al, ri);
-        cur = child;
-    }
-
-    // 2. Gather the rightmost leaf's existing values followed by the run into a
-    //    heap buffer (heap allocation never remaps the arena, so the leaf bytes
-    //    stay valid while we copy them out). Then pack the combined run into
-    //    leaves filled to LEAF_CAP: the first new leaf reuses the old leaf's
-    //    content topped up from the front of the run, the rest are full leaves.
-    const lv = try cnode.parseLeaf(try derefColNode(txn, leaf_ref));
-    const total: usize = @as(usize, lv.count) + values.len;
-    const cvals = try al.alloc(u64, total);
-    defer al.free(cvals);
-    {
-        var t: usize = 0;
-        while (t < lv.count) : (t += 1) cvals[t] = lv.value(t);
-        for (values) |v| {
-            cvals[t] = v;
-            t += 1;
-        }
-    }
-
-    var level = try packColumnLeaves(txn, cvals, al);
-    errdefer level.deinit(al);
-
-    // 3. Rebuild the rightmost inner spine bottom-up. At each inner level the
-    //    shared LEFT children (all but the rightmost) are re-emitted unchanged
-    //    with their (ref, subtree_count), and the rightmost child is replaced by
-    //    the level rebuilt below, which may have grown into several nodes.
-    //    Packing in runs of FANOUT splits automatically on overflow; the extra
-    //    nodes propagate up as additional children of the next level.
-    var i: usize = path_refs.items.len;
-    while (i > 0) {
-        i -= 1;
-        const iv = try cnode.parseInner(try derefColNode(txn, path_refs.items[i]));
-        const ri = path_ridx.items[i];
-        var full = std.ArrayList(ColChild).empty;
-        defer full.deinit(al);
-        var j: usize = 0;
-        while (j < ri) : (j += 1) {
-            try full.append(al, .{ .ref = iv.childRef(j), .count = iv.childCount(j) });
-        }
-        for (level.items) |c| try full.append(al, c);
-        const next = try stackColumnInner(txn, full.items, al);
-        level.deinit(al);
-        level = next;
-    }
-
-    // 4. If the (rebuilt) root level overflowed FANOUT it is now several nodes;
-    //    stack further inner levels until a single root remains, growing the
-    //    tree height by one or more as needed.
-    while (level.items.len > 1) {
-        const next = try stackColumnInner(txn, level.items, al);
-        level.deinit(al);
-        level = next;
-    }
-
-    const result = level.items[0].ref;
-
-    // 5. Free the replaced right-edge nodes (old rightmost leaf + old spine),
-    //    exactly as indexAppendRun does: they are unreferenced by the new tree.
-    //    Frees run before the manual deinit so the errdefer never double-frees.
-    try txn.free(leaf_ref, cnode.leaf_node_size);
-    for (path_refs.items) |old_ref| try txn.free(old_ref, cnode.inner_node_size);
-
-    level.deinit(al);
-    return result;
 }
 
 /// Build a value index (value -> inner okey-set) from `entries`, sorted by
@@ -726,7 +364,7 @@ pub fn bulkAppend(txn: *WriteTxn, cat: Ref, rows: []const []const u64) !Ref {
 
     // If the BLIND rightmost pk-index leaf is empty (removals never merge
     // leaves), its RECORDED LOW may exceed every surviving key -- a pk-history
-    // gap. indexAppendRun rebuilds exactly that leaf and derives the new
+    // gap. Index.appendRun rebuilds exactly that leaf and derives the new
     // parent low from the batch's first key; a batch below the recorded low
     // would break the ascending-lows invariant and make the appended rows
     // unreachable. Such a batch must take the row-by-row fallback. (The
@@ -761,7 +399,7 @@ pub fn bulkAppend(txn: *WriteTxn, cat: Ref, rows: []const []const u64) !Ref {
         var p: usize = 0;
         while (p < prop_count) : (p += 1) {
             for (rows, 0..) |row, j| col_vals[j] = row[p];
-            s.props[p].col = try columnAppendRun(txn, s.props[p].col, col_vals[0..n]);
+            s.props[p].col = try Column.appendRun(txn, s.props[p].col, col_vals[0..n], al);
         }
     }
 
@@ -769,15 +407,15 @@ pub fn bulkAppend(txn: *WriteTxn, cat: Ref, rows: []const []const u64) !Ref {
     const stamps = try al.alloc(u64, n);
     defer al.free(stamps);
     @memset(stamps, txn.new_version);
-    s.version_col_ref = try columnAppendRun(txn, s.version_col_ref, stamps[0..n]);
+    s.version_col_ref = try Column.appendRun(txn, s.version_col_ref, stamps[0..n], al);
     @memset(stamps, 1);
-    s.live_col_ref = try columnAppendRun(txn, s.live_col_ref, stamps[0..n]);
+    s.live_col_ref = try Column.appendRun(txn, s.live_col_ref, stamps[0..n], al);
 
     // pk index (pk -> okey) and key->row index (okey -> physical row). Both runs
     // land on the right edge: batch pks are ascending and above the current max,
     // and okeys are consecutive from next_key (thus above every existing okey).
-    s.pk_index_ref = try indexAppendRun(txn, s.pk_index_ref, pks[0..n], okeys[0..n]);
-    s.keyrow_index_ref = try indexAppendRun(txn, s.keyrow_index_ref, okeys[0..n], phys_rows[0..n]);
+    s.pk_index_ref = try Index.appendRun(txn, s.pk_index_ref, pks[0..n], okeys[0..n], al);
+    s.keyrow_index_ref = try Index.appendRun(txn, s.keyrow_index_ref, okeys[0..n], phys_rows[0..n], al);
 
     s.next_row = old_next_row + @as(u64, @intCast(n));
     s.next_key = old_next_key + @as(u64, @intCast(n));
