@@ -120,7 +120,7 @@ test "object keys and links survive compaction" {
 
     const a = try objects.insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .link = null } });
     catalogRef = a.catalogRef;
-    const objectKeyA = a.row;
+    const objectKeyA = a.objectKey;
     const b = try objects.insertTyped(&w, catalogRef, &.{ .{ .int = 2 }, .{ .link = null } });
     catalogRef = b.catalogRef;
     const c = try objects.insertTyped(&w, catalogRef, &.{ .{ .int = 3 }, .{ .link = objectKeyA } });
@@ -248,7 +248,7 @@ test "all value kinds deep-copy across databases preserving keys" {
             .{ .int = 1 }, .{ .bytes = "a" }, .{ .listInt = &.{ 10, 20 } }, .{ .setInt = &.{ 5, 6 } }, .{ .link = null },
         });
         catalogRef = r1.catalogRef;
-        primaryKey1ObjectKey = r1.row;
+        primaryKey1ObjectKey = r1.objectKey;
         const r2 = try objects.insertTyped(&w, catalogRef, &.{
             .{ .int = 2 }, .{ .bytes = "bb" }, .{ .listInt = &.{} }, .{ .setInt = &.{7} }, .{ .link = primaryKey1ObjectKey },
         });
@@ -355,7 +355,7 @@ test "compactToNewFile produces a verified, smaller, equivalent file" {
             const s = try std.fmt.bufPrint(&nbuf, "author-{d}", .{i});
             const r = try typeRouting.insert(&w, dir, 0, &.{ .{ .int = i }, .{ .bytes = s } });
             dir = r.dir;
-            authorObjectKeys[@intCast(i)] = r.row;
+            authorObjectKeys[@intCast(i)] = r.objectKey;
         }
         i = 0;
         while (i < 300) : (i += 1) {
@@ -573,7 +573,7 @@ test "compactStep packs a delete-heavy type across several small steps" {
     while (primaryKey < 12) : (primaryKey += 1) {
         const r = try rows.insert(&w, catalogRef, &.{ primaryKey, primaryKey * 100 });
         catalogRef = r.catalogRef;
-        objectKeys[@intCast(primaryKey)] = r.row;
+        objectKeys[@intCast(primaryKey)] = r.objectKey;
     }
 
     const dels = [_]u64{ 0, 2, 3, 5, 7, 8, 11 };
@@ -674,7 +674,7 @@ test "compactStep is a no-op on an already-packed type" {
     while (primaryKey < 5) : (primaryKey += 1) {
         const r = try rows.insert(&w, catalogRef, &.{ primaryKey, primaryKey * 7 });
         catalogRef = r.catalogRef;
-        objectKeys[@intCast(primaryKey)] = r.row;
+        objectKeys[@intCast(primaryKey)] = r.objectKey;
     }
 
     const res = try compactStep(&w, catalogRef, 0, 4);
@@ -728,7 +728,7 @@ test "compactStep cursor path packs identically to the scan path" {
     while (primaryKey < 20) : (primaryKey += 1) {
         const rs = try rows.insert(&stepW, stepCatalog, &.{ primaryKey, primaryKey * 100 });
         stepCatalog = rs.catalogRef;
-        stepObjectKeys[@intCast(primaryKey)] = rs.row;
+        stepObjectKeys[@intCast(primaryKey)] = rs.objectKey;
         const rc = try rows.insert(&ctrlW, controlCatalog, &.{ primaryKey, primaryKey * 100 });
         controlCatalog = rc.catalogRef;
     }
@@ -803,7 +803,7 @@ test "compactStep truncation never drops a live row at the top" {
     while (primaryKey < 10) : (primaryKey += 1) {
         const r = try rows.insert(&w, catalogRef, &.{ primaryKey, primaryKey * 1000 });
         catalogRef = r.catalogRef;
-        objectKeys[@intCast(primaryKey)] = r.row;
+        objectKeys[@intCast(primaryKey)] = r.objectKey;
     }
     primaryKey = 0;
     while (primaryKey < 5) : (primaryKey += 1) {
@@ -947,7 +947,7 @@ test "compactInPlace shrinks and preserves data" {
             const s = try std.fmt.bufPrint(&nbuf, "author-{d}", .{i});
             const r = try typeRouting.insert(&w, dir, 0, &.{ .{ .int = i }, .{ .bytes = s } });
             dir = r.dir;
-            authorObjectKeys[@intCast(i)] = r.row;
+            authorObjectKeys[@intCast(i)] = r.objectKey;
         }
         i = 0;
         while (i < 200) : (i += 1) {

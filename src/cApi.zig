@@ -154,7 +154,7 @@ export fn airdb_insert(handle: ?*DatabaseHandle, values: [*]const u64, length: u
     };
     writeTransaction.setRoot(result.catalogRef);
     _ = writeTransaction.commit() catch return commitErrCode(self);
-    return @intCast(result.row);
+    return @intCast(result.objectKey);
 }
 
 /// Read the row with primary key `primaryKey` into `out` (length must equal propertyCount).
@@ -398,7 +398,7 @@ export fn airdb_txn_insert(transaction: ?*Transaction, values: [*]const u64, len
         return AIRDB_E_GENERIC;
     };
     handle.catalogRef = result.catalogRef; // thread the new catalog ref; do NOT commit
-    return @intCast(result.row);
+    return @intCast(result.objectKey);
 }
 
 /// Stage an update in the open transaction (no commit). Mirrors airdb_update

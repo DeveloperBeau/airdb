@@ -64,10 +64,10 @@ test "relocateRow moves a row and keeps key, primaryKey, and value" {
     catalogRef = r1.catalogRef;
     const r2 = try rows.insert(&writeTransaction, catalogRef, &.{ 2, 200 });
     catalogRef = r2.catalogRef;
-    const objectKeyB = r2.row;
+    const objectKeyB = r2.objectKey;
     const r3 = try rows.insert(&writeTransaction, catalogRef, &.{ 3, 300 });
     catalogRef = r3.catalogRef;
-    const objectKeyC = r3.row;
+    const objectKeyC = r3.objectKey;
 
     // Free b's physical slot by deleting primaryKey 2.
     const bRow = (try catalog.objectKeyToRow(&writeTransaction, catalogRef, objectKeyB)).?;
@@ -125,19 +125,19 @@ test "setLink after relocating the SOURCE keeps the backlink graph exact" {
 
     // Free the throwaway's physical slot and relocate the SOURCE into it, so
     // the source's row and objectKey diverge.
-    const deadRow = (try catalog.objectKeyToRow(&writeTransaction, catalogRef, dead.row)).?;
+    const deadRow = (try catalog.objectKeyToRow(&writeTransaction, catalogRef, dead.objectKey)).?;
     var out: [2]u64 = undefined;
     const dv = (try rows.getByPrimaryKey(&writeTransaction, catalogRef, 99, &out)).?;
     catalogRef = (try rows.delete(&writeTransaction, catalogRef, 99, dv)).ok;
-    catalogRef = try relocateRow(&writeTransaction, catalogRef, src.row, deadRow);
-    try testing.expect((try catalog.objectKeyToRow(&writeTransaction, catalogRef, src.row)).? != src.row);
+    catalogRef = try relocateRow(&writeTransaction, catalogRef, src.objectKey, deadRow);
+    try testing.expect((try catalog.objectKeyToRow(&writeTransaction, catalogRef, src.objectKey)).? != src.objectKey);
 
     // Link src -> t1, then move it to t2: counts must track exactly.
-    catalogRef = try links.setLink(&writeTransaction, catalogRef, 3, 1, t1.row);
-    try testing.expectEqual(@as(u64, 1), try links.backlinkCount(&writeTransaction, catalogRef, 1, t1.row));
-    catalogRef = try links.setLink(&writeTransaction, catalogRef, 3, 1, t2.row);
-    try testing.expectEqual(@as(u64, 0), try links.backlinkCount(&writeTransaction, catalogRef, 1, t1.row));
-    try testing.expectEqual(@as(u64, 1), try links.backlinkCount(&writeTransaction, catalogRef, 1, t2.row));
+    catalogRef = try links.setLink(&writeTransaction, catalogRef, 3, 1, t1.objectKey);
+    try testing.expectEqual(@as(u64, 1), try links.backlinkCount(&writeTransaction, catalogRef, 1, t1.objectKey));
+    catalogRef = try links.setLink(&writeTransaction, catalogRef, 3, 1, t2.objectKey);
+    try testing.expectEqual(@as(u64, 0), try links.backlinkCount(&writeTransaction, catalogRef, 1, t1.objectKey));
+    try testing.expectEqual(@as(u64, 1), try links.backlinkCount(&writeTransaction, catalogRef, 1, t2.objectKey));
 
     // Deleting t2 must nullify the relocated source's link (backlink resolves
     // through the objectKey), leaving t1 and the source's other data untouched.
@@ -168,11 +168,11 @@ test "a same-type link to a relocated object still resolves" {
     // Throwaway object to free a dead slot.
     const rd = try rows.insert(&writeTransaction, catalogRef, &.{ 10, 0 });
     catalogRef = rd.catalogRef;
-    const objectKeyD = rd.row;
+    const objectKeyD = rd.objectKey;
 
     const rt = try rows.insert(&writeTransaction, catalogRef, &.{ 1, 0 });
     catalogRef = rt.catalogRef;
-    const targetObjectKey = rt.row;
+    const targetObjectKey = rt.objectKey;
 
     const rs = try rows.insert(&writeTransaction, catalogRef, &.{ 2, 0 });
     catalogRef = rs.catalogRef;

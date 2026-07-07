@@ -322,12 +322,12 @@ test "verifyIntegrity passes on a clean link graph after churn" {
         dir = a.dir;
         const b = try typeRouting.insert(&w, dir, 0, &.{ .{ .int = 2 }, .{ .bytes = "B" } });
         dir = b.dir;
-        dir = (try typeRouting.insert(&w, dir, 1, &.{ .{ .int = 1 }, .{ .link = a.row }, .{ .linkSet = &.{ a.row, b.row } } })).dir;
-        dir = (try typeRouting.insert(&w, dir, 1, &.{ .{ .int = 2 }, .{ .link = b.row }, .{ .linkSet = &.{} } })).dir;
+        dir = (try typeRouting.insert(&w, dir, 1, &.{ .{ .int = 1 }, .{ .link = a.objectKey }, .{ .linkSet = &.{ a.objectKey, b.objectKey } } })).dir;
+        dir = (try typeRouting.insert(&w, dir, 1, &.{ .{ .int = 2 }, .{ .link = b.objectKey }, .{ .linkSet = &.{} } })).dir;
         // Churn: move source 1's to-one link, drop one set member.
-        dir = try typeRouting.setLink(&w, dir, 1, 1, 1, b.row);
+        dir = try typeRouting.setLink(&w, dir, 1, 1, 1, b.objectKey);
         const sourceCatalog = try typedir.catalogRef(&w, dir, 1);
-        const newCatalog = try links.linkSetRemove(&w, sourceCatalog, 1, 2, a.row);
+        const newCatalog = try links.linkSetRemove(&w, sourceCatalog, 1, 2, a.objectKey);
         dir = try typedir.setCatalogRef(&w, dir, 1, newCatalog);
         w.setRoot(dir);
         _ = try w.commit();
@@ -351,7 +351,7 @@ test "verifyIntegrity detects a corrupted backlink index" {
         }, &.{false});
         const a = try typeRouting.insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .link = null } });
         dir = a.dir;
-        targetObjectKey = a.row;
+        targetObjectKey = a.objectKey;
         dir = (try typeRouting.insert(&w, dir, 0, &.{ .{ .int = 2 }, .{ .link = targetObjectKey } })).dir;
         w.setRoot(dir);
         _ = try w.commit();

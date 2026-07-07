@@ -28,12 +28,12 @@ pub const UpdateResult = union(enum) { ok: UpdateOk, conflict: Objects.Conflict,
 pub const DeleteResult = union(enum) { ok: Reference, conflict: Objects.Conflict, notFound, blocked };
 
 /// Insert a typed object into `typeId`, returning the new directory ref and
-/// the object's row.
-pub fn insert(transaction: *WriteTransaction, dir: Reference, typeId: u16, values: []const Value) !struct { dir: Reference, row: u64 } {
+/// the object's stable object key.
+pub fn insert(transaction: *WriteTransaction, dir: Reference, typeId: u16, values: []const Value) !struct { dir: Reference, objectKey: u64 } {
     const catalogRef = try typedir.catalogRef(transaction, dir, typeId);
     const result = try Objects.insertTyped(transaction, catalogRef, values);
     const newDir = try setCatalogRef(transaction, dir, typeId, result.catalogRef);
-    return .{ .dir = newDir, .row = result.row };
+    return .{ .dir = newDir, .objectKey = result.objectKey };
 }
 
 /// Read the object with primary key `primaryKey` from `typeId` into `out`, returning

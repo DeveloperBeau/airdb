@@ -200,10 +200,10 @@ test "query returns stable object keys after relocation" {
     catalogRef = throwaway.catalogRef;
     const target = try rows.insert(&w, catalogRef, &.{ 2, 30 });
     catalogRef = target.catalogRef;
-    const targetObjectKey = target.row;
+    const targetObjectKey = target.objectKey;
 
     // Free the throwaway's physical slot.
-    const deadRow = (try catalog.objectKeyToRow(&w, catalogRef, throwaway.row)).?;
+    const deadRow = (try catalog.objectKeyToRow(&w, catalogRef, throwaway.objectKey)).?;
     var vbuf: [2]u64 = undefined;
     const tv = (try rows.getByPrimaryKey(&w, catalogRef, 1, &vbuf)).?;
     catalogRef = (try rows.delete(&w, catalogRef, 1, tv)).ok;

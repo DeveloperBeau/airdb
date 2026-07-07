@@ -72,8 +72,9 @@ fn removeValueIndex(transaction: *WriteTransaction, catalogRef: Reference, prope
 
 /// Append a new row to all columns and update the primaryKey index.
 /// values.len must equal the propertyCount stored in the catalog.
-/// Returns error.DuplicateKey if values[0] (the primary key) already exists.
-pub fn insert(transaction: *WriteTransaction, catalogRef: Reference, values: []const u64) !struct { catalogRef: Reference, row: u64 } {
+/// Returns the new catalog ref and the row's stable object key, or
+/// error.DuplicateKey if values[0] (the primary key) already exists.
+pub fn insert(transaction: *WriteTransaction, catalogRef: Reference, values: []const u64) !struct { catalogRef: Reference, objectKey: u64 } {
     var snapshot = try catalog.CatalogSnapshot.load(transaction, catalogRef);
     std.debug.assert(values.len == snapshot.propertyCount);
     const propertyCount = snapshot.propertyCount;
@@ -108,7 +109,7 @@ pub fn insert(transaction: *WriteTransaction, catalogRef: Reference, values: []c
             if (snapshot.properties[propertyIndex].indexed) updatedCatalog = try addValueIndex(transaction, updatedCatalog, propertyIndex, values[propertyIndex], objectKey);
         }
     }
-    return .{ .catalogRef = updatedCatalog, .row = objectKey };
+    return .{ .catalogRef = updatedCatalog, .objectKey = objectKey };
 }
 
 /// The row's current version, reported when an optimistic write loses the race.

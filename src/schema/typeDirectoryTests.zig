@@ -229,15 +229,15 @@ test "multi-type directory carries links and collections via createWithDefs" {
     // insert two type-1 rows; row a links to nothing, b's set links to a.
     const a = try Objects.insertTyped(&w, try catalogRef(&w, dir, 1), &.{ .{ .int = 10 }, .{ .link = null }, .{ .linkSet = &.{} } });
     dir = try setCatalogRef(&w, dir, 1, a.catalogRef);
-    const b = try Objects.insertTyped(&w, try catalogRef(&w, dir, 1), &.{ .{ .int = 20 }, .{ .link = a.row }, .{ .linkSet = &.{a.row} } });
+    const b = try Objects.insertTyped(&w, try catalogRef(&w, dir, 1), &.{ .{ .int = 20 }, .{ .link = a.objectKey }, .{ .linkSet = &.{a.objectKey} } });
     dir = try setCatalogRef(&w, dir, 1, b.catalogRef);
 
     // route a to-many add through the directory
-    dir = try linkSetAdd(&w, dir, 1, 20, 2, a.row); // already member -> no-op
-    try testing.expect(try linkSetContains(&w, dir, 1, 20, 2, a.row));
-    try testing.expectEqual(@as(?u64, a.row), try getLink(&w, dir, 1, 20, 1));
+    dir = try linkSetAdd(&w, dir, 1, 20, 2, a.objectKey); // already member -> no-op
+    try testing.expect(try linkSetContains(&w, dir, 1, 20, 2, a.objectKey));
+    try testing.expectEqual(@as(?u64, a.objectKey), try getLink(&w, dir, 1, 20, 1));
     // a has 2 inbound to-one? no: only b's to-one links a -> backlink on property 1 == 1
-    try testing.expectEqual(@as(u64, 1), try backlinkCount(&w, dir, 1, 1, a.row));
+    try testing.expectEqual(@as(u64, 1), try backlinkCount(&w, dir, 1, 1, a.objectKey));
 
     // addTypeDefinitions: append a type with a list property
     const added = try addTypeDefinitions(&w, dir, &.{ .{ .kind = .int }, .{ .kind = .list, .element = .int } });
@@ -265,7 +265,7 @@ test "a cross-type link resolves to the target type's object" {
 
     const ains = try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .bytes = "Ada" } });
     dir = ains.dir;
-    const authorObjectKey = ains.row;
+    const authorObjectKey = ains.objectKey;
     dir = (try insert(&w, dir, 1, &.{ .{ .int = 1 }, .{ .link = authorObjectKey } })).dir;
 
     const r = (try resolveLink(&w, dir, 1, 1, 1)).?;
@@ -295,7 +295,7 @@ test "deleting a target nullifies inbound links from another type" {
 
     const ains = try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .bytes = "Ada" } });
     dir = ains.dir;
-    const authorObjectKey = ains.row;
+    const authorObjectKey = ains.objectKey;
     dir = (try insert(&w, dir, 1, &.{ .{ .int = 1 }, .{ .link = authorObjectKey } })).dir;
     dir = (try insert(&w, dir, 1, &.{ .{ .int = 2 }, .{ .link = authorObjectKey } })).dir;
 
@@ -330,7 +330,7 @@ test "cross-type links persist across reopen" {
         var dir = try createWithDefinitions(&w, &schema);
         const ains = try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .bytes = "Ada" } });
         dir = ains.dir;
-        authorObjectKey = ains.row;
+        authorObjectKey = ains.objectKey;
         var i: u64 = 1;
         while (i <= 20) : (i += 1) {
             dir = (try insert(&w, dir, 1, &.{ .{ .int = i }, .{ .link = authorObjectKey } })).dir;
@@ -369,7 +369,7 @@ test "block prevents deleting a referenced object" {
     var dir = try createWithDefinitions(&w, &schema);
     const author = try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .bytes = "Ada" } });
     dir = author.dir;
-    const book = try insert(&w, dir, 1, &.{ .{ .int = 1 }, .{ .link = author.row } });
+    const book = try insert(&w, dir, 1, &.{ .{ .int = 1 }, .{ .link = author.objectKey } });
     dir = book.dir;
 
     var av: [2]Value = undefined;
@@ -411,7 +411,7 @@ test "cascade deletes owned children" {
     dir = c2.dir;
     const c3 = try insert(&w, dir, 1, &.{.{ .int = 30 }});
     dir = c3.dir;
-    const parent = try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .linkSet = &.{ c1.row, c2.row, c3.row } } });
+    const parent = try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .linkSet = &.{ c1.objectKey, c2.objectKey, c3.objectKey } } });
     dir = parent.dir;
     try testing.expectEqual(@as(u64, 3), try liveCount(&w, dir, 1));
 
@@ -553,11 +553,11 @@ test "directory delete works after relocating the target" {
     // A throwaway author opens a dead slot for the real author to move into.
     const throwaway = try insert(&w, dir, 0, &.{ .{ .int = 99 }, .{ .bytes = "tmp" } });
     dir = throwaway.dir;
-    const throwawayObjectKey = throwaway.row;
+    const throwawayObjectKey = throwaway.objectKey;
 
     const author = try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .bytes = "Ada" } });
     dir = author.dir;
-    const authorObjectKey = author.row;
+    const authorObjectKey = author.objectKey;
 
     // A book links the real author by its stable objectKey.
     dir = (try insert(&w, dir, 1, &.{ .{ .int = 1 }, .{ .link = authorObjectKey } })).dir;
@@ -605,7 +605,7 @@ test "a self-linked object is deletable across transactions" {
         });
         const a = try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .link = null } });
         dir = a.dir;
-        dir = try setLink(&w, dir, 0, 1, 1, a.row);
+        dir = try setLink(&w, dir, 0, 1, 1, a.objectKey);
         w.setRoot(dir);
         _ = try w.commit();
     }
@@ -642,9 +642,9 @@ test "cascade is cycle-safe" {
     var dir = try createWithDefinitions(&w, &schema);
     const a = try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .link = null } });
     dir = a.dir;
-    const b = try insert(&w, dir, 0, &.{ .{ .int = 2 }, .{ .link = a.row } }); // b -> a
+    const b = try insert(&w, dir, 0, &.{ .{ .int = 2 }, .{ .link = a.objectKey } }); // b -> a
     dir = b.dir;
-    dir = try setLink(&w, dir, 0, 1, 1, b.row); // a -> b (cycle)
+    dir = try setLink(&w, dir, 0, 1, 1, b.objectKey); // a -> b (cycle)
     try testing.expectEqual(@as(u64, 2), try liveCount(&w, dir, 0));
 
     var av: [2]Value = undefined;
@@ -673,7 +673,7 @@ test "a directory delete of a self-referencing linkSet row frees its set root ex
         });
         const ins = try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .linkSet = &.{} } });
         dir = ins.dir;
-        dir = try linkSetAdd(&w, dir, 0, 1, 1, ins.row); // set contains own objectKey
+        dir = try linkSetAdd(&w, dir, 0, 1, 1, ins.objectKey); // set contains own objectKey
         w.setRoot(dir);
         _ = try w.commit();
     }
@@ -755,7 +755,7 @@ test "a cascade delete frees the child's collection storage" {
         });
         const child = try insert(&w, dir, 1, &.{ .{ .int = 100 }, .{ .setInt = &.{ 1, 2, 3 } } });
         dir = child.dir;
-        dir = (try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .link = child.row } })).dir;
+        dir = (try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .link = child.objectKey } })).dir;
         w.setRoot(dir);
         _ = try w.commit();
     }

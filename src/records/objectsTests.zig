@@ -502,15 +502,15 @@ test "getByObjectKey reads a row by its stable object key" {
     const r1 = try insert(&w, catalogRef, &.{ 200, 8 });
     catalogRef = r1.catalogRef;
     var out: [2]u64 = undefined;
-    const v1 = try getByObjectKey(&w, catalogRef, r1.row, &out);
+    const v1 = try getByObjectKey(&w, catalogRef, r1.objectKey, &out);
     try testing.expect(v1 != null);
     try testing.expectEqual(@as(u64, 200), out[0]);
     try testing.expectEqual(@as(u64, 8), out[1]);
     try testing.expectEqual(@as(?u64, null), try getByObjectKey(&w, catalogRef, 999, &out));
-    const vk = (try getByObjectKey(&w, catalogRef, r0.row, &out)).?;
+    const vk = (try getByObjectKey(&w, catalogRef, r0.objectKey, &out)).?;
     const dres = try delete(&w, catalogRef, 100, vk);
     catalogRef = dres.ok;
-    try testing.expectEqual(@as(?u64, null), try getByObjectKey(&w, catalogRef, r0.row, &out));
+    try testing.expectEqual(@as(?u64, null), try getByObjectKey(&w, catalogRef, r0.objectKey, &out));
     w.deinit();
 }
 
@@ -528,10 +528,10 @@ test "getByObjectKey resolves through the key-to-row index" {
     const r1 = try insert(&w, catalogRef, &.{ 200, 8 });
     catalogRef = r1.catalogRef;
     var out: [2]u64 = undefined;
-    try testing.expect((try getByObjectKey(&w, catalogRef, r0.row, &out)) != null);
+    try testing.expect((try getByObjectKey(&w, catalogRef, r0.objectKey, &out)) != null);
     try testing.expectEqual(@as(u64, 100), out[0]);
     try testing.expectEqual(@as(u64, 7), out[1]);
-    try testing.expect((try getByObjectKey(&w, catalogRef, r1.row, &out)) != null);
+    try testing.expect((try getByObjectKey(&w, catalogRef, r1.objectKey, &out)) != null);
     try testing.expectEqual(@as(u64, 200), out[0]);
     try testing.expectEqual(@as(u64, 8), out[1]);
     // An object key with no mapping resolves to null.
@@ -592,9 +592,9 @@ test "value index tracks inserts" {
     catalogRef = o2.catalogRef;
     const o3 = try insert(&w, catalogRef, &.{ 4, 30 });
     catalogRef = o3.catalogRef;
-    try expectIndexObjectKeys(&w, catalogRef, 1, 10, &.{ o0.row, o2.row });
-    try expectIndexObjectKeys(&w, catalogRef, 1, 20, &.{o1.row});
-    try expectIndexObjectKeys(&w, catalogRef, 1, 30, &.{o3.row});
+    try expectIndexObjectKeys(&w, catalogRef, 1, 10, &.{ o0.objectKey, o2.objectKey });
+    try expectIndexObjectKeys(&w, catalogRef, 1, 20, &.{o1.objectKey});
+    try expectIndexObjectKeys(&w, catalogRef, 1, 30, &.{o3.objectKey});
     w.deinit();
 }
 
@@ -619,7 +619,7 @@ test "value index tracks updates" {
     const res = try update(&w, catalogRef, 2, &.{ 2, 10 }, version);
     try testing.expect(res == .ok);
     catalogRef = res.ok.catalogRef;
-    try expectIndexObjectKeys(&w, catalogRef, 1, 10, &.{ o0.row, o1.row, o2.row });
+    try expectIndexObjectKeys(&w, catalogRef, 1, 10, &.{ o0.objectKey, o1.objectKey, o2.objectKey });
     // The 20 entry is now empty.
     try expectIndexObjectKeys(&w, catalogRef, 1, 20, &.{});
     w.deinit();
@@ -640,13 +640,13 @@ test "value index tracks deletes" {
     catalogRef = o1.catalogRef;
     const o2 = try insert(&w, catalogRef, &.{ 3, 10 });
     catalogRef = o2.catalogRef;
-    try expectIndexObjectKeys(&w, catalogRef, 1, 10, &.{ o0.row, o2.row });
+    try expectIndexObjectKeys(&w, catalogRef, 1, 10, &.{ o0.objectKey, o2.objectKey });
     // Delete o0 (value 10); only o2 should remain under 10.
     var out: [2]u64 = undefined;
     const version = (try getByPrimaryKey(&w, catalogRef, 1, &out)).?;
     catalogRef = (try delete(&w, catalogRef, 1, version)).ok;
-    try expectIndexObjectKeys(&w, catalogRef, 1, 10, &.{o2.row});
-    try expectIndexObjectKeys(&w, catalogRef, 1, 20, &.{o1.row});
+    try expectIndexObjectKeys(&w, catalogRef, 1, 10, &.{o2.objectKey});
+    try expectIndexObjectKeys(&w, catalogRef, 1, 20, &.{o1.objectKey});
     w.deinit();
 }
 
@@ -735,18 +735,18 @@ test "updateTyped moves backlinks when a link value changes" {
     catalogRef = a.catalogRef;
     const b = try insertTyped(&w, catalogRef, &.{ .{ .int = 2 }, .{ .link = null } });
     catalogRef = b.catalogRef;
-    const c = try insertTyped(&w, catalogRef, &.{ .{ .int = 3 }, .{ .link = a.row } });
+    const c = try insertTyped(&w, catalogRef, &.{ .{ .int = 3 }, .{ .link = a.objectKey } });
     catalogRef = c.catalogRef;
 
     var out: [2]Value = undefined;
     const version = (try getTyped(&w, catalogRef, 3, &out)).?;
-    const res = try updateTyped(&w, catalogRef, 3, &.{ .{ .int = 3 }, .{ .link = b.row } }, version);
+    const res = try updateTyped(&w, catalogRef, 3, &.{ .{ .int = 3 }, .{ .link = b.objectKey } }, version);
     try testing.expect(res == .ok);
     catalogRef = res.ok.catalogRef;
 
     const linksMod = @import("links.zig");
-    try testing.expectEqual(@as(u64, 0), try linksMod.backlinkCount(&w, catalogRef, 1, a.row));
-    try testing.expectEqual(@as(u64, 1), try linksMod.backlinkCount(&w, catalogRef, 1, b.row));
+    try testing.expectEqual(@as(u64, 0), try linksMod.backlinkCount(&w, catalogRef, 1, a.objectKey));
+    try testing.expectEqual(@as(u64, 1), try linksMod.backlinkCount(&w, catalogRef, 1, b.objectKey));
     // Deleting the NEW target nullifies the source's link.
     var raw: [2]u64 = undefined;
     const bv = (try getByPrimaryKey(&w, catalogRef, 2, &raw)).?;
@@ -841,13 +841,13 @@ test "reinserting a primary key after delete yields a new object key" {
     var catalogRef = try create(&w, 2);
     const first = try insert(&w, catalogRef, &.{ 100, 7 });
     catalogRef = first.catalogRef;
-    const objectKeyA = first.row;
+    const objectKeyA = first.objectKey;
     var out: [2]u64 = undefined;
     const v = (try getByPrimaryKey(&w, catalogRef, 100, &out)).?;
     catalogRef = (try delete(&w, catalogRef, 100, v)).ok;
     const second = try insert(&w, catalogRef, &.{ 100, 70 });
     catalogRef = second.catalogRef;
-    const objectKeyB = second.row;
+    const objectKeyB = second.objectKey;
     try testing.expect(objectKeyA != objectKeyB);
     // The old object key is tombstoned and resolves to null.
     try testing.expectEqual(@as(?u64, null), try getByObjectKey(&w, catalogRef, objectKeyA, &out));
@@ -882,7 +882,7 @@ test "deleteTyped frees a self-referencing linkSet root exactly once" {
         });
         const ins = try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .linkSet = &.{} } });
         catalogRef = ins.catalogRef;
-        catalogRef = try links.linkSetAdd(&w, catalogRef, 1, 1, ins.row); // set contains own objectKey
+        catalogRef = try links.linkSetAdd(&w, catalogRef, 1, 1, ins.objectKey); // set contains own objectKey
         w.setRoot(catalogRef);
         _ = try w.commit();
     }

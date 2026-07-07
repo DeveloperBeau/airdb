@@ -240,7 +240,7 @@ pub fn insertEmbedded(transaction: *WriteTransaction, dir: Reference, ownerType:
 
     const ins = try typeRouting.insert(transaction, currentDir, childType, childValues);
     currentDir = ins.dir;
-    return try typeRouting.setLink(transaction, currentDir, ownerType, ownerPrimaryKey, property, ins.row);
+    return try typeRouting.setLink(transaction, currentDir, ownerType, ownerPrimaryKey, property, ins.objectKey);
 }
 
 /// Delete the embedded child owned via to-one link `property`, returning the

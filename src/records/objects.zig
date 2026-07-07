@@ -34,10 +34,9 @@ pub const DeleteResult = rows.DeleteResult;
 /// Encode a []Value row into raw u64 storage -- allocating a blob node for
 /// each .blob property and building each collection's tree -- then insert it
 /// via rows.insert, maintaining backlinks for any links the row carries.
-/// Returns the new catalog ref and the row's stable object key (the `row`
-/// field). One tree walk per property plus collection builds proportional to
-/// their element counts.
-pub fn insertTyped(transaction: *WriteTransaction, catalogRef: Reference, values: []const Value) !struct { catalogRef: Reference, row: u64 } {
+/// Returns the new catalog ref and the row's stable object key. One tree walk
+/// per property plus collection builds proportional to their element counts.
+pub fn insertTyped(transaction: *WriteTransaction, catalogRef: Reference, values: []const Value) !struct { catalogRef: Reference, objectKey: u64 } {
     const view = try loadCatalog(transaction, catalogRef);
     const propertyCount = view.propertyCount;
     std.debug.assert(values.len == propertyCount);
@@ -81,19 +80,19 @@ pub fn insertTyped(transaction: *WriteTransaction, catalogRef: Reference, values
             switch (kinds[linkIndex]) {
                 .link => {
                     if (values[linkIndex].link) |target| {
-                        updatedCatalog = try links.addBacklink(transaction, updatedCatalog, linkIndex, target, result.row);
+                        updatedCatalog = try links.addBacklink(transaction, updatedCatalog, linkIndex, target, result.objectKey);
                     }
                 },
                 .linkSet => {
                     for (values[linkIndex].linkSet) |target| {
-                        updatedCatalog = try links.addBacklink(transaction, updatedCatalog, linkIndex, target, result.row);
+                        updatedCatalog = try links.addBacklink(transaction, updatedCatalog, linkIndex, target, result.objectKey);
                     }
                 },
                 else => {},
             }
         }
     }
-    return .{ .catalogRef = updatedCatalog, .row = result.row };
+    return .{ .catalogRef = updatedCatalog, .objectKey = result.objectKey };
 }
 
 /// Read a row by primary key and decode each property into `out` as a Value.
