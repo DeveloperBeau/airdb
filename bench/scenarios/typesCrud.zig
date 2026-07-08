@@ -69,19 +69,19 @@ fn nowNs(io: Io) i96 {
 
 // Deterministic 64-bit pseudo-random stream (xorshift64*), no clock/global state.
 fn xorshift(state: *u64) u64 {
-    var x = state.*;
-    x ^= x >> 12;
-    x ^= x << 25;
-    x ^= x >> 27;
-    state.* = x;
-    return x *% 0x2545F4914F6CDD1D;
+    var value = state.*;
+    value ^= value >> 12;
+    value ^= value << 25;
+    value ^= value >> 27;
+    state.* = value;
+    return value *% 0x2545F4914F6CDD1D;
 }
 
 pub fn run(ctx: *harness.Ctx) !harness.Result {
     const alloc = ctx.alloc;
     const io = sysIo();
 
-    const rows = @min(ctx.n, maxRows);
+    const rows = @min(ctx.rowCount, maxRows);
 
     const path = try harness.scratchPath(ctx.*, name ++ ".airdb");
     defer alloc.free(path);
@@ -92,8 +92,8 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
 
     // One type carrying a property of each exercised kind.
     {
-        var w = try database.beginWrite();
-        const catalogRef = try catalog.createFromDefinitions(&w, &.{
+        var writeTransaction = try database.beginWrite();
+        const catalogRef = try catalog.createFromDefinitions(&writeTransaction, &.{
             .{ .kind = .int }, // 0 primaryKey
             .{ .kind = .int }, // 1 int
             .{ .kind = .int }, // 2 bool (0/1)
@@ -103,8 +103,8 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
             .{ .kind = .set, .element = .int }, // 6 set of int
             .{ .kind = .set, .element = .blob }, // 7 set of blob
         });
-        w.setRoot(catalogRef);
-        _ = try w.commit();
+        writeTransaction.setRoot(catalogRef);
+        _ = try writeTransaction.commit();
     }
 
     var combined = harness.Latencies.init();
@@ -126,29 +126,29 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         var inserted: usize = 0;
         while (inserted < rows) {
             const thisBatch = @min(batchSize, rows - inserted);
-            var w = try database.beginWrite();
-            var catalogRef = w.newRoot;
-            var j: usize = 0;
-            while (j < thisBatch) : (j += 1) {
-                const primaryKey: u64 = inserted + j;
+            var writeTransaction = try database.beginWrite();
+            var catalogRef = writeTransaction.newRoot;
+            var innerIndex: usize = 0;
+            while (innerIndex < thisBatch) : (innerIndex += 1) {
+                const primaryKey: u64 = inserted + innerIndex;
                 // objectKeys are assigned 0,1,2,... so objectKey == primaryKey for a fresh insert.
                 var rng: u64 = primaryKey +% 0x9E3779B97F4A7C15;
-                const iv = xorshift(&rng);
+                const randomValue = xorshift(&rng);
 
                 var blobBuffer: [32]u8 = undefined;
-                for (&blobBuffer, 0..) |*b, k| b.* = @truncate(iv +% k);
+                for (&blobBuffer, 0..) |*byte, byteK| byte.* = @truncate(randomValue +% byteK);
 
                 const dictEntries = [_]catalog.DictEntry{
-                    .{ .key = "alpha", .value = iv & 0xffff },
-                    .{ .key = "beta", .value = (iv >> 16) & 0xffff },
-                    .{ .key = "gamma", .value = (iv >> 32) & 0xffff },
+                    .{ .key = "alpha", .value = randomValue & 0xffff },
+                    .{ .key = "beta", .value = (randomValue >> 16) & 0xffff },
+                    .{ .key = "gamma", .value = (randomValue >> 32) & 0xffff },
                 };
-                const setInts = [_]u64{ iv % 1000, (iv >> 10) % 1000, (iv >> 20) % 1000 };
+                const setInts = [_]u64{ randomValue % 1000, (randomValue >> 10) % 1000, (randomValue >> 20) % 1000 };
                 const setBlobs = [_][]const u8{ "m0", "m1", "m2" };
 
                 const row = [propertyCount]Value{
                     .{ .int = primaryKey },
-                    .{ .int = iv },
+                    .{ .int = randomValue },
                     .{ .int = primaryKey & 1 }, // bool
                     .{ .bytes = &blobBuffer },
                     .{ .link = if (primaryKey == 0) null else primaryKey - 1 }, // self-link to prior objectKey
@@ -157,15 +157,15 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
                     .{ .setBlob = &setBlobs },
                 };
 
-                const t0 = nowNs(io);
-                const r = try objects.insertTyped(&w, catalogRef, &row);
-                const dt: u64 = @intCast(nowNs(io) - t0);
-                catalogRef = r.catalogRef;
-                try createLat.add(alloc, dt);
-                try combined.add(alloc, dt);
+                const startNs = nowNs(io);
+                const result = try objects.insertTyped(&writeTransaction, catalogRef, &row);
+                const elapsedNs: u64 = @intCast(nowNs(io) - startNs);
+                catalogRef = result.catalogRef;
+                try createLat.add(alloc, elapsedNs);
+                try combined.add(alloc, elapsedNs);
             }
-            w.setRoot(catalogRef);
-            _ = try w.commit();
+            writeTransaction.setRoot(catalogRef);
+            _ = try writeTransaction.commit();
             inserted += thisBatch;
         }
         totalNs += @intCast(nowNs(io) - phaseStart);
@@ -182,24 +182,24 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     // --- READ phase: materialize every property kind -----------------------------
     {
         const phaseStart = nowNs(io);
-        var r = try database.beginRead();
-        const catalogRef = r.root();
+        var readTransaction = try database.beginRead();
+        const catalogRef = readTransaction.root();
         var out: [propertyCount]Value = undefined;
-        var k: usize = 0;
-        while (k < readN) : (k += 1) {
-            const primaryKey: u64 = (k * readStride) % rows;
-            const t0 = nowNs(io);
-            _ = try objects.getTyped(&r, catalogRef, primaryKey, &out); // int/bool/blob/link
-            _ = try collections.dictCount(&r, catalogRef, primaryKey, pDict);
-            _ = try collections.dictGet(&r, catalogRef, primaryKey, pDict, "alpha");
-            _ = try collections.setCountInt(&r, catalogRef, primaryKey, pSetInt);
-            _ = try collections.setCountBlob(&r, catalogRef, primaryKey, pSetBlob);
-            _ = try collections.setContainsBlob(&r, catalogRef, primaryKey, pSetBlob, "m1");
-            const dt: u64 = @intCast(nowNs(io) - t0);
-            try readLat.add(alloc, dt);
-            try combined.add(alloc, dt);
+        var key: usize = 0;
+        while (key < readN) : (key += 1) {
+            const primaryKey: u64 = (key * readStride) % rows;
+            const startNs = nowNs(io);
+            _ = try objects.getTyped(&readTransaction, catalogRef, primaryKey, &out); // int/bool/blob/link
+            _ = try collections.dictCount(&readTransaction, catalogRef, primaryKey, pDict);
+            _ = try collections.dictGet(&readTransaction, catalogRef, primaryKey, pDict, "alpha");
+            _ = try collections.setCountInt(&readTransaction, catalogRef, primaryKey, pSetInt);
+            _ = try collections.setCountBlob(&readTransaction, catalogRef, primaryKey, pSetBlob);
+            _ = try collections.setContainsBlob(&readTransaction, catalogRef, primaryKey, pSetBlob, "m1");
+            const elapsedNs: u64 = @intCast(nowNs(io) - startNs);
+            try readLat.add(alloc, elapsedNs);
+            try combined.add(alloc, elapsedNs);
         }
-        r.end();
+        readTransaction.end();
         totalNs += @intCast(nowNs(io) - phaseStart);
     }
 
@@ -209,22 +209,22 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         var done: usize = 0;
         while (done < updateN) {
             const thisBatch = @min(batchSize, updateN - done);
-            var w = try database.beginWrite();
-            var catalogRef = w.newRoot;
-            var j: usize = 0;
-            while (j < thisBatch) : (j += 1) {
-                const primaryKey: u64 = ((done + j) * updateStride) % rows;
+            var writeTransaction = try database.beginWrite();
+            var catalogRef = writeTransaction.newRoot;
+            var innerIndex: usize = 0;
+            while (innerIndex < thisBatch) : (innerIndex += 1) {
+                const primaryKey: u64 = ((done + innerIndex) * updateStride) % rows;
                 const target: u64 = (primaryKey + 7) % rows;
-                const t0 = nowNs(io);
-                catalogRef = try collections.setAddInt(&w, catalogRef, primaryKey, pSetInt, 1_000_000 + primaryKey);
-                catalogRef = try collections.dictPut(&w, catalogRef, primaryKey, pDict, "delta", primaryKey);
-                catalogRef = try links.setLink(&w, catalogRef, primaryKey, pLink, target);
-                const dt: u64 = @intCast(nowNs(io) - t0);
-                try updateLat.add(alloc, dt);
-                try combined.add(alloc, dt);
+                const startNs = nowNs(io);
+                catalogRef = try collections.setAddInt(&writeTransaction, catalogRef, primaryKey, pSetInt, 1_000_000 + primaryKey);
+                catalogRef = try collections.dictPut(&writeTransaction, catalogRef, primaryKey, pDict, "delta", primaryKey);
+                catalogRef = try links.setLink(&writeTransaction, catalogRef, primaryKey, pLink, target);
+                const elapsedNs: u64 = @intCast(nowNs(io) - startNs);
+                try updateLat.add(alloc, elapsedNs);
+                try combined.add(alloc, elapsedNs);
             }
-            w.setRoot(catalogRef);
-            _ = try w.commit();
+            writeTransaction.setRoot(catalogRef);
+            _ = try writeTransaction.commit();
             done += thisBatch;
         }
         totalNs += @intCast(nowNs(io) - phaseStart);
@@ -237,28 +237,28 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         var done: usize = 0;
         while (done < deleteN) {
             const thisBatch = @min(batchSize, deleteN - done);
-            var w = try database.beginWrite();
-            var catalogRef = w.newRoot;
+            var writeTransaction = try database.beginWrite();
+            var catalogRef = writeTransaction.newRoot;
             var raw: [propertyCount]u64 = undefined;
-            var j: usize = 0;
-            while (j < thisBatch) : (j += 1) {
-                const primaryKey: u64 = ((done + j) * deleteStride) % rows;
-                const version = (try rawRows.getByPrimaryKey(&w, catalogRef, primaryKey, &raw)) orelse continue;
-                const t0 = nowNs(io);
-                const dres = try objects.deleteTyped(&w, catalogRef, primaryKey, version);
-                const dt: u64 = @intCast(nowNs(io) - t0);
+            var innerIndex: usize = 0;
+            while (innerIndex < thisBatch) : (innerIndex += 1) {
+                const primaryKey: u64 = ((done + innerIndex) * deleteStride) % rows;
+                const version = (try rawRows.getByPrimaryKey(&writeTransaction, catalogRef, primaryKey, &raw)) orelse continue;
+                const startNs = nowNs(io);
+                const dres = try objects.deleteTyped(&writeTransaction, catalogRef, primaryKey, version);
+                const elapsedNs: u64 = @intCast(nowNs(io) - startNs);
                 switch (dres) {
-                    .ok => |c| {
-                        catalogRef = c;
+                    .ok => |newCatalog| {
+                        catalogRef = newCatalog;
                         deleted += 1;
-                        try deleteLat.add(alloc, dt);
-                        try combined.add(alloc, dt);
+                        try deleteLat.add(alloc, elapsedNs);
+                        try combined.add(alloc, elapsedNs);
                     },
                     else => {},
                 }
             }
-            w.setRoot(catalogRef);
-            _ = try w.commit();
+            writeTransaction.setRoot(catalogRef);
+            _ = try writeTransaction.commit();
             done += thisBatch;
         }
         totalNs += @intCast(nowNs(io) - phaseStart);

@@ -49,19 +49,19 @@ test "create builds a directory with one catalog per type" {
     defer testing.allocator.free(path);
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
-    var w = try database.beginWrite();
+    var writeTransaction = try database.beginWrite();
     const schema = [_][]const catalog.PropertyKind{
         &.{ .int, .blob },
         &.{ .int, .int, .int },
     };
-    const dir = try create(&w, &schema);
-    try testing.expectEqual(@as(u16, 2), try typeCount(&w, dir));
-    const c0 = try catalogRef(&w, dir, 0);
-    const c1 = try catalogRef(&w, dir, 1);
-    try testing.expect(c0 != 0 and c1 != 0 and c0 != c1);
-    try testing.expectEqual(@as(catalog.PropertyCount, 2), (try catalog.loadCatalog(&w, c0)).propertyCount);
-    try testing.expectEqual(@as(catalog.PropertyCount, 3), (try catalog.loadCatalog(&w, c1)).propertyCount);
-    w.deinit();
+    const dir = try create(&writeTransaction, &schema);
+    try testing.expectEqual(@as(u16, 2), try typeCount(&writeTransaction, dir));
+    const catalog0 = try catalogRef(&writeTransaction, dir, 0);
+    const catalog1 = try catalogRef(&writeTransaction, dir, 1);
+    try testing.expect(catalog0 != 0 and catalog1 != 0 and catalog0 != catalog1);
+    try testing.expectEqual(@as(catalog.PropertyCount, 2), (try catalog.loadCatalog(&writeTransaction, catalog0)).propertyCount);
+    try testing.expectEqual(@as(catalog.PropertyCount, 3), (try catalog.loadCatalog(&writeTransaction, catalog1)).propertyCount);
+    writeTransaction.deinit();
 }
 
 test "catalogRef rejects an out-of-range type id" {
@@ -71,11 +71,11 @@ test "catalogRef rejects an out-of-range type id" {
     defer testing.allocator.free(path);
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
-    var w = try database.beginWrite();
+    var writeTransaction = try database.beginWrite();
     const schema = [_][]const catalog.PropertyKind{&.{ .int, .int }};
-    const dir = try create(&w, &schema);
-    try testing.expectError(error.NoSuchType, catalogRef(&w, dir, 5));
-    w.deinit();
+    const dir = try create(&writeTransaction, &schema);
+    try testing.expectError(error.NoSuchType, catalogRef(&writeTransaction, dir, 5));
+    writeTransaction.deinit();
 }
 
 test "validate accepts a matching schema and rejects a mismatch" {
@@ -87,23 +87,23 @@ test "validate accepts a matching schema and rejects a mismatch" {
     {
         var database = try Database.create(testing.allocator, path);
         defer database.deinit();
-        var w = try database.beginWrite();
-        const dir = try create(&w, &schema);
-        w.setRoot(dir);
-        _ = try w.commit();
+        var writeTransaction = try database.beginWrite();
+        const dir = try create(&writeTransaction, &schema);
+        writeTransaction.setRoot(dir);
+        _ = try writeTransaction.commit();
     }
     {
         var database = try Database.open(testing.allocator, path);
         defer database.deinit();
-        var r = try database.beginRead();
-        try validate(&r, r.root(), &schema); // matches
+        var readTransaction = try database.beginRead();
+        try validate(&readTransaction, readTransaction.root(), &schema); // matches
         const fewer = [_][]const catalog.PropertyKind{&.{ .int, .blob }};
-        try testing.expectError(error.SchemaMismatch, validate(&r, r.root(), &fewer));
+        try testing.expectError(error.SchemaMismatch, validate(&readTransaction, readTransaction.root(), &fewer));
         const wrongKind = [_][]const catalog.PropertyKind{ &.{ .int, .int }, &.{ .int, .int, .int } };
-        try testing.expectError(error.SchemaMismatch, validate(&r, r.root(), &wrongKind));
+        try testing.expectError(error.SchemaMismatch, validate(&readTransaction, readTransaction.root(), &wrongKind));
         const wrongCount = [_][]const catalog.PropertyKind{ &.{ .int, .blob }, &.{ .int, .int } };
-        try testing.expectError(error.SchemaMismatch, validate(&r, r.root(), &wrongCount));
-        r.end();
+        try testing.expectError(error.SchemaMismatch, validate(&readTransaction, readTransaction.root(), &wrongCount));
+        readTransaction.end();
     }
 }
 
@@ -114,35 +114,35 @@ test "two types route independently through the directory" {
     defer testing.allocator.free(path);
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
-    var w = try database.beginWrite();
+    var writeTransaction = try database.beginWrite();
     const schema = [_][]const PropertyKind{ &.{ .int, .blob }, &.{ .int, .int } };
-    var dir = try create(&w, &schema);
+    var dir = try create(&writeTransaction, &schema);
 
-    dir = (try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .bytes = "Ada" } })).dir;
-    dir = (try insert(&w, dir, 1, &.{ .{ .int = 1 }, .{ .int = 42 } })).dir;
+    dir = (try insert(&writeTransaction, dir, 0, &.{ .{ .int = 1 }, .{ .bytes = "Ada" } })).dir;
+    dir = (try insert(&writeTransaction, dir, 1, &.{ .{ .int = 1 }, .{ .int = 42 } })).dir;
 
     var out0: [2]Value = undefined;
-    _ = (try get(&w, dir, 0, 1, &out0)).?;
+    _ = (try get(&writeTransaction, dir, 0, 1, &out0)).?;
     try testing.expectEqualStrings("Ada", out0[1].bytes);
 
     var out1: [2]Value = undefined;
-    const ver1 = (try get(&w, dir, 1, 1, &out1)).?;
+    const ver1 = (try get(&writeTransaction, dir, 1, 1, &out1)).?;
     try testing.expectEqual(@as(u64, 42), out1[1].int);
 
-    const ur = try update(&w, dir, 1, 1, &.{ .{ .int = 1 }, .{ .int = 99 } }, ver1);
-    dir = ur.ok.dir;
-    _ = (try get(&w, dir, 1, 1, &out1)).?;
+    const updateResult = try update(&writeTransaction, dir, 1, 1, &.{ .{ .int = 1 }, .{ .int = 99 } }, ver1);
+    dir = updateResult.ok.dir;
+    _ = (try get(&writeTransaction, dir, 1, 1, &out1)).?;
     try testing.expectEqual(@as(u64, 99), out1[1].int);
-    _ = (try get(&w, dir, 0, 1, &out0)).?;
+    _ = (try get(&writeTransaction, dir, 0, 1, &out0)).?;
     try testing.expectEqualStrings("Ada", out0[1].bytes);
 
     // delete type 0's row
-    const v0 = (try get(&w, dir, 0, 1, &out0)).?;
-    const dr = try delete(&w, dir, 0, 1, v0);
-    dir = dr.ok;
-    try testing.expectEqual(@as(?u64, null), try get(&w, dir, 0, 1, &out0));
-    try testing.expectEqual(@as(u64, 1), try liveCount(&w, dir, 1)); // type 1 unaffected
-    w.deinit();
+    const version0 = (try get(&writeTransaction, dir, 0, 1, &out0)).?;
+    const deleteResult = try delete(&writeTransaction, dir, 0, 1, version0);
+    dir = deleteResult.ok;
+    try testing.expectEqual(@as(?u64, null), try get(&writeTransaction, dir, 0, 1, &out0));
+    try testing.expectEqual(@as(u64, 1), try liveCount(&writeTransaction, dir, 1)); // type 1 unaffected
+    writeTransaction.deinit();
 }
 
 test "multiple types persist across reopen and validate" {
@@ -154,32 +154,32 @@ test "multiple types persist across reopen and validate" {
     {
         var database = try Database.create(testing.allocator, path);
         defer database.deinit();
-        var w = try database.beginWrite();
-        var dir = try create(&w, &schema);
-        var i: u64 = 0;
+        var writeTransaction = try database.beginWrite();
+        var dir = try create(&writeTransaction, &schema);
+        var index: u64 = 0;
         var buffer: [16]u8 = undefined;
-        while (i < 300) : (i += 1) {
-            const s = try std.fmt.bufPrint(&buffer, "p{d}", .{i});
-            dir = (try insert(&w, dir, 0, &.{ .{ .int = i }, .{ .bytes = s } })).dir;
-            dir = (try insert(&w, dir, 1, &.{ .{ .int = i }, .{ .int = i * 10 } })).dir;
+        while (index < 300) : (index += 1) {
+            const name = try std.fmt.bufPrint(&buffer, "p{d}", .{index});
+            dir = (try insert(&writeTransaction, dir, 0, &.{ .{ .int = index }, .{ .bytes = name } })).dir;
+            dir = (try insert(&writeTransaction, dir, 1, &.{ .{ .int = index }, .{ .int = index * 10 } })).dir;
         }
-        w.setRoot(dir);
-        _ = try w.commit();
+        writeTransaction.setRoot(dir);
+        _ = try writeTransaction.commit();
     }
     {
         var database = try Database.open(testing.allocator, path);
         defer database.deinit();
-        var r = try database.beginRead();
-        try validate(&r, r.root(), &schema);
-        try testing.expectEqual(@as(u64, 300), try liveCount(&r, r.root(), 0));
-        try testing.expectEqual(@as(u64, 300), try liveCount(&r, r.root(), 1));
+        var readTransaction = try database.beginRead();
+        try validate(&readTransaction, readTransaction.root(), &schema);
+        try testing.expectEqual(@as(u64, 300), try liveCount(&readTransaction, readTransaction.root(), 0));
+        try testing.expectEqual(@as(u64, 300), try liveCount(&readTransaction, readTransaction.root(), 1));
         var out0: [2]Value = undefined;
-        _ = (try get(&r, r.root(), 0, 250, &out0)).?;
+        _ = (try get(&readTransaction, readTransaction.root(), 0, 250, &out0)).?;
         try testing.expectEqualStrings("p250", out0[1].bytes);
         var out1: [2]Value = undefined;
-        _ = (try get(&r, r.root(), 1, 250, &out1)).?;
+        _ = (try get(&readTransaction, readTransaction.root(), 1, 250, &out1)).?;
         try testing.expectEqual(@as(u64, 2500), out1[1].int);
-        r.end();
+        readTransaction.end();
     }
 }
 
@@ -190,23 +190,23 @@ test "addType grows the directory and routes the new type" {
     defer testing.allocator.free(path);
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
-    var w = try database.beginWrite();
+    var writeTransaction = try database.beginWrite();
     const schema = [_][]const PropertyKind{&.{ .int, .blob }};
-    var dir = try create(&w, &schema);
-    try testing.expectEqual(@as(u16, 1), try typeCount(&w, dir));
-    const added = try addType(&w, dir, &.{ .int, .int, .int });
+    var dir = try create(&writeTransaction, &schema);
+    try testing.expectEqual(@as(u16, 1), try typeCount(&writeTransaction, dir));
+    const added = try addType(&writeTransaction, dir, &.{ .int, .int, .int });
     dir = added.dir;
     try testing.expectEqual(@as(u16, 1), added.typeId);
-    try testing.expectEqual(@as(u16, 2), try typeCount(&w, dir));
+    try testing.expectEqual(@as(u16, 2), try typeCount(&writeTransaction, dir));
     // old type still works; new type accepts rows
-    dir = (try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .bytes = "x" } })).dir;
-    dir = (try insert(&w, dir, 1, &.{ .{ .int = 1 }, .{ .int = 2 }, .{ .int = 3 } })).dir;
-    try testing.expectEqual(@as(u64, 1), try liveCount(&w, dir, 0));
-    try testing.expectEqual(@as(u64, 1), try liveCount(&w, dir, 1));
+    dir = (try insert(&writeTransaction, dir, 0, &.{ .{ .int = 1 }, .{ .bytes = "x" } })).dir;
+    dir = (try insert(&writeTransaction, dir, 1, &.{ .{ .int = 1 }, .{ .int = 2 }, .{ .int = 3 } })).dir;
+    try testing.expectEqual(@as(u64, 1), try liveCount(&writeTransaction, dir, 0));
+    try testing.expectEqual(@as(u64, 1), try liveCount(&writeTransaction, dir, 1));
     var out: [3]Value = undefined;
-    _ = (try get(&w, dir, 1, 1, &out)).?;
+    _ = (try get(&writeTransaction, dir, 1, 1, &out)).?;
     try testing.expectEqual(@as(u64, 3), out[2].int);
-    w.deinit();
+    writeTransaction.deinit();
 }
 
 test "multi-type directory carries links and collections via createWithDefs" {
@@ -216,36 +216,36 @@ test "multi-type directory carries links and collections via createWithDefs" {
     defer testing.allocator.free(path);
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
-    var w = try database.beginWrite();
+    var writeTransaction = try database.beginWrite();
     const PD = catalog.PropertyDefinition;
     // type 0: scalar (int primaryKey, blob name); type 1: int primaryKey + a to-one link + a to-many linkSet
     const schema = [_][]const PD{
         &.{ .{ .kind = .int }, .{ .kind = .blob } },
         &.{ .{ .kind = .int }, .{ .kind = .link }, .{ .kind = .linkSet } },
     };
-    var dir = try createWithDefinitions(&w, &schema);
-    try testing.expectEqual(@as(u16, 2), try typeCount(&w, dir));
+    var dir = try createWithDefinitions(&writeTransaction, &schema);
+    try testing.expectEqual(@as(u16, 2), try typeCount(&writeTransaction, dir));
 
     // insert two type-1 rows; row a links to nothing, b's set links to a.
-    const a = try Objects.insertTyped(&w, try catalogRef(&w, dir, 1), &.{ .{ .int = 10 }, .{ .link = null }, .{ .linkSet = &.{} } });
-    dir = try setCatalogRef(&w, dir, 1, a.catalogRef);
-    const b = try Objects.insertTyped(&w, try catalogRef(&w, dir, 1), &.{ .{ .int = 20 }, .{ .link = a.objectKey }, .{ .linkSet = &.{a.objectKey} } });
-    dir = try setCatalogRef(&w, dir, 1, b.catalogRef);
+    const insertedA = try Objects.insertTyped(&writeTransaction, try catalogRef(&writeTransaction, dir, 1), &.{ .{ .int = 10 }, .{ .link = null }, .{ .linkSet = &.{} } });
+    dir = try setCatalogRef(&writeTransaction, dir, 1, insertedA.catalogRef);
+    const insertedB = try Objects.insertTyped(&writeTransaction, try catalogRef(&writeTransaction, dir, 1), &.{ .{ .int = 20 }, .{ .link = insertedA.objectKey }, .{ .linkSet = &.{insertedA.objectKey} } });
+    dir = try setCatalogRef(&writeTransaction, dir, 1, insertedB.catalogRef);
 
     // route a to-many add through the directory
-    dir = try linkSetAdd(&w, dir, 1, 20, 2, a.objectKey); // already member -> no-op
-    try testing.expect(try linkSetContains(&w, dir, 1, 20, 2, a.objectKey));
-    try testing.expectEqual(@as(?u64, a.objectKey), try getLink(&w, dir, 1, 20, 1));
+    dir = try linkSetAdd(&writeTransaction, dir, 1, 20, 2, insertedA.objectKey); // already member -> no-op
+    try testing.expect(try linkSetContains(&writeTransaction, dir, 1, 20, 2, insertedA.objectKey));
+    try testing.expectEqual(@as(?u64, insertedA.objectKey), try getLink(&writeTransaction, dir, 1, 20, 1));
     // a has 2 inbound to-one? no: only b's to-one links a -> backlink on property 1 == 1
-    try testing.expectEqual(@as(u64, 1), try backlinkCount(&w, dir, 1, 1, a.objectKey));
+    try testing.expectEqual(@as(u64, 1), try backlinkCount(&writeTransaction, dir, 1, 1, insertedA.objectKey));
 
     // addTypeDefinitions: append a type with a list property
-    const added = try addTypeDefinitions(&w, dir, &.{ .{ .kind = .int }, .{ .kind = .list, .element = .int } });
+    const added = try addTypeDefinitions(&writeTransaction, dir, &.{ .{ .kind = .int }, .{ .kind = .list, .element = .int } });
     dir = added.dir;
     try testing.expectEqual(@as(u16, 2), added.typeId);
-    dir = (try insert(&w, dir, 2, &.{ .{ .int = 1 }, .{ .listInt = &.{ 7, 8, 9 } } })).dir;
-    try testing.expectEqual(@as(?u64, 3), try collections.listLength(&w, try catalogRef(&w, dir, 2), 1, 1));
-    w.deinit();
+    dir = (try insert(&writeTransaction, dir, 2, &.{ .{ .int = 1 }, .{ .listInt = &.{ 7, 8, 9 } } })).dir;
+    try testing.expectEqual(@as(?u64, 3), try collections.listLength(&writeTransaction, try catalogRef(&writeTransaction, dir, 2), 1, 1));
+    writeTransaction.deinit();
 }
 
 test "a cross-type link resolves to the target type's object" {
@@ -255,27 +255,27 @@ test "a cross-type link resolves to the target type's object" {
     defer testing.allocator.free(path);
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
-    var w = try database.beginWrite();
+    var writeTransaction = try database.beginWrite();
     const PD = catalog.PropertyDefinition;
     const schema = [_][]const PD{
         &.{ .{ .kind = .int }, .{ .kind = .blob } }, // 0: Author
         &.{ .{ .kind = .int }, .{ .kind = .link, .linkTarget = 0 } }, // 1: Book.author -> Author
     };
-    var dir = try createWithDefinitions(&w, &schema);
+    var dir = try createWithDefinitions(&writeTransaction, &schema);
 
-    const ains = try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .bytes = "Ada" } });
+    const ains = try insert(&writeTransaction, dir, 0, &.{ .{ .int = 1 }, .{ .bytes = "Ada" } });
     dir = ains.dir;
     const authorObjectKey = ains.objectKey;
-    dir = (try insert(&w, dir, 1, &.{ .{ .int = 1 }, .{ .link = authorObjectKey } })).dir;
+    dir = (try insert(&writeTransaction, dir, 1, &.{ .{ .int = 1 }, .{ .link = authorObjectKey } })).dir;
 
-    const r = (try resolveLink(&w, dir, 1, 1, 1)).?;
-    try testing.expectEqual(@as(u16, 0), r.targetType);
-    try testing.expectEqual(authorObjectKey, r.objectKey);
+    const readTransaction = (try resolveLink(&writeTransaction, dir, 1, 1, 1)).?;
+    try testing.expectEqual(@as(u16, 0), readTransaction.targetType);
+    try testing.expectEqual(authorObjectKey, readTransaction.objectKey);
 
     var out: [2]Value = undefined;
-    _ = (try getLinked(&w, dir, 1, 1, 1, &out)).?;
+    _ = (try getLinked(&writeTransaction, dir, 1, 1, 1, &out)).?;
     try testing.expectEqualStrings("Ada", out[1].bytes);
-    w.deinit();
+    writeTransaction.deinit();
 }
 
 test "deleting a target nullifies inbound links from another type" {
@@ -285,31 +285,31 @@ test "deleting a target nullifies inbound links from another type" {
     defer testing.allocator.free(path);
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
-    var w = try database.beginWrite();
+    var writeTransaction = try database.beginWrite();
     const PD = catalog.PropertyDefinition;
     const schema = [_][]const PD{
         &.{ .{ .kind = .int }, .{ .kind = .blob } }, // 0: Author
         &.{ .{ .kind = .int }, .{ .kind = .link, .linkTarget = 0 } }, // 1: Book.author -> Author
     };
-    var dir = try createWithDefinitions(&w, &schema);
+    var dir = try createWithDefinitions(&writeTransaction, &schema);
 
-    const ains = try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .bytes = "Ada" } });
+    const ains = try insert(&writeTransaction, dir, 0, &.{ .{ .int = 1 }, .{ .bytes = "Ada" } });
     dir = ains.dir;
     const authorObjectKey = ains.objectKey;
-    dir = (try insert(&w, dir, 1, &.{ .{ .int = 1 }, .{ .link = authorObjectKey } })).dir;
-    dir = (try insert(&w, dir, 1, &.{ .{ .int = 2 }, .{ .link = authorObjectKey } })).dir;
+    dir = (try insert(&writeTransaction, dir, 1, &.{ .{ .int = 1 }, .{ .link = authorObjectKey } })).dir;
+    dir = (try insert(&writeTransaction, dir, 1, &.{ .{ .int = 2 }, .{ .link = authorObjectKey } })).dir;
 
-    try testing.expectEqual(@as(u64, 2), try backlinkCount(&w, dir, 1, 1, authorObjectKey));
+    try testing.expectEqual(@as(u64, 2), try backlinkCount(&writeTransaction, dir, 1, 1, authorObjectKey));
 
     var abuf: [2]Value = undefined;
-    const authorVersion = (try get(&w, dir, 0, 1, &abuf)).?;
-    const dres = try deleteNullifyCrossType(&w, dir, 0, 1, authorVersion);
+    const authorVersion = (try get(&writeTransaction, dir, 0, 1, &abuf)).?;
+    const dres = try deleteNullifyCrossType(&writeTransaction, dir, 0, 1, authorVersion);
     dir = dres.ok;
 
-    try testing.expectEqual(@as(?u64, null), try getLink(&w, dir, 1, 1, 1));
-    try testing.expectEqual(@as(?u64, null), try getLink(&w, dir, 1, 2, 1));
-    try testing.expectEqual(@as(u64, 0), try backlinkCount(&w, dir, 1, 1, authorObjectKey));
-    w.deinit();
+    try testing.expectEqual(@as(?u64, null), try getLink(&writeTransaction, dir, 1, 1, 1));
+    try testing.expectEqual(@as(?u64, null), try getLink(&writeTransaction, dir, 1, 2, 1));
+    try testing.expectEqual(@as(u64, 0), try backlinkCount(&writeTransaction, dir, 1, 1, authorObjectKey));
+    writeTransaction.deinit();
 }
 
 test "cross-type links persist across reopen" {
@@ -326,30 +326,30 @@ test "cross-type links persist across reopen" {
     {
         var database = try Database.create(testing.allocator, path);
         defer database.deinit();
-        var w = try database.beginWrite();
-        var dir = try createWithDefinitions(&w, &schema);
-        const ains = try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .bytes = "Ada" } });
+        var writeTransaction = try database.beginWrite();
+        var dir = try createWithDefinitions(&writeTransaction, &schema);
+        const ains = try insert(&writeTransaction, dir, 0, &.{ .{ .int = 1 }, .{ .bytes = "Ada" } });
         dir = ains.dir;
         authorObjectKey = ains.objectKey;
-        var i: u64 = 1;
-        while (i <= 20) : (i += 1) {
-            dir = (try insert(&w, dir, 1, &.{ .{ .int = i }, .{ .link = authorObjectKey } })).dir;
+        var index: u64 = 1;
+        while (index <= 20) : (index += 1) {
+            dir = (try insert(&writeTransaction, dir, 1, &.{ .{ .int = index }, .{ .link = authorObjectKey } })).dir;
         }
-        w.setRoot(dir);
-        _ = try w.commit();
+        writeTransaction.setRoot(dir);
+        _ = try writeTransaction.commit();
     }
     {
         var database = try Database.open(testing.allocator, path);
         defer database.deinit();
-        var r = try database.beginRead();
-        try testing.expectEqual(@as(u64, 20), try backlinkCount(&r, r.root(), 1, 1, authorObjectKey));
-        const res = (try resolveLink(&r, r.root(), 1, 7, 1)).?;
+        var readTransaction = try database.beginRead();
+        try testing.expectEqual(@as(u64, 20), try backlinkCount(&readTransaction, readTransaction.root(), 1, 1, authorObjectKey));
+        const res = (try resolveLink(&readTransaction, readTransaction.root(), 1, 7, 1)).?;
         try testing.expectEqual(@as(u16, 0), res.targetType);
         try testing.expectEqual(authorObjectKey, res.objectKey);
         var out: [2]Value = undefined;
-        _ = (try getLinked(&r, r.root(), 1, 13, 1, &out)).?;
+        _ = (try getLinked(&readTransaction, readTransaction.root(), 1, 13, 1, &out)).?;
         try testing.expectEqualStrings("Ada", out[1].bytes);
-        r.end();
+        readTransaction.end();
     }
 }
 
@@ -360,35 +360,35 @@ test "block prevents deleting a referenced object" {
     defer testing.allocator.free(path);
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
-    var w = try database.beginWrite();
+    var writeTransaction = try database.beginWrite();
     const PD = catalog.PropertyDefinition;
     const schema = [_][]const PD{
         &.{ .{ .kind = .int }, .{ .kind = .blob } }, // Author
         &.{ .{ .kind = .int }, .{ .kind = .link, .linkTarget = 0, .deletionRule = .block } }, // Book.author (block)
     };
-    var dir = try createWithDefinitions(&w, &schema);
-    const author = try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .bytes = "Ada" } });
+    var dir = try createWithDefinitions(&writeTransaction, &schema);
+    const author = try insert(&writeTransaction, dir, 0, &.{ .{ .int = 1 }, .{ .bytes = "Ada" } });
     dir = author.dir;
-    const book = try insert(&w, dir, 1, &.{ .{ .int = 1 }, .{ .link = author.objectKey } });
+    const book = try insert(&writeTransaction, dir, 1, &.{ .{ .int = 1 }, .{ .link = author.objectKey } });
     dir = book.dir;
 
-    var av: [2]Value = undefined;
-    const aver = (try get(&w, dir, 0, 1, &av)).?;
-    const blocked = try deleteNullifyCrossType(&w, dir, 0, 1, aver);
+    var valuesA: [2]Value = undefined;
+    const versionA = (try get(&writeTransaction, dir, 0, 1, &valuesA)).?;
+    const blocked = try deleteNullifyCrossType(&writeTransaction, dir, 0, 1, versionA);
     try testing.expect(blocked == .blocked);
-    try testing.expect((try get(&w, dir, 0, 1, &av)) != null); // author still there
+    try testing.expect((try get(&writeTransaction, dir, 0, 1, &valuesA)) != null); // author still there
 
     // Remove the book, then the author deletes fine.
-    var bv: [2]Value = undefined;
-    const versionB = (try get(&w, dir, 1, 1, &bv)).?;
-    const dbk = try deleteNullifyCrossType(&w, dir, 1, 1, versionB);
-    dir = dbk.ok;
-    const aver2 = (try get(&w, dir, 0, 1, &av)).?;
-    const da = try deleteNullifyCrossType(&w, dir, 0, 1, aver2);
-    try testing.expect(da == .ok);
-    dir = da.ok;
-    try testing.expectEqual(@as(?u64, null), try get(&w, dir, 0, 1, &av));
-    w.deinit();
+    var valuesB: [2]Value = undefined;
+    const versionB = (try get(&writeTransaction, dir, 1, 1, &valuesB)).?;
+    const deleteResultB = try deleteNullifyCrossType(&writeTransaction, dir, 1, 1, versionB);
+    dir = deleteResultB.ok;
+    const versionA2 = (try get(&writeTransaction, dir, 0, 1, &valuesA)).?;
+    const deleteResultA = try deleteNullifyCrossType(&writeTransaction, dir, 0, 1, versionA2);
+    try testing.expect(deleteResultA == .ok);
+    dir = deleteResultA.ok;
+    try testing.expectEqual(@as(?u64, null), try get(&writeTransaction, dir, 0, 1, &valuesA));
+    writeTransaction.deinit();
 }
 
 test "cascade deletes owned children" {
@@ -398,30 +398,30 @@ test "cascade deletes owned children" {
     defer testing.allocator.free(path);
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
-    var w = try database.beginWrite();
+    var writeTransaction = try database.beginWrite();
     const PD = catalog.PropertyDefinition;
     const schema = [_][]const PD{
         &.{ .{ .kind = .int }, .{ .kind = .linkSet, .linkTarget = 1, .deletionRule = .cascade } }, // Parent.children
         &.{.{ .kind = .int }}, // Child
     };
-    var dir = try createWithDefinitions(&w, &schema);
-    const c1 = try insert(&w, dir, 1, &.{.{ .int = 10 }});
-    dir = c1.dir;
-    const c2 = try insert(&w, dir, 1, &.{.{ .int = 20 }});
-    dir = c2.dir;
-    const c3 = try insert(&w, dir, 1, &.{.{ .int = 30 }});
-    dir = c3.dir;
-    const parent = try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .linkSet = &.{ c1.objectKey, c2.objectKey, c3.objectKey } } });
+    var dir = try createWithDefinitions(&writeTransaction, &schema);
+    const child1 = try insert(&writeTransaction, dir, 1, &.{.{ .int = 10 }});
+    dir = child1.dir;
+    const child2 = try insert(&writeTransaction, dir, 1, &.{.{ .int = 20 }});
+    dir = child2.dir;
+    const child3 = try insert(&writeTransaction, dir, 1, &.{.{ .int = 30 }});
+    dir = child3.dir;
+    const parent = try insert(&writeTransaction, dir, 0, &.{ .{ .int = 1 }, .{ .linkSet = &.{ child1.objectKey, child2.objectKey, child3.objectKey } } });
     dir = parent.dir;
-    try testing.expectEqual(@as(u64, 3), try liveCount(&w, dir, 1));
+    try testing.expectEqual(@as(u64, 3), try liveCount(&writeTransaction, dir, 1));
 
-    var pv: [2]Value = undefined;
-    const pver = (try get(&w, dir, 0, 1, &pv)).?;
-    const dp = try deleteNullifyCrossType(&w, dir, 0, 1, pver);
-    dir = dp.ok;
-    try testing.expectEqual(@as(?u64, null), try get(&w, dir, 0, 1, &pv)); // parent gone
-    try testing.expectEqual(@as(u64, 0), try liveCount(&w, dir, 1)); // all children gone
-    w.deinit();
+    var parentValues: [2]Value = undefined;
+    const parentVersion = (try get(&writeTransaction, dir, 0, 1, &parentValues)).?;
+    const parentDelete = try deleteNullifyCrossType(&writeTransaction, dir, 0, 1, parentVersion);
+    dir = parentDelete.ok;
+    try testing.expectEqual(@as(?u64, null), try get(&writeTransaction, dir, 0, 1, &parentValues)); // parent gone
+    try testing.expectEqual(@as(u64, 0), try liveCount(&writeTransaction, dir, 1)); // all children gone
+    writeTransaction.deinit();
 }
 
 test "directory records per-type embedded flags" {
@@ -431,21 +431,21 @@ test "directory records per-type embedded flags" {
     defer testing.allocator.free(path);
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
-    var w = try database.beginWrite();
+    var writeTransaction = try database.beginWrite();
     const PD = catalog.PropertyDefinition;
     const schema = [_][]const PD{
         &.{ .{ .kind = .int }, .{ .kind = .blob } },
         &.{ .{ .kind = .int }, .{ .kind = .int } },
     };
-    var dir = try createTypes(&w, &schema, &.{ false, true });
-    try testing.expectEqual(false, try isEmbedded(&w, dir, 0));
-    try testing.expectEqual(true, try isEmbedded(&w, dir, 1));
+    var dir = try createTypes(&writeTransaction, &schema, &.{ false, true });
+    try testing.expectEqual(false, try isEmbedded(&writeTransaction, dir, 0));
+    try testing.expectEqual(true, try isEmbedded(&writeTransaction, dir, 1));
 
     // A setCatalogRef (via insert) rebuilds the node; flags must survive.
-    dir = (try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .bytes = "x" } })).dir;
-    try testing.expectEqual(false, try isEmbedded(&w, dir, 0));
-    try testing.expectEqual(true, try isEmbedded(&w, dir, 1));
-    w.deinit();
+    dir = (try insert(&writeTransaction, dir, 0, &.{ .{ .int = 1 }, .{ .bytes = "x" } })).dir;
+    try testing.expectEqual(false, try isEmbedded(&writeTransaction, dir, 0));
+    try testing.expectEqual(true, try isEmbedded(&writeTransaction, dir, 1));
+    writeTransaction.deinit();
 }
 
 const embeddedOwnerSchema = [_][]const catalog.PropertyDefinition{
@@ -460,17 +460,17 @@ test "insertEmbedded creates an owned child reachable from the owner" {
     defer testing.allocator.free(path);
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
-    var w = try database.beginWrite();
-    var dir = try createTypes(&w, &embeddedOwnerSchema, &.{ false, true });
+    var writeTransaction = try database.beginWrite();
+    var dir = try createTypes(&writeTransaction, &embeddedOwnerSchema, &.{ false, true });
 
-    dir = (try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .link = null } })).dir;
-    dir = try insertEmbedded(&w, dir, 0, 1, 1, &.{ .{ .int = 100 }, .{ .bytes = "note" } });
+    dir = (try insert(&writeTransaction, dir, 0, &.{ .{ .int = 1 }, .{ .link = null } })).dir;
+    dir = try insertEmbedded(&writeTransaction, dir, 0, 1, 1, &.{ .{ .int = 100 }, .{ .bytes = "note" } });
 
     var out: [2]Value = undefined;
-    _ = (try getLinked(&w, dir, 0, 1, 1, &out)).?;
+    _ = (try getLinked(&writeTransaction, dir, 0, 1, 1, &out)).?;
     try testing.expectEqualStrings("note", out[1].bytes);
-    try testing.expectEqual(@as(u64, 1), try liveCount(&w, dir, 1));
-    w.deinit();
+    try testing.expectEqual(@as(u64, 1), try liveCount(&writeTransaction, dir, 1));
+    writeTransaction.deinit();
 }
 
 test "clearEmbedded deletes the owned child" {
@@ -480,16 +480,16 @@ test "clearEmbedded deletes the owned child" {
     defer testing.allocator.free(path);
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
-    var w = try database.beginWrite();
-    var dir = try createTypes(&w, &embeddedOwnerSchema, &.{ false, true });
+    var writeTransaction = try database.beginWrite();
+    var dir = try createTypes(&writeTransaction, &embeddedOwnerSchema, &.{ false, true });
 
-    dir = (try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .link = null } })).dir;
-    dir = try insertEmbedded(&w, dir, 0, 1, 1, &.{ .{ .int = 100 }, .{ .bytes = "note" } });
-    dir = try clearEmbedded(&w, dir, 0, 1, 1);
+    dir = (try insert(&writeTransaction, dir, 0, &.{ .{ .int = 1 }, .{ .link = null } })).dir;
+    dir = try insertEmbedded(&writeTransaction, dir, 0, 1, 1, &.{ .{ .int = 100 }, .{ .bytes = "note" } });
+    dir = try clearEmbedded(&writeTransaction, dir, 0, 1, 1);
 
-    try testing.expectEqual(@as(?u64, null), try getLink(&w, dir, 0, 1, 1));
-    try testing.expectEqual(@as(u64, 0), try liveCount(&w, dir, 1));
-    w.deinit();
+    try testing.expectEqual(@as(?u64, null), try getLink(&writeTransaction, dir, 0, 1, 1));
+    try testing.expectEqual(@as(u64, 0), try liveCount(&writeTransaction, dir, 1));
+    writeTransaction.deinit();
 }
 
 test "replacing an embedded child deletes the old one" {
@@ -499,18 +499,18 @@ test "replacing an embedded child deletes the old one" {
     defer testing.allocator.free(path);
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
-    var w = try database.beginWrite();
-    var dir = try createTypes(&w, &embeddedOwnerSchema, &.{ false, true });
+    var writeTransaction = try database.beginWrite();
+    var dir = try createTypes(&writeTransaction, &embeddedOwnerSchema, &.{ false, true });
 
-    dir = (try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .link = null } })).dir;
-    dir = try insertEmbedded(&w, dir, 0, 1, 1, &.{ .{ .int = 1 }, .{ .bytes = "first" } });
-    dir = try insertEmbedded(&w, dir, 0, 1, 1, &.{ .{ .int = 2 }, .{ .bytes = "second" } });
+    dir = (try insert(&writeTransaction, dir, 0, &.{ .{ .int = 1 }, .{ .link = null } })).dir;
+    dir = try insertEmbedded(&writeTransaction, dir, 0, 1, 1, &.{ .{ .int = 1 }, .{ .bytes = "first" } });
+    dir = try insertEmbedded(&writeTransaction, dir, 0, 1, 1, &.{ .{ .int = 2 }, .{ .bytes = "second" } });
 
-    try testing.expectEqual(@as(u64, 1), try liveCount(&w, dir, 1));
+    try testing.expectEqual(@as(u64, 1), try liveCount(&writeTransaction, dir, 1));
     var out: [2]Value = undefined;
-    _ = (try getLinked(&w, dir, 0, 1, 1, &out)).?;
+    _ = (try getLinked(&writeTransaction, dir, 0, 1, 1, &out)).?;
     try testing.expectEqualStrings("second", out[1].bytes);
-    w.deinit();
+    writeTransaction.deinit();
 }
 
 test "deleting the owner cascades to the embedded child" {
@@ -520,19 +520,19 @@ test "deleting the owner cascades to the embedded child" {
     defer testing.allocator.free(path);
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
-    var w = try database.beginWrite();
-    var dir = try createTypes(&w, &embeddedOwnerSchema, &.{ false, true });
+    var writeTransaction = try database.beginWrite();
+    var dir = try createTypes(&writeTransaction, &embeddedOwnerSchema, &.{ false, true });
 
-    dir = (try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .link = null } })).dir;
-    dir = try insertEmbedded(&w, dir, 0, 1, 1, &.{ .{ .int = 100 }, .{ .bytes = "note" } });
+    dir = (try insert(&writeTransaction, dir, 0, &.{ .{ .int = 1 }, .{ .link = null } })).dir;
+    dir = try insertEmbedded(&writeTransaction, dir, 0, 1, 1, &.{ .{ .int = 100 }, .{ .bytes = "note" } });
 
-    var ov: [2]Value = undefined;
-    const ownerVersion = (try get(&w, dir, 0, 1, &ov)).?;
-    const dres = try deleteNullifyCrossType(&w, dir, 0, 1, ownerVersion);
+    var ownerValues: [2]Value = undefined;
+    const ownerVersion = (try get(&writeTransaction, dir, 0, 1, &ownerValues)).?;
+    const dres = try deleteNullifyCrossType(&writeTransaction, dir, 0, 1, ownerVersion);
     dir = dres.ok;
-    try testing.expectEqual(@as(?u64, null), try get(&w, dir, 0, 1, &ov));
-    try testing.expectEqual(@as(u64, 0), try liveCount(&w, dir, 1));
-    w.deinit();
+    try testing.expectEqual(@as(?u64, null), try get(&writeTransaction, dir, 0, 1, &ownerValues));
+    try testing.expectEqual(@as(u64, 0), try liveCount(&writeTransaction, dir, 1));
+    writeTransaction.deinit();
 }
 
 test "directory delete works after relocating the target" {
@@ -542,45 +542,45 @@ test "directory delete works after relocating the target" {
     defer testing.allocator.free(path);
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
-    var w = try database.beginWrite();
+    var writeTransaction = try database.beginWrite();
     const PD = catalog.PropertyDefinition;
     const schema = [_][]const PD{
         &.{ .{ .kind = .int }, .{ .kind = .blob } }, // 0: Author
         &.{ .{ .kind = .int }, .{ .kind = .link, .linkTarget = 0 } }, // 1: Book.author -> Author
     };
-    var dir = try createWithDefinitions(&w, &schema);
+    var dir = try createWithDefinitions(&writeTransaction, &schema);
 
     // A throwaway author opens a dead slot for the real author to move into.
-    const throwaway = try insert(&w, dir, 0, &.{ .{ .int = 99 }, .{ .bytes = "tmp" } });
+    const throwaway = try insert(&writeTransaction, dir, 0, &.{ .{ .int = 99 }, .{ .bytes = "tmp" } });
     dir = throwaway.dir;
     const throwawayObjectKey = throwaway.objectKey;
 
-    const author = try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .bytes = "Ada" } });
+    const author = try insert(&writeTransaction, dir, 0, &.{ .{ .int = 1 }, .{ .bytes = "Ada" } });
     dir = author.dir;
     const authorObjectKey = author.objectKey;
 
     // A book links the real author by its stable objectKey.
-    dir = (try insert(&w, dir, 1, &.{ .{ .int = 1 }, .{ .link = authorObjectKey } })).dir;
-    try testing.expectEqual(@as(?u64, authorObjectKey), try getLink(&w, dir, 1, 1, 1));
+    dir = (try insert(&writeTransaction, dir, 1, &.{ .{ .int = 1 }, .{ .link = authorObjectKey } })).dir;
+    try testing.expectEqual(@as(?u64, authorObjectKey), try getLink(&writeTransaction, dir, 1, 1, 1));
 
     // Free the throwaway's physical slot, then relocate the author into it.
-    const authorCatalog = try catalogRef(&w, dir, 0);
-    const deadRow = (try catalog.objectKeyToRow(&w, authorCatalog, throwawayObjectKey)).?;
+    const authorCatalog = try catalogRef(&writeTransaction, dir, 0);
+    const deadRow = (try catalog.objectKeyToRow(&writeTransaction, authorCatalog, throwawayObjectKey)).?;
     var vbuf: [2]Value = undefined;
-    const tv = (try get(&w, dir, 0, 99, &vbuf)).?;
-    const dthrow = try delete(&w, dir, 0, 99, tv);
-    dir = dthrow.ok;
-    const relocated = try relocation.relocateRow(&w, try catalogRef(&w, dir, 0), authorObjectKey, deadRow);
-    dir = try setCatalogRef(&w, dir, 0, relocated);
+    const throwawayVersion = (try get(&writeTransaction, dir, 0, 99, &vbuf)).?;
+    const throwawayDelete = try delete(&writeTransaction, dir, 0, 99, throwawayVersion);
+    dir = throwawayDelete.ok;
+    const relocated = try relocation.relocateRow(&writeTransaction, try catalogRef(&writeTransaction, dir, 0), authorObjectKey, deadRow);
+    dir = try setCatalogRef(&writeTransaction, dir, 0, relocated);
 
     // Deleting the author must nullify the book's link, proving the delete used
     // the object key rather than a stale physical row.
     var abuf: [2]Value = undefined;
-    const authorVersion = (try get(&w, dir, 0, 1, &abuf)).?;
-    const dres = try deleteNullifyCrossType(&w, dir, 0, 1, authorVersion);
+    const authorVersion = (try get(&writeTransaction, dir, 0, 1, &abuf)).?;
+    const dres = try deleteNullifyCrossType(&writeTransaction, dir, 0, 1, authorVersion);
     dir = dres.ok;
-    try testing.expectEqual(@as(?u64, null), try getLink(&w, dir, 1, 1, 1));
-    w.deinit();
+    try testing.expectEqual(@as(?u64, null), try getLink(&writeTransaction, dir, 1, 1, 1));
+    writeTransaction.deinit();
 }
 
 const relocation = @import("../storage/relocation.zig");
@@ -599,30 +599,30 @@ test "a self-linked object is deletable across transactions" {
 
     // Commit a row that links to ITSELF via a block-rule property.
     {
-        var w = try database.beginWrite();
-        var dir = try createWithDefinitions(&w, &.{
+        var writeTransaction = try database.beginWrite();
+        var dir = try createWithDefinitions(&writeTransaction, &.{
             &.{ .{ .kind = .int }, .{ .kind = .link, .linkTarget = 0, .deletionRule = .block } },
         });
-        const a = try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .link = null } });
-        dir = a.dir;
-        dir = try setLink(&w, dir, 0, 1, 1, a.objectKey);
-        w.setRoot(dir);
-        _ = try w.commit();
+        const valueA = try insert(&writeTransaction, dir, 0, &.{ .{ .int = 1 }, .{ .link = null } });
+        dir = valueA.dir;
+        dir = try setLink(&writeTransaction, dir, 0, 1, 1, valueA.objectKey);
+        writeTransaction.setRoot(dir);
+        _ = try writeTransaction.commit();
     }
     // Deleting it in a LATER transaction must succeed: the self-link neither
     // blocks nor invalidates the version the caller read.
     {
-        var w = try database.beginWrite();
+        var writeTransaction = try database.beginWrite();
         var out: [2]Value = undefined;
-        const version = (try get(&w, w.newRoot, 0, 1, &out)).?;
-        const res = try deleteNullifyCrossType(&w, w.newRoot, 0, 1, version);
+        const version = (try get(&writeTransaction, writeTransaction.newRoot, 0, 1, &out)).?;
+        const res = try deleteNullifyCrossType(&writeTransaction, writeTransaction.newRoot, 0, 1, version);
         try testing.expect(res == .ok);
-        w.setRoot(res.ok);
-        _ = try w.commit();
+        writeTransaction.setRoot(res.ok);
+        _ = try writeTransaction.commit();
     }
-    var r = try database.beginRead();
-    defer r.end();
-    try testing.expectEqual(@as(u64, 0), try liveCount(&r, r.root(), 0));
+    var readTransaction = try database.beginRead();
+    defer readTransaction.end();
+    try testing.expectEqual(@as(u64, 0), try liveCount(&readTransaction, readTransaction.root(), 0));
     // A FOREIGN block-rule source must still block, self-exemption or not.
     // (covered by the existing "block prevents deleting a referenced object")
 }
@@ -634,25 +634,25 @@ test "cascade is cycle-safe" {
     defer testing.allocator.free(path);
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
-    var w = try database.beginWrite();
+    var writeTransaction = try database.beginWrite();
     const PD = catalog.PropertyDefinition;
     const schema = [_][]const PD{
         &.{ .{ .kind = .int }, .{ .kind = .link, .linkTarget = 0, .deletionRule = .cascade } }, // Node.next (self type)
     };
-    var dir = try createWithDefinitions(&w, &schema);
-    const a = try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .link = null } });
-    dir = a.dir;
-    const b = try insert(&w, dir, 0, &.{ .{ .int = 2 }, .{ .link = a.objectKey } }); // b -> a
-    dir = b.dir;
-    dir = try setLink(&w, dir, 0, 1, 1, b.objectKey); // a -> b (cycle)
-    try testing.expectEqual(@as(u64, 2), try liveCount(&w, dir, 0));
+    var dir = try createWithDefinitions(&writeTransaction, &schema);
+    const valueA = try insert(&writeTransaction, dir, 0, &.{ .{ .int = 1 }, .{ .link = null } });
+    dir = valueA.dir;
+    const valueB = try insert(&writeTransaction, dir, 0, &.{ .{ .int = 2 }, .{ .link = valueA.objectKey } }); // b -> a
+    dir = valueB.dir;
+    dir = try setLink(&writeTransaction, dir, 0, 1, 1, valueB.objectKey); // a -> b (cycle)
+    try testing.expectEqual(@as(u64, 2), try liveCount(&writeTransaction, dir, 0));
 
-    var av: [2]Value = undefined;
-    const aver = (try get(&w, dir, 0, 1, &av)).?;
-    const da = try deleteNullifyCrossType(&w, dir, 0, 1, aver); // must terminate
-    dir = da.ok;
-    try testing.expectEqual(@as(u64, 0), try liveCount(&w, dir, 0)); // both gone
-    w.deinit();
+    var valuesA: [2]Value = undefined;
+    const versionA = (try get(&writeTransaction, dir, 0, 1, &valuesA)).?;
+    const deleteResultA = try deleteNullifyCrossType(&writeTransaction, dir, 0, 1, versionA); // must terminate
+    dir = deleteResultA.ok;
+    try testing.expectEqual(@as(u64, 0), try liveCount(&writeTransaction, dir, 0)); // both gone
+    writeTransaction.deinit();
 }
 
 test "a directory delete of a self-referencing linkSet row frees its set root exactly once" {
@@ -667,30 +667,30 @@ test "a directory delete of a self-referencing linkSet row frees its set root ex
     defer database.deinit();
 
     {
-        var w = try database.beginWrite();
-        var dir = try createWithDefinitions(&w, &.{
+        var writeTransaction = try database.beginWrite();
+        var dir = try createWithDefinitions(&writeTransaction, &.{
             &.{ .{ .kind = .int }, .{ .kind = .linkSet, .linkTarget = 0 } },
         });
-        const ins = try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .linkSet = &.{} } });
+        const ins = try insert(&writeTransaction, dir, 0, &.{ .{ .int = 1 }, .{ .linkSet = &.{} } });
         dir = ins.dir;
-        dir = try linkSetAdd(&w, dir, 0, 1, 1, ins.objectKey); // set contains own objectKey
-        w.setRoot(dir);
-        _ = try w.commit();
+        dir = try linkSetAdd(&writeTransaction, dir, 0, 1, 1, ins.objectKey); // set contains own objectKey
+        writeTransaction.setRoot(dir);
+        _ = try writeTransaction.commit();
     }
-    var w = try database.beginWrite();
-    defer w.deinit();
+    var writeTransaction = try database.beginWrite();
+    defer writeTransaction.deinit();
     var out: [2]Value = undefined;
-    const version = (try get(&w, w.newRoot, 0, 1, &out)).?;
-    const res = try deleteNullifyCrossType(&w, w.newRoot, 0, 1, version);
+    const version = (try get(&writeTransaction, writeTransaction.newRoot, 0, 1, &out)).?;
+    const res = try deleteNullifyCrossType(&writeTransaction, writeTransaction.newRoot, 0, 1, version);
     try testing.expect(res == .ok);
     var seen = std.AutoHashMap(u64, void).init(testing.allocator);
     defer seen.deinit();
-    for (w.transactionReuse.extents.items) |e| {
-        const gop = try seen.getOrPut(e.offset);
+    for (writeTransaction.transactionReuse.extents.items) |extent| {
+        const gop = try seen.getOrPut(extent.offset);
         try testing.expect(!gop.found_existing); // duplicate free
     }
-    for (w.inFlightFrees.items) |e| {
-        const gop = try seen.getOrPut(e.offset);
+    for (writeTransaction.inFlightFrees.items) |item| {
+        const gop = try seen.getOrPut(item.offset);
         try testing.expect(!gop.found_existing);
     }
 }
@@ -707,31 +707,31 @@ test "a directory delete frees the row's collection storage" {
     defer database.deinit();
 
     {
-        var w = try database.beginWrite();
-        var dir = try createWithDefinitions(&w, &.{
+        var writeTransaction = try database.beginWrite();
+        var dir = try createWithDefinitions(&writeTransaction, &.{
             &.{ .{ .kind = .int }, .{ .kind = .set, .element = .int }, .{ .kind = .list, .element = .int } },
         });
-        dir = (try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .setInt = &.{ 1, 2, 3 } }, .{ .listInt = &.{ 7, 8, 9 } } })).dir;
-        w.setRoot(dir);
-        _ = try w.commit();
+        dir = (try insert(&writeTransaction, dir, 0, &.{ .{ .int = 1 }, .{ .setInt = &.{ 1, 2, 3 } }, .{ .listInt = &.{ 7, 8, 9 } } })).dir;
+        writeTransaction.setRoot(dir);
+        _ = try writeTransaction.commit();
     }
-    var w = try database.beginWrite();
-    defer w.deinit();
+    var writeTransaction = try database.beginWrite();
+    defer writeTransaction.deinit();
     var raw: [3]u64 = undefined;
-    _ = (try rows.getByPrimaryKey(&w, try catalogRef(&w, w.newRoot, 0), 1, &raw)).?;
+    _ = (try rows.getByPrimaryKey(&writeTransaction, try catalogRef(&writeTransaction, writeTransaction.newRoot, 0), 1, &raw)).?;
     var out: [3]Value = undefined;
-    const version = (try get(&w, w.newRoot, 0, 1, &out)).?;
-    const res = try deleteNullifyCrossType(&w, w.newRoot, 0, 1, version);
+    const version = (try get(&writeTransaction, writeTransaction.newRoot, 0, 1, &out)).?;
+    const res = try deleteNullifyCrossType(&writeTransaction, writeTransaction.newRoot, 0, 1, version);
     try testing.expect(res == .ok);
     var freedSet = false;
     var freedList = false;
-    for (w.inFlightFrees.items) |e| {
-        if (e.offset == raw[1]) freedSet = true;
-        if (e.offset == raw[2]) freedList = true;
+    for (writeTransaction.inFlightFrees.items) |item| {
+        if (item.offset == raw[1]) freedSet = true;
+        if (item.offset == raw[2]) freedList = true;
     }
-    for (w.transactionReuse.extents.items) |e| {
-        if (e.offset == raw[1]) freedSet = true;
-        if (e.offset == raw[2]) freedList = true;
+    for (writeTransaction.transactionReuse.extents.items) |extent| {
+        if (extent.offset == raw[1]) freedSet = true;
+        if (extent.offset == raw[2]) freedList = true;
     }
     try testing.expect(freedSet);
     try testing.expect(freedList);
@@ -748,32 +748,32 @@ test "a cascade delete frees the child's collection storage" {
     defer database.deinit();
 
     {
-        var w = try database.beginWrite();
-        var dir = try createWithDefinitions(&w, &.{
+        var writeTransaction = try database.beginWrite();
+        var dir = try createWithDefinitions(&writeTransaction, &.{
             &.{ .{ .kind = .int }, .{ .kind = .link, .linkTarget = 1, .deletionRule = .cascade } }, // 0: owner
             &.{ .{ .kind = .int }, .{ .kind = .set, .element = .int } }, // 1: child
         });
-        const child = try insert(&w, dir, 1, &.{ .{ .int = 100 }, .{ .setInt = &.{ 1, 2, 3 } } });
+        const child = try insert(&writeTransaction, dir, 1, &.{ .{ .int = 100 }, .{ .setInt = &.{ 1, 2, 3 } } });
         dir = child.dir;
-        dir = (try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .link = child.objectKey } })).dir;
-        w.setRoot(dir);
-        _ = try w.commit();
+        dir = (try insert(&writeTransaction, dir, 0, &.{ .{ .int = 1 }, .{ .link = child.objectKey } })).dir;
+        writeTransaction.setRoot(dir);
+        _ = try writeTransaction.commit();
     }
-    var w = try database.beginWrite();
-    defer w.deinit();
+    var writeTransaction = try database.beginWrite();
+    defer writeTransaction.deinit();
     var raw: [2]u64 = undefined;
-    _ = (try rows.getByPrimaryKey(&w, try catalogRef(&w, w.newRoot, 1), 100, &raw)).?;
+    _ = (try rows.getByPrimaryKey(&writeTransaction, try catalogRef(&writeTransaction, writeTransaction.newRoot, 1), 100, &raw)).?;
     var out: [2]Value = undefined;
-    const version = (try get(&w, w.newRoot, 0, 1, &out)).?;
-    const res = try deleteNullifyCrossType(&w, w.newRoot, 0, 1, version);
+    const version = (try get(&writeTransaction, writeTransaction.newRoot, 0, 1, &out)).?;
+    const res = try deleteNullifyCrossType(&writeTransaction, writeTransaction.newRoot, 0, 1, version);
     try testing.expect(res == .ok);
-    try testing.expectEqual(@as(u64, 0), try liveCount(&w, res.ok, 1)); // child cascaded
+    try testing.expectEqual(@as(u64, 0), try liveCount(&writeTransaction, res.ok, 1)); // child cascaded
     var freedChildSet = false;
-    for (w.inFlightFrees.items) |e| {
-        if (e.offset == raw[1]) freedChildSet = true;
+    for (writeTransaction.inFlightFrees.items) |item| {
+        if (item.offset == raw[1]) freedChildSet = true;
     }
-    for (w.transactionReuse.extents.items) |e| {
-        if (e.offset == raw[1]) freedChildSet = true;
+    for (writeTransaction.transactionReuse.extents.items) |extent| {
+        if (extent.offset == raw[1]) freedChildSet = true;
     }
     try testing.expect(freedChildSet);
 }
@@ -794,19 +794,19 @@ test "replacing an embedded child surfaces a blocked delete" {
     defer testing.allocator.free(path);
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
-    var w = try database.beginWrite();
-    defer w.deinit();
-    var dir = try createTypes(&w, &embeddedBlockSchema, &.{ false, true, false });
+    var writeTransaction = try database.beginWrite();
+    defer writeTransaction.deinit();
+    var dir = try createTypes(&writeTransaction, &embeddedBlockSchema, &.{ false, true, false });
 
-    dir = (try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .link = null } })).dir;
-    dir = try insertEmbedded(&w, dir, 0, 1, 1, &.{ .{ .int = 100 }, .{ .bytes = "old" } });
-    const childObjectKey = (try getLink(&w, dir, 0, 1, 1)).?;
-    dir = (try insert(&w, dir, 2, &.{ .{ .int = 5 }, .{ .link = childObjectKey } })).dir;
+    dir = (try insert(&writeTransaction, dir, 0, &.{ .{ .int = 1 }, .{ .link = null } })).dir;
+    dir = try insertEmbedded(&writeTransaction, dir, 0, 1, 1, &.{ .{ .int = 100 }, .{ .bytes = "old" } });
+    const childObjectKey = (try getLink(&writeTransaction, dir, 0, 1, 1)).?;
+    dir = (try insert(&writeTransaction, dir, 2, &.{ .{ .int = 5 }, .{ .link = childObjectKey } })).dir;
 
-    try testing.expectError(error.Blocked, insertEmbedded(&w, dir, 0, 1, 1, &.{ .{ .int = 200 }, .{ .bytes = "new" } }));
+    try testing.expectError(error.Blocked, insertEmbedded(&writeTransaction, dir, 0, 1, 1, &.{ .{ .int = 200 }, .{ .bytes = "new" } }));
     // Old child intact and still owned.
-    try testing.expectEqual(@as(?u64, childObjectKey), try getLink(&w, dir, 0, 1, 1));
-    try testing.expectEqual(@as(u64, 1), try liveCount(&w, dir, 1));
+    try testing.expectEqual(@as(?u64, childObjectKey), try getLink(&writeTransaction, dir, 0, 1, 1));
+    try testing.expectEqual(@as(u64, 1), try liveCount(&writeTransaction, dir, 1));
 }
 
 test "clearing an embedded child surfaces a blocked delete" {
@@ -818,16 +818,16 @@ test "clearing an embedded child surfaces a blocked delete" {
     defer testing.allocator.free(path);
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
-    var w = try database.beginWrite();
-    defer w.deinit();
-    var dir = try createTypes(&w, &embeddedBlockSchema, &.{ false, true, false });
+    var writeTransaction = try database.beginWrite();
+    defer writeTransaction.deinit();
+    var dir = try createTypes(&writeTransaction, &embeddedBlockSchema, &.{ false, true, false });
 
-    dir = (try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .link = null } })).dir;
-    dir = try insertEmbedded(&w, dir, 0, 1, 1, &.{ .{ .int = 100 }, .{ .bytes = "note" } });
-    const childObjectKey = (try getLink(&w, dir, 0, 1, 1)).?;
-    dir = (try insert(&w, dir, 2, &.{ .{ .int = 5 }, .{ .link = childObjectKey } })).dir;
+    dir = (try insert(&writeTransaction, dir, 0, &.{ .{ .int = 1 }, .{ .link = null } })).dir;
+    dir = try insertEmbedded(&writeTransaction, dir, 0, 1, 1, &.{ .{ .int = 100 }, .{ .bytes = "note" } });
+    const childObjectKey = (try getLink(&writeTransaction, dir, 0, 1, 1)).?;
+    dir = (try insert(&writeTransaction, dir, 2, &.{ .{ .int = 5 }, .{ .link = childObjectKey } })).dir;
 
-    try testing.expectError(error.Blocked, clearEmbedded(&w, dir, 0, 1, 1));
-    try testing.expectEqual(@as(?u64, childObjectKey), try getLink(&w, dir, 0, 1, 1));
-    try testing.expectEqual(@as(u64, 1), try liveCount(&w, dir, 1));
+    try testing.expectError(error.Blocked, clearEmbedded(&writeTransaction, dir, 0, 1, 1));
+    try testing.expectEqual(@as(?u64, childObjectKey), try getLink(&writeTransaction, dir, 0, 1, 1));
+    try testing.expectEqual(@as(u64, 1), try liveCount(&writeTransaction, dir, 1));
 }

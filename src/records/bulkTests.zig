@@ -44,28 +44,28 @@ test "bulk append is refused when the batch does not clear the true max primaryK
     defer testing.allocator.free(path);
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
-    var w = try database.beginWrite();
-    defer w.deinit();
+    var writeTransaction = try database.beginWrite();
+    defer writeTransaction.deinit();
 
-    var catalogRef = try catalog.create(&w, 2);
+    var catalogRef = try catalog.create(&writeTransaction, 2);
     var primaryKey: u64 = 0;
-    while (primaryKey <= 64) : (primaryKey += 1) catalogRef = (try rawRows.insert(&w, catalogRef, &.{ primaryKey, primaryKey })).catalogRef; // primaryKey index splits
+    while (primaryKey <= 64) : (primaryKey += 1) catalogRef = (try rawRows.insert(&writeTransaction, catalogRef, &.{ primaryKey, primaryKey })).catalogRef; // primaryKey index splits
     var out: [2]u64 = undefined;
     primaryKey = 32;
     while (primaryKey <= 64) : (primaryKey += 1) {
-        const version = (try rawRows.getByPrimaryKey(&w, catalogRef, primaryKey, &out)).?;
-        catalogRef = (try rawRows.delete(&w, catalogRef, primaryKey, version)).ok;
+        const version = (try rawRows.getByPrimaryKey(&writeTransaction, catalogRef, primaryKey, &out)).?;
+        catalogRef = (try rawRows.delete(&writeTransaction, catalogRef, primaryKey, version)).ok;
     }
     // primaryKeys 0..31 survive; a batch starting at 10 must NOT take the fast path.
     const rows = [_][]const u64{ &.{ 10, 1 }, &.{ 11, 2 } };
-    try testing.expectError(error.NotAppendable, bulkAppend(&w, catalogRef, &rows));
+    try testing.expectError(error.NotAppendable, bulkAppend(&writeTransaction, catalogRef, &rows));
     // The orchestrator falls back to row-by-row, which detects the duplicate.
-    try testing.expectError(error.DuplicateKey, bulkAppendOrInsert(&w, catalogRef, &rows));
+    try testing.expectError(error.DuplicateKey, bulkAppendOrInsert(&writeTransaction, catalogRef, &rows));
     // A batch that truly clears the surviving max qualifies.
     const okRows = [_][]const u64{ &.{ 100, 1 }, &.{ 101, 2 } };
-    catalogRef = try bulkAppend(&w, catalogRef, &okRows);
-    try testing.expect((try rawRows.getByPrimaryKey(&w, catalogRef, 100, &out)) != null);
-    try testing.expect((try rawRows.getByPrimaryKey(&w, catalogRef, 31, &out)) != null);
+    catalogRef = try bulkAppend(&writeTransaction, catalogRef, &okRows);
+    try testing.expect((try rawRows.getByPrimaryKey(&writeTransaction, catalogRef, 100, &out)) != null);
+    try testing.expect((try rawRows.getByPrimaryKey(&writeTransaction, catalogRef, 31, &out)) != null);
 }
 
 test "bulk append into a primaryKey-history gap takes the fallback" {
@@ -81,32 +81,32 @@ test "bulk append into a primaryKey-history gap takes the fallback" {
     defer testing.allocator.free(path);
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
-    var w = try database.beginWrite();
-    defer w.deinit();
+    var writeTransaction = try database.beginWrite();
+    defer writeTransaction.deinit();
 
-    var catalogRef = try catalog.create(&w, 2);
+    var catalogRef = try catalog.create(&writeTransaction, 2);
     var primaryKey: u64 = 0;
-    while (primaryKey <= 31) : (primaryKey += 1) catalogRef = (try rawRows.insert(&w, catalogRef, &.{ primaryKey, primaryKey })).catalogRef;
+    while (primaryKey <= 31) : (primaryKey += 1) catalogRef = (try rawRows.insert(&writeTransaction, catalogRef, &.{ primaryKey, primaryKey })).catalogRef;
     primaryKey = 40;
-    while (primaryKey <= 104) : (primaryKey += 1) catalogRef = (try rawRows.insert(&w, catalogRef, &.{ primaryKey, primaryKey })).catalogRef;
+    while (primaryKey <= 104) : (primaryKey += 1) catalogRef = (try rawRows.insert(&writeTransaction, catalogRef, &.{ primaryKey, primaryKey })).catalogRef;
     var out: [2]u64 = undefined;
     primaryKey = 40;
     while (primaryKey <= 104) : (primaryKey += 1) {
-        const version = (try rawRows.getByPrimaryKey(&w, catalogRef, primaryKey, &out)).?;
-        catalogRef = (try rawRows.delete(&w, catalogRef, primaryKey, version)).ok;
+        const version = (try rawRows.getByPrimaryKey(&writeTransaction, catalogRef, primaryKey, &out)).?;
+        catalogRef = (try rawRows.delete(&writeTransaction, catalogRef, primaryKey, version)).ok;
     }
 
     // Below the stale low: NotAppendable; the orchestrator's fallback must
     // leave every row reachable.
     const gapRows = [_][]const u64{ &.{ 33, 1 }, &.{ 34, 2 } };
-    try testing.expectError(error.NotAppendable, bulkAppend(&w, catalogRef, &gapRows));
-    catalogRef = try bulkAppendOrInsert(&w, catalogRef, &gapRows);
-    try testing.expect((try rawRows.getByPrimaryKey(&w, catalogRef, 33, &out)) != null);
-    try testing.expect((try rawRows.getByPrimaryKey(&w, catalogRef, 34, &out)) != null);
+    try testing.expectError(error.NotAppendable, bulkAppend(&writeTransaction, catalogRef, &gapRows));
+    catalogRef = try bulkAppendOrInsert(&writeTransaction, catalogRef, &gapRows);
+    try testing.expect((try rawRows.getByPrimaryKey(&writeTransaction, catalogRef, 33, &out)) != null);
+    try testing.expect((try rawRows.getByPrimaryKey(&writeTransaction, catalogRef, 34, &out)) != null);
 
     // Every surviving primaryKey still resolves (routing lows intact).
     primaryKey = 0;
-    while (primaryKey <= 31) : (primaryKey += 1) try testing.expect((try rawRows.getByPrimaryKey(&w, catalogRef, primaryKey, &out)) != null);
+    while (primaryKey <= 31) : (primaryKey += 1) try testing.expect((try rawRows.getByPrimaryKey(&writeTransaction, catalogRef, primaryKey, &out)) != null);
 }
 
 test "bulk append fallback refuses link-bearing schemas" {
@@ -119,11 +119,11 @@ test "bulk append fallback refuses link-bearing schemas" {
     defer testing.allocator.free(path);
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
-    var w = try database.beginWrite();
-    defer w.deinit();
-    const catalogRef = try catalog.createFromDefinitions(&w, &.{ .{ .kind = .int }, .{ .kind = .link } });
+    var writeTransaction = try database.beginWrite();
+    defer writeTransaction.deinit();
+    const catalogRef = try catalog.createFromDefinitions(&writeTransaction, &.{ .{ .kind = .int }, .{ .kind = .link } });
     const rows = [_][]const u64{&.{ 1, 0 }};
-    try testing.expectError(error.UnsupportedForBulk, bulkAppendOrInsert(&w, catalogRef, &rows));
+    try testing.expectError(error.UnsupportedForBulk, bulkAppendOrInsert(&writeTransaction, catalogRef, &rows));
 }
 
 test "bulk append frees the replaced right-edge nodes" {
@@ -136,38 +136,38 @@ test "bulk append frees the replaced right-edge nodes" {
 
     // Commit a populated type so the old right edge is committed nodes.
     {
-        var w = try database.beginWrite();
-        var catalogRef = try catalog.create(&w, 2);
+        var writeTransaction = try database.beginWrite();
+        var catalogRef = try catalog.create(&writeTransaction, 2);
         var primaryKey: u64 = 0;
-        while (primaryKey < 200) : (primaryKey += 1) catalogRef = (try rawRows.insert(&w, catalogRef, &.{ primaryKey, primaryKey })).catalogRef;
-        w.setRoot(catalogRef);
-        _ = try w.commit();
+        while (primaryKey < 200) : (primaryKey += 1) catalogRef = (try rawRows.insert(&writeTransaction, catalogRef, &.{ primaryKey, primaryKey })).catalogRef;
+        writeTransaction.setRoot(catalogRef);
+        _ = try writeTransaction.commit();
     }
 
     // A qualifying append must record the replaced committed spine as
     // in-flight frees (deferred, MVCC-safe reclaim) instead of leaking it.
-    var w = try database.beginWrite();
-    defer w.deinit();
+    var writeTransaction = try database.beginWrite();
+    defer writeTransaction.deinit();
     const rows = [_][]const u64{ &.{ 1000, 1 }, &.{ 1001, 2 } };
-    _ = try bulkAppend(&w, w.newRoot, &rows);
-    try testing.expect(w.inFlightFrees.items.len > 0);
+    _ = try bulkAppend(&writeTransaction, writeTransaction.newRoot, &rows);
+    try testing.expect(writeTransaction.inFlightFrees.items.len > 0);
 }
 
-fn checkColumnSize(w: *WriteTransaction, n: usize) !void {
-    const values = try testing.allocator.alloc(u64, n);
+fn checkColumnSize(writeTransaction: *WriteTransaction, valueCount: usize) !void {
+    const values = try testing.allocator.alloc(u64, valueCount);
     defer testing.allocator.free(values);
-    for (values, 0..) |*v, i| v.* = @as(u64, i) * 7;
+    for (values, 0..) |*value, position| value.* = @as(u64, position) * 7;
 
-    const built = try bulkColumn(w, values);
+    const built = try bulkColumn(writeTransaction, values);
 
-    var seq = try Column.create(w);
-    for (values) |v| seq = try Column.append(w, seq, v);
+    var seq = try Column.create(writeTransaction);
+    for (values) |value| seq = try Column.append(writeTransaction, seq, value);
 
-    try testing.expectEqual(try Column.length(w, seq), try Column.length(w, built));
-    try testing.expectEqual(@as(u64, n), try Column.length(w, built));
-    var i: u64 = 0;
-    while (i < n) : (i += 1) {
-        try testing.expectEqual(try Column.get(w, seq, i), try Column.get(w, built, i));
+    try testing.expectEqual(try Column.length(writeTransaction, seq), try Column.length(writeTransaction, built));
+    try testing.expectEqual(@as(u64, valueCount), try Column.length(writeTransaction, built));
+    var index: u64 = 0;
+    while (index < valueCount) : (index += 1) {
+        try testing.expectEqual(try Column.get(writeTransaction, seq, index), try Column.get(writeTransaction, built, index));
     }
 }
 
@@ -178,9 +178,9 @@ test "bulkColumn equals sequential appends" {
     defer testing.allocator.free(path);
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
-    var w = try database.beginWrite();
-    try checkColumnSize(&w, 1000);
-    w.deinit();
+    var writeTransaction = try database.beginWrite();
+    try checkColumnSize(&writeTransaction, 1000);
+    writeTransaction.deinit();
 }
 
 test "bulkColumn boundary sizes: 0, 1, leafCap, multi-inner-level" {
@@ -190,12 +190,12 @@ test "bulkColumn boundary sizes: 0, 1, leafCap, multi-inner-level" {
     defer testing.allocator.free(path);
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
-    var w = try database.beginWrite();
-    try checkColumnSize(&w, 0);
-    try checkColumnSize(&w, 1);
-    try checkColumnSize(&w, cnode.leafCap); // single full leaf
-    try checkColumnSize(&w, @as(usize, cnode.leafCap) * cnode.fanout + 1); // 3 levels
-    w.deinit();
+    var writeTransaction = try database.beginWrite();
+    try checkColumnSize(&writeTransaction, 0);
+    try checkColumnSize(&writeTransaction, 1);
+    try checkColumnSize(&writeTransaction, cnode.leafCap); // single full leaf
+    try checkColumnSize(&writeTransaction, @as(usize, cnode.leafCap) * cnode.fanout + 1); // 3 levels
+    writeTransaction.deinit();
 }
 
 const IdxCollector = struct {
@@ -207,38 +207,38 @@ const IdxCollector = struct {
     }
 };
 
-fn checkIndexSize(w: *WriteTransaction, n: usize) !void {
-    const keys = try testing.allocator.alloc(u64, n);
+fn checkIndexSize(writeTransaction: *WriteTransaction, entryCount: usize) !void {
+    const keys = try testing.allocator.alloc(u64, entryCount);
     defer testing.allocator.free(keys);
-    const vals = try testing.allocator.alloc(u64, n);
+    const vals = try testing.allocator.alloc(u64, entryCount);
     defer testing.allocator.free(vals);
-    for (keys, vals, 0..) |*k, *v, i| {
-        k.* = @intCast(i);
-        v.* = @as(u64, i) * 10;
+    for (keys, vals, 0..) |*key, *value, keyI| {
+        key.* = @intCast(keyI);
+        value.* = @as(u64, keyI) * 10;
     }
 
-    const built = try bulkIndex(w, keys, vals);
+    const built = try bulkIndex(writeTransaction, keys, vals);
 
-    var seq = try Index.create(w);
-    for (keys, vals) |k, v| seq = try Index.insert(w, seq, k, v);
+    var seq = try Index.create(writeTransaction);
+    for (keys, vals) |key, value| seq = try Index.insert(writeTransaction, seq, key, value);
 
-    try testing.expectEqual(@as(u64, n), try Index.count(w, built));
-    try testing.expectEqual(try Index.count(w, seq), try Index.count(w, built));
+    try testing.expectEqual(@as(u64, entryCount), try Index.count(writeTransaction, built));
+    try testing.expectEqual(try Index.count(writeTransaction, seq), try Index.count(writeTransaction, built));
 
-    var i: u64 = 0;
-    while (i < n) : (i += 1) {
-        try testing.expectEqual(try Index.get(w, seq, i), try Index.get(w, built, i));
+    var index: u64 = 0;
+    while (index < entryCount) : (index += 1) {
+        try testing.expectEqual(try Index.get(writeTransaction, seq, index), try Index.get(writeTransaction, built, index));
     }
 
-    var bk = std.ArrayList(u64).empty;
-    defer bk.deinit(testing.allocator);
-    var bv = std.ArrayList(u64).empty;
-    defer bv.deinit(testing.allocator);
-    try Index.forEachEntry(w, built, IdxCollector{ .keys = &bk, .vals = &bv }, IdxCollector.onEntry);
-    try testing.expectEqual(n, bk.items.len);
-    for (bk.items, bv.items, 0..) |k, v, j| {
-        try testing.expectEqual(@as(u64, j), k);
-        try testing.expectEqual(@as(u64, j) * 10, v);
+    var collectedKeys = std.ArrayList(u64).empty;
+    defer collectedKeys.deinit(testing.allocator);
+    var collectedValues = std.ArrayList(u64).empty;
+    defer collectedValues.deinit(testing.allocator);
+    try Index.forEachEntry(writeTransaction, built, IdxCollector{ .keys = &collectedKeys, .vals = &collectedValues }, IdxCollector.onEntry);
+    try testing.expectEqual(entryCount, collectedKeys.items.len);
+    for (collectedKeys.items, collectedValues.items, 0..) |item, itemV, itemJ| {
+        try testing.expectEqual(@as(u64, itemJ), item);
+        try testing.expectEqual(@as(u64, itemJ) * 10, itemV);
     }
 }
 
@@ -249,9 +249,9 @@ test "bulkIndex equals sequential inserts" {
     defer testing.allocator.free(path);
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
-    var w = try database.beginWrite();
-    try checkIndexSize(&w, 1000);
-    w.deinit();
+    var writeTransaction = try database.beginWrite();
+    try checkIndexSize(&writeTransaction, 1000);
+    writeTransaction.deinit();
 }
 
 test "bulkIndex boundary sizes: 0, 1, leafCap, multi-inner-level" {
@@ -261,12 +261,12 @@ test "bulkIndex boundary sizes: 0, 1, leafCap, multi-inner-level" {
     defer testing.allocator.free(path);
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
-    var w = try database.beginWrite();
-    try checkIndexSize(&w, 0);
-    try checkIndexSize(&w, 1);
-    try checkIndexSize(&w, inode.leafCap);
-    try checkIndexSize(&w, @as(usize, inode.leafCap) * inode.fanout + 1);
-    w.deinit();
+    var writeTransaction = try database.beginWrite();
+    try checkIndexSize(&writeTransaction, 0);
+    try checkIndexSize(&writeTransaction, 1);
+    try checkIndexSize(&writeTransaction, inode.leafCap);
+    try checkIndexSize(&writeTransaction, @as(usize, inode.leafCap) * inode.fanout + 1);
+    writeTransaction.deinit();
 }
 
 const SetCollector = struct {
@@ -276,9 +276,9 @@ const SetCollector = struct {
     }
 };
 
-fn collectSet(w: *WriteTransaction, setRoot: Reference, out: *std.ArrayList(u64)) !void {
+fn collectSet(writeTransaction: *WriteTransaction, setRoot: Reference, out: *std.ArrayList(u64)) !void {
     out.clearRetainingCapacity();
-    try Index.forEachKey(w, setRoot, SetCollector{ .keys = out }, SetCollector.onKey);
+    try Index.forEachKey(writeTransaction, setRoot, SetCollector{ .keys = out }, SetCollector.onKey);
 }
 
 test "bulkValueIndex equals sequential maintenance" {
@@ -288,7 +288,7 @@ test "bulkValueIndex equals sequential maintenance" {
     defer testing.allocator.free(path);
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
-    var w = try database.beginWrite();
+    var writeTransaction = try database.beginWrite();
 
     const N: u64 = 1000;
     const numValues: u64 = 100;
@@ -296,29 +296,29 @@ test "bulkValueIndex equals sequential maintenance" {
     // Build the grouped entries: value v=i%100 maps to objectKeys {i : i%100==v}, ascending.
     var entries = std.ArrayList(ValueObjectKeys).empty;
     defer {
-        for (entries.items) |e| testing.allocator.free(e.objectKeys);
+        for (entries.items) |entry| testing.allocator.free(entry.objectKeys);
         entries.deinit(testing.allocator);
     }
-    var v: u64 = 0;
-    while (v < numValues) : (v += 1) {
+    var version: u64 = 0;
+    while (version < numValues) : (version += 1) {
         var objectKeys = std.ArrayList(u64).empty;
-        var i: u64 = v; // first objectKey with i%100==v
-        while (i < N) : (i += numValues) try objectKeys.append(testing.allocator, i);
-        try entries.append(testing.allocator, .{ .value = v, .objectKeys = try objectKeys.toOwnedSlice(testing.allocator) });
+        var index: u64 = version; // first objectKey with i%100==v
+        while (index < N) : (index += numValues) try objectKeys.append(testing.allocator, index);
+        try entries.append(testing.allocator, .{ .value = version, .objectKeys = try objectKeys.toOwnedSlice(testing.allocator) });
     }
 
-    const built = try bulkValueIndex(&w, entries.items);
+    const built = try bulkValueIndex(&writeTransaction, entries.items);
 
     // Sequential maintenance mirror: for each (value, objectKey) add objectKey to the inner
     // set for value, exactly as rows.valueIndexAdd does.
-    var seq = try Index.create(&w);
-    var i: u64 = 0;
-    while (i < N) : (i += 1) {
-        const value = i % numValues;
-        const existing = try Index.get(&w, seq, value);
-        var setRoot = existing orelse try Index.create(&w);
-        setRoot = try Index.insert(&w, setRoot, i, 1);
-        seq = try Index.insert(&w, seq, value, setRoot);
+    var seq = try Index.create(&writeTransaction);
+    var index: u64 = 0;
+    while (index < N) : (index += 1) {
+        const value = index % numValues;
+        const existing = try Index.get(&writeTransaction, seq, value);
+        var setRoot = existing orelse try Index.create(&writeTransaction);
+        setRoot = try Index.insert(&writeTransaction, setRoot, index, 1);
+        seq = try Index.insert(&writeTransaction, seq, value, setRoot);
     }
 
     // Compare the inner objectKey set for every value.
@@ -327,15 +327,15 @@ test "bulkValueIndex equals sequential maintenance" {
     var seqSet = std.ArrayList(u64).empty;
     defer seqSet.deinit(testing.allocator);
 
-    v = 0;
-    while (v < numValues) : (v += 1) {
-        const bInner = (try Index.get(&w, built, v)) orelse return error.MissingValue;
-        const sInner = (try Index.get(&w, seq, v)) orelse return error.MissingValue;
-        try collectSet(&w, bInner, &builtSet);
-        try collectSet(&w, sInner, &seqSet);
+    version = 0;
+    while (version < numValues) : (version += 1) {
+        const bInner = (try Index.get(&writeTransaction, built, version)) orelse return error.MissingValue;
+        const sInner = (try Index.get(&writeTransaction, seq, version)) orelse return error.MissingValue;
+        try collectSet(&writeTransaction, bInner, &builtSet);
+        try collectSet(&writeTransaction, sInner, &seqSet);
         try testing.expectEqualSlices(u64, seqSet.items, builtSet.items);
     }
-    w.deinit();
+    writeTransaction.deinit();
 }
 
 // Schema shared by the orchestrator tests: int primaryKey, int value, int category (indexed).
@@ -360,7 +360,7 @@ test "bulkImport equals row-by-row for a scalar indexed type" {
     // in-order row-by-row twin produces.
     const order = try testing.allocator.alloc(u64, N);
     defer testing.allocator.free(order);
-    for (order, 0..) |*o, i| o.* = @intCast(i);
+    for (order, 0..) |*slot, index| slot.* = @intCast(index);
     var prng = std.Random.DefaultPrng.init(0xC0FFEE12345678);
     prng.random().shuffle(u64, order);
 
@@ -368,22 +368,22 @@ test "bulkImport equals row-by-row for a scalar indexed type" {
     defer testing.allocator.free(storage);
     const rowSlices = try testing.allocator.alloc([]const u64, N);
     defer testing.allocator.free(rowSlices);
-    for (order, 0..) |primaryKey, k| {
-        storage[k] = .{ primaryKey, primaryKey * 3, primaryKey % 50 };
-        rowSlices[k] = &storage[k];
+    for (order, 0..) |primaryKey, key| {
+        storage[key] = .{ primaryKey, primaryKey * 3, primaryKey % 50 };
+        rowSlices[key] = &storage[key];
     }
 
     // database A: bulk import inside a one-type directory so verifyIntegrity audits it.
     {
         var database = try Database.create(testing.allocator, pathA);
         defer database.deinit();
-        var w = try database.beginWrite();
-        const dir = try typeDirectory.createTypes(&w, &.{&importDefinitions}, &.{false});
-        const catalog0 = try typeDirectory.catalogRef(&w, dir, 0);
-        const newCatalog = try bulkImport(&w, catalog0, rowSlices, .{});
-        const newDir = try typeDirectory.setCatalogRef(&w, dir, 0, newCatalog);
-        w.setRoot(newDir);
-        _ = try w.commit();
+        var writeTransaction = try database.beginWrite();
+        const dir = try typeDirectory.createTypes(&writeTransaction, &.{&importDefinitions}, &.{false});
+        const catalog0 = try typeDirectory.catalogRef(&writeTransaction, dir, 0);
+        const newCatalog = try bulkImport(&writeTransaction, catalog0, rowSlices, .{});
+        const newDir = try typeDirectory.setCatalogRef(&writeTransaction, dir, 0, newCatalog);
+        writeTransaction.setRoot(newDir);
+        _ = try writeTransaction.commit();
         try verification.verifyIntegrity(&database); // both value-index directions, in memory
     }
 
@@ -391,67 +391,67 @@ test "bulkImport equals row-by-row for a scalar indexed type" {
     {
         var database = try Database.create(testing.allocator, pathB);
         defer database.deinit();
-        var w = try database.beginWrite();
-        var catalogRef = try catalog.createFromDefinitions(&w, &importDefinitions);
+        var writeTransaction = try database.beginWrite();
+        var catalogRef = try catalog.createFromDefinitions(&writeTransaction, &importDefinitions);
         var primaryKey: u64 = 0;
-        while (primaryKey < N) : (primaryKey += 1) catalogRef = (try rawRows.insert(&w, catalogRef, &.{ primaryKey, primaryKey * 3, primaryKey % 50 })).catalogRef;
-        w.setRoot(catalogRef);
-        _ = try w.commit();
+        while (primaryKey < N) : (primaryKey += 1) catalogRef = (try rawRows.insert(&writeTransaction, catalogRef, &.{ primaryKey, primaryKey * 3, primaryKey % 50 })).catalogRef;
+        writeTransaction.setRoot(catalogRef);
+        _ = try writeTransaction.commit();
     }
 
     // Reopen A from disk (durability) and compare against B.
-    var da = try Database.open(testing.allocator, pathA);
-    defer da.deinit();
-    try verification.verifyIntegrity(&da); // audit again after reopen
+    var database = try Database.open(testing.allocator, pathA);
+    defer database.deinit();
+    try verification.verifyIntegrity(&database); // audit again after reopen
     var databaseB = try Database.open(testing.allocator, pathB);
     defer databaseB.deinit();
 
-    var ra = try da.beginRead();
-    defer ra.end();
-    var rb = try databaseB.beginRead();
-    defer rb.end();
+    var readTransactionA = try database.beginRead();
+    defer readTransactionA.end();
+    var readTransactionB = try databaseB.beginRead();
+    defer readTransactionB.end();
 
-    const catalogA = try typeDirectory.catalogRef(&ra, ra.root(), 0);
-    const catalogB = rb.root();
+    const catalogA = try typeDirectory.catalogRef(&readTransactionA, readTransactionA.root(), 0);
+    const catalogB = readTransactionB.root();
 
     // Counts equal.
-    try testing.expectEqual(N, try catalog.liveCount(&ra, catalogA));
-    try testing.expectEqual(try catalog.liveCount(&rb, catalogB), try catalog.liveCount(&ra, catalogA));
+    try testing.expectEqual(N, try catalog.liveCount(&readTransactionA, catalogA));
+    try testing.expectEqual(try catalog.liveCount(&readTransactionB, catalogB), try catalog.liveCount(&readTransactionA, catalogA));
 
     // Every primaryKey lookup equal: property values AND row version.
     var primaryKey: u64 = 0;
     while (primaryKey < N) : (primaryKey += 1) {
-        var oa: [3]u64 = undefined;
-        var ob: [3]u64 = undefined;
-        const va = try rawRows.getByPrimaryKey(&ra, catalogA, primaryKey, &oa);
-        const vb = try rawRows.getByPrimaryKey(&rb, catalogB, primaryKey, &ob);
-        try testing.expectEqual(vb, va);
-        try testing.expectEqualSlices(u64, &ob, &oa);
+        var valuesA: [3]u64 = undefined;
+        var valuesB: [3]u64 = undefined;
+        const version = try rawRows.getByPrimaryKey(&readTransactionA, catalogA, primaryKey, &valuesA);
+        const version2 = try rawRows.getByPrimaryKey(&readTransactionB, catalogB, primaryKey, &valuesB);
+        try testing.expectEqual(version2, version);
+        try testing.expectEqualSlices(u64, &valuesB, &valuesA);
     }
 
     // Full-scan order equal (ascending objectKey for both).
     {
-        var sa = std.ArrayList(u64).empty;
-        defer sa.deinit(testing.allocator);
-        var sb = std.ArrayList(u64).empty;
-        defer sb.deinit(testing.allocator);
-        try query.where(&ra, catalogA, &.{}, &sa, testing.allocator);
-        try query.where(&rb, catalogB, &.{}, &sb, testing.allocator);
-        try testing.expectEqualSlices(u64, sb.items, sa.items);
+        var setA = std.ArrayList(u64).empty;
+        defer setA.deinit(testing.allocator);
+        var setB = std.ArrayList(u64).empty;
+        defer setB.deinit(testing.allocator);
+        try query.where(&readTransactionA, catalogA, &.{}, &setA, testing.allocator);
+        try query.where(&readTransactionB, catalogB, &.{}, &setB, testing.allocator);
+        try testing.expectEqualSlices(u64, setB.items, setA.items);
     }
 
     // Indexed query: category == 7, equal sorted objectKey sets.
     {
-        var sa = std.ArrayList(u64).empty;
-        defer sa.deinit(testing.allocator);
-        var sb = std.ArrayList(u64).empty;
-        defer sb.deinit(testing.allocator);
-        try query.where(&ra, catalogA, &.{.{ .property = 2, .operator = .eq, .value = 7 }}, &sa, testing.allocator);
-        try query.where(&rb, catalogB, &.{.{ .property = 2, .operator = .eq, .value = 7 }}, &sb, testing.allocator);
-        std.mem.sort(u64, sa.items, {}, std.sort.asc(u64));
-        std.mem.sort(u64, sb.items, {}, std.sort.asc(u64));
-        try testing.expectEqualSlices(u64, sb.items, sa.items);
-        try testing.expectEqual(@as(usize, 100), sa.items.len); // primaryKey%50==7 over 0..5000
+        var setA = std.ArrayList(u64).empty;
+        defer setA.deinit(testing.allocator);
+        var setB = std.ArrayList(u64).empty;
+        defer setB.deinit(testing.allocator);
+        try query.where(&readTransactionA, catalogA, &.{.{ .property = 2, .operator = .eq, .value = 7 }}, &setA, testing.allocator);
+        try query.where(&readTransactionB, catalogB, &.{.{ .property = 2, .operator = .eq, .value = 7 }}, &setB, testing.allocator);
+        std.mem.sort(u64, setA.items, {}, std.sort.asc(u64));
+        std.mem.sort(u64, setB.items, {}, std.sort.asc(u64));
+        try testing.expectEqualSlices(u64, setB.items, setA.items);
+        try testing.expectEqual(@as(usize, 100), setA.items.len); // primaryKey%50==7 over 0..5000
     }
 }
 
@@ -462,21 +462,21 @@ test "bulkImport rejects a non-empty type" {
     defer testing.allocator.free(path);
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
-    var w = try database.beginWrite();
-    var catalogRef = try catalog.createFromDefinitions(&w, &importDefinitions);
-    catalogRef = (try rawRows.insert(&w, catalogRef, &.{ 1, 3, 1 })).catalogRef;
+    var writeTransaction = try database.beginWrite();
+    var catalogRef = try catalog.createFromDefinitions(&writeTransaction, &importDefinitions);
+    catalogRef = (try rawRows.insert(&writeTransaction, catalogRef, &.{ 1, 3, 1 })).catalogRef;
 
     const more = [_][]const u64{ &.{ 10, 30, 5 }, &.{ 11, 33, 6 } };
-    try testing.expectError(error.TypeNotEmpty, bulkImport(&w, catalogRef, &more, .{}));
+    try testing.expectError(error.TypeNotEmpty, bulkImport(&writeTransaction, catalogRef, &more, .{}));
 
     // The type is unchanged: still one live row, intact.
-    try testing.expectEqual(@as(u64, 1), try catalog.liveCount(&w, catalogRef));
+    try testing.expectEqual(@as(u64, 1), try catalog.liveCount(&writeTransaction, catalogRef));
     var out: [3]u64 = undefined;
-    try testing.expect((try rawRows.getByPrimaryKey(&w, catalogRef, 1, &out)) != null);
+    try testing.expect((try rawRows.getByPrimaryKey(&writeTransaction, catalogRef, 1, &out)) != null);
     try testing.expectEqual(@as(u64, 1), out[0]);
     try testing.expectEqual(@as(u64, 3), out[1]);
     try testing.expectEqual(@as(u64, 1), out[2]);
-    w.deinit();
+    writeTransaction.deinit();
 }
 
 test "bulkImport rejects duplicate primaryKey before committing" {
@@ -486,18 +486,18 @@ test "bulkImport rejects duplicate primaryKey before committing" {
     defer testing.allocator.free(path);
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
-    var w = try database.beginWrite();
-    const catalogRef = try catalog.createFromDefinitions(&w, &importDefinitions);
+    var writeTransaction = try database.beginWrite();
+    const catalogRef = try catalog.createFromDefinitions(&writeTransaction, &importDefinitions);
 
     const dup = [_][]const u64{ &.{ 5, 1, 0 }, &.{ 6, 2, 0 }, &.{ 5, 3, 0 } };
-    try testing.expectError(error.DuplicateKey, bulkImport(&w, catalogRef, &dup, .{}));
+    try testing.expectError(error.DuplicateKey, bulkImport(&writeTransaction, catalogRef, &dup, .{}));
 
     // Nothing was written: the type is still empty.
-    try testing.expectEqual(@as(u64, 0), try catalog.liveCount(&w, catalogRef));
-    const cv = try catalog.loadCatalog(&w, catalogRef);
-    try testing.expectEqual(@as(u64, 0), cv.nextRow);
-    try testing.expectEqual(@as(u64, 0), cv.nextKey);
-    w.deinit();
+    try testing.expectEqual(@as(u64, 0), try catalog.liveCount(&writeTransaction, catalogRef));
+    const view = try catalog.loadCatalog(&writeTransaction, catalogRef);
+    try testing.expectEqual(@as(u64, 0), view.nextRow);
+    try testing.expectEqual(@as(u64, 0), view.nextKey);
+    writeTransaction.deinit();
 }
 
 test "bulkImport rejects a link-bearing type" {
@@ -507,59 +507,59 @@ test "bulkImport rejects a link-bearing type" {
     defer testing.allocator.free(path);
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
-    var w = try database.beginWrite();
+    var writeTransaction = try database.beginWrite();
     const linkDefinitions = [_]catalog.PropertyDefinition{ .{ .kind = .int }, .{ .kind = .link, .linkTarget = 0 } };
-    const catalogRef = try catalog.createFromDefinitions(&w, &linkDefinitions);
+    const catalogRef = try catalog.createFromDefinitions(&writeTransaction, &linkDefinitions);
 
     const rws = [_][]const u64{&.{ 1, 0 }};
-    try testing.expectError(error.UnsupportedForBulk, bulkImport(&w, catalogRef, &rws, .{}));
-    w.deinit();
+    try testing.expectError(error.UnsupportedForBulk, bulkImport(&writeTransaction, catalogRef, &rws, .{}));
+    writeTransaction.deinit();
 }
 
 test "bulkImport edge sizes: empty, single, leafCap" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const sizes = [_]u64{ 0, 1, @as(u64, cnode.leafCap) };
-    for (sizes, 0..) |n, si| {
+    for (sizes, 0..) |count, si| {
         var namebuf: [32]u8 = undefined;
         const name = try std.fmt.bufPrint(&namebuf, "edge_{d}.airdb", .{si});
         const path = try bulkTmpPath(testing.allocator, &tmp, name);
         defer testing.allocator.free(path);
 
-        const storage = try testing.allocator.alloc([3]u64, n);
+        const storage = try testing.allocator.alloc([3]u64, count);
         defer testing.allocator.free(storage);
-        const rowSlices = try testing.allocator.alloc([]const u64, n);
+        const rowSlices = try testing.allocator.alloc([]const u64, count);
         defer testing.allocator.free(rowSlices);
-        var i: u64 = 0;
-        while (i < n) : (i += 1) {
-            storage[i] = .{ i, i * 3, i % 7 };
-            rowSlices[i] = &storage[i];
+        var index: u64 = 0;
+        while (index < count) : (index += 1) {
+            storage[index] = .{ index, index * 3, index % 7 };
+            rowSlices[index] = &storage[index];
         }
 
         var database = try Database.create(testing.allocator, path);
         defer database.deinit();
         {
-            var w = try database.beginWrite();
-            const dir = try typeDirectory.createTypes(&w, &.{&importDefinitions}, &.{false});
-            const catalog0 = try typeDirectory.catalogRef(&w, dir, 0);
-            const newCatalog = try bulkImport(&w, catalog0, rowSlices, .{ .presorted = true });
-            const newDir = try typeDirectory.setCatalogRef(&w, dir, 0, newCatalog);
-            w.setRoot(newDir);
-            _ = try w.commit();
+            var writeTransaction = try database.beginWrite();
+            const dir = try typeDirectory.createTypes(&writeTransaction, &.{&importDefinitions}, &.{false});
+            const catalog0 = try typeDirectory.catalogRef(&writeTransaction, dir, 0);
+            const newCatalog = try bulkImport(&writeTransaction, catalog0, rowSlices, .{ .presorted = true });
+            const newDir = try typeDirectory.setCatalogRef(&writeTransaction, dir, 0, newCatalog);
+            writeTransaction.setRoot(newDir);
+            _ = try writeTransaction.commit();
         }
         try verification.verifyIntegrity(&database);
 
-        var r = try database.beginRead();
-        defer r.end();
-        const catalogRef = try typeDirectory.catalogRef(&r, r.root(), 0);
-        try testing.expectEqual(n, try catalog.liveCount(&r, catalogRef));
-        const cv = try catalog.loadCatalog(&r, catalogRef);
-        try testing.expectEqual(n, cv.nextRow);
-        try testing.expectEqual(n, cv.nextKey);
-        if (n > 0) {
+        var readTransaction = try database.beginRead();
+        defer readTransaction.end();
+        const catalogRef = try typeDirectory.catalogRef(&readTransaction, readTransaction.root(), 0);
+        try testing.expectEqual(count, try catalog.liveCount(&readTransaction, catalogRef));
+        const view = try catalog.loadCatalog(&readTransaction, catalogRef);
+        try testing.expectEqual(count, view.nextRow);
+        try testing.expectEqual(count, view.nextKey);
+        if (count > 0) {
             var out: [3]u64 = undefined;
-            const last = n - 1;
-            try testing.expect((try rawRows.getByPrimaryKey(&r, catalogRef, last, &out)) != null);
+            const last = count - 1;
+            try testing.expect((try rawRows.getByPrimaryKey(&readTransaction, catalogRef, last, &out)) != null);
             try testing.expectEqual(last, out[0]);
             try testing.expectEqual(last * 3, out[1]);
             try testing.expectEqual(last % 7, out[2]);
@@ -588,11 +588,11 @@ test "bulkAppend equals row-by-row for a contiguous monotonic batch" {
     const batch = try testing.allocator.alloc([]const u64, APPEND);
     defer testing.allocator.free(batch);
     {
-        var j: usize = 0;
-        while (j < APPEND) : (j += 1) {
-            const primaryKey = BASE + @as(u64, @intCast(j));
-            storage[j] = .{ primaryKey, primaryKey * 3 };
-            batch[j] = &storage[j];
+        var innerIndex: usize = 0;
+        while (innerIndex < APPEND) : (innerIndex += 1) {
+            const primaryKey = BASE + @as(u64, @intCast(innerIndex));
+            storage[innerIndex] = .{ primaryKey, primaryKey * 3 };
+            batch[innerIndex] = &storage[innerIndex];
         }
     }
 
@@ -601,15 +601,15 @@ test "bulkAppend equals row-by-row for a contiguous monotonic batch" {
     {
         var database = try Database.create(testing.allocator, pathA);
         defer database.deinit();
-        var w = try database.beginWrite();
-        const dir = try typeDirectory.createTypes(&w, &.{&appendDefinitions}, &.{false});
-        var catalogRef = try typeDirectory.catalogRef(&w, dir, 0);
+        var writeTransaction = try database.beginWrite();
+        const dir = try typeDirectory.createTypes(&writeTransaction, &.{&appendDefinitions}, &.{false});
+        var catalogRef = try typeDirectory.catalogRef(&writeTransaction, dir, 0);
         var primaryKey: u64 = 0;
-        while (primaryKey < BASE) : (primaryKey += 1) catalogRef = (try rawRows.insert(&w, catalogRef, &.{ primaryKey, primaryKey * 3 })).catalogRef;
-        const newCatalog = try bulkAppend(&w, catalogRef, batch);
-        const newDir = try typeDirectory.setCatalogRef(&w, dir, 0, newCatalog);
-        w.setRoot(newDir);
-        _ = try w.commit();
+        while (primaryKey < BASE) : (primaryKey += 1) catalogRef = (try rawRows.insert(&writeTransaction, catalogRef, &.{ primaryKey, primaryKey * 3 })).catalogRef;
+        const newCatalog = try bulkAppend(&writeTransaction, catalogRef, batch);
+        const newDir = try typeDirectory.setCatalogRef(&writeTransaction, dir, 0, newCatalog);
+        writeTransaction.setRoot(newDir);
+        _ = try writeTransaction.commit();
         try verification.verifyIntegrity(&database);
     }
 
@@ -617,53 +617,53 @@ test "bulkAppend equals row-by-row for a contiguous monotonic batch" {
     {
         var database = try Database.create(testing.allocator, pathB);
         defer database.deinit();
-        var w = try database.beginWrite();
-        var catalogRef = try catalog.createFromDefinitions(&w, &appendDefinitions);
+        var writeTransaction = try database.beginWrite();
+        var catalogRef = try catalog.createFromDefinitions(&writeTransaction, &appendDefinitions);
         var primaryKey: u64 = 0;
-        while (primaryKey < TOTAL) : (primaryKey += 1) catalogRef = (try rawRows.insert(&w, catalogRef, &.{ primaryKey, primaryKey * 3 })).catalogRef;
-        w.setRoot(catalogRef);
-        _ = try w.commit();
+        while (primaryKey < TOTAL) : (primaryKey += 1) catalogRef = (try rawRows.insert(&writeTransaction, catalogRef, &.{ primaryKey, primaryKey * 3 })).catalogRef;
+        writeTransaction.setRoot(catalogRef);
+        _ = try writeTransaction.commit();
     }
 
     // Reopen A from disk (durability) and compare against B.
-    var da = try Database.open(testing.allocator, pathA);
-    defer da.deinit();
-    try verification.verifyIntegrity(&da); // audit again after reopen
+    var database = try Database.open(testing.allocator, pathA);
+    defer database.deinit();
+    try verification.verifyIntegrity(&database); // audit again after reopen
     var databaseB = try Database.open(testing.allocator, pathB);
     defer databaseB.deinit();
 
-    var ra = try da.beginRead();
-    defer ra.end();
-    var rb = try databaseB.beginRead();
-    defer rb.end();
+    var readTransactionA = try database.beginRead();
+    defer readTransactionA.end();
+    var readTransactionB = try databaseB.beginRead();
+    defer readTransactionB.end();
 
-    const catalogA = try typeDirectory.catalogRef(&ra, ra.root(), 0);
-    const catalogB = rb.root();
+    const catalogA = try typeDirectory.catalogRef(&readTransactionA, readTransactionA.root(), 0);
+    const catalogB = readTransactionB.root();
 
     // Counts equal.
-    try testing.expectEqual(TOTAL, try catalog.liveCount(&ra, catalogA));
-    try testing.expectEqual(try catalog.liveCount(&rb, catalogB), try catalog.liveCount(&ra, catalogA));
+    try testing.expectEqual(TOTAL, try catalog.liveCount(&readTransactionA, catalogA));
+    try testing.expectEqual(try catalog.liveCount(&readTransactionB, catalogB), try catalog.liveCount(&readTransactionA, catalogA));
 
     // Every primaryKey lookup equal: property values AND row version.
     var primaryKey: u64 = 0;
     while (primaryKey < TOTAL) : (primaryKey += 1) {
-        var oa: [2]u64 = undefined;
-        var ob: [2]u64 = undefined;
-        const va = try rawRows.getByPrimaryKey(&ra, catalogA, primaryKey, &oa);
-        const vb = try rawRows.getByPrimaryKey(&rb, catalogB, primaryKey, &ob);
-        try testing.expectEqual(vb, va);
-        try testing.expectEqualSlices(u64, &ob, &oa);
+        var valuesA: [2]u64 = undefined;
+        var valuesB: [2]u64 = undefined;
+        const version = try rawRows.getByPrimaryKey(&readTransactionA, catalogA, primaryKey, &valuesA);
+        const version2 = try rawRows.getByPrimaryKey(&readTransactionB, catalogB, primaryKey, &valuesB);
+        try testing.expectEqual(version2, version);
+        try testing.expectEqualSlices(u64, &valuesB, &valuesA);
     }
 
     // Full-scan order equal (ascending objectKey for both).
     {
-        var sa = std.ArrayList(u64).empty;
-        defer sa.deinit(testing.allocator);
-        var sb = std.ArrayList(u64).empty;
-        defer sb.deinit(testing.allocator);
-        try query.where(&ra, catalogA, &.{}, &sa, testing.allocator);
-        try query.where(&rb, catalogB, &.{}, &sb, testing.allocator);
-        try testing.expectEqualSlices(u64, sb.items, sa.items);
+        var setA = std.ArrayList(u64).empty;
+        defer setA.deinit(testing.allocator);
+        var setB = std.ArrayList(u64).empty;
+        defer setB.deinit(testing.allocator);
+        try query.where(&readTransactionA, catalogA, &.{}, &setA, testing.allocator);
+        try query.where(&readTransactionB, catalogB, &.{}, &setB, testing.allocator);
+        try testing.expectEqualSlices(u64, setB.items, setA.items);
     }
 }
 
@@ -674,25 +674,25 @@ test "bulkAppend returns NotAppendable for a scattered batch" {
     defer testing.allocator.free(path);
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
-    var w = try database.beginWrite();
-    var catalogRef = try catalog.createFromDefinitions(&w, &appendDefinitions);
+    var writeTransaction = try database.beginWrite();
+    var catalogRef = try catalog.createFromDefinitions(&writeTransaction, &appendDefinitions);
     var primaryKey: u64 = 0;
-    while (primaryKey < 100) : (primaryKey += 1) catalogRef = (try rawRows.insert(&w, catalogRef, &.{ primaryKey, primaryKey * 3 })).catalogRef;
+    while (primaryKey < 100) : (primaryKey += 1) catalogRef = (try rawRows.insert(&writeTransaction, catalogRef, &.{ primaryKey, primaryKey * 3 })).catalogRef;
 
-    const before = try catalog.liveCount(&w, catalogRef);
+    const before = try catalog.liveCount(&writeTransaction, catalogRef);
     var beforeRow: [2]u64 = undefined;
-    try testing.expect((try rawRows.getByPrimaryKey(&w, catalogRef, 50, &beforeRow)) != null);
+    try testing.expect((try rawRows.getByPrimaryKey(&writeTransaction, catalogRef, 50, &beforeRow)) != null);
 
     // First batch primaryKey (50) is <= the current max (99): not a right-edge append.
     const batch = [_][]const u64{ &.{ 50, 150 }, &.{ 200, 600 }, &.{ 201, 603 } };
-    try testing.expectError(error.NotAppendable, bulkAppend(&w, catalogRef, &batch));
+    try testing.expectError(error.NotAppendable, bulkAppend(&writeTransaction, catalogRef, &batch));
 
     // The type is byte-unchanged: same count, and the sampled row is intact.
-    try testing.expectEqual(before, try catalog.liveCount(&w, catalogRef));
+    try testing.expectEqual(before, try catalog.liveCount(&writeTransaction, catalogRef));
     var afterRow: [2]u64 = undefined;
-    try testing.expect((try rawRows.getByPrimaryKey(&w, catalogRef, 50, &afterRow)) != null);
+    try testing.expect((try rawRows.getByPrimaryKey(&writeTransaction, catalogRef, 50, &afterRow)) != null);
     try testing.expectEqualSlices(u64, &beforeRow, &afterRow);
-    w.deinit();
+    writeTransaction.deinit();
 }
 
 test "bulkAppend returns NotAppendable for an indexed type" {
@@ -702,15 +702,15 @@ test "bulkAppend returns NotAppendable for an indexed type" {
     defer testing.allocator.free(path);
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
-    var w = try database.beginWrite();
-    var catalogRef = try catalog.createFromDefinitions(&w, &.{ .{ .kind = .int }, .{ .kind = .int, .indexed = true } });
-    catalogRef = (try rawRows.insert(&w, catalogRef, &.{ 1, 10 })).catalogRef;
+    var writeTransaction = try database.beginWrite();
+    var catalogRef = try catalog.createFromDefinitions(&writeTransaction, &.{ .{ .kind = .int }, .{ .kind = .int, .indexed = true } });
+    catalogRef = (try rawRows.insert(&writeTransaction, catalogRef, &.{ 1, 10 })).catalogRef;
 
     // Even an ascending batch above the max is rejected: a pure right-edge append
     // cannot maintain the value index.
     const batch = [_][]const u64{ &.{ 100, 5 }, &.{ 101, 6 } };
-    try testing.expectError(error.NotAppendable, bulkAppend(&w, catalogRef, &batch));
-    w.deinit();
+    try testing.expectError(error.NotAppendable, bulkAppend(&writeTransaction, catalogRef, &batch));
+    writeTransaction.deinit();
 }
 
 test "bulkAppend returns NotAppendable for a link-bearing type" {
@@ -720,13 +720,13 @@ test "bulkAppend returns NotAppendable for a link-bearing type" {
     defer testing.allocator.free(path);
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
-    var w = try database.beginWrite();
-    var catalogRef = try catalog.createFromDefinitions(&w, &.{ .{ .kind = .int }, .{ .kind = .link, .linkTarget = 0 } });
-    catalogRef = (try rawRows.insert(&w, catalogRef, &.{ 1, 0 })).catalogRef;
+    var writeTransaction = try database.beginWrite();
+    var catalogRef = try catalog.createFromDefinitions(&writeTransaction, &.{ .{ .kind = .int }, .{ .kind = .link, .linkTarget = 0 } });
+    catalogRef = (try rawRows.insert(&writeTransaction, catalogRef, &.{ 1, 0 })).catalogRef;
 
     const batch = [_][]const u64{ &.{ 100, 0 }, &.{ 101, 0 } };
-    try testing.expectError(error.NotAppendable, bulkAppend(&w, catalogRef, &batch));
-    w.deinit();
+    try testing.expectError(error.NotAppendable, bulkAppend(&writeTransaction, catalogRef, &batch));
+    writeTransaction.deinit();
 }
 
 test "bulkAppend returns NotAppendable for a non-ascending or duplicate batch" {
@@ -736,18 +736,18 @@ test "bulkAppend returns NotAppendable for a non-ascending or duplicate batch" {
     defer testing.allocator.free(path);
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
-    var w = try database.beginWrite();
-    var catalogRef = try catalog.createFromDefinitions(&w, &appendDefinitions);
-    catalogRef = (try rawRows.insert(&w, catalogRef, &.{ 1, 3 })).catalogRef;
+    var writeTransaction = try database.beginWrite();
+    var catalogRef = try catalog.createFromDefinitions(&writeTransaction, &appendDefinitions);
+    catalogRef = (try rawRows.insert(&writeTransaction, catalogRef, &.{ 1, 3 })).catalogRef;
 
     // Non-ascending batch (both primaryKeys above the max, but out of order).
     const desc = [_][]const u64{ &.{ 200, 600 }, &.{ 150, 450 } };
-    try testing.expectError(error.NotAppendable, bulkAppend(&w, catalogRef, &desc));
+    try testing.expectError(error.NotAppendable, bulkAppend(&writeTransaction, catalogRef, &desc));
 
     // In-batch duplicate primaryKey.
     const dup = [_][]const u64{ &.{ 300, 900 }, &.{ 300, 901 } };
-    try testing.expectError(error.NotAppendable, bulkAppend(&w, catalogRef, &dup));
-    w.deinit();
+    try testing.expectError(error.NotAppendable, bulkAppend(&writeTransaction, catalogRef, &dup));
+    writeTransaction.deinit();
 }
 
 test "bulkAppendOrInsert falls back and equals row-by-row for a scattered batch" {
@@ -766,9 +766,9 @@ test "bulkAppendOrInsert falls back and equals row-by-row for a scattered batch"
 
     var storage: [scatteredPrimaryKeys.len][2]u64 = undefined;
     var batch: [scatteredPrimaryKeys.len][]const u64 = undefined;
-    for (scatteredPrimaryKeys, 0..) |primaryKey, j| {
-        storage[j] = .{ primaryKey, primaryKey * 3 };
-        batch[j] = &storage[j];
+    for (scatteredPrimaryKeys, 0..) |primaryKey, innerIndex| {
+        storage[innerIndex] = .{ primaryKey, primaryKey * 3 };
+        batch[innerIndex] = &storage[innerIndex];
     }
 
     // database A: base via insert, then the scattered batch via bulkAppendOrInsert,
@@ -776,15 +776,15 @@ test "bulkAppendOrInsert falls back and equals row-by-row for a scattered batch"
     {
         var database = try Database.create(testing.allocator, pathA);
         defer database.deinit();
-        var w = try database.beginWrite();
-        const dir = try typeDirectory.createTypes(&w, &.{&appendDefinitions}, &.{false});
-        var catalogRef = try typeDirectory.catalogRef(&w, dir, 0);
+        var writeTransaction = try database.beginWrite();
+        const dir = try typeDirectory.createTypes(&writeTransaction, &.{&appendDefinitions}, &.{false});
+        var catalogRef = try typeDirectory.catalogRef(&writeTransaction, dir, 0);
         var primaryKey: u64 = 0;
-        while (primaryKey < BASE) : (primaryKey += 1) catalogRef = (try rawRows.insert(&w, catalogRef, &.{ primaryKey, primaryKey * 3 })).catalogRef;
-        const newCatalog = try bulkAppendOrInsert(&w, catalogRef, &batch);
-        const newDir = try typeDirectory.setCatalogRef(&w, dir, 0, newCatalog);
-        w.setRoot(newDir);
-        _ = try w.commit();
+        while (primaryKey < BASE) : (primaryKey += 1) catalogRef = (try rawRows.insert(&writeTransaction, catalogRef, &.{ primaryKey, primaryKey * 3 })).catalogRef;
+        const newCatalog = try bulkAppendOrInsert(&writeTransaction, catalogRef, &batch);
+        const newDir = try typeDirectory.setCatalogRef(&writeTransaction, dir, 0, newCatalog);
+        writeTransaction.setRoot(newDir);
+        _ = try writeTransaction.commit();
         try verification.verifyIntegrity(&database);
     }
 
@@ -793,52 +793,52 @@ test "bulkAppendOrInsert falls back and equals row-by-row for a scattered batch"
     {
         var database = try Database.create(testing.allocator, pathB);
         defer database.deinit();
-        var w = try database.beginWrite();
-        var catalogRef = try catalog.createFromDefinitions(&w, &appendDefinitions);
+        var writeTransaction = try database.beginWrite();
+        var catalogRef = try catalog.createFromDefinitions(&writeTransaction, &appendDefinitions);
         var primaryKey: u64 = 0;
-        while (primaryKey < BASE) : (primaryKey += 1) catalogRef = (try rawRows.insert(&w, catalogRef, &.{ primaryKey, primaryKey * 3 })).catalogRef;
-        for (scatteredPrimaryKeys) |scatteredPrimaryKey| catalogRef = (try rawRows.insert(&w, catalogRef, &.{ scatteredPrimaryKey, scatteredPrimaryKey * 3 })).catalogRef;
-        w.setRoot(catalogRef);
-        _ = try w.commit();
+        while (primaryKey < BASE) : (primaryKey += 1) catalogRef = (try rawRows.insert(&writeTransaction, catalogRef, &.{ primaryKey, primaryKey * 3 })).catalogRef;
+        for (scatteredPrimaryKeys) |scatteredPrimaryKey| catalogRef = (try rawRows.insert(&writeTransaction, catalogRef, &.{ scatteredPrimaryKey, scatteredPrimaryKey * 3 })).catalogRef;
+        writeTransaction.setRoot(catalogRef);
+        _ = try writeTransaction.commit();
     }
 
-    var da = try Database.open(testing.allocator, pathA);
-    defer da.deinit();
-    try verification.verifyIntegrity(&da);
+    var database = try Database.open(testing.allocator, pathA);
+    defer database.deinit();
+    try verification.verifyIntegrity(&database);
     var databaseB = try Database.open(testing.allocator, pathB);
     defer databaseB.deinit();
 
-    var ra = try da.beginRead();
-    defer ra.end();
-    var rb = try databaseB.beginRead();
-    defer rb.end();
+    var readTransactionA = try database.beginRead();
+    defer readTransactionA.end();
+    var readTransactionB = try databaseB.beginRead();
+    defer readTransactionB.end();
 
-    const catalogA = try typeDirectory.catalogRef(&ra, ra.root(), 0);
-    const catalogB = rb.root();
+    const catalogA = try typeDirectory.catalogRef(&readTransactionA, readTransactionA.root(), 0);
+    const catalogB = readTransactionB.root();
 
-    try testing.expectEqual(@as(u64, TOTAL), try catalog.liveCount(&ra, catalogA));
-    try testing.expectEqual(try catalog.liveCount(&rb, catalogB), try catalog.liveCount(&ra, catalogA));
+    try testing.expectEqual(@as(u64, TOTAL), try catalog.liveCount(&readTransactionA, catalogA));
+    try testing.expectEqual(try catalog.liveCount(&readTransactionB, catalogB), try catalog.liveCount(&readTransactionA, catalogA));
 
     // Every primaryKey over the union (and the absent gaps between) resolves identically.
     var primaryKey: u64 = 0;
     while (primaryKey <= 401) : (primaryKey += 1) {
-        var oa: [2]u64 = undefined;
-        var ob: [2]u64 = undefined;
-        const va = try rawRows.getByPrimaryKey(&ra, catalogA, primaryKey, &oa);
-        const vb = try rawRows.getByPrimaryKey(&rb, catalogB, primaryKey, &ob);
-        try testing.expectEqual(vb, va);
-        if (vb != null) try testing.expectEqualSlices(u64, &ob, &oa);
+        var valuesA: [2]u64 = undefined;
+        var valuesB: [2]u64 = undefined;
+        const version = try rawRows.getByPrimaryKey(&readTransactionA, catalogA, primaryKey, &valuesA);
+        const version2 = try rawRows.getByPrimaryKey(&readTransactionB, catalogB, primaryKey, &valuesB);
+        try testing.expectEqual(version2, version);
+        if (version2 != null) try testing.expectEqualSlices(u64, &valuesB, &valuesA);
     }
 
     // Full-scan order equal (ascending objectKey for both).
     {
-        var sa = std.ArrayList(u64).empty;
-        defer sa.deinit(testing.allocator);
-        var sb = std.ArrayList(u64).empty;
-        defer sb.deinit(testing.allocator);
-        try query.where(&ra, catalogA, &.{}, &sa, testing.allocator);
-        try query.where(&rb, catalogB, &.{}, &sb, testing.allocator);
-        try testing.expectEqualSlices(u64, sb.items, sa.items);
+        var setA = std.ArrayList(u64).empty;
+        defer setA.deinit(testing.allocator);
+        var setB = std.ArrayList(u64).empty;
+        defer setB.deinit(testing.allocator);
+        try query.where(&readTransactionA, catalogA, &.{}, &setA, testing.allocator);
+        try query.where(&readTransactionB, catalogB, &.{}, &setB, testing.allocator);
+        try testing.expectEqualSlices(u64, setB.items, setA.items);
     }
 }
 
@@ -849,13 +849,13 @@ test "bulkAppendOrInsert empty batch is a no-op" {
     defer testing.allocator.free(path);
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
-    var w = try database.beginWrite();
-    var catalogRef = try catalog.createFromDefinitions(&w, &appendDefinitions);
-    catalogRef = (try rawRows.insert(&w, catalogRef, &.{ 1, 3 })).catalogRef;
+    var writeTransaction = try database.beginWrite();
+    var catalogRef = try catalog.createFromDefinitions(&writeTransaction, &appendDefinitions);
+    catalogRef = (try rawRows.insert(&writeTransaction, catalogRef, &.{ 1, 3 })).catalogRef;
 
-    const before = try catalog.liveCount(&w, catalogRef);
-    const after = try bulkAppendOrInsert(&w, catalogRef, &.{});
+    const before = try catalog.liveCount(&writeTransaction, catalogRef);
+    const after = try bulkAppendOrInsert(&writeTransaction, catalogRef, &.{});
     try testing.expectEqual(catalogRef, after); // same ref, untouched
-    try testing.expectEqual(before, try catalog.liveCount(&w, after));
-    w.deinit();
+    try testing.expectEqual(before, try catalog.liveCount(&writeTransaction, after));
+    writeTransaction.deinit();
 }

@@ -3,7 +3,7 @@
 //   Part A (large-blob throughput): write and read back a handful of multi-MiB
 //   blobs to exercise the chunked blob path (blobs over ~16 MiB are split into
 //   chunk nodes). Reports PUT and GET bandwidth in MiB/s. The blob count is a
-//   fixed small constant (NOT scaled by ctx.n): each blob is 24 MiB, so eight of
+//   fixed small constant (NOT scaled by ctx.rowCount): each blob is 24 MiB, so eight of
 //   them is ~192 MiB on disk -- scaling by the 1M/10M row count would write
 //   hundreds of GiB.
 //
@@ -29,7 +29,7 @@ const rows = airdb.rows;
 pub const name = "blobs_pitr";
 
 // --- Part A knobs -----------------------------------------------------------
-// Bounded, NOT scaled by ctx.n. 24 MiB > the ~16 MiB inline cap, so each blob
+// Bounded, NOT scaled by ctx.rowCount. 24 MiB > the ~16 MiB inline cap, so each blob
 // takes the chunked path. Eight blobs is ~192 MiB total.
 const blobBytes: usize = 24 * 1024 * 1024;
 const blobCount: usize = 8;
@@ -53,9 +53,9 @@ fn nowNs(io: Io) i96 {
 
 fn mibPerSec(bytes: u64, ns: u64) f64 {
     if (ns == 0) return 0;
-    const b: f64 = @floatFromInt(bytes);
-    const t: f64 = @floatFromInt(ns);
-    return (b * 1e9) / (t * 1048576.0);
+    const valueB: f64 = @floatFromInt(bytes);
+    const typeId: f64 = @floatFromInt(ns);
+    return (valueB * 1e9) / (typeId * 1048576.0);
 }
 
 pub fn run(ctx: *harness.Ctx) !harness.Result {
@@ -70,7 +70,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     // One deterministic 24 MiB source buffer, reused for every blob.
     const buffer = try alloc.alloc(u8, blobBytes);
     defer alloc.free(buffer);
-    for (buffer, 0..) |*b, i| b.* = @truncate(i *% 2654435761);
+    for (buffer, 0..) |*byte, byteI| byte.* = @truncate(byteI *% 2654435761);
 
     var database = try airdb.Database.create(alloc, blobPath);
     errdefer database.deinit();
@@ -80,11 +80,11 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     // PUT: one blob per write transaction.
     var putBytes: u64 = 0;
     const putStart = nowNs(io);
-    var i: usize = 0;
-    while (i < blobCount) : (i += 1) {
-        var w = try database.beginWrite();
-        refs[i] = try blob.put(&w, buffer);
-        _ = try w.commit();
+    var index: usize = 0;
+    while (index < blobCount) : (index += 1) {
+        var writeTransaction = try database.beginWrite();
+        refs[index] = try blob.put(&writeTransaction, buffer);
+        _ = try writeTransaction.commit();
         putBytes += blobBytes;
     }
     const putNs: u64 = @intCast(nowNs(io) - putStart);
@@ -92,21 +92,21 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     // GET: read every blob back in a single read snapshot.
     var getBytes: u64 = 0;
     const getStart = nowNs(io);
-    var rd = try database.beginRead();
-    i = 0;
-    while (i < blobCount) : (i += 1) {
-        const out = try blob.getAlloc(&rd, refs[i], alloc);
+    var readTransaction = try database.beginRead();
+    index = 0;
+    while (index < blobCount) : (index += 1) {
+        const out = try blob.getAlloc(&readTransaction, refs[index], alloc);
         defer alloc.free(out);
         getBytes += out.len;
         // Correctness guard on the last blob: a chunked round-trip that silently
         // dropped or reordered bytes must fail the bench loudly.
-        if (i == blobCount - 1) {
+        if (index == blobCount - 1) {
             if (out.len != blobBytes or out[0] != buffer[0] or out[out.len - 1] != buffer[buffer.len - 1]) {
                 return error.BlobRoundTripMismatch;
             }
         }
     }
-    rd.end();
+    readTransaction.end();
     const getNs: u64 = @intCast(nowNs(io) - getStart);
 
     // Capture the (large) blob-database metrics before closing it.
@@ -127,10 +127,10 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
 
     // Two-int type {primaryKey, value}; property 0 is the primary key.
     {
-        var w = try pitrDatabase.beginWrite();
-        const c = try catalog.create(&w, 2);
-        w.setRoot(c);
-        _ = try w.commit();
+        var writeTransaction = try pitrDatabase.beginWrite();
+        const catalogRef = try catalog.create(&writeTransaction, 2);
+        writeTransaction.setRoot(catalogRef);
+        _ = try writeTransaction.commit();
     }
 
     // Insert in batches; the first batch's commit fixes the historical version.
@@ -138,17 +138,17 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     var inserted: usize = 0;
     while (inserted < pitrRows) {
         const thisBatch = @min(pitrBatch, pitrRows - inserted);
-        var w = try pitrDatabase.beginWrite();
+        var writeTransaction = try pitrDatabase.beginWrite();
         var catalogRef = pitrDatabase.activeRoot;
-        var j: usize = 0;
-        while (j < thisBatch) : (j += 1) {
-            const primaryKey: u64 = inserted + j;
-            const r = try rows.insert(&w, catalogRef, &.{ primaryKey, primaryKey *% 7 });
-            catalogRef = r.catalogRef;
+        var innerIndex: usize = 0;
+        while (innerIndex < thisBatch) : (innerIndex += 1) {
+            const primaryKey: u64 = inserted + innerIndex;
+            const result = try rows.insert(&writeTransaction, catalogRef, &.{ primaryKey, primaryKey *% 7 });
+            catalogRef = result.catalogRef;
         }
-        w.setRoot(catalogRef);
-        const v = try w.commit();
-        if (inserted == 0) vOld = v; // primaryKeys [0, pitrBatch) exist from here on
+        writeTransaction.setRoot(catalogRef);
+        const version = try writeTransaction.commit();
+        if (inserted == 0) vOld = version; // primaryKeys [0, pitrBatch) exist from here on
         inserted += thisBatch;
     }
 
@@ -160,44 +160,44 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     var latLatest = harness.Latencies.init();
     defer latLatest.deinit(alloc);
     {
-        var rl = try pitrDatabase.beginRead();
-        const catalogRef = rl.root();
-        var x: u64 = 0x9E3779B97F4A7C15;
-        var k: usize = 0;
-        while (k < pitrLookups) : (k += 1) {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            const primaryKey: u64 = x % primaryKeyModulus;
+        var latestRead = try pitrDatabase.beginRead();
+        const catalogRef = latestRead.root();
+        var state: u64 = 0x9E3779B97F4A7C15;
+        var key: usize = 0;
+        while (key < pitrLookups) : (key += 1) {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            const primaryKey: u64 = state % primaryKeyModulus;
             var out: [2]u64 = undefined;
-            const t0 = nowNs(io);
-            _ = try rows.getByPrimaryKey(&rl, catalogRef, primaryKey, &out);
-            const dt: u64 = @intCast(nowNs(io) - t0);
-            try latLatest.add(alloc, dt);
+            const startNs = nowNs(io);
+            _ = try rows.getByPrimaryKey(&latestRead, catalogRef, primaryKey, &out);
+            const elapsedNs: u64 = @intCast(nowNs(io) - startNs);
+            try latLatest.add(alloc, elapsedNs);
         }
-        rl.end();
+        latestRead.end();
     }
 
     // Historical-snapshot lookups at vOld (same primaryKey sequence).
     var latHist = harness.Latencies.init();
     defer latHist.deinit(alloc);
     {
-        var rh = try pitrDatabase.beginReadAt(vOld);
-        const catalogRef = rh.root();
-        var x: u64 = 0x9E3779B97F4A7C15;
-        var k: usize = 0;
-        while (k < pitrLookups) : (k += 1) {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            const primaryKey: u64 = x % primaryKeyModulus;
+        var historicalRead = try pitrDatabase.beginReadAt(vOld);
+        const catalogRef = historicalRead.root();
+        var state: u64 = 0x9E3779B97F4A7C15;
+        var key: usize = 0;
+        while (key < pitrLookups) : (key += 1) {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            const primaryKey: u64 = state % primaryKeyModulus;
             var out: [2]u64 = undefined;
-            const t0 = nowNs(io);
-            _ = try rows.getByPrimaryKey(&rh, catalogRef, primaryKey, &out);
-            const dt: u64 = @intCast(nowNs(io) - t0);
-            try latHist.add(alloc, dt);
+            const startNs = nowNs(io);
+            _ = try rows.getByPrimaryKey(&historicalRead, catalogRef, primaryKey, &out);
+            const elapsedNs: u64 = @intCast(nowNs(io) - startNs);
+            try latHist.add(alloc, elapsedNs);
         }
-        rh.end();
+        historicalRead.end();
     }
 
     const latestP50 = latLatest.percentile(50);

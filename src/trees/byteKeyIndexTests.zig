@@ -31,21 +31,21 @@ test "a byteKeyIndex ref cycle fails with error.Corrupt" {
     defer testing.allocator.free(path);
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
-    var w = try database.beginWrite();
-    defer w.deinit();
+    var writeTransaction = try database.beginWrite();
+    defer writeTransaction.deinit();
 
     // Inner node whose only child is itself; its low key is a real blob so the
     // ordering compare succeeds and the walk descends into the cycle.
-    const keyRef = try blob.put(&w, "k");
-    const a = try w.alloc(innerNodeSize);
-    _ = encodeInner(a.bytes, &.{a.ref}, &.{keyRef}, &.{1});
-    try testing.expectError(error.Corrupt, get(&w, a.ref, "k"));
-    try testing.expectError(error.Corrupt, insert(&w, a.ref, "x", 1));
-    try testing.expectError(error.Corrupt, remove(&w, a.ref, "k"));
+    const keyRef = try blob.put(&writeTransaction, "k");
+    const allocation = try writeTransaction.alloc(innerNodeSize);
+    _ = encodeInner(allocation.bytes, &.{allocation.ref}, &.{keyRef}, &.{1});
+    try testing.expectError(error.Corrupt, get(&writeTransaction, allocation.ref, "k"));
+    try testing.expectError(error.Corrupt, insert(&writeTransaction, allocation.ref, "x", 1));
+    try testing.expectError(error.Corrupt, remove(&writeTransaction, allocation.ref, "k"));
     const NopSink = struct {
         fn onEntry(_: @This(), _: []const u8, _: u64) !void {}
     };
-    try testing.expectError(error.Corrupt, forEachEntry(&w, a.ref, NopSink{}, NopSink.onEntry));
+    try testing.expectError(error.Corrupt, forEachEntry(&writeTransaction, allocation.ref, NopSink{}, NopSink.onEntry));
 }
 
 test "freeTree over a three-level tree frees every blob exactly once" {
@@ -61,28 +61,28 @@ test "freeTree over a three-level tree frees every blob exactly once" {
     defer testing.allocator.free(path);
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
-    var w = try database.beginWrite();
-    defer w.deinit();
+    var writeTransaction = try database.beginWrite();
+    defer writeTransaction.deinit();
 
-    var root = try create(&w);
+    var root = try create(&writeTransaction);
     var buffer: [10]u8 = undefined;
-    var i: u64 = 0;
-    while (i < 4300) : (i += 1) { // > leafCap * fanout: forces inner splits
-        const key = try std.fmt.bufPrint(&buffer, "k{d:0>7}", .{i});
-        root = try insert(&w, root, key, i);
+    var round: u64 = 0;
+    while (round < 4300) : (round += 1) { // > leafCap * fanout: forces inner splits
+        const key = try std.fmt.bufPrint(&buffer, "k{d:0>7}", .{round});
+        root = try insert(&writeTransaction, root, key, round);
     }
-    try testing.expectEqual(@as(u64, 4300), try count(&w, root));
+    try testing.expectEqual(@as(u64, 4300), try count(&writeTransaction, root));
 
-    try freeTree(&w, root);
+    try freeTree(&writeTransaction, root);
 
     var seen = std.AutoHashMap(u64, void).init(testing.allocator);
     defer seen.deinit();
-    for (w.transactionReuse.extents.items) |e| {
-        const gop = try seen.getOrPut(e.offset);
+    for (writeTransaction.transactionReuse.extents.items) |extent| {
+        const gop = try seen.getOrPut(extent.offset);
         try testing.expect(!gop.found_existing); // duplicate free
     }
-    for (w.inFlightFrees.items) |e| {
-        const gop = try seen.getOrPut(e.offset);
+    for (writeTransaction.inFlightFrees.items) |item| {
+        const gop = try seen.getOrPut(item.offset);
         try testing.expect(!gop.found_existing);
     }
 }
@@ -99,40 +99,40 @@ test "removing split-boundary keys never dangles routing separators" {
     defer testing.allocator.free(path);
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
-    var w = try database.beginWrite();
-    defer w.deinit();
+    var writeTransaction = try database.beginWrite();
+    defer writeTransaction.deinit();
 
-    var root = try create(&w);
+    var root = try create(&writeTransaction);
     var buffer: [8]u8 = undefined;
-    var i: u64 = 0;
-    while (i < 200) : (i += 1) { // multiple leaf splits
-        const key = try std.fmt.bufPrint(&buffer, "k{d:0>5}", .{i});
-        root = try insert(&w, root, key, i);
+    var round: u64 = 0;
+    while (round < 200) : (round += 1) { // multiple leaf splits
+        const key = try std.fmt.bufPrint(&buffer, "k{d:0>5}", .{round});
+        root = try insert(&writeTransaction, root, key, round);
     }
     // Remove each key (any of them may be a split boundary) and immediately
     // insert a same-length replacement so the freed key blob is reused.
-    i = 0;
-    while (i < 200) : (i += 1) {
-        const key = try std.fmt.bufPrint(&buffer, "k{d:0>5}", .{i});
-        root = try remove(&w, root, key);
-        const repl = try std.fmt.bufPrint(&buffer, "z{d:0>5}", .{i});
-        root = try insert(&w, root, repl, i);
+    round = 0;
+    while (round < 200) : (round += 1) {
+        const key = try std.fmt.bufPrint(&buffer, "k{d:0>5}", .{round});
+        root = try remove(&writeTransaction, root, key);
+        const repl = try std.fmt.bufPrint(&buffer, "z{d:0>5}", .{round});
+        root = try insert(&writeTransaction, root, repl, round);
         // Every surviving original key must still resolve exactly.
-        var j: u64 = i + 1;
-        while (j < 200) : (j += 17) {
-            const probe = try std.fmt.bufPrint(&buffer, "k{d:0>5}", .{j});
-            try testing.expectEqual(@as(?u64, j), try get(&w, root, probe));
+        var innerRound: u64 = round + 1;
+        while (innerRound < 200) : (innerRound += 17) {
+            const probe = try std.fmt.bufPrint(&buffer, "k{d:0>5}", .{innerRound});
+            try testing.expectEqual(@as(?u64, innerRound), try get(&writeTransaction, root, probe));
         }
     }
     // All replacements resolve; all originals are gone.
-    i = 0;
-    while (i < 200) : (i += 1) {
-        const repl = try std.fmt.bufPrint(&buffer, "z{d:0>5}", .{i});
-        try testing.expectEqual(@as(?u64, i), try get(&w, root, repl));
-        const orig = try std.fmt.bufPrint(&buffer, "k{d:0>5}", .{i});
-        try testing.expectEqual(@as(?u64, null), try get(&w, root, orig));
+    round = 0;
+    while (round < 200) : (round += 1) {
+        const repl = try std.fmt.bufPrint(&buffer, "z{d:0>5}", .{round});
+        try testing.expectEqual(@as(?u64, round), try get(&writeTransaction, root, repl));
+        const orig = try std.fmt.bufPrint(&buffer, "k{d:0>5}", .{round});
+        try testing.expectEqual(@as(?u64, null), try get(&writeTransaction, root, orig));
     }
-    try testing.expectEqual(@as(u64, 200), try count(&w, root));
+    try testing.expectEqual(@as(u64, 200), try count(&writeTransaction, root));
 }
 
 test "insert and get round-trip byte keys" {
@@ -142,22 +142,22 @@ test "insert and get round-trip byte keys" {
     defer testing.allocator.free(path);
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
-    var w = try database.beginWrite();
-    var root = try create(&w);
+    var writeTransaction = try database.beginWrite();
+    var root = try create(&writeTransaction);
     // Scrambled insertion order.
-    root = try insert(&w, root, "banana", 1);
-    root = try insert(&w, root, "apple", 2);
-    root = try insert(&w, root, "cherry", 3);
-    root = try insert(&w, root, "app", 4);
-    try testing.expectEqual(@as(?u64, 1), try get(&w, root, "banana"));
-    try testing.expectEqual(@as(?u64, 2), try get(&w, root, "apple"));
-    try testing.expectEqual(@as(?u64, 3), try get(&w, root, "cherry"));
-    try testing.expectEqual(@as(?u64, 4), try get(&w, root, "app"));
-    try testing.expect((try get(&w, root, "ap")) == null);
-    try testing.expect((try get(&w, root, "")) == null);
-    try testing.expect((try get(&w, root, "bananas")) == null);
-    try testing.expectEqual(@as(u64, 4), try count(&w, root));
-    w.deinit();
+    root = try insert(&writeTransaction, root, "banana", 1);
+    root = try insert(&writeTransaction, root, "apple", 2);
+    root = try insert(&writeTransaction, root, "cherry", 3);
+    root = try insert(&writeTransaction, root, "app", 4);
+    try testing.expectEqual(@as(?u64, 1), try get(&writeTransaction, root, "banana"));
+    try testing.expectEqual(@as(?u64, 2), try get(&writeTransaction, root, "apple"));
+    try testing.expectEqual(@as(?u64, 3), try get(&writeTransaction, root, "cherry"));
+    try testing.expectEqual(@as(?u64, 4), try get(&writeTransaction, root, "app"));
+    try testing.expect((try get(&writeTransaction, root, "ap")) == null);
+    try testing.expect((try get(&writeTransaction, root, "")) == null);
+    try testing.expect((try get(&writeTransaction, root, "bananas")) == null);
+    try testing.expectEqual(@as(u64, 4), try count(&writeTransaction, root));
+    writeTransaction.deinit();
 }
 
 test "keys iterate in ascending byte order" {
@@ -167,12 +167,12 @@ test "keys iterate in ascending byte order" {
     defer testing.allocator.free(path);
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
-    var w = try database.beginWrite();
-    var root = try create(&w);
-    root = try insert(&w, root, "cherry", 30);
-    root = try insert(&w, root, "app", 40);
-    root = try insert(&w, root, "banana", 10);
-    root = try insert(&w, root, "apple", 20);
+    var writeTransaction = try database.beginWrite();
+    var root = try create(&writeTransaction);
+    root = try insert(&writeTransaction, root, "cherry", 30);
+    root = try insert(&writeTransaction, root, "app", 40);
+    root = try insert(&writeTransaction, root, "banana", 10);
+    root = try insert(&writeTransaction, root, "apple", 20);
 
     const Collector = struct {
         keys: *std.ArrayList([]u8),
@@ -184,27 +184,27 @@ test "keys iterate in ascending byte order" {
     };
     var keys = std.ArrayList([]u8).empty;
     defer {
-        for (keys.items) |k| testing.allocator.free(k);
+        for (keys.items) |key| testing.allocator.free(key);
         keys.deinit(testing.allocator);
     }
     var vals = std.ArrayList(u64).empty;
     defer vals.deinit(testing.allocator);
-    try forEachEntry(&w, root, Collector{ .keys = &keys, .vals = &vals }, Collector.onEntry);
+    try forEachEntry(&writeTransaction, root, Collector{ .keys = &keys, .vals = &vals }, Collector.onEntry);
 
     // Expected ascending byte order: "app" < "apple" < "banana" < "cherry".
     const expectKeys = [_][]const u8{ "app", "apple", "banana", "cherry" };
     const expectVals = [_]u64{ 40, 20, 10, 30 };
     try testing.expectEqual(expectKeys.len, keys.items.len);
-    for (keys.items, vals.items, 0..) |k, val, index| {
-        try testing.expectEqualStrings(expectKeys[index], k);
+    for (keys.items, vals.items, 0..) |key, val, index| {
+        try testing.expectEqualStrings(expectKeys[index], key);
         try testing.expectEqual(expectVals[index], val);
     }
     // And explicitly assert the collected keys are sorted by std.mem.order.
-    var i: usize = 1;
-    while (i < keys.items.len) : (i += 1) {
-        try testing.expect(std.mem.order(u8, keys.items[i - 1], keys.items[i]) == .lt);
+    var round: usize = 1;
+    while (round < keys.items.len) : (round += 1) {
+        try testing.expect(std.mem.order(u8, keys.items[round - 1], keys.items[round]) == .lt);
     }
-    w.deinit();
+    writeTransaction.deinit();
 }
 
 test "insert overwrites an existing key" {
@@ -214,14 +214,14 @@ test "insert overwrites an existing key" {
     defer testing.allocator.free(path);
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
-    var w = try database.beginWrite();
-    var root = try create(&w);
-    root = try insert(&w, root, "k", 1);
-    try testing.expectEqual(@as(?u64, 1), try get(&w, root, "k"));
-    root = try insert(&w, root, "k", 2);
-    try testing.expectEqual(@as(?u64, 2), try get(&w, root, "k"));
-    try testing.expectEqual(@as(u64, 1), try count(&w, root));
-    w.deinit();
+    var writeTransaction = try database.beginWrite();
+    var root = try create(&writeTransaction);
+    root = try insert(&writeTransaction, root, "k", 1);
+    try testing.expectEqual(@as(?u64, 1), try get(&writeTransaction, root, "k"));
+    root = try insert(&writeTransaction, root, "k", 2);
+    try testing.expectEqual(@as(?u64, 2), try get(&writeTransaction, root, "k"));
+    try testing.expectEqual(@as(u64, 1), try count(&writeTransaction, root));
+    writeTransaction.deinit();
 }
 
 test "remove deletes a key" {
@@ -231,21 +231,21 @@ test "remove deletes a key" {
     defer testing.allocator.free(path);
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
-    var w = try database.beginWrite();
-    var root = try create(&w);
-    root = try insert(&w, root, "apple", 2);
-    root = try insert(&w, root, "banana", 1);
-    root = try insert(&w, root, "cherry", 3);
-    try testing.expectEqual(@as(u64, 3), try count(&w, root));
-    root = try remove(&w, root, "apple");
-    try testing.expect((try get(&w, root, "apple")) == null);
-    try testing.expectEqual(@as(u64, 2), try count(&w, root));
-    try testing.expectEqual(@as(?u64, 1), try get(&w, root, "banana"));
-    try testing.expectEqual(@as(?u64, 3), try get(&w, root, "cherry"));
+    var writeTransaction = try database.beginWrite();
+    var root = try create(&writeTransaction);
+    root = try insert(&writeTransaction, root, "apple", 2);
+    root = try insert(&writeTransaction, root, "banana", 1);
+    root = try insert(&writeTransaction, root, "cherry", 3);
+    try testing.expectEqual(@as(u64, 3), try count(&writeTransaction, root));
+    root = try remove(&writeTransaction, root, "apple");
+    try testing.expect((try get(&writeTransaction, root, "apple")) == null);
+    try testing.expectEqual(@as(u64, 2), try count(&writeTransaction, root));
+    try testing.expectEqual(@as(?u64, 1), try get(&writeTransaction, root, "banana"));
+    try testing.expectEqual(@as(?u64, 3), try get(&writeTransaction, root, "cherry"));
     // Removing an absent key is a no-op.
-    root = try remove(&w, root, "apple");
-    try testing.expectEqual(@as(u64, 2), try count(&w, root));
-    w.deinit();
+    root = try remove(&writeTransaction, root, "apple");
+    try testing.expectEqual(@as(u64, 2), try count(&writeTransaction, root));
+    writeTransaction.deinit();
 }
 
 test "many keys across splits" {
@@ -255,25 +255,25 @@ test "many keys across splits" {
     defer testing.allocator.free(path);
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
-    var w = try database.beginWrite();
-    var root = try create(&w);
+    var writeTransaction = try database.beginWrite();
+    var root = try create(&writeTransaction);
 
     const N: u64 = 1000;
     var buffer: [64]u8 = undefined;
     // Scrambled insertion order; varied lengths/zero-padding make byte order non-trivial.
-    var i: u64 = 0;
-    while (i < N) : (i += 1) {
-        const k = (i *% 2654435761) % N; // permutation of 0..N-1
-        const key = try std.fmt.bufPrint(&buffer, "key-{d}", .{k});
-        root = try insert(&w, root, key, k +% 7);
+    var round: u64 = 0;
+    while (round < N) : (round += 1) {
+        const keyNumber = (round *% 2654435761) % N; // permutation of 0..N-1
+        const key = try std.fmt.bufPrint(&buffer, "key-{d}", .{keyNumber});
+        root = try insert(&writeTransaction, root, key, keyNumber +% 7);
     }
-    try testing.expectEqual(N, try count(&w, root));
+    try testing.expectEqual(N, try count(&writeTransaction, root));
 
     // Get every key back.
-    i = 0;
-    while (i < N) : (i += 1) {
-        const key = try std.fmt.bufPrint(&buffer, "key-{d}", .{i});
-        try testing.expectEqual(@as(?u64, i +% 7), try get(&w, root, key));
+    round = 0;
+    while (round < N) : (round += 1) {
+        const key = try std.fmt.bufPrint(&buffer, "key-{d}", .{round});
+        try testing.expectEqual(@as(?u64, round +% 7), try get(&writeTransaction, root, key));
     }
 
     // Iteration is sorted by std.mem.order and values match their keys.
@@ -287,21 +287,21 @@ test "many keys across splits" {
     };
     var keys = std.ArrayList([]u8).empty;
     defer {
-        for (keys.items) |k| testing.allocator.free(k);
+        for (keys.items) |key| testing.allocator.free(key);
         keys.deinit(testing.allocator);
     }
     var vals = std.ArrayList(u64).empty;
     defer vals.deinit(testing.allocator);
-    try forEachEntry(&w, root, Collector{ .keys = &keys, .vals = &vals }, Collector.onEntry);
+    try forEachEntry(&writeTransaction, root, Collector{ .keys = &keys, .vals = &vals }, Collector.onEntry);
     try testing.expectEqual(@as(usize, N), keys.items.len);
-    var j: usize = 1;
-    while (j < keys.items.len) : (j += 1) {
-        try testing.expect(std.mem.order(u8, keys.items[j - 1], keys.items[j]) == .lt);
+    var innerRound: usize = 1;
+    while (innerRound < keys.items.len) : (innerRound += 1) {
+        try testing.expect(std.mem.order(u8, keys.items[innerRound - 1], keys.items[innerRound]) == .lt);
     }
     // Each emitted key's value matches the number parsed from "key-{d}".
-    for (keys.items, vals.items) |k, val| {
-        const num = try std.fmt.parseInt(u64, k["key-".len..], 10);
+    for (keys.items, vals.items) |key, val| {
+        const num = try std.fmt.parseInt(u64, key["key-".len..], 10);
         try testing.expectEqual(num +% 7, val);
     }
-    w.deinit();
+    writeTransaction.deinit();
 }

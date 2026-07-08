@@ -46,26 +46,26 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
 
     // Simple two-int type: {primaryKey, value}. The first value is the primary key.
     var catalogRef: Reference = blk: {
-        var w = try database.beginWrite();
-        const c = try catalog.create(&w, 2);
-        w.setRoot(c);
-        _ = try w.commit();
-        break :blk c;
+        var writeTransaction = try database.beginWrite();
+        const catalogRef = try catalog.create(&writeTransaction, 2);
+        writeTransaction.setRoot(catalogRef);
+        _ = try writeTransaction.commit();
+        break :blk catalogRef;
     };
 
     var inserted: usize = 0;
-    while (inserted < ctx.n) {
-        const thisBatch = @min(batchSize, ctx.n - inserted);
-        var w = try database.beginWrite();
+    while (inserted < ctx.rowCount) {
+        const thisBatch = @min(batchSize, ctx.rowCount - inserted);
+        var writeTransaction = try database.beginWrite();
         catalogRef = database.activeRoot; // reload the committed catalog ref
-        var j: usize = 0;
-        while (j < thisBatch) : (j += 1) {
-            const primaryKey: u64 = inserted + j;
-            const r = try rows.insert(&w, catalogRef, &.{ primaryKey, primaryKey });
-            catalogRef = r.catalogRef;
+        var innerIndex: usize = 0;
+        while (innerIndex < thisBatch) : (innerIndex += 1) {
+            const primaryKey: u64 = inserted + innerIndex;
+            const result = try rows.insert(&writeTransaction, catalogRef, &.{ primaryKey, primaryKey });
+            catalogRef = result.catalogRef;
         }
-        w.setRoot(catalogRef);
-        _ = try w.commit();
+        writeTransaction.setRoot(catalogRef);
+        _ = try writeTransaction.commit();
         inserted += thisBatch;
     }
 
@@ -77,7 +77,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     // --- Recovery signal: close, reopen, first read --------------------------
     const fileBytes = try database.fileSize();
     const logicalBytes = database.logicalSize();
-    const m = database.metrics(); // measurement-only commit/file-growth cost counters
+    const metrics = database.metrics(); // measurement-only commit/file-growth cost counters
     database.deinit();
 
     const reopenStart = nowNs(io);
@@ -88,12 +88,12 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     // First beginRead refreshes to the latest committed version and pins it,
     // forcing the freshly reopened mapping live. Time a single lookup with it.
     const readStart = nowNs(io);
-    var r = try reopened.beginRead();
-    catalogRef = r.root();
+    var readTransaction = try reopened.beginRead();
+    catalogRef = readTransaction.root();
     var out: [2]u64 = undefined;
-    _ = try rows.getByPrimaryKey(&r, catalogRef, 0, &out);
+    _ = try rows.getByPrimaryKey(&readTransaction, catalogRef, 0, &out);
     const firstReadNs: u64 = @intCast(nowNs(io) - readStart);
-    r.end();
+    readTransaction.end();
 
     const note = try std.fmt.allocPrint(
         alloc,
@@ -101,13 +101,13 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         .{
             reopenNs / std.time.ns_per_ms,
             firstReadNs / std.time.ns_per_us,
-            m.flEncodeNs / std.time.ns_per_ms,
-            m.flExtentsEncoded,
-            m.commitCount,
-            m.setlengthNs / std.time.ns_per_ms,
-            m.setlengthCalls,
-            m.flRebuildNs / std.time.ns_per_ms,
-            m.flCloneNs / std.time.ns_per_ms,
+            metrics.flEncodeNs / std.time.ns_per_ms,
+            metrics.flExtentsEncoded,
+            metrics.commitCount,
+            metrics.setlengthNs / std.time.ns_per_ms,
+            metrics.setlengthCalls,
+            metrics.flRebuildNs / std.time.ns_per_ms,
+            metrics.flCloneNs / std.time.ns_per_ms,
             minfltDelta,
             majfltDelta,
         },
@@ -115,7 +115,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
 
     return .{
         .name = name,
-        .ops = ctx.n,
+        .ops = ctx.rowCount,
         .wallNs = insertNs,
         .fileBytes = fileBytes,
         .logicalBytes = logicalBytes,
