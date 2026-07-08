@@ -230,7 +230,7 @@ pub fn insertEmbedded(transaction: *WriteTransaction, dir: Reference, ownerType:
         var buffer: [256]u64 = undefined;
         if (try rows.getByObjectKey(transaction, childCatalog, oldObjectKey, buffer[0..propertyCount])) |oldVersion| {
             const oldPrimaryKey = buffer[0];
-            const deleteResult = try typeRouting.deleteNullifyX(transaction, currentDir, childType, oldPrimaryKey, oldVersion);
+            const deleteResult = try typeRouting.deleteNullifyCrossType(transaction, currentDir, childType, oldPrimaryKey, oldVersion);
             switch (deleteResult) {
                 .ok => |directory| currentDir = directory,
                 else => return error.Blocked,
@@ -240,7 +240,7 @@ pub fn insertEmbedded(transaction: *WriteTransaction, dir: Reference, ownerType:
 
     const ins = try typeRouting.insert(transaction, currentDir, childType, childValues);
     currentDir = ins.dir;
-    return try typeRouting.setLink(transaction, currentDir, ownerType, ownerPrimaryKey, property, ins.row);
+    return try typeRouting.setLink(transaction, currentDir, ownerType, ownerPrimaryKey, property, ins.objectKey);
 }
 
 /// Delete the embedded child owned via to-one link `property`, returning the
@@ -255,7 +255,7 @@ pub fn clearEmbedded(transaction: *WriteTransaction, dir: Reference, ownerType: 
     var buffer: [256]u64 = undefined;
     const childVersion = (try rows.getByObjectKey(transaction, childCatalog, childObjectKey, buffer[0..propertyCount])) orelse return dir;
     const childPrimaryKey = buffer[0];
-    const deleteResult = try typeRouting.deleteNullifyX(transaction, dir, childType, childPrimaryKey, childVersion);
+    const deleteResult = try typeRouting.deleteNullifyCrossType(transaction, dir, childType, childPrimaryKey, childVersion);
     return switch (deleteResult) {
         .ok => |directory| directory,
         // A refused clear must surface: returning the unchanged dir read as

@@ -46,15 +46,15 @@ pub const Opts = struct {
     only: ?[]const u8 = null,
 
     pub fn deinit(self: Opts, alloc: Allocator) void {
-        if (self.jsonPath) |p| alloc.free(p);
-        if (self.only) |o| alloc.free(o);
+        if (self.jsonPath) |jsonPath| alloc.free(jsonPath);
+        if (self.only) |onlyFilter| alloc.free(onlyFilter);
     }
 };
 
 /// Per-scenario context. Scenarios open their own Database under `tmpDir`.
 pub const Ctx = struct {
     alloc: Allocator,
-    n: usize,
+    rowCount: usize,
     tmpDir: []const u8,
 };
 
@@ -103,11 +103,11 @@ pub const Latencies = struct {
 
     /// Returns the p-th percentile sample (p in 0..=100), sorting in place.
     /// Returns 0 when there are no samples.
-    pub fn percentile(self: *Latencies, p: u64) u64 {
+    pub fn percentile(self: *Latencies, percentileRank: u64) u64 {
         const items = self.samples.items;
         if (items.len == 0) return 0;
         std.mem.sort(u64, items, {}, std.sort.asc(u64));
-        const rank = (items.len - 1) * p / 100;
+        const rank = (items.len - 1) * percentileRank / 100;
         return items[rank];
     }
 };
@@ -131,32 +131,32 @@ fn bytesToMib(bytes: u64) f64 {
 /// Writes an ASCII table of results to `w` (a `*std.Io.Writer`). Numbers are
 /// right-aligned in fixed columns; latency columns show "-" for scenarios that
 /// recorded no per-op samples (p99Ns == 0).
-pub fn printTable(results: []const Result, w: anytype) !void {
-    try w.print(
+pub fn printTable(results: []const Result, writer: anytype) !void {
+    try writer.print(
         "{s:<24} {s:>12} {s:>14} {s:>10} {s:>10} {s:>10} {s:>11} {s:>11} {s:>11}\n",
         .{ "name", "ops", "ops/s", "p50 us", "p99 us", "max us", "file MiB", "logical MiB", "rss MiB" },
     );
-    for (results) |r| {
-        if (r.p99Ns == 0) {
-            try w.print(
+    for (results) |result| {
+        if (result.p99Ns == 0) {
+            try writer.print(
                 "{s:<24} {d:12} {d:14.0} {s:>10} {s:>10} {s:>10} {d:11.1} {d:11.1} {d:11.1}\n",
                 .{
-                    r.name,                     r.ops,
-                    r.throughputPerSec(),       "-",
-                    "-",                        "-",
-                    bytesToMib(r.fileBytes),    bytesToMib(r.logicalBytes),
-                    bytesToMib(r.peakRssBytes),
+                    result.name,                     result.ops,
+                    result.throughputPerSec(),       "-",
+                    "-",                             "-",
+                    bytesToMib(result.fileBytes),    bytesToMib(result.logicalBytes),
+                    bytesToMib(result.peakRssBytes),
                 },
             );
         } else {
-            try w.print(
+            try writer.print(
                 "{s:<24} {d:12} {d:14.0} {d:10.1} {d:10.1} {d:10.1} {d:11.1} {d:11.1} {d:11.1}\n",
                 .{
-                    r.name,                     r.ops,
-                    r.throughputPerSec(),       nsToUs(r.p50Ns),
-                    nsToUs(r.p99Ns),            nsToUs(r.maxNs),
-                    bytesToMib(r.fileBytes),    bytesToMib(r.logicalBytes),
-                    bytesToMib(r.peakRssBytes),
+                    result.name,                     result.ops,
+                    result.throughputPerSec(),       nsToUs(result.p50Ns),
+                    nsToUs(result.p99Ns),            nsToUs(result.maxNs),
+                    bytesToMib(result.fileBytes),    bytesToMib(result.logicalBytes),
+                    bytesToMib(result.peakRssBytes),
                 },
             );
         }
@@ -191,19 +191,19 @@ pub fn appendJson(path: []const u8, scale: Scale, results: []const Result, alloc
 
     var buffer: std.ArrayList(u8) = .empty;
     defer buffer.deinit(alloc);
-    for (results) |r| {
+    for (results) |result| {
         const rec = Record{
-            .scenario = r.name,
+            .scenario = result.name,
             .scale = scaleStr(scale),
-            .ops = r.ops,
-            .ops_per_sec = r.throughputPerSec(),
-            .p50_us = nsToUs(r.p50Ns),
-            .p99_us = nsToUs(r.p99Ns),
-            .max_us = nsToUs(r.maxNs),
-            .file_mib = bytesToMib(r.fileBytes),
-            .logical_mib = bytesToMib(r.logicalBytes),
-            .rss_mib = bytesToMib(r.peakRssBytes),
-            .note = r.note,
+            .ops = result.ops,
+            .ops_per_sec = result.throughputPerSec(),
+            .p50_us = nsToUs(result.p50Ns),
+            .p99_us = nsToUs(result.p99Ns),
+            .max_us = nsToUs(result.maxNs),
+            .file_mib = bytesToMib(result.fileBytes),
+            .logical_mib = bytesToMib(result.logicalBytes),
+            .rss_mib = bytesToMib(result.peakRssBytes),
+            .note = result.note,
         };
         const line = try std.fmt.allocPrint(alloc, "{f}\n", .{std.json.fmt(rec, .{})});
         defer alloc.free(line);
@@ -251,14 +251,14 @@ pub fn parseArgs(alloc: Allocator, args: []const [:0]const u8) !Opts {
     var opts: Opts = .{};
     errdefer opts.deinit(alloc);
 
-    var i: usize = 1; // skip the program name
-    while (i < args.len) : (i += 1) {
-        const arg = args[i];
+    var index: usize = 1; // skip the program name
+    while (index < args.len) : (index += 1) {
+        const arg = args[index];
         if (std.mem.startsWith(u8, arg, "--scale=")) {
-            const v = arg["--scale=".len..];
-            if (std.mem.eql(u8, v, "1m")) {
+            const version = arg["--scale=".len..];
+            if (std.mem.eql(u8, version, "1m")) {
                 opts.scale = .m1;
-            } else if (std.mem.eql(u8, v, "10m")) {
+            } else if (std.mem.eql(u8, version, "10m")) {
                 opts.scale = .m10;
             } else {
                 usage();
@@ -269,7 +269,7 @@ pub fn parseArgs(alloc: Allocator, args: []const [:0]const u8) !Opts {
         } else if (std.mem.startsWith(u8, arg, "--json=")) {
             try setJsonPath(&opts, alloc, arg["--json=".len..]);
         } else if (std.mem.startsWith(u8, arg, "--only=")) {
-            if (opts.only) |o| alloc.free(o);
+            if (opts.only) |onlyFilter| alloc.free(onlyFilter);
             opts.only = try alloc.dupe(u8, arg["--only=".len..]);
         } else {
             usage();
@@ -280,7 +280,7 @@ pub fn parseArgs(alloc: Allocator, args: []const [:0]const u8) !Opts {
 }
 
 fn setJsonPath(opts: *Opts, alloc: Allocator, path: []const u8) !void {
-    if (opts.jsonPath) |p| alloc.free(p);
+    if (opts.jsonPath) |jsonPath| alloc.free(jsonPath);
     opts.jsonPath = try alloc.dupe(u8, path);
 }
 
@@ -296,7 +296,7 @@ const Scenario = struct {
 /// Runs every registered scenario (filtered by `opts.only`), prints the result
 /// table to stdout, and optionally appends JSON. Manages the scratch directory.
 pub fn runAll(alloc: Allocator, opts: Opts) !void {
-    const n: usize = if (opts.scale == .m1) 1_000_000 else 10_000_000;
+    const count: usize = if (opts.scale == .m1) 1_000_000 else 10_000_000;
 
     const io = sysIo();
     const scratch = scratchDir();
@@ -330,22 +330,22 @@ pub fn runAll(alloc: Allocator, opts: Opts) !void {
     var results: std.ArrayList(Result) = .empty;
     defer results.deinit(alloc);
 
-    for (scenarios) |s| {
+    for (scenarios) |scenario| {
         if (opts.only) |only| {
-            if (!std.mem.eql(u8, only, s.name)) continue;
+            if (!std.mem.eql(u8, only, scenario.name)) continue;
         }
-        var ctx = Ctx{ .alloc = alloc, .n = n, .tmpDir = scratch };
-        try results.append(alloc, try s.run(&ctx));
+        var ctx = Ctx{ .alloc = alloc, .rowCount = count, .tmpDir = scratch };
+        try results.append(alloc, try scenario.run(&ctx));
     }
 
     var buffer: [4096]u8 = undefined;
-    var fw: Io.File.Writer = .init(.stdout(), io, &buffer);
-    const w = &fw.interface;
-    try printTable(results.items, w);
-    try w.flush();
+    var fileWriter: Io.File.Writer = .init(.stdout(), io, &buffer);
+    const writeTransaction = &fileWriter.interface;
+    try printTable(results.items, writeTransaction);
+    try writeTransaction.flush();
 
-    if (opts.jsonPath) |jp| {
-        try appendJson(jp, opts.scale, results.items, alloc);
+    if (opts.jsonPath) |jsonPath| {
+        try appendJson(jsonPath, opts.scale, results.items, alloc);
     }
 }
 
@@ -367,8 +367,8 @@ test "Latencies percentiles pick the right sample" {
     var lat = Latencies.init();
     defer lat.deinit(alloc);
 
-    var v: u64 = 1;
-    while (v <= 100) : (v += 1) try lat.add(alloc, v);
+    var version: u64 = 1;
+    while (version <= 100) : (version += 1) try lat.add(alloc, version);
 
     try std.testing.expectEqual(@as(u64, 50), lat.percentile(50));
     try std.testing.expectEqual(@as(u64, 100), lat.percentile(100));
@@ -383,11 +383,11 @@ test "Latencies percentiles on an empty set are zero" {
 }
 
 test "Result throughput math" {
-    const r = Result{ .name = "x", .ops = 1000, .wallNs = 1_000_000_000 };
-    try std.testing.expectEqual(@as(f64, 1000), r.throughputPerSec());
+    const result = Result{ .name = "x", .ops = 1000, .wallNs = 1_000_000_000 };
+    try std.testing.expectEqual(@as(f64, 1000), result.throughputPerSec());
 }
 
 test "Result throughput guards zero wall time" {
-    const r = Result{ .name = "x", .ops = 1000, .wallNs = 0 };
-    try std.testing.expectEqual(@as(f64, 0), r.throughputPerSec());
+    const result = Result{ .name = "x", .ops = 1000, .wallNs = 0 };
+    try std.testing.expectEqual(@as(f64, 0), result.throughputPerSec());
 }

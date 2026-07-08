@@ -14,7 +14,7 @@ const Index = @import("../trees/index.zig");
 const catalog = @import("../schema/catalog.zig");
 const blob = @import("../records/blob.zig");
 const links = @import("../records/links.zig");
-const bindex = @import("../trees/byteKeyIndex.zig");
+const byteKeyIndex = @import("../trees/byteKeyIndex.zig");
 
 /// One key->row index entry: a stable object key and its physical row.
 pub const Pair = struct { objectKey: u64, row: u64 };
@@ -57,11 +57,11 @@ fn copyValue(source: anytype, destination: *WriteTransaction, kind: catalog.Prop
             break :blk newc;
         },
         .set => switch (element) {
-            .blob => try copyBindex(source, destination, srcRaw), // byte-keyed set -> bindex deep-copy
+            .blob => try copyBindex(source, destination, srcRaw), // byte-keyed set -> byteKeyIndex deep-copy
             else => try copyKeySet(source, destination, srcRaw), // int-keyed set: a u64-keyed Index
         },
         .linkSet => try copyKeySet(source, destination, srcRaw),
-        .dict => try copyBindex(source, destination, srcRaw), // byte-keyed dict -> bindex deep-copy
+        .dict => try copyBindex(source, destination, srcRaw), // byte-keyed dict -> byteKeyIndex deep-copy
     };
 }
 
@@ -80,22 +80,22 @@ fn copyKeySet(source: anytype, destination: *WriteTransaction, srcRoot: u64) !u6
     return newi;
 }
 
-// Deep-copy a bindex root (dict or byte-keyed set) from `src` into `dst` by
-// iterating the source tree and re-inserting each entry. bindex.insert re-puts
+// Deep-copy a byteKeyIndex root (dict or byte-keyed set) from `src` into `dst` by
+// iterating the source tree and re-inserting each entry. byteKeyIndex.insert re-puts
 // the key into the destination's blob heap, so this is a correct cross-database
 // deep-copy. forEachEntry hands the callback a key slice into the SOURCE mapping;
-// bindex.insert grows only the DST arena (a different mapping), so the source key
+// byteKeyIndex.insert grows only the DST arena (a different mapping), so the source key
 // stays valid for the duration of the insert -- keep the insert inside onEntry.
 fn copyBindex(source: anytype, destination: *WriteTransaction, srcRoot: u64) !u64 {
-    var newr = try bindex.create(destination);
+    var newr = try byteKeyIndex.create(destination);
     const Sink = struct {
         dstp: *WriteTransaction,
         root: *u64,
         fn onEntry(self: @This(), key: []const u8, value: u64) !void {
-            self.root.* = try bindex.insert(self.dstp, self.root.*, key, value);
+            self.root.* = try byteKeyIndex.insert(self.dstp, self.root.*, key, value);
         }
     };
-    try bindex.forEachEntry(source, srcRoot, Sink{ .dstp = destination, .root = &newr }, Sink.onEntry);
+    try byteKeyIndex.forEachEntry(source, srcRoot, Sink{ .dstp = destination, .root = &newr }, Sink.onEntry);
     return newr;
 }
 
@@ -116,12 +116,12 @@ fn viAddInto(destination: *WriteTransaction, valueIndexRef: Reference, value: u6
 fn createDestinationStructures(destination: *WriteTransaction, snapshot: *catalog.CatalogSnapshot) !void {
     var propertyIndex: usize = 0;
     while (propertyIndex < snapshot.propertyCount) : (propertyIndex += 1) {
-        snapshot.properties[propertyIndex].col = try Column.create(destination);
+        snapshot.properties[propertyIndex].column = try Column.create(destination);
         snapshot.properties[propertyIndex].backlink = if (snapshot.properties[propertyIndex].kind == .link or snapshot.properties[propertyIndex].kind == .linkSet) try Index.create(destination) else 0;
         snapshot.properties[propertyIndex].valueIndex = if (snapshot.properties[propertyIndex].indexed) try Index.create(destination) else 0;
     }
-    snapshot.versionColRef = try Column.create(destination);
-    snapshot.liveColRef = try Column.create(destination);
+    snapshot.versionColumnRef = try Column.create(destination);
+    snapshot.liveColumnRef = try Column.create(destination);
     snapshot.keyrowIndexRef = try Index.create(destination);
     snapshot.primaryKeyIndexRef = try Index.create(destination);
 }
@@ -141,10 +141,10 @@ pub fn copyTypeRows(source: anytype, sourceCatalog: Reference, destination: *Wri
     var sourcePropertyColumns: [catalog.maxPropertyCount]Reference = undefined;
     {
         var propertyIndex: usize = 0;
-        while (propertyIndex < propertyCount) : (propertyIndex += 1) sourcePropertyColumns[propertyIndex] = snapshot.properties[propertyIndex].col;
+        while (propertyIndex < propertyCount) : (propertyIndex += 1) sourcePropertyColumns[propertyIndex] = snapshot.properties[propertyIndex].column;
     }
-    const sourceVersionColumn = snapshot.versionColRef;
-    const sLive = snapshot.liveColRef;
+    const sourceVersionColumn = snapshot.versionColumnRef;
+    const sLive = snapshot.liveColumnRef;
     const sKeyrow = snapshot.keyrowIndexRef;
 
     // Collect live (objectKey, srcRow) pairs, then re-point at fresh dst structures.
@@ -160,7 +160,7 @@ pub fn copyTypeRows(source: anytype, sourceCatalog: Reference, destination: *Wri
         while (propertyIndex < propertyCount) : (propertyIndex += 1) {
             const sraw = try Column.get(source, sourcePropertyColumns[propertyIndex], pair.row);
             const draw = try copyValue(source, destination, snapshot.properties[propertyIndex].kind, snapshot.properties[propertyIndex].element, sraw);
-            snapshot.properties[propertyIndex].col = try Column.append(destination, snapshot.properties[propertyIndex].col, draw);
+            snapshot.properties[propertyIndex].column = try Column.append(destination, snapshot.properties[propertyIndex].column, draw);
             // Repopulate the destination value index in the same pass. Leaving
             // it empty while the catalog still says indexed=true silently
             // empties every indexed query after a full-file compaction (the
@@ -170,8 +170,8 @@ pub fn copyTypeRows(source: anytype, sourceCatalog: Reference, destination: *Wri
             }
         }
         const version = try Column.get(source, sourceVersionColumn, pair.row);
-        snapshot.versionColRef = try Column.append(destination, snapshot.versionColRef, version);
-        snapshot.liveColRef = try Column.append(destination, snapshot.liveColRef, 1);
+        snapshot.versionColumnRef = try Column.append(destination, snapshot.versionColumnRef, version);
+        snapshot.liveColumnRef = try Column.append(destination, snapshot.liveColumnRef, 1);
         snapshot.keyrowIndexRef = try Index.insert(destination, snapshot.keyrowIndexRef, pair.objectKey, dRow);
         const primaryKey = try Column.get(source, sourcePropertyColumns[0], pair.row);
         snapshot.primaryKeyIndexRef = try Index.insert(destination, snapshot.primaryKeyIndexRef, primaryKey, pair.objectKey);
@@ -201,8 +201,8 @@ pub fn rebuildBacklinks(destination: *WriteTransaction, catalogRef: Reference) !
         defer pairs.deinit(scratchAllocator);
         for (pairs.items) |pair| {
             const currentView = try catalog.loadCatalog(destination, currentCatalog);
-            const col = currentView.propertyColumnRef(propertyIndex);
-            const raw = try Column.get(destination, col, pair.row);
+            const column = currentView.propertyColumnRef(propertyIndex);
+            const raw = try Column.get(destination, column, pair.row);
             if (kind == .link) {
                 if (raw != 0) currentCatalog = try links.addBacklink(destination, currentCatalog, propertyIndex, raw - 1, pair.objectKey);
             } else {

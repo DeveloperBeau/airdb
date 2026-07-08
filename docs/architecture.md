@@ -13,7 +13,7 @@ maintenance (compaction) is driven explicitly by the caller.
 | Platform | `platform.zig`, `storage/syncer.zig` | mmap sections, file locks, pid/incarnation checks, durability barrier (`F_FULLFSYNC` on Darwin, `fsync` elsewhere), injectable `Syncing` for crash tests |
 | Store | `storage/fileStore.zig`, `storage/slots.zig`, `storage/arena.zig`, `storage/freeList.zig` | CRC-checked header, two CRC-checked commit slots, bump-allocating arena over the mapping, persisted free list with size-class buckets |
 | Transactions | `database.zig`, `transactions/writeTransaction.zig`, `transactions/readTransaction.zig`, `transactions/coordination.zig` | MVCC snapshots and pins, the commit protocol, version→root ring for point-in-time reads, cross-process coordination |
-| Trees | `trees/index.zig`/`trees/indexNode.zig`, `trees/column.zig`/`trees/columnNode.zig`, `trees/byteKeyIndex.zig`, `records/blob.zig` | copy-on-write B+trees (u64-keyed index with subtree counts, row-indexed column, byte-keyed bindex), chunked blob heap |
+| Trees | `trees/index.zig`/`trees/indexNode.zig`, `trees/column.zig`/`trees/columnNode.zig`, `trees/byteKeyIndex.zig`, `records/blob.zig` | copy-on-write B+trees (u64-keyed index with subtree counts, row-indexed column, byte-keyed byteKeyIndex), chunked blob heap |
 | Objects | `schema/catalog.zig`, `records/objects.zig`, `schema/typeDirectory.zig`, `records/links.zig`, `records/collections.zig` | typed columnar storage, stable object keys, optimistic versioning, value indexes, link graph with delete rules |
 | Operations | `storage/compaction.zig`, `storage/relocation.zig`, `records/bulk.zig`, `schema/migrations.zig`, `query.zig` | incremental and full compaction, bulk import/append, schema evolution, predicate queries |
 | Edge | `cApi.zig`, `include/airdb.h` | C ABI: auto-commit CRUD, bulk, explicit transactions |
@@ -42,7 +42,7 @@ The header page holds two commit slots (A and B), each a CRC32-checksummed
 4. Flip `header.active_slot` to the new slot; rewrite the header CRC.
 5. **Flush** — the commit point. Failure here: all in-memory header state is
    reverted; recovery still sees the old slot.
-6. Only now: publish the new version in memory and in the coord file.
+6. Only now: publish the new version in memory and in the coordination file.
 
 Recovery follows `header.active_slot`, never "highest version": a slot made
 durable by step 3 whose commit never reached step 5 must not be resurrected.
@@ -55,7 +55,7 @@ Nth flush.
 
 Every mutation is copy-on-write: a write transaction builds a new tree
 version; committed nodes are never modified in place. Readers pin the version
-they opened and publish that pin to their coord participant slot.
+they opened and publish that pin to their coordination participant slot.
 
 Freed space is reclaimed through a horizon:
 
@@ -64,7 +64,7 @@ Freed space is reclaimed through a horizon:
 - Nodes belonging to a committed version enter the persistent free list tagged
   with the version that freed them. They become reusable only when every live
   reader in every attached process has moved past that version
-  (`coord.globalHorizon`), further clamped by the **retention window**.
+  (`coordination.globalHorizon`), further clamped by the **retention window**.
 - The retention window (`setRetainVersions`) is stored in the header page and
   shared by all processes: space freed within the most recent N versions is
   withheld, which is what makes point-in-time reads (`beginReadAt`) safe under

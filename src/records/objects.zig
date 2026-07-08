@@ -34,10 +34,9 @@ pub const DeleteResult = rows.DeleteResult;
 /// Encode a []Value row into raw u64 storage -- allocating a blob node for
 /// each .blob property and building each collection's tree -- then insert it
 /// via rows.insert, maintaining backlinks for any links the row carries.
-/// Returns the new catalog ref and the row's stable object key (the `row`
-/// field). One tree walk per property plus collection builds proportional to
-/// their element counts.
-pub fn insertTyped(transaction: *WriteTransaction, catalogRef: Reference, values: []const Value) !struct { catalogRef: Reference, row: u64 } {
+/// Returns the new catalog ref and the row's stable object key. One tree walk
+/// per property plus collection builds proportional to their element counts.
+pub fn insertTyped(transaction: *WriteTransaction, catalogRef: Reference, values: []const Value) !struct { catalogRef: Reference, objectKey: u64 } {
     const view = try loadCatalog(transaction, catalogRef);
     const propertyCount = view.propertyCount;
     std.debug.assert(values.len == propertyCount);
@@ -81,19 +80,19 @@ pub fn insertTyped(transaction: *WriteTransaction, catalogRef: Reference, values
             switch (kinds[linkIndex]) {
                 .link => {
                     if (values[linkIndex].link) |target| {
-                        updatedCatalog = try links.addBacklink(transaction, updatedCatalog, linkIndex, target, result.row);
+                        updatedCatalog = try links.addBacklink(transaction, updatedCatalog, linkIndex, target, result.objectKey);
                     }
                 },
                 .linkSet => {
                     for (values[linkIndex].linkSet) |target| {
-                        updatedCatalog = try links.addBacklink(transaction, updatedCatalog, linkIndex, target, result.row);
+                        updatedCatalog = try links.addBacklink(transaction, updatedCatalog, linkIndex, target, result.objectKey);
                     }
                 },
                 else => {},
             }
         }
     }
-    return .{ .catalogRef = updatedCatalog, .row = result.row };
+    return .{ .catalogRef = updatedCatalog, .objectKey = result.objectKey };
 }
 
 /// Read a row by primary key and decode each property into `out` as a Value.
@@ -123,7 +122,7 @@ pub fn getTyped(transaction: anytype, catalogRef: Reference, primaryKey: u64, ou
                 error.BlobChunked => .{ .blobRef = raw[propertyIndex] },
                 else => return err,
             },
-            .list, .set, .dict, .linkSet => .{ .collRoot = raw[propertyIndex] },
+            .list, .set, .dict, .linkSet => .{ .collectionRoot = raw[propertyIndex] },
             .link => .{ .link = if (raw[propertyIndex] == 0) null else raw[propertyIndex] - 1 },
         };
     }
@@ -154,7 +153,7 @@ pub fn getTypedByObjectKey(transaction: anytype, catalogRef: Reference, objectKe
                 error.BlobChunked => .{ .blobRef = raw[propertyIndex] },
                 else => return err,
             },
-            .list, .set, .dict, .linkSet => .{ .collRoot = raw[propertyIndex] },
+            .list, .set, .dict, .linkSet => .{ .collectionRoot = raw[propertyIndex] },
             .link => .{ .link = if (raw[propertyIndex] == 0) null else raw[propertyIndex] - 1 },
         };
     }
@@ -169,7 +168,7 @@ pub fn deleteAndNullify(transaction: *WriteTransaction, catalogRef: Reference, p
     const view = try loadCatalog(transaction, catalogRef);
     const objectKey = (try Index.get(transaction, view.primaryKeyIndexRef, primaryKey)) orelse return .notFound;
     const row = (try catalog.objectKeyToRow(transaction, catalogRef, objectKey)) orelse return .notFound;
-    const currentVersion = try Column.get(transaction, view.versionColRef, row);
+    const currentVersion = try Column.get(transaction, view.versionColumnRef, row);
     if (currentVersion != expectedVersion) return .{ .conflict = .{ .currentVersion = currentVersion } };
     const fixed = try links.fixBacklinksForDelete(transaction, catalogRef, objectKey);
     return try rows.delete(transaction, fixed, primaryKey, expectedVersion);

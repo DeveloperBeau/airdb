@@ -47,12 +47,12 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     // --- Build the rows once, shared by both paths. Two-int type {primaryKey, value};
     // primaryKey = i, value = i. A flat backing buffer sliced into per-row windows so
     // bulkImport sees a []const []const u64.
-    const storage = try alloc.alloc([2]u64, ctx.n);
+    const storage = try alloc.alloc([2]u64, ctx.rowCount);
     defer alloc.free(storage);
-    const rows = try alloc.alloc([]const u64, ctx.n);
+    const rows = try alloc.alloc([]const u64, ctx.rowCount);
     defer alloc.free(rows);
-    for (storage, rows, 0..) |*cells, *row, i| {
-        cells.* = .{ @intCast(i), @intCast(i) };
+    for (storage, rows, 0..) |*cells, *row, rowIndex| {
+        cells.* = .{ @intCast(rowIndex), @intCast(rowIndex) };
         row.* = &cells.*;
     }
 
@@ -63,20 +63,20 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     // Empty two-int catalog committed as the root, so the bulk write transaction
     // sees it via w.newRoot. bulkImport requires the type to be empty.
     {
-        var w = try databaseA.beginWrite();
-        const c = try catalog.create(&w, 2);
-        w.setRoot(c);
-        _ = try w.commit();
+        var writeTransaction = try databaseA.beginWrite();
+        const catalogRef = try catalog.create(&writeTransaction, 2);
+        writeTransaction.setRoot(catalogRef);
+        _ = try writeTransaction.commit();
     }
 
     const aCommitsBefore = databaseA.metrics().commitCount;
     const aPfBefore = airdb.pageFaults();
     const bulkStart = nowNs(io);
     {
-        var w = try databaseA.beginWrite();
-        const newCatalog = try bulk.bulkImport(&w, w.newRoot, rows, .{});
-        w.setRoot(newCatalog);
-        _ = try w.commit();
+        var writeTransaction = try databaseA.beginWrite();
+        const newCatalog = try bulk.bulkImport(&writeTransaction, writeTransaction.newRoot, rows, .{});
+        writeTransaction.setRoot(newCatalog);
+        _ = try writeTransaction.commit();
     }
     const bulkNs: u64 = @intCast(nowNs(io) - bulkStart);
     const aPfAfter = airdb.pageFaults();
@@ -90,29 +90,29 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     var databaseB = try airdb.Database.create(alloc, pathB);
     errdefer databaseB.deinit();
     var catalogRef: Reference = blk: {
-        var w = try databaseB.beginWrite();
-        const c = try catalog.create(&w, 2);
-        w.setRoot(c);
-        _ = try w.commit();
-        break :blk c;
+        var writeTransaction = try databaseB.beginWrite();
+        const catalogRef = try catalog.create(&writeTransaction, 2);
+        writeTransaction.setRoot(catalogRef);
+        _ = try writeTransaction.commit();
+        break :blk catalogRef;
     };
 
     const bCommitsBefore = databaseB.metrics().commitCount;
     const bPfBefore = airdb.pageFaults();
     const rowwiseStart = nowNs(io);
     var inserted: usize = 0;
-    while (inserted < ctx.n) {
-        const thisBatch = @min(batchSize, ctx.n - inserted);
-        var w = try databaseB.beginWrite();
+    while (inserted < ctx.rowCount) {
+        const thisBatch = @min(batchSize, ctx.rowCount - inserted);
+        var writeTransaction = try databaseB.beginWrite();
         catalogRef = databaseB.activeRoot; // reload the committed catalog ref
-        var j: usize = 0;
-        while (j < thisBatch) : (j += 1) {
-            const primaryKey: u64 = inserted + j;
-            const r = try rawRows.insert(&w, catalogRef, &.{ primaryKey, primaryKey });
-            catalogRef = r.catalogRef;
+        var innerIndex: usize = 0;
+        while (innerIndex < thisBatch) : (innerIndex += 1) {
+            const primaryKey: u64 = inserted + innerIndex;
+            const result = try rawRows.insert(&writeTransaction, catalogRef, &.{ primaryKey, primaryKey });
+            catalogRef = result.catalogRef;
         }
-        w.setRoot(catalogRef);
-        _ = try w.commit();
+        writeTransaction.setRoot(catalogRef);
+        _ = try writeTransaction.commit();
         inserted += thisBatch;
     }
     const rowwiseNs: u64 = @intCast(nowNs(io) - rowwiseStart);
@@ -144,7 +144,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
 
     return .{
         .name = name,
-        .ops = ctx.n,
+        .ops = ctx.rowCount,
         .wallNs = bulkNs,
         .p50Ns = 0,
         .p99Ns = 0,

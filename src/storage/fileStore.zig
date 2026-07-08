@@ -285,7 +285,7 @@ pub const FileStore = struct {
     }
 
     /// Return the current on-disk file length in bytes (a whole-section multiple).
-    pub fn fileLen(self: *FileStore) !u64 {
+    pub fn fileLength(self: *FileStore) !u64 {
         return self.file.length(sysIo());
     }
 
@@ -316,7 +316,7 @@ pub const FileStore = struct {
 /// Delete an absolute path, treating a missing file as success. Used to remove
 /// coordination files during the publish step of in-place compaction. Any other
 /// failure is swallowed best-effort: the data file is already published by the
-/// atomic rename, and a leftover/stale coord is recreated fresh by Database.open
+/// atomic rename, and a leftover/stale coordination file is recreated fresh by Database.open
 /// (openOrCreate), so it cannot corrupt the published data. Does I/O.
 pub fn deleteAbsoluteIgnoreMissing(io: Io, absPath: []const u8) void {
     Io.Dir.deleteFileAbsolute(io, absPath) catch {};
@@ -326,7 +326,7 @@ pub fn deleteAbsoluteIgnoreMissing(io: Io, absPath: []const u8) void {
 /// Uses libc fsync directly on the directory fd, which is the portable POSIX way:
 /// the std.Io File sync wrapper panics with BADF on a directory handle on Linux.
 /// Best-effort -- errors are swallowed. No-op on Windows. Does I/O.
-pub fn syncParentDir(path: []const u8) void {
+pub fn syncParentDirectory(path: []const u8) void {
     if (@import("builtin").os.tag == .windows) return;
     const io = std.Io.Threaded.global_single_threaded.io();
     const dirPath = std.fs.path.dirname(path) orelse return;

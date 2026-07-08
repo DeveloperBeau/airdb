@@ -15,7 +15,7 @@ const Database = databaseModule.Database;
 const Reference = @import("../storage/reference.zig").Reference;
 const Slot = @import("../storage/slots.zig").Slot;
 const FreeList = @import("../storage/freeList.zig").FreeList;
-const coordMod = @import("coordination.zig");
+const sentinelMax = @import("coordination.zig").sentinelMax;
 const freeListRecovery = @import("../storage/freeListRecovery.zig");
 const defaultPageSize = @import("../storage/fileStore.zig").defaultPageSize;
 
@@ -90,7 +90,7 @@ fn selectPublishedSlot(database: *Database, latestVersion: u64) ?Slot {
 }
 
 /// Refresh the instance's in-memory view from the shared memory mapping.
-/// Gates advancement on coord.latestVersion() so that a slot written by an
+/// Gates advancement on coordination.latestVersion() so that a slot written by an
 /// aborted commit (durable data barrier but failed header flush) is never
 /// observed. Only a version <= the published latestVersion may be adopted.
 ///
@@ -98,12 +98,12 @@ fn selectPublishedSlot(database: *Database, latestVersion: u64) ?Slot {
 /// It is called at the start of beginRead and beginWrite (before any transaction
 /// state is built), which is safe.
 pub fn refreshToLatest(database: *Database) !void {
-    const latestVersion = database.coord.latestVersion(); // acquire-load of the published version
+    const latestVersion = database.coordination.latestVersion(); // acquire-load of the published version
     if (latestVersion <= database.activeVersion) return; // nothing newer has been published
     try database.store.readHeader(); // refresh headerChecksumOk / mapping view (for integrity use elsewhere)
     // If another process extended the file, map the new sections before dereferencing
     // slot descriptors or free-list nodes that may live in the grown region.
-    const flen = try database.store.fileLen();
+    const flen = try database.store.fileLength();
     const mapped = database.store.sectionsView().len * platform.sectionSize;
     if (flen > mapped) {
         try database.store.grow(@intCast(flen));
@@ -140,13 +140,13 @@ fn localMinPinned(database: *Database) u64 {
         if (entry.value_ptr.* == 0) continue;
         if (min == null or entry.key_ptr.* < min.?) min = entry.key_ptr.*;
     }
-    return min orelse coordMod.sentinelMax;
+    return min orelse sentinelMax;
 }
 
 /// Publish the local minimum pinned version to the instance's participant slot
 /// (if it has one), making the pins visible to other processes' reclaim horizons.
 pub fn publishPins(database: *Database) void {
-    if (database.participantSlot) |slotIndex| database.coord.publishMinPinned(slotIndex, localMinPinned(database));
+    if (database.participantSlot) |slotIndex| database.coordination.publishMinPinned(slotIndex, localMinPinned(database));
 }
 
 /// The minimum version pinned by a live reader in this process, or the active
@@ -228,7 +228,7 @@ pub fn oldestRetainedVersion(database: *Database) u64 {
 pub fn oldestReadableVersion(database: *Database) u64 {
     const ringFloor = oldestRetainedVersion(database);
     const retain = retainVersions(database);
-    if (retain == coordMod.sentinelMax) return ringFloor;
+    if (retain == sentinelMax) return ringFloor;
     return @max(ringFloor, database.activeVersion -| retain);
 }
 
@@ -252,18 +252,18 @@ test "refresh does not advance to a durable-but-unpublished (aborted) slot" {
         const allocation = try writeTransaction.alloc(8);
         @memcpy(allocation.bytes, "PUBLISH_");
         writeTransaction.setRoot(allocation.ref);
-        _ = try writeTransaction.commit(); // publishes; coord.latestVersion advances to this version
+        _ = try writeTransaction.commit(); // publishes; coordination.latestVersion advances to this version
     }
     const publishedVersion = database.activeVersion;
     // Forge a VALID slot with a much higher version into the inactive slot bytes,
-    // WITHOUT advancing coord.latestVersion (simulates an aborted-but-durable commit).
+    // WITHOUT advancing coordination.latestVersion (simulates an aborted-but-durable commit).
     const forged = Slot{ .version = publishedVersion + 50, .rootRef = 0, .freeListRef = 0, .logicalSize = defaultPageSize };
     var buffer: [Slot.size]u8 = undefined;
     forged.encode(&buffer);
     // Write it into whichever slot is currently inactive. The active slot is header.activeSlot.
     const inactiveOff: usize = if (database.store.header.activeSlot == 0) slotBOff else slotAOff;
     @memcpy(database.store.map[inactiveOff .. inactiveOff + Slot.size], &buffer);
-    // Refresh must NOT advance to the forged version (coord.latestVersion unchanged).
+    // Refresh must NOT advance to the forged version (coordination.latestVersion unchanged).
     try refreshToLatest(&database);
     try testing.expectEqual(publishedVersion, database.activeVersion);
 }

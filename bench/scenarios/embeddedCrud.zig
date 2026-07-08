@@ -1,13 +1,13 @@
 // embedded_crud -- CRUD latency for EMBEDDED objects (subentities): owner rows
 // that each own exactly one embedded child via a cascade-rule to-one link.
 //
-// Embedded objects live under the typedir multi-type API, not the raw single
+// Embedded objects live under the typeDirectory multi-type API, not the raw single
 // catalog. The directory carries two types:
 //   type 0  owner  {int primaryKey, link(cascade -> type 1)}   non-embedded
 //   type 1  child  {int primaryKey, int value}                 embedded (single-owner)
 // The owner's property 1 is the to-one link the embedded child hangs off; declaring
 // type 1 embedded marks it single-owner. insertEmbedded/clearEmbedded drive the
-// child lifecycle through that link (mirrors the typedir embedded tests).
+// child lifecycle through that link (mirrors the typeDirectory embedded tests).
 //
 // Phase honesty:
 //   CREATE  insert owner row + insertEmbedded one child (timed together).
@@ -24,7 +24,7 @@ const harness = @import("../harness.zig");
 const Io = std.Io;
 const Reference = airdb.Reference;
 const catalog = airdb.catalog;
-const typedir = airdb.typedir;
+const typeDirectory = airdb.typeDirectory;
 const typeRouting = airdb.typeRouting;
 const Value = catalog.Value;
 
@@ -48,7 +48,7 @@ const childProperties: usize = 2;
 
 // Owner: {int primaryKey, link(cascade -> child)}. Child: {int primaryKey, int value}, embedded.
 const ownerSchema = [_][]const catalog.PropertyDefinition{
-    &.{ .{ .kind = .int }, .{ .kind = .link, .linkTarget = childType, .delRule = .cascade } },
+    &.{ .{ .kind = .int }, .{ .kind = .link, .linkTarget = childType, .deletionRule = .cascade } },
     &.{ .{ .kind = .int }, .{ .kind = .int } },
 };
 
@@ -64,7 +64,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     const alloc = ctx.alloc;
     const io = sysIo();
 
-    const owners = @min(ctx.n, maxOwners);
+    const owners = @min(ctx.rowCount, maxOwners);
 
     const path = try harness.scratchPath(ctx.*, name ++ ".airdb");
     defer alloc.free(path);
@@ -75,10 +75,10 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
 
     // Build the directory: non-embedded owner + embedded child.
     {
-        var w = try database.beginWrite();
-        const dir = try typedir.createTypes(&w, &ownerSchema, &.{ false, true });
-        w.setRoot(dir);
-        _ = try w.commit();
+        var writeTransaction = try database.beginWrite();
+        const dir = try typeDirectory.createTypes(&writeTransaction, &ownerSchema, &.{ false, true });
+        writeTransaction.setRoot(dir);
+        _ = try writeTransaction.commit();
     }
 
     var combined = harness.Latencies.init();
@@ -100,20 +100,20 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         var inserted: usize = 0;
         while (inserted < owners) {
             const thisBatch = @min(batchSize, owners - inserted);
-            var w = try database.beginWrite();
-            var dir = w.newRoot;
-            var j: usize = 0;
-            while (j < thisBatch) : (j += 1) {
-                const primaryKey: u64 = inserted + j;
-                const t0 = nowNs(io);
-                dir = (try typeRouting.insert(&w, dir, ownerType, &.{ .{ .int = primaryKey }, .{ .link = null } })).dir;
-                dir = try typedir.insertEmbedded(&w, dir, ownerType, primaryKey, embeddedProperty, &.{ .{ .int = primaryKey }, .{ .int = primaryKey *% 2654435761 } });
-                const dt: u64 = @intCast(nowNs(io) - t0);
-                try createLat.add(alloc, dt);
-                try combined.add(alloc, dt);
+            var writeTransaction = try database.beginWrite();
+            var dir = writeTransaction.newRoot;
+            var innerIndex: usize = 0;
+            while (innerIndex < thisBatch) : (innerIndex += 1) {
+                const primaryKey: u64 = inserted + innerIndex;
+                const startNs = nowNs(io);
+                dir = (try typeRouting.insert(&writeTransaction, dir, ownerType, &.{ .{ .int = primaryKey }, .{ .link = null } })).dir;
+                dir = try typeDirectory.insertEmbedded(&writeTransaction, dir, ownerType, primaryKey, embeddedProperty, &.{ .{ .int = primaryKey }, .{ .int = primaryKey *% 2654435761 } });
+                const elapsedNs: u64 = @intCast(nowNs(io) - startNs);
+                try createLat.add(alloc, elapsedNs);
+                try combined.add(alloc, elapsedNs);
             }
-            w.setRoot(dir);
-            _ = try w.commit();
+            writeTransaction.setRoot(dir);
+            _ = try writeTransaction.commit();
             inserted += thisBatch;
         }
         totalNs += @intCast(nowNs(io) - phaseStart);
@@ -130,19 +130,19 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     // --- READ phase: materialize the embedded child --------------------------
     {
         const phaseStart = nowNs(io);
-        var r = try database.beginRead();
-        const dir = r.root();
+        var readTransaction = try database.beginRead();
+        const dir = readTransaction.root();
         var out: [childProperties]Value = undefined;
-        var k: usize = 0;
-        while (k < readN) : (k += 1) {
-            const primaryKey: u64 = (k * readStride) % owners;
-            const t0 = nowNs(io);
-            _ = try typeRouting.getLinked(&r, dir, ownerType, primaryKey, embeddedProperty, &out);
-            const dt: u64 = @intCast(nowNs(io) - t0);
-            try readLat.add(alloc, dt);
-            try combined.add(alloc, dt);
+        var key: usize = 0;
+        while (key < readN) : (key += 1) {
+            const primaryKey: u64 = (key * readStride) % owners;
+            const startNs = nowNs(io);
+            _ = try typeRouting.getLinked(&readTransaction, dir, ownerType, primaryKey, embeddedProperty, &out);
+            const elapsedNs: u64 = @intCast(nowNs(io) - startNs);
+            try readLat.add(alloc, elapsedNs);
+            try combined.add(alloc, elapsedNs);
         }
-        r.end();
+        readTransaction.end();
         totalNs += @intCast(nowNs(io) - phaseStart);
     }
 
@@ -152,20 +152,20 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         var done: usize = 0;
         while (done < updateN) {
             const thisBatch = @min(batchSize, updateN - done);
-            var w = try database.beginWrite();
-            var dir = w.newRoot;
-            var j: usize = 0;
-            while (j < thisBatch) : (j += 1) {
-                const primaryKey: u64 = ((done + j) * updateStride) % owners;
-                const t0 = nowNs(io);
-                dir = try typedir.clearEmbedded(&w, dir, ownerType, primaryKey, embeddedProperty);
-                dir = try typedir.insertEmbedded(&w, dir, ownerType, primaryKey, embeddedProperty, &.{ .{ .int = primaryKey }, .{ .int = primaryKey *% 40503 } });
-                const dt: u64 = @intCast(nowNs(io) - t0);
-                try updateLat.add(alloc, dt);
-                try combined.add(alloc, dt);
+            var writeTransaction = try database.beginWrite();
+            var dir = writeTransaction.newRoot;
+            var innerIndex: usize = 0;
+            while (innerIndex < thisBatch) : (innerIndex += 1) {
+                const primaryKey: u64 = ((done + innerIndex) * updateStride) % owners;
+                const startNs = nowNs(io);
+                dir = try typeDirectory.clearEmbedded(&writeTransaction, dir, ownerType, primaryKey, embeddedProperty);
+                dir = try typeDirectory.insertEmbedded(&writeTransaction, dir, ownerType, primaryKey, embeddedProperty, &.{ .{ .int = primaryKey }, .{ .int = primaryKey *% 40503 } });
+                const elapsedNs: u64 = @intCast(nowNs(io) - startNs);
+                try updateLat.add(alloc, elapsedNs);
+                try combined.add(alloc, elapsedNs);
             }
-            w.setRoot(dir);
-            _ = try w.commit();
+            writeTransaction.setRoot(dir);
+            _ = try writeTransaction.commit();
             done += thisBatch;
         }
         totalNs += @intCast(nowNs(io) - phaseStart);
@@ -178,23 +178,23 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         var done: usize = 0;
         while (done < deleteN) {
             const thisBatch = @min(batchSize, deleteN - done);
-            var w = try database.beginWrite();
-            var dir = w.newRoot;
-            var j: usize = 0;
-            while (j < thisBatch) : (j += 1) {
-                const primaryKey: u64 = ((done + j) * deleteStride) % owners;
-                const hadChild = (try typeRouting.getLink(&w, dir, ownerType, primaryKey, embeddedProperty)) != null;
-                const t0 = nowNs(io);
-                dir = try typedir.clearEmbedded(&w, dir, ownerType, primaryKey, embeddedProperty);
-                const dt: u64 = @intCast(nowNs(io) - t0);
+            var writeTransaction = try database.beginWrite();
+            var dir = writeTransaction.newRoot;
+            var innerIndex: usize = 0;
+            while (innerIndex < thisBatch) : (innerIndex += 1) {
+                const primaryKey: u64 = ((done + innerIndex) * deleteStride) % owners;
+                const hadChild = (try typeRouting.getLink(&writeTransaction, dir, ownerType, primaryKey, embeddedProperty)) != null;
+                const startNs = nowNs(io);
+                dir = try typeDirectory.clearEmbedded(&writeTransaction, dir, ownerType, primaryKey, embeddedProperty);
+                const elapsedNs: u64 = @intCast(nowNs(io) - startNs);
                 if (hadChild) {
                     deleted += 1;
-                    try deleteLat.add(alloc, dt);
-                    try combined.add(alloc, dt);
+                    try deleteLat.add(alloc, elapsedNs);
+                    try combined.add(alloc, elapsedNs);
                 }
             }
-            w.setRoot(dir);
-            _ = try w.commit();
+            writeTransaction.setRoot(dir);
+            _ = try writeTransaction.commit();
             done += thisBatch;
         }
         totalNs += @intCast(nowNs(io) - phaseStart);

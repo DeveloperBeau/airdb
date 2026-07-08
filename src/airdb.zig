@@ -18,7 +18,7 @@ pub const writeTransaction = @import("transactions/writeTransaction.zig");
 /// Commit-slot selection, version adoption, reader pins, and the retention window.
 pub const versioning = @import("transactions/versioning.zig");
 /// The cross-process coordination file: attach counts, latest version, reader pins.
-pub const coord = @import("transactions/coordination.zig");
+pub const coordination = @import("transactions/coordination.zig");
 
 // Records: typed objects, raw rows, and value representations.
 /// Typed encode/decode orchestration over the raw row layer.
@@ -38,7 +38,7 @@ pub const bulk = @import("records/bulk.zig");
 /// The per-type catalog: property definitions, columns, and indexes.
 pub const catalog = @import("schema/catalog.zig");
 /// The type directory mapping type ids to catalog refs.
-pub const typedir = @import("schema/typeDirectory.zig");
+pub const typeDirectory = @import("schema/typeDirectory.zig");
 /// Object/link/delete routing through the type directory.
 pub const typeRouting = @import("schema/typeRouting.zig");
 /// Structural schema evolution: add and remove properties.
@@ -54,7 +54,7 @@ pub const index = @import("trees/index.zig");
 /// The key->value B+tree's on-disk node formats.
 pub const indexNode = @import("trees/indexNode.zig");
 /// Byte-keyed B+tree (blob-ref keys).
-pub const bindex = @import("trees/byteKeyIndex.zig");
+pub const byteKeyIndex = @import("trees/byteKeyIndex.zig");
 
 // Storage primitives.
 /// A node's stable identity: an absolute byte offset into the mapped file.
@@ -62,7 +62,7 @@ pub const Reference = @import("storage/reference.zig").Reference;
 /// Bump allocation, pooled reuse, and the bounds-checked deref chokepoint.
 pub const arena = @import("storage/arena.zig");
 /// The reclaimable-extent pool and its persisted chunk-chain format.
-pub const freelist = @import("storage/freeList.zig");
+pub const freeList = @import("storage/freeList.zig");
 /// Recovery of the persisted free-list chain on open/refresh.
 pub const freeListRecovery = @import("storage/freeListRecovery.zig");
 /// Header, mmap sections, and the file-backed store.
@@ -94,7 +94,7 @@ pub const verification = @import("verification.zig");
 /// Predicate queries, aggregation, and sorting over a catalog.
 pub const query = @import("query.zig");
 /// The C ABI surface for language bindings.
-pub const ffi = @import("cApi.zig");
+pub const cApi = @import("cApi.zig");
 /// OS-specific operations: mmap, file locking, process checks.
 pub const platform = @import("platform.zig");
 /// Peak resident set size of the current process, in bytes (a syscall).

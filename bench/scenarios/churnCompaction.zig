@@ -26,7 +26,7 @@ const compaction = airdb.compaction;
 pub const name = "churn_compaction";
 
 // Rows churned (inserted and deleted) per iteration.
-const k: usize = 1000;
+const key: usize = 1000;
 
 // Maximum live working-set size. Capped so the per-step compaction walk over the
 // key->row index stays bounded regardless of scale. compactStep cost scales with
@@ -63,34 +63,34 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     defer alloc.free(path);
     defer harness.removeScratch(ctx.*, path);
 
-    const workingSet: u64 = @min(ctx.n, maxWorkingSet);
+    const workingSet: u64 = @min(ctx.rowCount, maxWorkingSet);
     // Total churn work scales with the requested row count but stays bounded:
     // iters * k inserts + iters * k deletes.
-    const iters: u64 = @min(maxIters, @max(@as(u64, 1), @as(u64, @intCast(ctx.n)) / k));
+    const iters: u64 = @min(maxIters, @max(@as(u64, 1), @as(u64, @intCast(ctx.rowCount)) / key));
 
     var database = try airdb.Database.create(alloc, path);
     defer database.deinit();
 
     // Two-int type: {primaryKey, value}. Property 0 is the primary key.
     var catalogRef: Reference = blk: {
-        var w = try database.beginWrite();
-        const c = try catalog.create(&w, 2);
-        w.setRoot(c);
-        _ = try w.commit();
-        break :blk c;
+        var writeTransaction = try database.beginWrite();
+        const catalogRef = try catalog.create(&writeTransaction, 2);
+        writeTransaction.setRoot(catalogRef);
+        _ = try writeTransaction.commit();
+        break :blk catalogRef;
     };
 
     // --- Seed the live working set (setup only, not timed) -------------------
     {
-        var w = try database.beginWrite();
+        var writeTransaction = try database.beginWrite();
         catalogRef = database.activeRoot;
         var primaryKey: u64 = 0;
         while (primaryKey < workingSet) : (primaryKey += 1) {
-            const r = try rows.insert(&w, catalogRef, &.{ primaryKey, primaryKey });
-            catalogRef = r.catalogRef;
+            const inserted = try rows.insert(&writeTransaction, catalogRef, &.{ primaryKey, primaryKey });
+            catalogRef = inserted.catalogRef;
         }
-        w.setRoot(catalogRef);
-        _ = try w.commit();
+        writeTransaction.setRoot(catalogRef);
+        _ = try writeTransaction.commit();
     }
 
     // Live primaryKeys form a sliding window [oldestPrimaryKey, nextPrimaryKey); its width stays at
@@ -106,50 +106,50 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     // --- Churn + compaction (timed) ------------------------------------------
     const phaseStart = nowNs(io);
 
-    var it: u64 = 0;
-    while (it < iters) : (it += 1) {
+    var iterator: u64 = 0;
+    while (iterator < iters) : (iterator += 1) {
         // Churn: insert k fresh rows and delete the k oldest live primaryKeys in one transaction.
         {
-            var w = try database.beginWrite();
+            var writeTransaction = try database.beginWrite();
             catalogRef = database.activeRoot;
 
-            var j: usize = 0;
-            while (j < k) : (j += 1) {
-                const primaryKey = nextPrimaryKey + j;
-                const r = try rows.insert(&w, catalogRef, &.{ primaryKey, primaryKey });
-                catalogRef = r.catalogRef;
+            var innerIndex: usize = 0;
+            while (innerIndex < key) : (innerIndex += 1) {
+                const primaryKey = nextPrimaryKey + innerIndex;
+                const inserted = try rows.insert(&writeTransaction, catalogRef, &.{ primaryKey, primaryKey });
+                catalogRef = inserted.catalogRef;
             }
 
-            j = 0;
-            while (j < k) : (j += 1) {
-                const primaryKey = oldestPrimaryKey + j;
+            innerIndex = 0;
+            while (innerIndex < key) : (innerIndex += 1) {
+                const primaryKey = oldestPrimaryKey + innerIndex;
                 var out: [2]u64 = undefined;
-                const version = (try rows.getByPrimaryKey(&w, catalogRef, primaryKey, &out)) orelse unreachable;
-                catalogRef = switch (try rows.delete(&w, catalogRef, primaryKey, version)) {
-                    .ok => |c| c,
+                const version = (try rows.getByPrimaryKey(&writeTransaction, catalogRef, primaryKey, &out)) orelse unreachable;
+                catalogRef = switch (try rows.delete(&writeTransaction, catalogRef, primaryKey, version)) {
+                    .ok => |newCatalog| newCatalog,
                     else => unreachable,
                 };
             }
 
-            w.setRoot(catalogRef);
-            _ = try w.commit();
+            writeTransaction.setRoot(catalogRef);
+            _ = try writeTransaction.commit();
 
-            nextPrimaryKey += k;
-            oldestPrimaryKey += k;
+            nextPrimaryKey += key;
+            oldestPrimaryKey += key;
         }
 
         // Compaction: repack the type until fully packed, one step per write transaction.
         while (true) {
-            var w = try database.beginWrite();
+            var writeTransaction = try database.beginWrite();
             catalogRef = database.activeRoot;
-            const t0 = nowNs(io);
-            const res = try compaction.compactStep(&w, catalogRef, 0, compactBudget);
-            const dt: u64 = @intCast(nowNs(io) - t0);
+            const startNs = nowNs(io);
+            const res = try compaction.compactStep(&writeTransaction, catalogRef, 0, compactBudget);
+            const elapsedNs: u64 = @intCast(nowNs(io) - startNs);
             catalogRef = res.catalogRef;
-            w.setRoot(catalogRef);
-            _ = try w.commit();
+            writeTransaction.setRoot(catalogRef);
+            _ = try writeTransaction.commit();
 
-            try stepLat.add(alloc, dt);
+            try stepLat.add(alloc, elapsedNs);
             totalMoved += res.moved;
             if (res.done or res.moved == 0) break;
         }
@@ -161,11 +161,11 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     var live: u64 = 0;
     var nextRow: u64 = 0;
     {
-        var rd = try database.beginRead();
-        defer rd.end();
-        catalogRef = rd.root();
-        live = try compaction.liveCount(&rd, catalogRef);
-        nextRow = (try catalog.loadCatalog(&rd, catalogRef)).nextRow;
+        var readTransaction = try database.beginRead();
+        defer readTransaction.end();
+        catalogRef = readTransaction.root();
+        live = try compaction.liveCount(&readTransaction, catalogRef);
+        nextRow = (try catalog.loadCatalog(&readTransaction, catalogRef)).nextRow;
     }
     const deadRatio: f64 = if (nextRow == 0)
         0

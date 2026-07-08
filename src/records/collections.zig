@@ -3,7 +3,7 @@ const WriteTransaction = @import("../transactions/writeTransaction.zig").WriteTr
 const Reference = @import("../storage/reference.zig").Reference;
 const Column = @import("../trees/column.zig");
 const Index = @import("../trees/index.zig");
-const bindex = @import("../trees/byteKeyIndex.zig");
+const byteKeyIndex = @import("../trees/byteKeyIndex.zig");
 const blob = @import("blob.zig");
 const catalog = @import("../schema/catalog.zig");
 
@@ -46,7 +46,7 @@ pub fn buildSetInt(transaction: *WriteTransaction, items: []const u64) !Referenc
 /// Number of elements in list property `property` of the object identified by
 /// `primaryKey`, or null when the object is absent or tombstoned. Two index
 /// descents to resolve the row, then a column walk (O(log n)).
-pub fn listLen(transaction: anytype, catalogRef: Reference, primaryKey: u64, property: usize) !?u64 {
+pub fn listLength(transaction: anytype, catalogRef: Reference, primaryKey: u64, property: usize) !?u64 {
     const resolved = (try catalog.resolveProperty(transaction, catalogRef, primaryKey, property)) orelse return null;
     const listRoot = try Column.get(transaction, resolved.propertyColumn, resolved.row);
     return try Column.length(transaction, listRoot);
@@ -79,7 +79,7 @@ pub fn listAppendInt(transaction: *WriteTransaction, catalogRef: Reference, prim
     const resolved = (try catalog.resolveProperty(transaction, catalogRef, primaryKey, property)) orelse return error.NotFound;
     const oldRoot = try Column.get(transaction, resolved.propertyColumn, resolved.row);
     const newRoot = try Column.append(transaction, oldRoot, value);
-    return catalog.replaceCollRoot(transaction, catalogRef, resolved.row, property, newRoot);
+    return catalog.replaceCollectionRoot(transaction, catalogRef, resolved.row, property, newRoot);
 }
 
 /// Overwrite the element at `index` of list property `property` with `value`
@@ -89,7 +89,7 @@ pub fn listSetInt(transaction: *WriteTransaction, catalogRef: Reference, primary
     const resolved = (try catalog.resolveProperty(transaction, catalogRef, primaryKey, property)) orelse return error.NotFound;
     const oldRoot = try Column.get(transaction, resolved.propertyColumn, resolved.row);
     const newRoot = try Column.set(transaction, oldRoot, index, value);
-    return catalog.replaceCollRoot(transaction, catalogRef, resolved.row, property, newRoot);
+    return catalog.replaceCollectionRoot(transaction, catalogRef, resolved.row, property, newRoot);
 }
 
 /// Append `bytes` as a new blob element of list property `property` and
@@ -100,7 +100,7 @@ pub fn listAppendBlob(transaction: *WriteTransaction, catalogRef: Reference, pri
     const oldRoot = try Column.get(transaction, resolved.propertyColumn, resolved.row);
     const blobRef = try blob.put(transaction, bytes);
     const newRoot = try Column.append(transaction, oldRoot, blobRef);
-    return catalog.replaceCollRoot(transaction, catalogRef, resolved.row, property, newRoot);
+    return catalog.replaceCollectionRoot(transaction, catalogRef, resolved.row, property, newRoot);
 }
 
 /// Number of members in set property `property`, or null when the object is
@@ -129,7 +129,7 @@ pub fn setAddInt(transaction: *WriteTransaction, catalogRef: Reference, primaryK
     const oldRoot = try Column.get(transaction, resolved.propertyColumn, resolved.row);
     if ((try Index.get(transaction, oldRoot, key)) != null) return catalogRef; // already a member, no version bump
     const newRoot = try Index.insert(transaction, oldRoot, key, 1);
-    return catalog.replaceCollRoot(transaction, catalogRef, resolved.row, property, newRoot);
+    return catalog.replaceCollectionRoot(transaction, catalogRef, resolved.row, property, newRoot);
 }
 
 /// Remove `key` from set property `property` and return the new catalog ref
@@ -141,7 +141,7 @@ pub fn setRemoveInt(transaction: *WriteTransaction, catalogRef: Reference, prima
     const oldRoot = try Column.get(transaction, resolved.propertyColumn, resolved.row);
     if ((try Index.get(transaction, oldRoot, key)) == null) return catalogRef; // not a member, no version bump
     const newRoot = try Index.remove(transaction, oldRoot, key);
-    return catalog.replaceCollRoot(transaction, catalogRef, resolved.row, property, newRoot);
+    return catalog.replaceCollectionRoot(transaction, catalogRef, resolved.row, property, newRoot);
 }
 
 /// Append every member of set property `property` to `out` in ascending
@@ -168,17 +168,17 @@ pub fn setCollectInt(
 }
 
 // ---------------------------------------------------------------------------
-// set of blob: byte-string members backed by the byte-keyed B+tree (bindex).
-// Members are the bindex keys; the value column is an unused sentinel (1).
+// set of blob: byte-string members backed by the byte-keyed B+tree (byteKeyIndex).
+// Members are the byteKeyIndex keys; the value column is an unused sentinel (1).
 // ---------------------------------------------------------------------------
 
 /// Build a set-of-blob tree from `items` and return its root. Members are the
 /// byte-keyed B+tree's keys, so duplicate members dedup. One insert per item
 /// (O(m log m) total).
 pub fn buildSetBlob(transaction: *WriteTransaction, items: []const []const u8) !Reference {
-    var root = try bindex.create(transaction);
-    // bindex.insert overwrites an existing key, so duplicate members dedup.
-    for (items) |member| root = try bindex.insert(transaction, root, member, 1);
+    var root = try byteKeyIndex.create(transaction);
+    // byteKeyIndex.insert overwrites an existing key, so duplicate members dedup.
+    for (items) |member| root = try byteKeyIndex.insert(transaction, root, member, 1);
     return root;
 }
 
@@ -188,7 +188,7 @@ pub fn buildSetBlob(transaction: *WriteTransaction, items: []const []const u8) !
 pub fn setCountBlob(transaction: anytype, catalogRef: Reference, primaryKey: u64, property: usize) !?u64 {
     const resolved = (try catalog.resolveProperty(transaction, catalogRef, primaryKey, property)) orelse return null;
     const setRoot = try Column.get(transaction, resolved.propertyColumn, resolved.row);
-    return try bindex.count(transaction, setRoot);
+    return try byteKeyIndex.count(transaction, setRoot);
 }
 
 /// True when `member` is in blob-set property `property`. Fails with
@@ -196,7 +196,7 @@ pub fn setCountBlob(transaction: anytype, catalogRef: Reference, primaryKey: u64
 pub fn setContainsBlob(transaction: anytype, catalogRef: Reference, primaryKey: u64, property: usize, member: []const u8) !bool {
     const resolved = (try catalog.resolveProperty(transaction, catalogRef, primaryKey, property)) orelse return error.NotFound;
     const setRoot = try Column.get(transaction, resolved.propertyColumn, resolved.row);
-    return (try bindex.get(transaction, setRoot, member)) != null;
+    return (try byteKeyIndex.get(transaction, setRoot, member)) != null;
 }
 
 /// Add `member` to blob-set property `property` and return the new catalog
@@ -206,9 +206,9 @@ pub fn setContainsBlob(transaction: anytype, catalogRef: Reference, primaryKey: 
 pub fn setAddBlob(transaction: *WriteTransaction, catalogRef: Reference, primaryKey: u64, property: usize, member: []const u8) !Reference {
     const resolved = (try catalog.resolveProperty(transaction, catalogRef, primaryKey, property)) orelse return error.NotFound;
     const oldRoot = try Column.get(transaction, resolved.propertyColumn, resolved.row);
-    if ((try bindex.get(transaction, oldRoot, member)) != null) return catalogRef; // already a member, no version bump
-    const newRoot = try bindex.insert(transaction, oldRoot, member, 1);
-    return catalog.replaceCollRoot(transaction, catalogRef, resolved.row, property, newRoot);
+    if ((try byteKeyIndex.get(transaction, oldRoot, member)) != null) return catalogRef; // already a member, no version bump
+    const newRoot = try byteKeyIndex.insert(transaction, oldRoot, member, 1);
+    return catalog.replaceCollectionRoot(transaction, catalogRef, resolved.row, property, newRoot);
 }
 
 /// Remove `member` from blob-set property `property` and return the new
@@ -218,9 +218,9 @@ pub fn setAddBlob(transaction: *WriteTransaction, catalogRef: Reference, primary
 pub fn setRemoveBlob(transaction: *WriteTransaction, catalogRef: Reference, primaryKey: u64, property: usize, member: []const u8) !Reference {
     const resolved = (try catalog.resolveProperty(transaction, catalogRef, primaryKey, property)) orelse return error.NotFound;
     const oldRoot = try Column.get(transaction, resolved.propertyColumn, resolved.row);
-    if ((try bindex.get(transaction, oldRoot, member)) == null) return catalogRef; // not a member, no version bump
-    const newRoot = try bindex.remove(transaction, oldRoot, member);
-    return catalog.replaceCollRoot(transaction, catalogRef, resolved.row, property, newRoot);
+    if ((try byteKeyIndex.get(transaction, oldRoot, member)) == null) return catalogRef; // not a member, no version bump
+    const newRoot = try byteKeyIndex.remove(transaction, oldRoot, member);
+    return catalog.replaceCollectionRoot(transaction, catalogRef, resolved.row, property, newRoot);
 }
 
 /// Append every member of blob-set property `property` to `out` in ascending
@@ -247,20 +247,20 @@ pub fn setCollectBlob(
             try self.list.append(self.alloc, try self.alloc.dupe(u8, key));
         }
     };
-    try bindex.forEachEntry(transaction, setRoot, Sink{ .list = out, .alloc = allocator }, Sink.onEntry);
+    try byteKeyIndex.forEachEntry(transaction, setRoot, Sink{ .list = out, .alloc = allocator }, Sink.onEntry);
 }
 
 // ---------------------------------------------------------------------------
-// dict: byte-string key -> u64 value, backed by the byte-keyed B+tree (bindex).
+// dict: byte-string key -> u64 value, backed by the byte-keyed B+tree (byteKeyIndex).
 // ---------------------------------------------------------------------------
 
 /// Build a dict tree (byte-string key -> u64 value) from `entries` and return
 /// its root. A repeated key keeps the last value. One insert per entry
 /// (O(m log m) total).
 pub fn buildDict(transaction: *WriteTransaction, entries: []const catalog.DictEntry) !Reference {
-    var root = try bindex.create(transaction);
-    // bindex.insert overwrites an existing key, so a repeated key keeps the last value.
-    for (entries) |entry| root = try bindex.insert(transaction, root, entry.key, entry.value);
+    var root = try byteKeyIndex.create(transaction);
+    // byteKeyIndex.insert overwrites an existing key, so a repeated key keeps the last value.
+    for (entries) |entry| root = try byteKeyIndex.insert(transaction, root, entry.key, entry.value);
     return root;
 }
 
@@ -270,7 +270,7 @@ pub fn buildDict(transaction: *WriteTransaction, entries: []const catalog.DictEn
 pub fn dictGet(transaction: anytype, catalogRef: Reference, primaryKey: u64, property: usize, key: []const u8) !?u64 {
     const resolved = (try catalog.resolveProperty(transaction, catalogRef, primaryKey, property)) orelse return error.NotFound;
     const dictRoot = try Column.get(transaction, resolved.propertyColumn, resolved.row);
-    return try bindex.get(transaction, dictRoot, key);
+    return try byteKeyIndex.get(transaction, dictRoot, key);
 }
 
 /// Number of entries in dict property `property`, or null when the object is
@@ -279,7 +279,7 @@ pub fn dictGet(transaction: anytype, catalogRef: Reference, primaryKey: u64, pro
 pub fn dictCount(transaction: anytype, catalogRef: Reference, primaryKey: u64, property: usize) !?u64 {
     const resolved = (try catalog.resolveProperty(transaction, catalogRef, primaryKey, property)) orelse return null;
     const dictRoot = try Column.get(transaction, resolved.propertyColumn, resolved.row);
-    return try bindex.count(transaction, dictRoot);
+    return try byteKeyIndex.count(transaction, dictRoot);
 }
 
 /// Insert or overwrite `key` -> `value` in dict property `property` and
@@ -288,8 +288,8 @@ pub fn dictCount(transaction: anytype, catalogRef: Reference, primaryKey: u64, p
 pub fn dictPut(transaction: *WriteTransaction, catalogRef: Reference, primaryKey: u64, property: usize, key: []const u8, value: u64) !Reference {
     const resolved = (try catalog.resolveProperty(transaction, catalogRef, primaryKey, property)) orelse return error.NotFound;
     const oldRoot = try Column.get(transaction, resolved.propertyColumn, resolved.row);
-    const newRoot = try bindex.insert(transaction, oldRoot, key, value); // overwrites existing key
-    return catalog.replaceCollRoot(transaction, catalogRef, resolved.row, property, newRoot);
+    const newRoot = try byteKeyIndex.insert(transaction, oldRoot, key, value); // overwrites existing key
+    return catalog.replaceCollectionRoot(transaction, catalogRef, resolved.row, property, newRoot);
 }
 
 /// Remove `key` from dict property `property` and return the new catalog ref
@@ -299,9 +299,9 @@ pub fn dictPut(transaction: *WriteTransaction, catalogRef: Reference, primaryKey
 pub fn dictRemove(transaction: *WriteTransaction, catalogRef: Reference, primaryKey: u64, property: usize, key: []const u8) !Reference {
     const resolved = (try catalog.resolveProperty(transaction, catalogRef, primaryKey, property)) orelse return error.NotFound;
     const oldRoot = try Column.get(transaction, resolved.propertyColumn, resolved.row);
-    if ((try bindex.get(transaction, oldRoot, key)) == null) return catalogRef; // absent, no version bump
-    const newRoot = try bindex.remove(transaction, oldRoot, key);
-    return catalog.replaceCollRoot(transaction, catalogRef, resolved.row, property, newRoot);
+    if ((try byteKeyIndex.get(transaction, oldRoot, key)) == null) return catalogRef; // absent, no version bump
+    const newRoot = try byteKeyIndex.remove(transaction, oldRoot, key);
+    return catalog.replaceCollectionRoot(transaction, catalogRef, resolved.row, property, newRoot);
 }
 
 /// Append every (key, value) entry of dict property `property` to `out` in
@@ -326,7 +326,7 @@ pub fn dictCollect(
             try self.list.append(self.alloc, .{ .key = try self.alloc.dupe(u8, key), .value = value });
         }
     };
-    try bindex.forEachEntry(transaction, dictRoot, Sink{ .list = out, .alloc = allocator }, Sink.onEntry);
+    try byteKeyIndex.forEachEntry(transaction, dictRoot, Sink{ .list = out, .alloc = allocator }, Sink.onEntry);
 }
 
 test {

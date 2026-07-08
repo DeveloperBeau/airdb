@@ -3,7 +3,7 @@
 //! Every function here follows the same pattern: resolve typeId to its catalog
 //! ref via the directory (typeDirectory.zig owns the directory node format), forward
 //! to the object/link layer, and COW the directory when the catalog changed.
-//! The cross-type delete machinery (deleteNullifyX and its worker) also lives
+//! The cross-type delete machinery (deleteNullifyCrossType and its worker) also lives
 //! here because it routes across every type in the directory.
 
 const std = @import("std");
@@ -13,11 +13,11 @@ const Objects = @import("../records/objects.zig");
 const rows = @import("../records/rows.zig");
 const catalog = @import("catalog.zig");
 const links = @import("../records/links.zig");
-const typedir = @import("typeDirectory.zig");
+const typeDirectory = @import("typeDirectory.zig");
 
 const Value = catalog.Value;
-const typeCount = typedir.typeCount;
-const setCatalogRef = typedir.setCatalogRef;
+const typeCount = typeDirectory.typeCount;
+const setCatalogRef = typeDirectory.setCatalogRef;
 
 /// A successful directory-routed update: the new directory ref and the row's
 /// new version.
@@ -28,23 +28,23 @@ pub const UpdateResult = union(enum) { ok: UpdateOk, conflict: Objects.Conflict,
 pub const DeleteResult = union(enum) { ok: Reference, conflict: Objects.Conflict, notFound, blocked };
 
 /// Insert a typed object into `typeId`, returning the new directory ref and
-/// the object's row.
-pub fn insert(transaction: *WriteTransaction, dir: Reference, typeId: u16, values: []const Value) !struct { dir: Reference, row: u64 } {
-    const catalogRef = try typedir.catalogRef(transaction, dir, typeId);
+/// the object's stable object key.
+pub fn insert(transaction: *WriteTransaction, dir: Reference, typeId: u16, values: []const Value) !struct { dir: Reference, objectKey: u64 } {
+    const catalogRef = try typeDirectory.catalogRef(transaction, dir, typeId);
     const result = try Objects.insertTyped(transaction, catalogRef, values);
     const newDir = try setCatalogRef(transaction, dir, typeId, result.catalogRef);
-    return .{ .dir = newDir, .row = result.row };
+    return .{ .dir = newDir, .objectKey = result.objectKey };
 }
 
 /// Read the object with primary key `primaryKey` from `typeId` into `out`, returning
 /// its version or null when absent.
 pub fn get(transaction: anytype, dir: Reference, typeId: u16, primaryKey: u64, out: []Value) !?u64 {
-    return Objects.getTyped(transaction, try typedir.catalogRef(transaction, dir, typeId), primaryKey, out);
+    return Objects.getTyped(transaction, try typeDirectory.catalogRef(transaction, dir, typeId), primaryKey, out);
 }
 
 /// Update the object with primary key `primaryKey` when `expectedVersion` matches.
 pub fn update(transaction: *WriteTransaction, dir: Reference, typeId: u16, primaryKey: u64, values: []const Value, expectedVersion: u64) !UpdateResult {
-    const catalogRef = try typedir.catalogRef(transaction, dir, typeId);
+    const catalogRef = try typeDirectory.catalogRef(transaction, dir, typeId);
     const result = try Objects.updateTyped(transaction, catalogRef, primaryKey, values, expectedVersion);
     return switch (result) {
         .ok => |okPayload| .{ .ok = .{ .dir = try setCatalogRef(transaction, dir, typeId, okPayload.catalogRef), .version = okPayload.version } },
@@ -55,7 +55,7 @@ pub fn update(transaction: *WriteTransaction, dir: Reference, typeId: u16, prima
 
 /// Delete the object with primary key `primaryKey` when `expectedVersion` matches.
 pub fn delete(transaction: *WriteTransaction, dir: Reference, typeId: u16, primaryKey: u64, expectedVersion: u64) !DeleteResult {
-    const catalogRef = try typedir.catalogRef(transaction, dir, typeId);
+    const catalogRef = try typeDirectory.catalogRef(transaction, dir, typeId);
     const result = try Objects.deleteTyped(transaction, catalogRef, primaryKey, expectedVersion);
     return switch (result) {
         .ok => |newCatalog| .{ .ok = try setCatalogRef(transaction, dir, typeId, newCatalog) },
@@ -66,45 +66,45 @@ pub fn delete(transaction: *WriteTransaction, dir: Reference, typeId: u16, prima
 
 /// Number of live objects in `typeId`.
 pub fn liveCount(transaction: anytype, dir: Reference, typeId: u16) !u64 {
-    return catalog.liveCount(transaction, try typedir.catalogRef(transaction, dir, typeId));
+    return catalog.liveCount(transaction, try typeDirectory.catalogRef(transaction, dir, typeId));
 }
 
 // --- link / to-many routing (mutators COW the directory) ---
 
 /// The to-one link target (object key) of `primaryKey`'s property `property`, or null.
 pub fn getLink(transaction: anytype, dir: Reference, typeId: u16, primaryKey: u64, property: usize) !?u64 {
-    return links.getLink(transaction, try typedir.catalogRef(transaction, dir, typeId), primaryKey, property);
+    return links.getLink(transaction, try typeDirectory.catalogRef(transaction, dir, typeId), primaryKey, property);
 }
 
 /// Set (or clear, with null) the to-one link of `primaryKey`'s property `property`.
 pub fn setLink(transaction: *WriteTransaction, dir: Reference, typeId: u16, primaryKey: u64, property: usize, target: ?u64) !Reference {
-    const catalogRef = try typedir.catalogRef(transaction, dir, typeId);
+    const catalogRef = try typeDirectory.catalogRef(transaction, dir, typeId);
     const newCatalog = try links.setLink(transaction, catalogRef, primaryKey, property, target);
     return try setCatalogRef(transaction, dir, typeId, newCatalog);
 }
 
 /// Number of `typeId` objects whose property `property` links to `target`.
 pub fn backlinkCount(transaction: anytype, dir: Reference, typeId: u16, property: usize, target: u64) !u64 {
-    return links.backlinkCount(transaction, try typedir.catalogRef(transaction, dir, typeId), property, target);
+    return links.backlinkCount(transaction, try typeDirectory.catalogRef(transaction, dir, typeId), property, target);
 }
 
 /// Add `target` to `primaryKey`'s link-set property `property`.
 pub fn linkSetAdd(transaction: *WriteTransaction, dir: Reference, typeId: u16, primaryKey: u64, property: usize, target: u64) !Reference {
-    const catalogRef = try typedir.catalogRef(transaction, dir, typeId);
+    const catalogRef = try typeDirectory.catalogRef(transaction, dir, typeId);
     const newCatalog = try links.linkSetAdd(transaction, catalogRef, primaryKey, property, target);
     return try setCatalogRef(transaction, dir, typeId, newCatalog);
 }
 
 /// Remove `target` from `primaryKey`'s link-set property `property`.
 pub fn linkSetRemove(transaction: *WriteTransaction, dir: Reference, typeId: u16, primaryKey: u64, property: usize, target: u64) !Reference {
-    const catalogRef = try typedir.catalogRef(transaction, dir, typeId);
+    const catalogRef = try typeDirectory.catalogRef(transaction, dir, typeId);
     const newCatalog = try links.linkSetRemove(transaction, catalogRef, primaryKey, property, target);
     return try setCatalogRef(transaction, dir, typeId, newCatalog);
 }
 
 /// Whether `primaryKey`'s link-set property `property` contains `target`.
 pub fn linkSetContains(transaction: anytype, dir: Reference, typeId: u16, primaryKey: u64, property: usize, target: u64) !bool {
-    return links.linkSetContains(transaction, try typedir.catalogRef(transaction, dir, typeId), primaryKey, property, target);
+    return links.linkSetContains(transaction, try typeDirectory.catalogRef(transaction, dir, typeId), primaryKey, property, target);
 }
 
 // ---------------------------------------------------------------------------
@@ -113,8 +113,8 @@ pub fn linkSetContains(transaction: anytype, dir: Reference, typeId: u16, primar
 
 /// Resolve `primaryKey`'s to-one link `property` to its target type and object key, or
 /// null when the link is unset.
-pub fn resolveLink(transaction: anytype, dir: Reference, srcType: u16, primaryKey: u64, property: usize) !?struct { targetType: u16, objectKey: u64 } {
-    const sourceCatalog = try typedir.catalogRef(transaction, dir, srcType);
+pub fn resolveLink(transaction: anytype, dir: Reference, sourceType: u16, primaryKey: u64, property: usize) !?struct { targetType: u16, objectKey: u64 } {
+    const sourceCatalog = try typeDirectory.catalogRef(transaction, dir, sourceType);
     const objectKey = (try links.getLink(transaction, sourceCatalog, primaryKey, property)) orelse return null;
     const targetType = (try catalog.loadCatalog(transaction, sourceCatalog)).linkTarget(property);
     return .{ .targetType = targetType, .objectKey = objectKey };
@@ -122,9 +122,9 @@ pub fn resolveLink(transaction: anytype, dir: Reference, srcType: u16, primaryKe
 
 /// Materialize the linked object into `out` (sized to the TARGET type's propertyCount).
 /// Returns the target row version, or null if the link is unset or the target is gone.
-pub fn getLinked(transaction: anytype, dir: Reference, srcType: u16, primaryKey: u64, property: usize, out: []Value) !?u64 {
-    const result = (try resolveLink(transaction, dir, srcType, primaryKey, property)) orelse return null;
-    const targetCatalog = try typedir.catalogRef(transaction, dir, result.targetType);
+pub fn getLinked(transaction: anytype, dir: Reference, sourceType: u16, primaryKey: u64, property: usize, out: []Value) !?u64 {
+    const result = (try resolveLink(transaction, dir, sourceType, primaryKey, property)) orelse return null;
+    const targetCatalog = try typeDirectory.catalogRef(transaction, dir, result.targetType);
     return Objects.getTypedByObjectKey(transaction, targetCatalog, result.objectKey, out);
 }
 
@@ -132,8 +132,8 @@ pub fn getLinked(transaction: anytype, dir: Reference, srcType: u16, primaryKey:
 /// block (refuse while a block-rule link points at it), cascade (delete owned
 /// children first), nullify (clear dangling inbound links). Cascade is recursive
 /// and cycle-safe.
-pub fn deleteNullifyX(transaction: *WriteTransaction, dir: Reference, typeId: u16, primaryKey: u64, expectedVersion: u64) !DeleteResult {
-    const catalog0 = try typedir.catalogRef(transaction, dir, typeId);
+pub fn deleteNullifyCrossType(transaction: *WriteTransaction, dir: Reference, typeId: u16, primaryKey: u64, expectedVersion: u64) !DeleteResult {
+    const catalog0 = try typeDirectory.catalogRef(transaction, dir, typeId);
     const propertyCount = (try catalog.loadCatalog(transaction, catalog0)).propertyCount;
     var buffer: [256]u64 = undefined;
     const version = (try rows.getByPrimaryKey(transaction, catalog0, primaryKey, buffer[0..propertyCount])) orelse return .notFound;
@@ -156,12 +156,12 @@ fn isBlocked(transaction: *WriteTransaction, dir: Reference, typeId: u16, object
     const typeCountTotal = try typeCount(transaction, dir);
     var sourceType: u16 = 0;
     while (sourceType < typeCountTotal) : (sourceType += 1) {
-        const sourceCatalog = try typedir.catalogRef(transaction, dir, sourceType);
+        const sourceCatalog = try typeDirectory.catalogRef(transaction, dir, sourceType);
         const sourceView = try catalog.loadCatalog(transaction, sourceCatalog);
         var propertyIndex: usize = 0;
         while (propertyIndex < sourceView.propertyCount) : (propertyIndex += 1) {
             const kind = sourceView.kind(propertyIndex);
-            if ((kind == .link or kind == .linkSet) and sourceView.linkTarget(propertyIndex) == typeId and sourceView.delRule(propertyIndex) == .block) {
+            if ((kind == .link or kind == .linkSet) and sourceView.linkTarget(propertyIndex) == typeId and sourceView.deletionRule(propertyIndex) == .block) {
                 const backlinkTotal = try links.backlinkCount(transaction, sourceCatalog, propertyIndex, objectKey);
                 if (backlinkTotal > 1) return true;
                 if (backlinkTotal == 1) {
@@ -194,7 +194,7 @@ fn snapshotSchema(transaction: *WriteTransaction, catalogRef: Reference, propert
     while (propertyIndex < propertyCount) : (propertyIndex += 1) {
         sourceType.kinds[propertyIndex] = sourceView.kind(propertyIndex);
         sourceType.elements[propertyIndex] = sourceView.elementKind(propertyIndex);
-        sourceType.rules[propertyIndex] = sourceView.delRule(propertyIndex);
+        sourceType.rules[propertyIndex] = sourceView.deletionRule(propertyIndex);
         sourceType.targets[propertyIndex] = sourceView.linkTarget(propertyIndex);
     }
     return sourceType;
@@ -210,7 +210,7 @@ fn deleteWorker(transaction: *WriteTransaction, dir: Reference, typeId: u16, obj
     try visited.put(key, {});
 
     var rowBuffer: [256]u64 = undefined;
-    const catalogBefore = try typedir.catalogRef(transaction, dir, typeId);
+    const catalogBefore = try typeDirectory.catalogRef(transaction, dir, typeId);
     const propertyCount = (try catalog.loadCatalog(transaction, catalogBefore)).propertyCount;
     if ((try rows.getByObjectKey(transaction, catalogBefore, objectKey, rowBuffer[0..propertyCount])) == null) return dir; // already gone
     const primaryKey = rowBuffer[0];
@@ -227,13 +227,13 @@ fn deleteWorker(transaction: *WriteTransaction, dir: Reference, typeId: u16, obj
             if ((kind != .link and kind != .linkSet) or schema.rules[propertyIndex] != .cascade) continue;
             const childType = schema.targets[propertyIndex];
             if (kind == .link) {
-                if (try links.getLink(transaction, try typedir.catalogRef(transaction, currentDir, typeId), primaryKey, propertyIndex)) |child| {
+                if (try links.getLink(transaction, try typeDirectory.catalogRef(transaction, currentDir, typeId), primaryKey, propertyIndex)) |child| {
                     currentDir = try deleteWorker(transaction, currentDir, childType, child, visited);
                 }
             } else {
                 var members = std.ArrayList(u64).empty;
                 defer members.deinit(transaction.database.store.allocator);
-                try links.linkSetCollect(transaction, try typedir.catalogRef(transaction, currentDir, typeId), primaryKey, propertyIndex, &members, transaction.database.store.allocator);
+                try links.linkSetCollect(transaction, try typeDirectory.catalogRef(transaction, currentDir, typeId), primaryKey, propertyIndex, &members, transaction.database.store.allocator);
                 for (members.items) |child| currentDir = try deleteWorker(transaction, currentDir, childType, child, visited);
             }
         }
@@ -250,7 +250,7 @@ fn nullifyInbound(transaction: *WriteTransaction, dir: Reference, typeId: u16, o
     const typeCountTotal = try typeCount(transaction, currentDir);
     var sourceType: u16 = 0;
     while (sourceType < typeCountTotal) : (sourceType += 1) {
-        const sourceCatalog = try typedir.catalogRef(transaction, currentDir, sourceType);
+        const sourceCatalog = try typeDirectory.catalogRef(transaction, currentDir, sourceType);
         const newSourceCatalog = try links.nullifyInboundInCatalog(transaction, sourceCatalog, objectKey, typeId, sourceType == typeId);
         currentDir = try setCatalogRef(transaction, currentDir, sourceType, newSourceCatalog);
     }
@@ -259,7 +259,7 @@ fn nullifyInbound(transaction: *WriteTransaction, dir: Reference, typeId: u16, o
 
 // Phase 3) Clean this object's own outbound backlink entries.
 fn cleanOutbound(transaction: *WriteTransaction, dir: Reference, typeId: u16, objectKey: u64) !Reference {
-    const typeCatalog = try typedir.catalogRef(transaction, dir, typeId);
+    const typeCatalog = try typeDirectory.catalogRef(transaction, dir, typeId);
     const cleaned = try links.cleanOutboundInCatalog(transaction, typeCatalog, objectKey);
     return setCatalogRef(transaction, dir, typeId, cleaned);
 }
@@ -273,7 +273,7 @@ fn cleanOutbound(transaction: *WriteTransaction, dir: Reference, typeId: u16, ob
 fn tombstoneAndReclaim(transaction: *WriteTransaction, dir: Reference, typeId: u16, primaryKey: u64, objectKey: u64, schema: *const SchemaSnapshot) !Reference {
     const propertyCount = schema.propertyCount;
     var rowBuffer: [256]u64 = undefined;
-    const typeCatalog = try typedir.catalogRef(transaction, dir, typeId);
+    const typeCatalog = try typeDirectory.catalogRef(transaction, dir, typeId);
     const currentVersion = (try rows.getByObjectKey(transaction, typeCatalog, objectKey, rowBuffer[0..propertyCount])) orelse return dir;
     const dres = try rows.delete(transaction, typeCatalog, primaryKey, currentVersion);
     switch (dres) {

@@ -43,19 +43,19 @@ fn nowNs(io: Io) i96 {
 // bulkImport in one transaction, so both databases start from an identical,
 // already-populated base. Returns nothing; the committed catalog is the root.
 fn seedBase(database: *airdb.Database, baseRows: []const []const u64) !void {
-    var w = try database.beginWrite();
-    const c = try catalog.create(&w, 2);
-    const seeded = try bulk.bulkImport(&w, c, baseRows, .{ .presorted = true });
-    w.setRoot(seeded);
-    _ = try w.commit();
+    var writeTransaction = try database.beginWrite();
+    const catalogRef = try catalog.create(&writeTransaction, 2);
+    const seeded = try bulk.bulkImport(&writeTransaction, catalogRef, baseRows, .{ .presorted = true });
+    writeTransaction.setRoot(seeded);
+    _ = try writeTransaction.commit();
 }
 
 pub fn run(ctx: *harness.Ctx) !harness.Result {
     const alloc = ctx.alloc;
     const io = sysIo();
 
-    const base: usize = ctx.n / 2;
-    const m: usize = ctx.n / 2;
+    const base: usize = ctx.rowCount / 2;
+    const metrics: usize = ctx.rowCount / 2;
 
     const pathA = try harness.scratchPath(ctx.*, name ++ "_bulk.airdb");
     defer alloc.free(pathA);
@@ -73,17 +73,17 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     defer alloc.free(baseStorage);
     const baseRows = try alloc.alloc([]const u64, base);
     defer alloc.free(baseRows);
-    for (baseStorage, baseRows, 0..) |*cells, *row, i| {
-        cells.* = .{ @intCast(i), @intCast(i) };
+    for (baseStorage, baseRows, 0..) |*cells, *row, rowIndex| {
+        cells.* = .{ @intCast(rowIndex), @intCast(rowIndex) };
         row.* = &cells.*;
     }
 
-    const batchStorage = try alloc.alloc([2]u64, m);
+    const batchStorage = try alloc.alloc([2]u64, metrics);
     defer alloc.free(batchStorage);
-    const batch = try alloc.alloc([]const u64, m);
+    const batch = try alloc.alloc([]const u64, metrics);
     defer alloc.free(batch);
-    for (batchStorage, batch, 0..) |*cells, *row, i| {
-        const primaryKey: u64 = @intCast(base + i);
+    for (batchStorage, batch, 0..) |*cells, *row, rowIndex| {
+        const primaryKey: u64 = @intCast(base + rowIndex);
         cells.* = .{ primaryKey, primaryKey };
         row.* = &cells.*;
     }
@@ -102,10 +102,10 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     const aPfBefore = airdb.pageFaults();
     const bulkStart = nowNs(io);
     {
-        var w = try databaseA.beginWrite();
-        const newCatalog = try bulk.bulkAppendOrInsert(&w, w.newRoot, batch);
-        w.setRoot(newCatalog);
-        _ = try w.commit();
+        var writeTransaction = try databaseA.beginWrite();
+        const newCatalog = try bulk.bulkAppendOrInsert(&writeTransaction, writeTransaction.newRoot, batch);
+        writeTransaction.setRoot(newCatalog);
+        _ = try writeTransaction.commit();
     }
     const bulkNs: u64 = @intCast(nowNs(io) - bulkStart);
     const aPfAfter = airdb.pageFaults();
@@ -120,18 +120,18 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     const bPfBefore = airdb.pageFaults();
     const rowwiseStart = nowNs(io);
     var inserted: usize = 0;
-    while (inserted < m) {
-        const thisBatch = @min(batchSize, m - inserted);
-        var w = try databaseB.beginWrite();
+    while (inserted < metrics) {
+        const thisBatch = @min(batchSize, metrics - inserted);
+        var writeTransaction = try databaseB.beginWrite();
         var catalogRef: Reference = databaseB.activeRoot; // reload the committed catalog ref
-        var j: usize = 0;
-        while (j < thisBatch) : (j += 1) {
-            const primaryKey: u64 = base + inserted + j;
-            const r = try rows.insert(&w, catalogRef, &.{ primaryKey, primaryKey });
-            catalogRef = r.catalogRef;
+        var innerIndex: usize = 0;
+        while (innerIndex < thisBatch) : (innerIndex += 1) {
+            const primaryKey: u64 = base + inserted + innerIndex;
+            const result = try rows.insert(&writeTransaction, catalogRef, &.{ primaryKey, primaryKey });
+            catalogRef = result.catalogRef;
         }
-        w.setRoot(catalogRef);
-        _ = try w.commit();
+        writeTransaction.setRoot(catalogRef);
+        _ = try writeTransaction.commit();
         inserted += thisBatch;
     }
     const rowwiseNs: u64 = @intCast(nowNs(io) - rowwiseStart);
@@ -147,22 +147,22 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         defer databaseC.deinit();
         var smallStorage: [4][2]u64 = undefined;
         var smallRows: [4][]const u64 = undefined;
-        for (&smallStorage, &smallRows, 0..) |*cells, *row, i| {
-            cells.* = .{ @intCast(i), @intCast(i) };
+        for (&smallStorage, &smallRows, 0..) |*cells, *row, rowIndex| {
+            cells.* = .{ @intCast(rowIndex), @intCast(rowIndex) };
             row.* = &cells.*;
         }
         try seedBase(&databaseC, &smallRows);
 
         // primaryKeys 100, 102, 101: above the max but NOT strictly ascending.
         const scattered = [_][]const u64{ &.{ 100, 100 }, &.{ 102, 102 }, &.{ 101, 101 } };
-        var w = try databaseC.beginWrite();
-        if (bulk.bulkAppend(&w, w.newRoot, &scattered)) |_| {
+        var writeTransaction = try databaseC.beginWrite();
+        if (bulk.bulkAppend(&writeTransaction, writeTransaction.newRoot, &scattered)) |_| {
             // Unexpectedly appendable: leave fallbackOk false.
-        } else |e| switch (e) {
+        } else |err| switch (err) {
             error.NotAppendable => fallbackOk = true,
-            else => return e,
+            else => return err,
         }
-        w.deinit(); // abort: nothing should have been written anyway
+        writeTransaction.deinit(); // abort: nothing should have been written anyway
     }
 
     const speedup: f64 = if (bulkNs == 0)
@@ -182,7 +182,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
             bulkCommits,
             rowwiseCommits,
             base,
-            m,
+            metrics,
             fallbackOk,
         },
     );
@@ -192,7 +192,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
 
     return .{
         .name = name,
-        .ops = m,
+        .ops = metrics,
         .wallNs = bulkNs,
         .p50Ns = 0,
         .p99Ns = 0,

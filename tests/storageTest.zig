@@ -18,26 +18,26 @@ test "recovery survives a corrupted header by falling back to the best valid slo
     {
         var database = try airdb.Database.create(testing.allocator, path);
         defer database.deinit();
-        var w = try database.beginWrite();
-        const a = try w.alloc(8);
-        @memcpy(a.bytes, "GOODDATA");
-        w.setRoot(a.ref);
-        _ = try w.commit();
+        var writeTransaction = try database.beginWrite();
+        const allocation = try writeTransaction.alloc(8);
+        @memcpy(allocation.bytes, "GOODDATA");
+        writeTransaction.setRoot(allocation.ref);
+        _ = try writeTransaction.commit();
     }
     { // scramble activeSlot (offset 13) and the header crc (offset 28) on disk, leaving slots intact
         const io = std.Io.Threaded.global_single_threaded.io();
-        var f = try std.Io.Dir.openFileAbsolute(io, path, .{ .mode = .read_write });
-        defer f.close(io);
-        try f.writePositionalAll(io, &[_]u8{0xAB}, 13);
-        try f.writePositionalAll(io, &[_]u8{ 0, 0, 0, 0 }, 28);
-        try f.sync(io);
+        var file = try std.Io.Dir.openFileAbsolute(io, path, .{ .mode = .read_write });
+        defer file.close(io);
+        try file.writePositionalAll(io, &[_]u8{0xAB}, 13);
+        try file.writePositionalAll(io, &[_]u8{ 0, 0, 0, 0 }, 28);
+        try file.sync(io);
     }
     {
         var database = try airdb.Database.open(testing.allocator, path);
         defer database.deinit();
-        var r = try database.beginRead();
-        try testing.expectEqualStrings("GOODDATA", try r.deref(r.root(), 8));
-        r.end();
+        var readTransaction = try database.beginRead();
+        try testing.expectEqualStrings("GOODDATA", try readTransaction.deref(readTransaction.root(), 8));
+        readTransaction.end();
     }
 }
 
@@ -49,31 +49,31 @@ test "data-barrier flush failure during commit leaves the prior version intact" 
     { // commit v1 with a real syncer
         var database = try airdb.Database.create(testing.allocator, path);
         defer database.deinit();
-        var w = try database.beginWrite();
-        const a = try w.alloc(4);
-        @memcpy(a.bytes, "v1__");
-        w.setRoot(a.ref);
-        _ = try w.commit();
+        var writeTransaction = try database.beginWrite();
+        const allocation = try writeTransaction.alloc(4);
+        @memcpy(allocation.bytes, "v1__");
+        writeTransaction.setRoot(allocation.ref);
+        _ = try writeTransaction.commit();
     }
     { // attempt v2; fail the FIRST flush of this session (the data barrier)
         var fsync = airdb.FailingSyncer{ .failOn = 1 };
         var database = try airdb.Database.openWith(testing.allocator, path, fsync.any());
         defer database.deinit();
-        var w = try database.beginWrite();
-        const b = try w.alloc(4);
-        @memcpy(b.bytes, "v2!!");
-        w.setRoot(b.ref);
+        var writeTransaction = try database.beginWrite();
+        const allocation = try writeTransaction.alloc(4);
+        @memcpy(allocation.bytes, "v2!!");
+        writeTransaction.setRoot(allocation.ref);
         const preVersion = database.activeVersion;
         const preRoot = database.activeRoot;
-        try testing.expectError(error.Durability, w.commit());
+        try testing.expectError(error.Durability, writeTransaction.commit());
         try testing.expectEqual(preVersion, database.activeVersion);
         try testing.expectEqual(preRoot, database.activeRoot);
     }
     { // reopen with a real syncer: must still see v1
         var database = try airdb.Database.open(testing.allocator, path);
         defer database.deinit();
-        var r = try database.beginRead();
-        try testing.expectEqualStrings("v1__", try r.deref(r.root(), 4));
+        var readTransaction = try database.beginRead();
+        try testing.expectEqualStrings("v1__", try readTransaction.deref(readTransaction.root(), 4));
     }
 }
 
@@ -85,32 +85,32 @@ test "header-flush failure during commit does not publish v2" {
     {
         var database = try airdb.Database.create(testing.allocator, path);
         defer database.deinit();
-        var w = try database.beginWrite();
-        const a = try w.alloc(4);
-        @memcpy(a.bytes, "v1__");
-        w.setRoot(a.ref);
-        _ = try w.commit();
+        var writeTransaction = try database.beginWrite();
+        const allocation = try writeTransaction.alloc(4);
+        @memcpy(allocation.bytes, "v1__");
+        writeTransaction.setRoot(allocation.ref);
+        _ = try writeTransaction.commit();
     }
     {
         // failOn = 2: data barrier (1) succeeds, header flush (2) fails -> revert, no publish.
         var fsync = airdb.FailingSyncer{ .failOn = 2 };
         var database = try airdb.Database.openWith(testing.allocator, path, fsync.any());
         defer database.deinit();
-        var w = try database.beginWrite();
-        const b = try w.alloc(4);
-        @memcpy(b.bytes, "v2!!");
-        w.setRoot(b.ref);
+        var writeTransaction = try database.beginWrite();
+        const allocation = try writeTransaction.alloc(4);
+        @memcpy(allocation.bytes, "v2!!");
+        writeTransaction.setRoot(allocation.ref);
         const preVersion = database.activeVersion;
         const preRoot = database.activeRoot;
-        try testing.expectError(error.Durability, w.commit());
+        try testing.expectError(error.Durability, writeTransaction.commit());
         try testing.expectEqual(preVersion, database.activeVersion);
         try testing.expectEqual(preRoot, database.activeRoot);
     }
     {
         var database = try airdb.Database.open(testing.allocator, path);
         defer database.deinit();
-        var r = try database.beginRead();
-        try testing.expectEqualStrings("v1__", try r.deref(r.root(), 4));
+        var readTransaction = try database.beginRead();
+        try testing.expectEqualStrings("v1__", try readTransaction.deref(readTransaction.root(), 4));
     }
 }
 
@@ -129,10 +129,10 @@ test "opening a file with bad magic fails cleanly" {
         // Overwrite the first 8 bytes (the magic) with garbage using Zig 0.16
         // positional writes (file.writePositionalAll), which map to pwrite syscall.
         const io = std.Io.Threaded.global_single_threaded.io();
-        const f = try std.Io.Dir.openFileAbsolute(io, path, .{ .mode = .read_write });
-        defer f.close(io);
-        try f.writePositionalAll(io, &[_]u8{ 0xDE, 0xAD, 0xBE, 0xEF, 0, 0, 0, 0 }, 0);
-        try f.sync(io);
+        const file = try std.Io.Dir.openFileAbsolute(io, path, .{ .mode = .read_write });
+        defer file.close(io);
+        try file.writePositionalAll(io, &[_]u8{ 0xDE, 0xAD, 0xBE, 0xEF, 0, 0, 0, 0 }, 0);
+        try file.sync(io);
     }
     try testing.expectError(error.BadMagic, airdb.Database.open(testing.allocator, path));
 }
@@ -147,23 +147,23 @@ test "second commit supersedes the first on reopen" {
         var database = try airdb.Database.create(testing.allocator, path);
         defer database.deinit();
 
-        var w1 = try database.beginWrite();
-        const a = try w1.alloc(4);
-        @memcpy(a.bytes, "v1__");
-        w1.setRoot(a.ref);
-        _ = try w1.commit();
+        var writeTransaction1 = try database.beginWrite();
+        const allocation = try writeTransaction1.alloc(4);
+        @memcpy(allocation.bytes, "v1__");
+        writeTransaction1.setRoot(allocation.ref);
+        _ = try writeTransaction1.commit();
 
-        var w2 = try database.beginWrite();
-        const b = try w2.alloc(4);
-        @memcpy(b.bytes, "v2!!");
-        w2.setRoot(b.ref);
-        _ = try w2.commit();
+        var writeTransaction2 = try database.beginWrite();
+        const allocationB = try writeTransaction2.alloc(4);
+        @memcpy(allocationB.bytes, "v2!!");
+        writeTransaction2.setRoot(allocationB.ref);
+        _ = try writeTransaction2.commit();
     }
     {
         var database = try airdb.Database.open(testing.allocator, path);
         defer database.deinit();
-        var r = try database.beginRead();
-        try testing.expectEqualStrings("v2!!", try r.deref(r.root(), 4));
+        var readTransaction = try database.beginRead();
+        try testing.expectEqualStrings("v2!!", try readTransaction.deref(readTransaction.root(), 4));
     }
 }
 
@@ -176,31 +176,31 @@ test "a reader pinned to an old version still reads its data after the writer re
     defer database.deinit();
 
     {
-        var w = try database.beginWrite();
-        const a = try w.alloc(8);
-        @memcpy(a.bytes, "AAAAAAAA");
-        w.setRoot(a.ref);
-        _ = try w.commit();
+        var writeTransaction = try database.beginWrite();
+        const allocation = try writeTransaction.alloc(8);
+        @memcpy(allocation.bytes, "AAAAAAAA");
+        writeTransaction.setRoot(allocation.ref);
+        _ = try writeTransaction.commit();
     }
 
     var reader = try database.beginRead();
     try testing.expectEqualStrings("AAAAAAAA", try reader.deref(reader.root(), 8));
 
     {
-        var w = try database.beginWrite();
-        const b = try w.alloc(8);
-        @memcpy(b.bytes, "BBBBBBBB");
-        try w.free(reader.root(), 8);
-        w.setRoot(b.ref);
-        _ = try w.commit();
+        var writeTransaction = try database.beginWrite();
+        const allocation = try writeTransaction.alloc(8);
+        @memcpy(allocation.bytes, "BBBBBBBB");
+        try writeTransaction.free(reader.root(), 8);
+        writeTransaction.setRoot(allocation.ref);
+        _ = try writeTransaction.commit();
     }
 
     try testing.expectEqualStrings("AAAAAAAA", try reader.deref(reader.root(), 8));
     reader.end();
 
-    var r2 = try database.beginRead();
-    try testing.expectEqualStrings("BBBBBBBB", try r2.deref(r2.root(), 8));
-    r2.end();
+    var readTransaction2 = try database.beginRead();
+    try testing.expectEqualStrings("BBBBBBBB", try readTransaction2.deref(readTransaction2.root(), 8));
+    readTransaction2.end();
 }
 
 test "freed space is reused only after the pinning reader releases" {
@@ -212,40 +212,40 @@ test "freed space is reused only after the pinning reader releases" {
     defer database.deinit();
 
     {
-        var w = try database.beginWrite();
-        const a = try w.alloc(8);
-        @memcpy(a.bytes, "AAAAAAAA");
-        w.setRoot(a.ref);
-        _ = try w.commit();
+        var writeTransaction = try database.beginWrite();
+        const allocation = try writeTransaction.alloc(8);
+        @memcpy(allocation.bytes, "AAAAAAAA");
+        writeTransaction.setRoot(allocation.ref);
+        _ = try writeTransaction.commit();
     }
     var reader = try database.beginRead();
     const oldRoot = reader.root();
 
     {
-        var w = try database.beginWrite();
-        const b = try w.alloc(8);
-        @memcpy(b.bytes, "BBBBBBBB");
-        try w.free(oldRoot, 8);
-        w.setRoot(b.ref);
-        _ = try w.commit();
+        var writeTransaction = try database.beginWrite();
+        const allocation = try writeTransaction.alloc(8);
+        @memcpy(allocation.bytes, "BBBBBBBB");
+        try writeTransaction.free(oldRoot, 8);
+        writeTransaction.setRoot(allocation.ref);
+        _ = try writeTransaction.commit();
     }
 
     // Reader still pinned: a fresh allocation must NOT land on oldRoot yet.
     {
-        var w = try database.beginWrite();
-        const c = try w.alloc(8);
-        try testing.expect(c.ref != oldRoot);
-        w.deinit(); // abandon the probe (no commit)
+        var writeTransaction = try database.beginWrite();
+        const allocation = try writeTransaction.alloc(8);
+        try testing.expect(allocation.ref != oldRoot);
+        writeTransaction.deinit(); // abandon the probe (no commit)
     }
 
     reader.end(); // horizon advances past the freed version
 
     // Now a fresh allocation may reuse oldRoot.
     {
-        var w = try database.beginWrite();
-        const d = try w.alloc(8);
-        try testing.expectEqual(oldRoot, d.ref);
-        w.deinit();
+        var writeTransaction = try database.beginWrite();
+        const allocation = try writeTransaction.alloc(8);
+        try testing.expectEqual(oldRoot, allocation.ref);
+        writeTransaction.deinit();
     }
 }
 
@@ -257,29 +257,29 @@ test "after a data-barrier flush failure, the reopened database passes verifyInt
     {
         var database = try airdb.Database.create(testing.allocator, path);
         defer database.deinit();
-        var w = try database.beginWrite();
-        const a = try w.alloc(8);
-        @memcpy(a.bytes, "BASELINE");
-        w.setRoot(a.ref);
-        _ = try w.commit();
+        var writeTransaction = try database.beginWrite();
+        const allocation = try writeTransaction.alloc(8);
+        @memcpy(allocation.bytes, "BASELINE");
+        writeTransaction.setRoot(allocation.ref);
+        _ = try writeTransaction.commit();
     }
     {
         var fsync = airdb.FailingSyncer{ .failOn = 1 }; // fail the data barrier
         var database = try airdb.Database.openWith(testing.allocator, path, fsync.any());
         defer database.deinit();
-        var w = try database.beginWrite();
-        const b = try w.alloc(8);
-        @memcpy(b.bytes, "NEWERVAL");
-        w.setRoot(b.ref);
-        try testing.expectError(error.Durability, w.commit());
+        var writeTransaction = try database.beginWrite();
+        const allocation = try writeTransaction.alloc(8);
+        @memcpy(allocation.bytes, "NEWERVAL");
+        writeTransaction.setRoot(allocation.ref);
+        try testing.expectError(error.Durability, writeTransaction.commit());
     }
     {
         var database = try airdb.Database.open(testing.allocator, path);
         defer database.deinit();
         try airdb.verification.verifyIntegrity(&database);
-        var r = try database.beginRead();
-        try testing.expectEqualStrings("BASELINE", try r.deref(r.root(), 8));
-        r.end();
+        var readTransaction = try database.beginRead();
+        try testing.expectEqualStrings("BASELINE", try readTransaction.deref(readTransaction.root(), 8));
+        readTransaction.end();
     }
 }
 
@@ -291,29 +291,29 @@ test "after a header-flush failure, the reopened database passes verifyIntegrity
     {
         var database = try airdb.Database.create(testing.allocator, path);
         defer database.deinit();
-        var w = try database.beginWrite();
-        const a = try w.alloc(8);
-        @memcpy(a.bytes, "BASELINE");
-        w.setRoot(a.ref);
-        _ = try w.commit();
+        var writeTransaction = try database.beginWrite();
+        const allocation = try writeTransaction.alloc(8);
+        @memcpy(allocation.bytes, "BASELINE");
+        writeTransaction.setRoot(allocation.ref);
+        _ = try writeTransaction.commit();
     }
     {
         var fsync = airdb.FailingSyncer{ .failOn = 2 }; // data barrier ok, header flush fails
         var database = try airdb.Database.openWith(testing.allocator, path, fsync.any());
         defer database.deinit();
-        var w = try database.beginWrite();
-        const b = try w.alloc(8);
-        @memcpy(b.bytes, "NEWERVAL");
-        w.setRoot(b.ref);
-        try testing.expectError(error.Durability, w.commit());
+        var writeTransaction = try database.beginWrite();
+        const allocation = try writeTransaction.alloc(8);
+        @memcpy(allocation.bytes, "NEWERVAL");
+        writeTransaction.setRoot(allocation.ref);
+        try testing.expectError(error.Durability, writeTransaction.commit());
     }
     {
         var database = try airdb.Database.open(testing.allocator, path);
         defer database.deinit();
         try airdb.verification.verifyIntegrity(&database);
-        var r = try database.beginRead();
-        try testing.expectEqualStrings("BASELINE", try r.deref(r.root(), 8));
-        r.end();
+        var readTransaction = try database.beginRead();
+        try testing.expectEqualStrings("BASELINE", try readTransaction.deref(readTransaction.root(), 8));
+        readTransaction.end();
     }
 }
 
@@ -322,51 +322,51 @@ test "a writer does not reuse space a reader in another instance still pins" {
     defer tmp.cleanup();
     const path = try tmpFilePath(testing.allocator, &tmp, "xpin.airdb");
     defer testing.allocator.free(path);
-    var a = try airdb.Database.create(testing.allocator, path);
-    defer a.deinit();
+    var databaseA = try airdb.Database.create(testing.allocator, path);
+    defer databaseA.deinit();
     {
-        var w = try a.beginWrite();
-        const x = try w.alloc(8);
-        @memcpy(x.bytes, "AAAAAAAA");
-        w.setRoot(x.ref);
-        _ = try w.commit();
+        var writeTransaction = try databaseA.beginWrite();
+        const allocation = try writeTransaction.alloc(8);
+        @memcpy(allocation.bytes, "AAAAAAAA");
+        writeTransaction.setRoot(allocation.ref);
+        _ = try writeTransaction.commit();
     }
 
-    var b = try airdb.Database.open(testing.allocator, path);
-    defer b.deinit();
-    var rb = try b.beginRead(); // b pins the current version in its participant slot
-    const pinnedRoot = rb.root();
-    try testing.expectEqualStrings("AAAAAAAA", try rb.deref(pinnedRoot, 8));
+    var databaseB = try airdb.Database.open(testing.allocator, path);
+    defer databaseB.deinit();
+    var readTransactionB = try databaseB.beginRead(); // b pins the current version in its participant slot
+    const pinnedRoot = readTransactionB.root();
+    try testing.expectEqualStrings("AAAAAAAA", try readTransactionB.deref(pinnedRoot, 8));
 
     // a frees the old root at the new version and commits new data.
     {
-        var w = try a.beginWrite();
-        const y = try w.alloc(8);
-        @memcpy(y.bytes, "BBBBBBBB");
-        try w.free(pinnedRoot, 8);
-        w.setRoot(y.ref);
-        _ = try w.commit();
+        var writeTransaction = try databaseA.beginWrite();
+        const allocation = try writeTransaction.alloc(8);
+        @memcpy(allocation.bytes, "BBBBBBBB");
+        try writeTransaction.free(pinnedRoot, 8);
+        writeTransaction.setRoot(allocation.ref);
+        _ = try writeTransaction.commit();
     }
 
     // a tries another allocation: the freed extent must NOT be reused, because b still
     // pins a version below the freeing-version (global horizon respects b's reader).
     {
-        var w = try a.beginWrite();
-        const c = try w.alloc(8);
-        try testing.expect(c.ref != pinnedRoot);
-        w.deinit();
+        var writeTransaction = try databaseA.beginWrite();
+        const allocation = try writeTransaction.alloc(8);
+        try testing.expect(allocation.ref != pinnedRoot);
+        writeTransaction.deinit();
     }
 
     // b's data is intact (never overwritten).
-    try testing.expectEqualStrings("AAAAAAAA", try rb.deref(pinnedRoot, 8));
-    rb.end(); // b publishes the sentinel -> the freed extent becomes reclaimable
+    try testing.expectEqualStrings("AAAAAAAA", try readTransactionB.deref(pinnedRoot, 8));
+    readTransactionB.end(); // b publishes the sentinel -> the freed extent becomes reclaimable
 
     // Now a may reuse the freed extent.
     {
-        var w = try a.beginWrite();
-        const d = try w.alloc(8);
-        try testing.expectEqual(pinnedRoot, d.ref);
-        w.deinit();
+        var writeTransaction = try databaseA.beginWrite();
+        const allocation = try writeTransaction.alloc(8);
+        try testing.expectEqual(pinnedRoot, allocation.ref);
+        writeTransaction.deinit();
     }
 }
 
@@ -375,40 +375,40 @@ test "an abandoned writer releases the lock and never publishes" {
     defer tmp.cleanup();
     const path = try tmpFilePath(testing.allocator, &tmp, "abandon.airdb");
     defer testing.allocator.free(path);
-    var a = try airdb.Database.create(testing.allocator, path);
-    defer a.deinit();
-    var b = try airdb.Database.open(testing.allocator, path);
-    defer b.deinit();
+    var databaseA = try airdb.Database.create(testing.allocator, path);
+    defer databaseA.deinit();
+    var databaseB = try airdb.Database.open(testing.allocator, path);
+    defer databaseB.deinit();
 
     { // baseline commit via a
-        var w = try a.beginWrite();
-        const x = try w.alloc(8);
-        @memcpy(x.bytes, "BASELINE");
-        w.setRoot(x.ref);
-        _ = try w.commit();
+        var writeTransaction = try databaseA.beginWrite();
+        const allocation = try writeTransaction.alloc(8);
+        @memcpy(allocation.bytes, "BASELINE");
+        writeTransaction.setRoot(allocation.ref);
+        _ = try writeTransaction.commit();
     }
 
     { // a begins a write but ABANDONS it (deinit without commit): releases lock, no publish
-        var w = try a.beginWrite();
-        const x = try w.alloc(8);
-        @memcpy(x.bytes, "DROPPED!");
-        w.setRoot(x.ref);
-        w.deinit();
+        var writeTransaction = try databaseA.beginWrite();
+        const allocation = try writeTransaction.alloc(8);
+        @memcpy(allocation.bytes, "DROPPED!");
+        writeTransaction.setRoot(allocation.ref);
+        writeTransaction.deinit();
     }
 
     // b can now acquire the write lock (proves the abandoned writer released it) and commit.
     {
-        var w = try b.beginWrite();
-        const y = try w.alloc(8);
-        @memcpy(y.bytes, "SECONDWR");
-        w.setRoot(y.ref);
-        _ = try w.commit();
+        var writeTransaction = try databaseB.beginWrite();
+        const allocation = try writeTransaction.alloc(8);
+        @memcpy(allocation.bytes, "SECONDWR");
+        writeTransaction.setRoot(allocation.ref);
+        _ = try writeTransaction.commit();
     }
 
     // a refreshes on read and sees SECONDWR, never the abandoned DROPPED! value.
-    var r = try a.beginRead();
-    try testing.expectEqualStrings("SECONDWR", try r.deref(r.root(), 8));
-    r.end();
+    var readTransaction = try databaseA.beginRead();
+    try testing.expectEqualStrings("SECONDWR", try readTransaction.deref(readTransaction.root(), 8));
+    readTransaction.end();
 }
 
 test "a database grown well past the initial size reopens and verifies" {
@@ -419,24 +419,24 @@ test "a database grown well past the initial size reopens and verifies" {
     {
         var database = try airdb.Database.create(testing.allocator, path);
         defer database.deinit();
-        var w = try database.beginWrite();
-        var i: usize = 0;
+        var writeTransaction = try database.beginWrite();
+        var index: usize = 0;
         var root: u64 = 0;
-        while (i < 600) : (i += 1) { // ~2.4 MiB of 4 KiB nodes, forces multiple grows past 1 MiB
-            const a = try w.alloc(4096);
-            @memset(a.bytes, @intCast(i & 0xff));
-            root = a.ref;
+        while (index < 600) : (index += 1) { // ~2.4 MiB of 4 KiB nodes, forces multiple grows past 1 MiB
+            const allocation = try writeTransaction.alloc(4096);
+            @memset(allocation.bytes, @intCast(index & 0xff));
+            root = allocation.ref;
         }
-        w.setRoot(root);
-        _ = try w.commit();
+        writeTransaction.setRoot(root);
+        _ = try writeTransaction.commit();
     }
     {
         var database = try airdb.Database.open(testing.allocator, path);
         defer database.deinit();
         try airdb.verification.verifyIntegrity(&database);
-        var r = try database.beginRead();
-        const got = try r.deref(r.root(), 4096);
+        var readTransaction = try database.beginRead();
+        const got = try readTransaction.deref(readTransaction.root(), 4096);
         try testing.expectEqual(@as(u8, @intCast(599 & 0xff)), got[0]);
-        r.end();
+        readTransaction.end();
     }
 }

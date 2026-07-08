@@ -16,7 +16,7 @@ thread-safe handle layer is future work.
 
 ## Single writer
 
-One write transaction at a time across all processes, serialized by the coord
+One write transaction at a time across all processes, serialized by the coordination
 file lock. `beginWrite` blocks; `beginWriteTry` returns `error.WouldBlock`.
 Writer throughput is therefore one commit pipeline; batch with explicit
 transactions or bulk operations rather than many small commits.
@@ -31,7 +31,7 @@ newer one. Ship a matched engine with your app.
 
 - One u64 primary key per type (property 0). Composite or string keys are
   future work at a layer above (secondary byte-keyed indexes exist as
-  `bindex`).
+  `byteKeyIndex`).
 - Up to 256 types, 256 properties per type. Properties are positional; names
   live in whatever binding layer sits on top.
 - `updateTyped` carries collection properties through unchanged; lists, sets,
@@ -70,7 +70,7 @@ newer one. Ship a matched engine with your app.
 - At most 64 simultaneously attached Database instances per database; the 65th
   open fails with TooManyAttachments rather than degrade to reads whose pins
   no writer can see.
-- The coord file must live next to the data file on the same filesystem.
+- The coordination file must live next to the data file on the same filesystem.
 - Advisory locks: a process that bypasses airdb and writes the file directly
   defeats every guarantee.
 

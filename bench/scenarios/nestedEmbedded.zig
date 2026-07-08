@@ -1,5 +1,5 @@
 // nested_embedded -- cost of embedded-WITHIN-embedded objects at nesting depth
-// 1, 2 and 3, to expose the depth-cost curve of the typedir embedded path.
+// 1, 2 and 3, to expose the depth-cost curve of the typeDirectory embedded path.
 //
 // An embedded child can itself own an embedded child (the engine places no
 // nesting cap: insertEmbedded works on any owner type that has a cascade to-one
@@ -31,7 +31,7 @@ const harness = @import("../harness.zig");
 
 const Io = std.Io;
 const catalog = airdb.catalog;
-const typedir = airdb.typedir;
+const typeDirectory = airdb.typeDirectory;
 const typeRouting = airdb.typeRouting;
 const Value = catalog.Value;
 
@@ -53,9 +53,9 @@ const depthStride: u64 = 1_000_000;
 // A 4-type chain: types 0..2 carry a cascade to-one link to the next type;
 // type 3 is the leaf. Type 0 is the non-embedded root, types 1..3 are embedded.
 const chainSchema = [_][]const catalog.PropertyDefinition{
-    &.{ .{ .kind = .int }, .{ .kind = .link, .linkTarget = 1, .delRule = .cascade } },
-    &.{ .{ .kind = .int }, .{ .kind = .link, .linkTarget = 2, .delRule = .cascade } },
-    &.{ .{ .kind = .int }, .{ .kind = .link, .linkTarget = 3, .delRule = .cascade } },
+    &.{ .{ .kind = .int }, .{ .kind = .link, .linkTarget = 1, .deletionRule = .cascade } },
+    &.{ .{ .kind = .int }, .{ .kind = .link, .linkTarget = 2, .deletionRule = .cascade } },
+    &.{ .{ .kind = .int }, .{ .kind = .link, .linkTarget = 3, .deletionRule = .cascade } },
     &.{ .{ .kind = .int }, .{ .kind = .int } },
 };
 const chainEmbedded = [_]bool{ false, true, true, true };
@@ -75,7 +75,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     const alloc = ctx.alloc;
     const io = sysIo();
 
-    const rows = @min(ctx.n, maxRows);
+    const rows = @min(ctx.rowCount, maxRows);
 
     const path = try harness.scratchPath(ctx.*, name ++ ".airdb");
     defer alloc.free(path);
@@ -85,10 +85,10 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     errdefer database.deinit();
 
     {
-        var w = try database.beginWrite();
-        const dir = try typedir.createTypes(&w, &chainSchema, &chainEmbedded);
-        w.setRoot(dir);
-        _ = try w.commit();
+        var writeTransaction = try database.beginWrite();
+        const dir = try typeDirectory.createTypes(&writeTransaction, &chainSchema, &chainEmbedded);
+        writeTransaction.setRoot(dir);
+        _ = try writeTransaction.commit();
     }
 
     var combined = harness.Latencies.init();
@@ -101,9 +101,9 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     var totalNs: u64 = 0;
     var totalBuilt: u64 = 0;
 
-    var d: usize = 1;
-    while (d <= maxDepth) : (d += 1) {
-        const keyBase: u64 = @as(u64, @intCast(d)) * depthStride;
+    var payload: usize = 1;
+    while (payload <= maxDepth) : (payload += 1) {
+        const keyBase: u64 = @as(u64, @intCast(payload)) * depthStride;
 
         var createLat = harness.Latencies.init();
         defer createLat.deinit(alloc);
@@ -116,30 +116,30 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
             var inserted: usize = 0;
             while (inserted < rows) {
                 const thisBatch = @min(batchSize, rows - inserted);
-                var w = try database.beginWrite();
-                var dir = w.newRoot;
-                var j: usize = 0;
-                while (j < thisBatch) : (j += 1) {
-                    const key: u64 = keyBase + inserted + j;
-                    const t0 = nowNs(io);
+                var writeTransaction = try database.beginWrite();
+                var dir = writeTransaction.newRoot;
+                var innerIndex: usize = 0;
+                while (innerIndex < thisBatch) : (innerIndex += 1) {
+                    const key: u64 = keyBase + inserted + innerIndex;
+                    const startNs = nowNs(io);
                     // Root row of type 0.
-                    dir = (try typeRouting.insert(&w, dir, 0, &.{ .{ .int = key }, .{ .link = null } })).dir;
+                    dir = (try typeRouting.insert(&writeTransaction, dir, 0, &.{ .{ .int = key }, .{ .link = null } })).dir;
                     // Embedded levels 1..d. Each shares `key` in its own primaryKey space.
                     var level: u16 = 0;
-                    while (level < d) : (level += 1) {
+                    while (level < payload) : (level += 1) {
                         const leaf = level + 1 == maxDepth;
                         const childVals: [2]Value = if (leaf)
                             .{ .{ .int = key }, .{ .int = key *% 2654435761 } }
                         else
                             .{ .{ .int = key }, .{ .link = null } };
-                        dir = try typedir.insertEmbedded(&w, dir, level, key, linkProperty, &childVals);
+                        dir = try typeDirectory.insertEmbedded(&writeTransaction, dir, level, key, linkProperty, &childVals);
                     }
-                    const dt: u64 = @intCast(nowNs(io) - t0);
-                    try createLat.add(alloc, dt);
-                    try combined.add(alloc, dt);
+                    const elapsedNs: u64 = @intCast(nowNs(io) - startNs);
+                    try createLat.add(alloc, elapsedNs);
+                    try combined.add(alloc, elapsedNs);
                 }
-                w.setRoot(dir);
-                _ = try w.commit();
+                writeTransaction.setRoot(dir);
+                _ = try writeTransaction.commit();
                 inserted += thisBatch;
             }
             totalNs += @intCast(nowNs(io) - phaseStart);
@@ -148,27 +148,27 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         // --- READ: full descent through all d levels via getLinked ------------
         {
             const phaseStart = nowNs(io);
-            var r = try database.beginRead();
-            const dir = r.root();
+            var readTransaction = try database.beginRead();
+            const dir = readTransaction.root();
             var out: [2]Value = undefined;
-            var i: usize = 0;
-            while (i < rows) : (i += 1) {
-                const key: u64 = keyBase + i;
-                const t0 = nowNs(io);
+            var index: usize = 0;
+            while (index < rows) : (index += 1) {
+                const key: u64 = keyBase + index;
+                const startNs = nowNs(io);
                 var level: u16 = 0;
-                while (level < d) : (level += 1) {
-                    _ = try typeRouting.getLinked(&r, dir, level, key, linkProperty, &out);
+                while (level < payload) : (level += 1) {
+                    _ = try typeRouting.getLinked(&readTransaction, dir, level, key, linkProperty, &out);
                 }
-                const dt: u64 = @intCast(nowNs(io) - t0);
-                try readLat.add(alloc, dt);
-                try combined.add(alloc, dt);
+                const elapsedNs: u64 = @intCast(nowNs(io) - startNs);
+                try readLat.add(alloc, elapsedNs);
+                try combined.add(alloc, elapsedNs);
             }
-            r.end();
+            readTransaction.end();
             totalNs += @intCast(nowNs(io) - phaseStart);
         }
 
-        createP50Us[d - 1] = @as(f64, @floatFromInt(createLat.percentile(50))) / 1000.0;
-        readP50Us[d - 1] = @as(f64, @floatFromInt(readLat.percentile(50))) / 1000.0;
+        createP50Us[payload - 1] = @as(f64, @floatFromInt(createLat.percentile(50))) / 1000.0;
+        readP50Us[payload - 1] = @as(f64, @floatFromInt(readLat.percentile(50))) / 1000.0;
         totalBuilt += rows;
     }
 
