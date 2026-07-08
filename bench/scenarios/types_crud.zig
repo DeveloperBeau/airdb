@@ -32,6 +32,7 @@ const Io = std.Io;
 const Ref = airdb.Ref;
 const catalog = airdb.catalog;
 const objects = airdb.objects;
+const rawRows = airdb.rows;
 const collections = airdb.collections;
 const links = airdb.links;
 const Value = catalog.Value;
@@ -242,7 +243,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
             var j: usize = 0;
             while (j < this_batch) : (j += 1) {
                 const pk: u64 = ((done + j) * delete_stride) % rows;
-                const ver = (try objects.getByPk(&w, cat, pk, &raw)) orelse continue;
+                const ver = (try rawRows.getByPk(&w, cat, pk, &raw)) orelse continue;
                 const t0 = nowNs(io);
                 const dres = try objects.deleteTyped(&w, cat, pk, ver);
                 const dt: u64 = @intCast(nowNs(io) - t0);

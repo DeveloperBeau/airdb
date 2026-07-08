@@ -20,7 +20,7 @@ const harness = @import("../harness.zig");
 const Io = std.Io;
 const Ref = airdb.Ref;
 const catalog = airdb.catalog;
-const objects = airdb.objects;
+const rows = airdb.rows;
 const query = airdb.query;
 
 pub const name = "lookup_query";
@@ -84,7 +84,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         var j: usize = 0;
         while (j < this_batch) : (j += 1) {
             const pk: u64 = inserted + j;
-            const r = try objects.insert(&w, cat, &.{ pk, pk % category_mod });
+            const r = try rows.insert(&w, cat, &.{ pk, pk % category_mod });
             cat = r.cat;
         }
         w.setRoot(cat);
@@ -113,7 +113,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         const pk: u64 = x % n_u64;
         var out: [2]u64 = undefined;
         const t0 = nowNs(io);
-        _ = try objects.getByPk(&rd, cat, pk, &out);
+        _ = try rows.getByPk(&rd, cat, pk, &out);
         const dt: u64 = @intCast(nowNs(io) - t0);
         try lat.add(alloc, dt);
     }

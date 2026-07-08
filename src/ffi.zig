@@ -14,7 +14,7 @@ const std = @import("std");
 const Db = @import("db.zig").Db;
 const WriteTxn = @import("db.zig").WriteTxn;
 const Ref = @import("ref.zig").Ref;
-const objects = @import("objects.zig");
+const rows = @import("rows.zig");
 const catalog = @import("catalog.zig");
 const bulk = @import("bulk.zig");
 
@@ -131,7 +131,7 @@ export fn airdb_insert(handle: ?*Database, vals: [*]const u64, len: usize) i64 {
     const self = handle orelse return AIRDB_E_GENERIC;
     if (len != self.prop_count) return AIRDB_E_BAD_ARGS;
     var w = self.db.beginWrite() catch return commitErrCode(self);
-    const r = objects.insert(&w, w.new_root, vals[0..len]) catch |e| {
+    const r = rows.insert(&w, w.new_root, vals[0..len]) catch |e| {
         w.deinit();
         return if (e == error.DuplicateKey) AIRDB_E_DUPLICATE else AIRDB_E_GENERIC;
     };
@@ -147,7 +147,7 @@ export fn airdb_get(handle: ?*Database, pk: u64, out: [*]u64, len: usize) i64 {
     if (len != self.prop_count) return AIRDB_E_BAD_ARGS;
     var r = self.db.beginRead() catch return AIRDB_E_GENERIC;
     defer r.end();
-    const ver = objects.getByPk(&r, r.root(), pk, out[0..len]) catch return AIRDB_E_GENERIC;
+    const ver = rows.getByPk(&r, r.root(), pk, out[0..len]) catch return AIRDB_E_GENERIC;
     return if (ver) |v| @intCast(v) else AIRDB_E_NOT_FOUND;
 }
 
@@ -169,7 +169,7 @@ export fn airdb_update(handle: ?*Database, vals: [*]const u64, len: usize) i64 {
     const pk = vals[0];
     var w = self.db.beginWrite() catch return commitErrCode(self);
     var cur: [MAX_PROPS]u64 = undefined;
-    const ver = objects.getByPk(&w, w.new_root, pk, cur[0..len]) catch {
+    const ver = rows.getByPk(&w, w.new_root, pk, cur[0..len]) catch {
         w.deinit();
         return AIRDB_E_GENERIC;
     };
@@ -177,7 +177,7 @@ export fn airdb_update(handle: ?*Database, vals: [*]const u64, len: usize) i64 {
         w.deinit();
         return AIRDB_E_NOT_FOUND;
     }
-    const res = objects.update(&w, w.new_root, pk, vals[0..len], ver.?) catch {
+    const res = rows.update(&w, w.new_root, pk, vals[0..len], ver.?) catch {
         w.deinit();
         return AIRDB_E_GENERIC;
     };
@@ -203,7 +203,7 @@ export fn airdb_delete(handle: ?*Database, pk: u64) i64 {
     const self = handle orelse return AIRDB_E_GENERIC;
     var w = self.db.beginWrite() catch return commitErrCode(self);
     var cur: [MAX_PROPS]u64 = undefined;
-    const ver = objects.getByPk(&w, w.new_root, pk, cur[0..self.prop_count]) catch {
+    const ver = rows.getByPk(&w, w.new_root, pk, cur[0..self.prop_count]) catch {
         w.deinit();
         return AIRDB_E_GENERIC;
     };
@@ -211,7 +211,7 @@ export fn airdb_delete(handle: ?*Database, pk: u64) i64 {
         w.deinit();
         return AIRDB_E_NOT_FOUND;
     }
-    const res = objects.delete(&w, w.new_root, pk, ver.?) catch {
+    const res = rows.delete(&w, w.new_root, pk, ver.?) catch {
         w.deinit();
         return AIRDB_E_GENERIC;
     };
@@ -375,7 +375,7 @@ export fn airdb_txn_insert(txn: ?*Txn, vals: [*]const u64, len: usize) i64 {
     const t = txn orelse return AIRDB_E_GENERIC;
     if (t.poisoned) return AIRDB_E_GENERIC;
     if (len != t.dbh.prop_count) return AIRDB_E_BAD_ARGS;
-    const r = objects.insert(&t.w, t.cat, vals[0..len]) catch |e| {
+    const r = rows.insert(&t.w, t.cat, vals[0..len]) catch |e| {
         if (e == error.DuplicateKey) return AIRDB_E_DUPLICATE; // pre-mutation check: txn stays usable
         t.poisoned = true; // mid-mutation failure: the batch may reference freed nodes
         return AIRDB_E_GENERIC;
@@ -393,9 +393,9 @@ export fn airdb_txn_update(txn: ?*Txn, vals: [*]const u64, len: usize) i64 {
     if (len != t.dbh.prop_count) return AIRDB_E_BAD_ARGS;
     const pk = vals[0];
     var cur: [MAX_PROPS]u64 = undefined;
-    const ver = objects.getByPk(&t.w, t.cat, pk, cur[0..len]) catch return AIRDB_E_GENERIC;
+    const ver = rows.getByPk(&t.w, t.cat, pk, cur[0..len]) catch return AIRDB_E_GENERIC;
     if (ver == null) return AIRDB_E_NOT_FOUND;
-    const res = objects.update(&t.w, t.cat, pk, vals[0..len], ver.?) catch {
+    const res = rows.update(&t.w, t.cat, pk, vals[0..len], ver.?) catch {
         t.poisoned = true; // mid-mutation failure
         return AIRDB_E_GENERIC;
     };
@@ -416,9 +416,9 @@ export fn airdb_txn_delete(txn: ?*Txn, pk: u64) i64 {
     const t = txn orelse return AIRDB_E_GENERIC;
     if (t.poisoned) return AIRDB_E_GENERIC;
     var cur: [MAX_PROPS]u64 = undefined;
-    const ver = objects.getByPk(&t.w, t.cat, pk, cur[0..t.dbh.prop_count]) catch return AIRDB_E_GENERIC;
+    const ver = rows.getByPk(&t.w, t.cat, pk, cur[0..t.dbh.prop_count]) catch return AIRDB_E_GENERIC;
     if (ver == null) return AIRDB_E_NOT_FOUND;
-    const res = objects.delete(&t.w, t.cat, pk, ver.?) catch {
+    const res = rows.delete(&t.w, t.cat, pk, ver.?) catch {
         t.poisoned = true; // mid-mutation failure
         return AIRDB_E_GENERIC;
     };

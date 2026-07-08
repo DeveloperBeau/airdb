@@ -1,5 +1,14 @@
+// The `txn` parameter of every operation is `anytype`: a comptime duck-typed
+// transaction capability, monomorphized at compile time (no vtable on this
+// B+tree hot path). Read-only operations need only
+//   deref(ref, len) ![]const u8
+// and mutating operations additionally require
+//   alloc(size) !Allocation, writableCopy(ref, len) !Allocation,
+//   free(ref, len) !void
+// where Allocation is arena.Allocation. WriteTxn is the production
+// implementation; ReadTxn satisfies the read-only subset.
+
 const std = @import("std");
-const WriteTxn = @import("db.zig").WriteTxn;
 const Ref = @import("ref.zig").Ref;
 const node = @import("column_node.zig");
 
@@ -25,7 +34,7 @@ const InnerView = node.InnerView;
 // ---------------------------------------------------------------------------
 
 /// Allocate an empty leaf column node and return its Ref.
-pub fn create(txn: *WriteTxn) !Ref {
+pub fn create(txn: anytype) !Ref {
     const a = try txn.alloc(leaf_node_size);
     _ = encodeLeaf(a.bytes, &.{});
     return a.ref;
@@ -93,7 +102,7 @@ fn getAt(txn: anytype, root: Ref, index: u64, depth: usize) !u64 {
 
 const AppendResult = struct { ref: Ref, count: u64, split: ?Ref, split_count: u64 };
 
-fn appendInto(txn: *WriteTxn, node_ref: Ref, value: u64, depth: usize) !AppendResult {
+fn appendInto(txn: anytype, node_ref: Ref, value: u64, depth: usize) !AppendResult {
     if (depth >= max_depth) return error.Corrupt;
     const bytes = try derefNode(txn, node_ref);
     if (bytes[0] == kind_leaf) {
@@ -150,7 +159,7 @@ fn appendInto(txn: *WriteTxn, node_ref: Ref, value: u64, depth: usize) !AppendRe
 
 /// Append value to the column. Returns the new root Ref (copy-on-write).
 /// Grows the tree through leaf splits and height increases as needed.
-pub fn append(txn: *WriteTxn, root: Ref, value: u64) !Ref {
+pub fn append(txn: anytype, root: Ref, value: u64) !Ref {
     const r = try appendInto(txn, root, value, 0);
     if (r.split == null) return r.ref;
     // Split propagated to the root: grow height by one.
@@ -163,7 +172,7 @@ pub fn append(txn: *WriteTxn, root: Ref, value: u64) !Ref {
 /// Recursive copy-on-write set: copies only the nodes on the path from root to
 /// the target leaf. Sibling subtrees are shared by reference, so the old root
 /// remains a valid, unchanged snapshot after the call returns.
-fn setInto(txn: *WriteTxn, node_ref: Ref, index: u64, value: u64, depth: usize) !Ref {
+fn setInto(txn: anytype, node_ref: Ref, index: u64, value: u64, depth: usize) !Ref {
     if (depth >= max_depth) return error.Corrupt;
     const bytes = try derefNode(txn, node_ref);
     if (bytes[0] == kind_leaf) {
@@ -205,17 +214,17 @@ fn setInto(txn: *WriteTxn, node_ref: Ref, index: u64, value: u64, depth: usize) 
 
 /// Overwrite the value at index. Returns the new root Ref (copy-on-write).
 /// Returns error.IndexOutOfBounds if out of range. Works on trees of any depth.
-pub fn set(txn: *WriteTxn, root: Ref, index: u64, value: u64) !Ref {
+pub fn set(txn: anytype, root: Ref, index: u64, value: u64) !Ref {
     return setInto(txn, root, index, value, 0);
 }
 
 /// Recursively free every node in the subtree rooted at node_ref. Leaves and inner
 /// nodes are freed at their respective on-disk sizes so the space becomes reclaimable.
-pub fn freeTree(txn: *WriteTxn, node_ref: Ref) !void {
+pub fn freeTree(txn: anytype, node_ref: Ref) !void {
     return freeTreeAt(txn, node_ref, 0);
 }
 
-fn freeTreeAt(txn: *WriteTxn, node_ref: Ref, depth: usize) !void {
+fn freeTreeAt(txn: anytype, node_ref: Ref, depth: usize) !void {
     if (depth >= max_depth) return error.Corrupt;
     const bytes = try derefNode(txn, node_ref);
     if (bytes[0] == kind_leaf) {
@@ -237,7 +246,7 @@ fn freeTreeAt(txn: *WriteTxn, node_ref: Ref, depth: usize) !void {
 /// Implemented by rebuilding: a fresh empty column is appended with entries 0..new_len
 /// copied from the old column, then the old tree is freed. O(new_len); trimming only the
 /// trailing nodes in place (instead of a full rebuild) is a deferred optimization.
-pub fn truncate(txn: *WriteTxn, root: Ref, new_len: u64) !Ref {
+pub fn truncate(txn: anytype, root: Ref, new_len: u64) !Ref {
     std.debug.assert(new_len <= try len(txn, root));
     var new_root = try create(txn);
     var i: u64 = 0;
@@ -250,7 +259,7 @@ pub fn truncate(txn: *WriteTxn, root: Ref, new_len: u64) !Ref {
 }
 
 /// Test-only helper: allocate an inner node over the given children and return its Ref.
-pub fn makeInnerForTest(txn: *WriteTxn, children: []const struct { ref: u64, count: u64 }) !Ref {
+pub fn makeInnerForTest(txn: anytype, children: []const struct { ref: u64, count: u64 }) !Ref {
     std.debug.assert(children.len <= FANOUT);
     var refs: [FANOUT]u64 = undefined;
     var counts: [FANOUT]u64 = undefined;
@@ -262,10 +271,6 @@ pub fn makeInnerForTest(txn: *WriteTxn, children: []const struct { ref: u64, cou
     _ = encodeInner(a.bytes, refs[0..children.len], counts[0..children.len]);
     return a.ref;
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 test {
     _ = @import("columnTests.zig");

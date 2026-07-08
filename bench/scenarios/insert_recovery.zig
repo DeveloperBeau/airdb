@@ -13,7 +13,7 @@ const harness = @import("../harness.zig");
 const Io = std.Io;
 const Ref = airdb.Ref;
 const catalog = airdb.catalog;
-const objects = airdb.objects;
+const rows = airdb.rows;
 
 pub const name = "insert_recovery";
 
@@ -61,7 +61,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         var j: usize = 0;
         while (j < this_batch) : (j += 1) {
             const pk: u64 = inserted + j;
-            const r = try objects.insert(&w, cat, &.{ pk, pk });
+            const r = try rows.insert(&w, cat, &.{ pk, pk });
             cat = r.cat;
         }
         w.setRoot(cat);
@@ -91,7 +91,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     var r = try reopened.beginRead();
     cat = r.root();
     var out: [2]u64 = undefined;
-    _ = try objects.getByPk(&r, cat, 0, &out);
+    _ = try rows.getByPk(&r, cat, 0, &out);
     const first_read_ns: u64 = @intCast(nowNs(io) - read_start);
     r.end();
 

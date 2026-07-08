@@ -10,6 +10,7 @@ const typedir = @import("typedir.zig");
 const objects = @import("objects.zig");
 const bindex = @import("bindex.zig");
 const relocateRow = @import("relocation.zig").relocateRow;
+const file_store = @import("file_store.zig");
 
 const max_prop_count = catalog.max_prop_count;
 
@@ -122,21 +123,10 @@ fn truncatePacked(txn: *WriteTxn, cat: Ref, new_len: u64) !Ref {
 // relocation targets; high_hi scans downward from next_row toward live_count
 // seeking live rows that must move down. Both advance monotonically across
 // steps so no slot is ever revisited (relocateRow is not idempotent).
-pub const CompactCursor = struct {
-    /// The TYPE this cursor belongs to plus the catalog ref it was persisted
-    /// against. Both are required for a resume: live_count/next_row are a
-    /// heuristic two different types can momentarily share, and the catalog
-    /// ref ALONE is recyclable (freed catalog nodes are exact-size-class
-    /// reused, so another type's catalog can land on the same ref). Resuming
-    /// a foreign cursor would leave rows unexamined ahead of the tail
-    /// truncate -- silent live-row loss in release builds.
-    type_id: u16,
-    cat: Ref,
-    live_count: u64,
-    next_row: u64,
-    hole_lo: u64,
-    high_hi: u64,
-};
+//
+// The struct itself lives on the Db (the cursor persists across the write
+// transactions of one packing run), so its definition is in db.zig.
+pub const CompactCursor = @import("db.zig").CompactCursor;
 
 // Map a physical row to its stable object key. There is no reverse key->row
 // index, so we go through the primary key: property 0 holds the pk, and the pk
@@ -651,28 +641,6 @@ pub fn compactToNewFile(allocator: std.mem.Allocator, src_path: []const u8, dst_
 
 const Io = std.Io;
 
-// Delete an absolute path, treating a missing file as success. Used to remove
-// coordination files during the publish step of in-place compaction. Any other
-// failure is swallowed best-effort: the data file is already published by the
-// atomic rename, and a leftover/stale coord is recreated fresh by Db.open
-// (openOrCreate), so it cannot corrupt the published data.
-fn deleteAbsoluteIgnoreMissing(io: Io, abs_path: []const u8) void {
-    Io.Dir.deleteFileAbsolute(io, abs_path) catch {};
-}
-
-// Make the directory ENTRY for `path` durable by fsync'ing its parent directory.
-// Uses libc fsync directly on the directory fd, which is the portable POSIX way:
-// the std.Io File sync wrapper panics with BADF on a directory handle on Linux.
-// Best-effort -- errors are swallowed. No-op on Windows.
-fn syncParentDir(path: []const u8) void {
-    if (@import("builtin").os.tag == .windows) return;
-    const io = std.Io.Threaded.global_single_threaded.io();
-    const dir_path = std.fs.path.dirname(path) orelse return;
-    var dir = std.Io.Dir.openDirAbsolute(io, dir_path, .{}) catch return;
-    defer dir.close(io);
-    _ = std.c.fsync(dir.handle);
-}
-
 // Compact a database file in place, crash-safely.
 //
 // The live data is first compacted into a sibling temp file "<path>.compacting"
@@ -708,8 +676,8 @@ pub fn compactInPlace(allocator: std.mem.Allocator, path: []const u8) !void {
     defer allocator.free(tmp_coord);
     const path_coord = try std.fmt.allocPrint(allocator, "{s}.coord", .{path});
     defer allocator.free(path_coord);
-    deleteAbsoluteIgnoreMissing(io, path_coord); // old coord (now describes replaced data)
-    deleteAbsoluteIgnoreMissing(io, tmp_coord); // compaction's coord (orphaned by the rename)
+    file_store.deleteAbsoluteIgnoreMissing(io, path_coord); // old coord (now describes replaced data)
+    file_store.deleteAbsoluteIgnoreMissing(io, tmp_coord); // compaction's coord (orphaned by the rename)
 
     // 4) Make the rename durable across power loss by fsync'ing the parent
     //    directory. The data file is F_FULLFSYNC'd by compactToNewFile and the
@@ -717,12 +685,8 @@ pub fn compactInPlace(allocator: std.mem.Allocator, path: []const u8) !void {
     //    Restored portably via libc fsync on the directory fd (the std.Io File
     //    sync wrapper panics with BADF on a directory handle on Linux).
     //    Best-effort: a failure here cannot un-publish the already-renamed file.
-    syncParentDir(path);
+    file_store.syncParentDir(path);
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 // NOTE: link/backlink survival across a relocation is covered directly by
 // relocation.zig's tests ("a same-type link to a relocated object still

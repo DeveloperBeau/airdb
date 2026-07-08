@@ -6,7 +6,7 @@ const Index = @import("index.zig");
 const bindex = @import("bindex.zig");
 const catalog = @import("catalog.zig");
 const blob = @import("blob.zig");
-const objects = @import("objects.zig");
+const rows = @import("rows.zig");
 
 const PropKind = catalog.PropKind;
 const ElemKind = catalog.ElemKind;
@@ -89,7 +89,7 @@ pub fn addProperty(txn: *WriteTxn, cat: Ref, def: PropDef, default_value: u64) !
             col: Ref,
             fn onEntry(self: @This(), okey: u64, row: u64) anyerror!void {
                 const raw = try Column.get(self.txn, self.col, row);
-                self.vi.* = try objects.viAdd(self.txn, self.vi.*, raw, okey);
+                self.vi.* = try rows.viAdd(self.txn, self.vi.*, raw, okey);
             }
         };
         try Index.forEachEntry(txn, s.keyrow_index_ref, Sink{ .txn = txn, .vi = &vi, .col = new_col }, Sink.onEntry);
@@ -136,10 +136,6 @@ pub fn removeProperty(txn: *WriteTxn, cat: Ref, prop: usize) !Ref {
     s.prop_count -= 1;
     return s.replace(txn);
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 test {
     _ = @import("migrationsTests.zig");

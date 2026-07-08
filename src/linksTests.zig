@@ -132,7 +132,7 @@ test "nullifying a source's link bumps its version" {
     {
         var w = try db.beginWrite();
         var raw: [2]u64 = undefined;
-        const av = (try @import("objects.zig").getByPk(&w, w.new_root, 1, &raw)).?;
+        const av = (try @import("rows.zig").getByPk(&w, w.new_root, 1, &raw)).?;
         const cat = switch (try @import("objects.zig").deleteAndNullify(&w, w.new_root, 1, av)) {
             .ok => |x| x,
             else => unreachable,

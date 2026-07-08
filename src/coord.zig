@@ -293,9 +293,7 @@ pub const Coord = struct {
     }
 };
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
+// Tests of file-private invariants; the main suite lives in coordTests.zig.
 
 const testing = std.testing;
 

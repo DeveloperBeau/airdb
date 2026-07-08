@@ -1,4 +1,5 @@
 const std = @import("std");
+const verification = @import("verification.zig");
 const migrations = @import("migrations.zig");
 const catalog = @import("catalog.zig");
 const objects = @import("objects.zig");
@@ -16,9 +17,9 @@ const create = catalog.create;
 
 const propCount = catalog.propCount;
 
-const insert = @import("objects.zig").insert;
+const insert = @import("rows.zig").insert;
 
-const getByPk = @import("objects.zig").getByPk;
+const getByPk = @import("rows.zig").getByPk;
 
 const getLink = @import("links.zig").getLink;
 
@@ -113,7 +114,7 @@ test "addProperty(indexed) backfills the value index for existing rows" {
         w.setRoot(cat);
         _ = try w.commit();
     }
-    try db.verifyIntegrity();
+    try verification.verifyIntegrity(&db);
     var r = try db.beginRead();
     defer r.end();
     var hits = std.ArrayList(u64).empty;
@@ -148,7 +149,7 @@ test "addProperty(link_set) leaves pre-migration rows deletable" {
         w.setRoot(dir);
         _ = try w.commit();
     }
-    try db.verifyIntegrity(); // the audit must not trip over the backfilled roots
+    try verification.verifyIntegrity(&db); // the audit must not trip over the backfilled roots
     {
         var w = try db.beginWrite();
         var out: [2]catalog.Value = undefined;

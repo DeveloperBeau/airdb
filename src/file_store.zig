@@ -298,6 +298,32 @@ pub const FileStore = struct {
 };
 
 // ---------------------------------------------------------------------------
+// Durable-file helpers
+// ---------------------------------------------------------------------------
+
+/// Delete an absolute path, treating a missing file as success. Used to remove
+/// coordination files during the publish step of in-place compaction. Any other
+/// failure is swallowed best-effort: the data file is already published by the
+/// atomic rename, and a leftover/stale coord is recreated fresh by Db.open
+/// (openOrCreate), so it cannot corrupt the published data. Does I/O.
+pub fn deleteAbsoluteIgnoreMissing(io: Io, abs_path: []const u8) void {
+    Io.Dir.deleteFileAbsolute(io, abs_path) catch {};
+}
+
+/// Make the directory ENTRY for `path` durable by fsync'ing its parent directory.
+/// Uses libc fsync directly on the directory fd, which is the portable POSIX way:
+/// the std.Io File sync wrapper panics with BADF on a directory handle on Linux.
+/// Best-effort -- errors are swallowed. No-op on Windows. Does I/O.
+pub fn syncParentDir(path: []const u8) void {
+    if (@import("builtin").os.tag == .windows) return;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const dir_path = std.fs.path.dirname(path) orelse return;
+    var dir = std.Io.Dir.openDirAbsolute(io, dir_path, .{}) catch return;
+    defer dir.close(io);
+    _ = std.c.fsync(dir.handle);
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

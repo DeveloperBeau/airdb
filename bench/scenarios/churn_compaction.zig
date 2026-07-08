@@ -20,7 +20,7 @@ const harness = @import("../harness.zig");
 const Io = std.Io;
 const Ref = airdb.Ref;
 const catalog = airdb.catalog;
-const objects = airdb.objects;
+const rows = airdb.rows;
 const compaction = airdb.compaction;
 
 pub const name = "churn_compaction";
@@ -86,7 +86,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         cat = db.active_root;
         var pk: u64 = 0;
         while (pk < working_set) : (pk += 1) {
-            const r = try objects.insert(&w, cat, &.{ pk, pk });
+            const r = try rows.insert(&w, cat, &.{ pk, pk });
             cat = r.cat;
         }
         w.setRoot(cat);
@@ -116,7 +116,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
             var j: usize = 0;
             while (j < k) : (j += 1) {
                 const pk = next_pk + j;
-                const r = try objects.insert(&w, cat, &.{ pk, pk });
+                const r = try rows.insert(&w, cat, &.{ pk, pk });
                 cat = r.cat;
             }
 
@@ -124,8 +124,8 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
             while (j < k) : (j += 1) {
                 const pk = oldest_pk + j;
                 var out: [2]u64 = undefined;
-                const ver = (try objects.getByPk(&w, cat, pk, &out)) orelse unreachable;
-                cat = switch (try objects.delete(&w, cat, pk, ver)) {
+                const ver = (try rows.getByPk(&w, cat, pk, &out)) orelse unreachable;
+                cat = switch (try rows.delete(&w, cat, pk, ver)) {
                     .ok => |c| c,
                     else => unreachable,
                 };

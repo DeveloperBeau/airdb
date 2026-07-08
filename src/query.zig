@@ -1,5 +1,5 @@
 const std = @import("std");
-const objects = @import("objects.zig");
+const rows = @import("rows.zig");
 const catalog = @import("catalog.zig");
 const index = @import("index.zig");
 const Column = @import("column.zig");
@@ -366,9 +366,7 @@ pub fn sortByPropAsc(
     for (pairs, 0..) |pr, i| okeys[i] = pr.key;
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
+// Tests of file-private invariants; the main suite lives in queryTests.zig.
 
 const testing = std.testing;
 const Db = @import("db.zig").Db;
@@ -400,7 +398,7 @@ fn seedPlannerCat(w: *@import("db.zig").WriteTxn, idx: bool, n: u64) !Ref {
     };
     var cat = try catalog.createDefs(w, &defs);
     var i: u64 = 0;
-    while (i < n) : (i += 1) cat = (try objects.insert(w, cat, &.{ i, i % 100, i })).cat;
+    while (i < n) : (i += 1) cat = (try rows.insert(w, cat, &.{ i, i % 100, i })).cat;
     return cat;
 }
 

@@ -1,6 +1,14 @@
+// The `txn` parameter of every operation is `anytype`: a comptime duck-typed
+// transaction capability, monomorphized at compile time (no vtable on this
+// B+tree hot path). Read-only operations need only
+//   deref(ref, len) ![]const u8
+// and mutating operations additionally require
+//   alloc(size) !Allocation, writableCopy(ref, len) !Allocation,
+//   free(ref, len) !void
+// where Allocation is arena.Allocation. WriteTxn is the production
+// implementation; ReadTxn satisfies the read-only subset.
+
 const std = @import("std");
-const testing = std.testing;
-const WriteTxn = @import("db.zig").WriteTxn;
 const Ref = @import("ref.zig").Ref;
 const node = @import("index_node.zig");
 
@@ -49,7 +57,7 @@ fn derefNode(txn: anytype, ref: Ref) ![]const u8 {
 }
 
 // Test-only helper: build an inner node from a slice of (ref, low, count) triples.
-pub fn makeInnerForTest(txn: *WriteTxn, children: []const struct { ref: u64, low: u64, count: u64 }) !Ref {
+pub fn makeInnerForTest(txn: anytype, children: []const struct { ref: u64, low: u64, count: u64 }) !Ref {
     var refs: [FANOUT]u64 = undefined;
     var lows: [FANOUT]u64 = undefined;
     var counts: [FANOUT]u64 = undefined;
@@ -91,7 +99,7 @@ test "lowerBound finds the first index whose key is >= the search key" {
 // ---------------------------------------------------------------------------
 
 /// Create a new empty leaf node and return its Ref.
-pub fn create(txn: *WriteTxn) !Ref {
+pub fn create(txn: anytype) !Ref {
     const a = try txn.alloc(leaf_node_size);
     _ = encodeLeaf(a.bytes, &.{}, &.{});
     return a.ref;
@@ -182,7 +190,7 @@ fn minKey(txn: anytype, ref: Ref) !u64 {
 
 /// Recursive insert. Returns the (possibly new) node ref and an optional right
 /// sibling produced by a midpoint split.
-fn insertInto(txn: *WriteTxn, node_ref: Ref, key: u64, val: u64, depth: usize) !InsertResult {
+fn insertInto(txn: anytype, node_ref: Ref, key: u64, val: u64, depth: usize) !InsertResult {
     if (depth >= max_depth) return error.Corrupt;
     const node_bytes = try txn.deref(node_ref, 1);
     const kind = node_bytes[0];
@@ -339,7 +347,7 @@ fn insertInto(txn: *WriteTxn, node_ref: Ref, key: u64, val: u64, depth: usize) !
 
 /// Insert or update key->val in the tree rooted at root.
 /// Returns the (possibly new) root Ref. Grows the tree height on root split.
-pub fn insert(txn: *WriteTxn, root: Ref, key: u64, val: u64) !Ref {
+pub fn insert(txn: anytype, root: Ref, key: u64, val: u64) !Ref {
     const r = try insertInto(txn, root, key, val, 0);
     if (r.split == null) return r.ref;
     // Root was split: build a new two-child inner root.
@@ -356,7 +364,7 @@ const RemoveResult = struct { ref: Ref, count: u64 };
 
 /// Recursive remove. Returns the (possibly new) node ref and its subtree count.
 /// Returns node_ref unchanged when the key is absent (no COW on the path).
-fn removeInto(txn: *WriteTxn, node_ref: Ref, key: u64, depth: usize) !RemoveResult {
+fn removeInto(txn: anytype, node_ref: Ref, key: u64, depth: usize) !RemoveResult {
     if (depth >= max_depth) return error.Corrupt;
     const kind = (try txn.deref(node_ref, 1))[0];
 
@@ -398,7 +406,7 @@ fn removeInto(txn: *WriteTxn, node_ref: Ref, key: u64, depth: usize) !RemoveResu
 
 /// Remove key from the tree rooted at root.
 /// Returns the (possibly new) root Ref. No-op if key is absent.
-pub fn remove(txn: *WriteTxn, root: Ref, key: u64) !Ref {
+pub fn remove(txn: anytype, root: Ref, key: u64) !Ref {
     return (try removeInto(txn, root, key, 0)).ref;
 }
 
@@ -406,11 +414,11 @@ pub fn remove(txn: *WriteTxn, root: Ref, key: u64) !Ref {
 /// becomes reclaimable. Only the NODES are freed; for trees whose leaf values
 /// are refs to other structures (e.g. value-index inner sets) the caller owns
 /// those separately.
-pub fn freeTree(txn: *WriteTxn, node_ref: Ref) !void {
+pub fn freeTree(txn: anytype, node_ref: Ref) !void {
     return freeTreeAt(txn, node_ref, 0);
 }
 
-fn freeTreeAt(txn: *WriteTxn, node_ref: Ref, depth: usize) !void {
+fn freeTreeAt(txn: anytype, node_ref: Ref, depth: usize) !void {
     if (depth >= max_depth) return error.Corrupt;
     const bytes = try derefNode(txn, node_ref);
     if (bytes[0] == kind_leaf) {
@@ -551,509 +559,6 @@ fn forEachEntryInRangeAt(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
-const Db = @import("db.zig").Db;
-
-fn idxTmpPath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const u8) ![]const u8 {
-    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const dlen = try tmp.dir.realPath(testing.io, &path_buf);
-    return std.fs.path.join(allocator, &.{ path_buf[0..dlen], name });
-}
-
-test "a ref cycle or unknown kind byte fails with error.Corrupt" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try idxTmpPath(testing.allocator, &tmp, "idx_cycle.airdb");
-    defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
-    defer w.deinit();
-
-    // An inner node whose only child is itself: every walk must hit the depth
-    // cap and error out rather than overflow the stack. (count is exempt: it is
-    // a single-node read of the stored subtree counts and never descends.)
-    const a = try w.alloc(inner_node_size);
-    _ = encodeInner(a.bytes, &.{a.ref}, &.{0}, &.{1});
-    try testing.expectError(error.Corrupt, get(&w, a.ref, 5));
-    try testing.expectError(error.Corrupt, maxKey(&w, a.ref));
-    try testing.expectError(error.Corrupt, insert(&w, a.ref, 1, 1));
-    try testing.expectError(error.Corrupt, remove(&w, a.ref, 1));
-    const NopSink = struct {
-        fn onKey(_: @This(), _: u64) !void {}
-    };
-    try testing.expectError(error.Corrupt, forEachKey(&w, a.ref, NopSink{}, NopSink.onKey));
-
-    // A node with an out-of-range kind byte is rejected outright.
-    const b = try w.alloc(leaf_node_size);
-    _ = encodeLeaf(b.bytes, &.{}, &.{});
-    // Rewrite the kind byte through the arena (b.bytes is mutable).
-    b.bytes[0] = 7;
-    try testing.expectError(error.Corrupt, get(&w, b.ref, 1));
-}
-
-test "get and count traverse an inner node over two leaves" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try idxTmpPath(testing.allocator, &tmp, "idx3.airdb");
-    defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
-    var a = try create(&w);
-    a = try insert(&w, a, 1, 11);
-    a = try insert(&w, a, 3, 33);
-    var b = try create(&w);
-    b = try insert(&w, b, 5, 55);
-    b = try insert(&w, b, 7, 77);
-    const inner = try makeInnerForTest(&w, &.{ .{ .ref = a, .low = 1, .count = 2 }, .{ .ref = b, .low = 5, .count = 2 } });
-    try testing.expectEqual(@as(u64, 4), try count(&w, inner));
-    try testing.expectEqual(@as(?u64, 11), try get(&w, inner, 1));
-    try testing.expectEqual(@as(?u64, 55), try get(&w, inner, 5));
-    try testing.expectEqual(@as(?u64, 77), try get(&w, inner, 7));
-    try testing.expect((try get(&w, inner, 6)) == null);
-    try testing.expect((try get(&w, inner, 0)) == null);
-    w.deinit();
-}
-
-test "insert builds a balanced tree across many leaves and reads back correctly" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try idxTmpPath(testing.allocator, &tmp, "idx4.airdb");
-    defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
-    var root = try create(&w);
-    const N: u64 = 5000;
-    var i: u64 = 0;
-    while (i < N) : (i += 1) {
-        const k = (i *% 2654435761) % 1_000_003; // scattered keys force mid-splits
-        root = try insert(&w, root, k, k +% 7);
-    }
-    var ref_map = std.AutoHashMap(u64, u64).init(testing.allocator);
-    defer ref_map.deinit();
-    i = 0;
-    while (i < N) : (i += 1) {
-        const k = (i *% 2654435761) % 1_000_003;
-        try ref_map.put(k, k +% 7);
-    }
-    try testing.expectEqual(@as(u64, ref_map.count()), try count(&w, root));
-    var it = ref_map.iterator();
-    while (it.next()) |e| {
-        try testing.expectEqual(@as(?u64, e.value_ptr.*), try get(&w, root, e.key_ptr.*));
-    }
-    w.deinit();
-}
-
-test "single-leaf index: insert, get, upsert, remove, count" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try idxTmpPath(testing.allocator, &tmp, "idx1.airdb");
-    defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
-    var root = try create(&w);
-    try testing.expect((try get(&w, root, 5)) == null);
-    root = try insert(&w, root, 5, 50);
-    root = try insert(&w, root, 1, 10);
-    root = try insert(&w, root, 9, 90);
-    try testing.expectEqual(@as(u64, 3), try count(&w, root));
-    try testing.expectEqual(@as(?u64, 50), try get(&w, root, 5));
-    try testing.expectEqual(@as(?u64, 10), try get(&w, root, 1));
-    root = try insert(&w, root, 5, 555);
-    try testing.expectEqual(@as(?u64, 555), try get(&w, root, 5));
-    try testing.expectEqual(@as(u64, 3), try count(&w, root));
-    root = try remove(&w, root, 1);
-    try testing.expect((try get(&w, root, 1)) == null);
-    try testing.expectEqual(@as(u64, 2), try count(&w, root));
-    w.deinit();
-}
-
-test "a committed index version stays intact for a pinned reader while a later commit mutates it" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try idxTmpPath(testing.allocator, &tmp, "idx5.airdb");
-    defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-
-    // Commit version 1: keys 0..1999, value = key*10.
-    {
-        var w = try db.beginWrite();
-        var root = try create(&w);
-        var i: u64 = 0;
-        while (i < 2000) : (i += 1) root = try insert(&w, root, i, i * 10);
-        w.setRoot(root);
-        _ = try w.commit();
-    }
-
-    // Pin a reader on version 1.
-    var r1 = try db.beginRead();
-    const root_v1 = r1.root();
-    try testing.expectEqual(@as(?u64, 1234 * 10), try get(&r1, root_v1, 1234));
-
-    // Commit version 2: update key 1234, remove key 500.
-    {
-        var w = try db.beginWrite();
-        var root = w.new_root; // start from the latest committed root (refreshed in beginWrite)
-        root = try insert(&w, root, 1234, 999999);
-        root = try remove(&w, root, 500);
-        w.setRoot(root);
-        _ = try w.commit();
-    }
-
-    // The pinned v1 reader still sees the original values (committed snapshot intact).
-    try testing.expectEqual(@as(?u64, 1234 * 10), try get(&r1, root_v1, 1234));
-    try testing.expectEqual(@as(?u64, 500 * 10), try get(&r1, root_v1, 500));
-    r1.end();
-
-    // A fresh read sees version 2.
-    var r2 = try db.beginRead();
-    try testing.expectEqual(@as(?u64, 999999), try get(&r2, r2.root(), 1234));
-    try testing.expect((try get(&r2, r2.root(), 500)) == null);
-    try testing.expectEqual(@as(?u64, 1235 * 10), try get(&r2, r2.root(), 1235)); // untouched key
-    r2.end();
-}
-
-test "maxKey survives an emptied rightmost leaf" {
-    // Removals never merge or drop leaves, so deleting the upper key range
-    // leaves an EMPTY rightmost leaf. maxKey must keep descending into the
-    // last non-empty subtree instead of reporting the tree empty -- bulkAppend
-    // uses maxKey to qualify batches, and a false "empty" admits keys below
-    // the true maximum.
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try idxTmpPath(testing.allocator, &tmp, "idx_maxkey.airdb");
-    defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
-    defer w.deinit();
-
-    var root = try create(&w);
-    var k: u64 = 0;
-    while (k <= 64) : (k += 1) root = try insert(&w, root, k, k); // forces a leaf split
-    try testing.expectEqual(@as(?u64, 64), try maxKey(&w, root));
-    // Empty the rightmost leaf by removing the upper half.
-    k = 32;
-    while (k <= 64) : (k += 1) root = try remove(&w, root, k);
-    try testing.expectEqual(@as(?u64, 31), try maxKey(&w, root));
-    // Fully emptied tree reports null.
-    k = 0;
-    while (k < 32) : (k += 1) root = try remove(&w, root, k);
-    try testing.expectEqual(@as(?u64, null), try maxKey(&w, root));
-}
-
-test "stored subtree counts match a full iteration under churn" {
-    // count() reads per-child subtree counts from a single node. Verify the
-    // stored counts stay exact through scattered inserts (with splits and
-    // height growth), upserts (which must NOT bump counts), and removes.
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try idxTmpPath(testing.allocator, &tmp, "idx_counts.airdb");
-    defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
-    defer w.deinit();
-
-    var root = try create(&w);
-    const N: u64 = 5000;
-    var i: u64 = 0;
-    while (i < N) : (i += 1) {
-        const k = (i *% 2654435761) % 1_000_003;
-        root = try insert(&w, root, k, k);
-    }
-    // Upserts: rewrite existing keys; counts must not change.
-    i = 0;
-    while (i < 500) : (i += 1) {
-        const k = (i *% 2654435761) % 1_000_003;
-        root = try insert(&w, root, k, k + 1);
-    }
-    // Remove every 3rd inserted key.
-    i = 0;
-    while (i < N) : (i += 3) {
-        const k = (i *% 2654435761) % 1_000_003;
-        root = try remove(&w, root, k);
-    }
-
-    const Tally = struct {
-        n: *u64,
-        fn onKey(self: @This(), _: u64) !void {
-            self.n.* += 1;
-        }
-    };
-    var walked: u64 = 0;
-    try forEachKey(&w, root, Tally{ .n = &walked }, Tally.onKey);
-    try testing.expectEqual(walked, try count(&w, root));
-}
-
-test "forEachKey visits all keys in ascending order" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try idxTmpPath(testing.allocator, &tmp, "iter.airdb");
-    defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
-    var root = try create(&w);
-    var i: u64 = 0;
-    while (i < 500) : (i += 1) {
-        const k = (i *% 2654435761) % 100_003;
-        root = try insert(&w, root, k, k + 1);
-    }
-    const Collector = struct {
-        list: *std.ArrayList(u64),
-        fn onKey(self: @This(), key: u64) !void {
-            try self.list.append(testing.allocator, key);
-        }
-    };
-    var seen = std.ArrayList(u64).empty;
-    defer seen.deinit(testing.allocator);
-    try forEachKey(&w, root, Collector{ .list = &seen }, Collector.onKey);
-    try testing.expectEqual(try count(&w, root), @as(u64, seen.items.len));
-    var prev: u64 = 0;
-    var first = true;
-    for (seen.items) |k| {
-        if (!first) try testing.expect(k > prev);
-        prev = k;
-        first = false;
-    }
-    w.deinit();
-}
-
-test "forEachEntry visits key/value pairs in ascending key order" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try idxTmpPath(testing.allocator, &tmp, "iter_entry.airdb");
-    defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
-    var root = try create(&w);
-    var i: u64 = 0;
-    while (i < 200) : (i += 1) {
-        const k = (i *% 2654435761) % 100_003; // scrambled insertion order
-        root = try insert(&w, root, k, k * 7 + 1);
-    }
-    const Collector = struct {
-        keys: *std.ArrayList(u64),
-        vals: *std.ArrayList(u64),
-        fn onEntry(self: @This(), key: u64, val: u64) !void {
-            try self.keys.append(testing.allocator, key);
-            try self.vals.append(testing.allocator, val);
-        }
-    };
-    var keys = std.ArrayList(u64).empty;
-    defer keys.deinit(testing.allocator);
-    var vals = std.ArrayList(u64).empty;
-    defer vals.deinit(testing.allocator);
-    try forEachEntry(&w, root, Collector{ .keys = &keys, .vals = &vals }, Collector.onEntry);
-    try testing.expectEqual(try count(&w, root), @as(u64, keys.items.len));
-    try testing.expectEqual(keys.items.len, vals.items.len);
-    var prev: u64 = 0;
-    var first = true;
-    for (keys.items, vals.items) |k, val| {
-        if (!first) try testing.expect(k > prev);
-        try testing.expectEqual(k * 7 + 1, val);
-        prev = k;
-        first = false;
-    }
-    w.deinit();
-}
-
-// Build a tree holding keys 0..=1000 (each once) inserted in scrambled order,
-// with value == key*10. 397 is coprime to 1001 (=7*11*13), so (i*397)%1001
-// visits every residue exactly once.
-fn buildScrambled0to1000(w: *WriteTxn) !Ref {
-    var root = try create(w);
-    var i: u64 = 0;
-    while (i <= 1000) : (i += 1) {
-        const k = (i * 397) % 1001;
-        root = try insert(w, root, k, k * 10);
-    }
-    return root;
-}
-
-const RangeCollector = struct {
-    keys: *std.ArrayList(u64),
-    vals: *std.ArrayList(u64),
-    fn onEntry(self: @This(), key: u64, val: u64) !void {
-        try self.keys.append(testing.allocator, key);
-        try self.vals.append(testing.allocator, val);
-    }
-};
-
-test "forEachEntryInRange visits only [lo,hi] ascending" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try idxTmpPath(testing.allocator, &tmp, "range1.airdb");
-    defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
-    const root = try buildScrambled0to1000(&w);
-
-    var keys = std.ArrayList(u64).empty;
-    defer keys.deinit(testing.allocator);
-    var vals = std.ArrayList(u64).empty;
-    defer vals.deinit(testing.allocator);
-    try forEachEntryInRange(&w, root, 200, 300, RangeCollector{ .keys = &keys, .vals = &vals }, RangeCollector.onEntry);
-
-    try testing.expectEqual(@as(usize, 101), keys.items.len);
-    try testing.expectEqual(keys.items.len, vals.items.len);
-    var expected: u64 = 200;
-    var prev: u64 = 0;
-    var first = true;
-    for (keys.items, vals.items) |k, val| {
-        try testing.expectEqual(expected, k); // strictly ascending 200..300
-        try testing.expectEqual(k * 10, val);
-        try testing.expect(k >= 200 and k <= 300); // nothing outside
-        if (!first) try testing.expect(k > prev);
-        prev = k;
-        first = false;
-        expected += 1;
-    }
-    try testing.expectEqual(@as(u64, 200), keys.items[0]);
-    try testing.expectEqual(@as(u64, 300), keys.items[keys.items.len - 1]);
-    w.deinit();
-}
-
-test "forEachEntryInRange empty range" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try idxTmpPath(testing.allocator, &tmp, "range2.airdb");
-    defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
-    const root = try buildScrambled0to1000(&w);
-
-    var keys = std.ArrayList(u64).empty;
-    defer keys.deinit(testing.allocator);
-    var vals = std.ArrayList(u64).empty;
-    defer vals.deinit(testing.allocator);
-
-    // lo above the max key -> nothing.
-    try forEachEntryInRange(&w, root, 1001, 2000, RangeCollector{ .keys = &keys, .vals = &vals }, RangeCollector.onEntry);
-    try testing.expectEqual(@as(usize, 0), keys.items.len);
-
-    // lo > hi -> nothing.
-    try forEachEntryInRange(&w, root, 300, 200, RangeCollector{ .keys = &keys, .vals = &vals }, RangeCollector.onEntry);
-    try testing.expectEqual(@as(usize, 0), keys.items.len);
-    w.deinit();
-}
-
-test "forEachEntryInRange single key" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try idxTmpPath(testing.allocator, &tmp, "range3.airdb");
-    defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
-    const root = try buildScrambled0to1000(&w);
-
-    var keys = std.ArrayList(u64).empty;
-    defer keys.deinit(testing.allocator);
-    var vals = std.ArrayList(u64).empty;
-    defer vals.deinit(testing.allocator);
-
-    // Present single key.
-    try forEachEntryInRange(&w, root, 500, 500, RangeCollector{ .keys = &keys, .vals = &vals }, RangeCollector.onEntry);
-    try testing.expectEqual(@as(usize, 1), keys.items.len);
-    try testing.expectEqual(@as(u64, 500), keys.items[0]);
-    try testing.expectEqual(@as(u64, 5000), vals.items[0]);
-
-    // Absent single key.
-    keys.clearRetainingCapacity();
-    vals.clearRetainingCapacity();
-    try forEachEntryInRange(&w, root, 10001, 10001, RangeCollector{ .keys = &keys, .vals = &vals }, RangeCollector.onEntry);
-    try testing.expectEqual(@as(usize, 0), keys.items.len);
-    w.deinit();
-}
-
-test "forEachEntryInRange spans multiple leaves" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try idxTmpPath(testing.allocator, &tmp, "range4.airdb");
-    defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
-    const root = try buildScrambled0to1000(&w);
-
-    var keys = std.ArrayList(u64).empty;
-    defer keys.deinit(testing.allocator);
-    var vals = std.ArrayList(u64).empty;
-    defer vals.deinit(testing.allocator);
-
-    // [50,800] crosses many leaves (LEAF_CAP == 64).
-    try forEachEntryInRange(&w, root, 50, 800, RangeCollector{ .keys = &keys, .vals = &vals }, RangeCollector.onEntry);
-
-    try testing.expectEqual(@as(usize, 751), keys.items.len); // 800-50+1
-    try testing.expectEqual(@as(u64, 50), keys.items[0]);
-    try testing.expectEqual(@as(u64, 800), keys.items[keys.items.len - 1]);
-    var prev: u64 = 0;
-    var first = true;
-    for (keys.items, vals.items) |k, val| {
-        if (!first) try testing.expect(k == prev + 1); // no gaps or dupes
-        try testing.expectEqual(k * 10, val);
-        prev = k;
-        first = false;
-    }
-    w.deinit();
-}
-
-test "ordered index persists across reopen and matches a reference map under churn" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try idxTmpPath(testing.allocator, &tmp, "idx6.airdb");
-    defer testing.allocator.free(path);
-    var ref_map = std.AutoHashMap(u64, u64).init(testing.allocator);
-    defer ref_map.deinit();
-    const N: u64 = 100_000;
-    {
-        var db = try Db.create(testing.allocator, path);
-        defer db.deinit();
-        var w = try db.beginWrite();
-        var root = try create(&w);
-        var i: u64 = 0;
-        while (i < N) : (i += 1) {
-            const k = (i *% 2654435761) % 5_000_011;
-            root = try insert(&w, root, k, i);
-            try ref_map.put(k, i);
-        }
-        // Remove every 3rd inserted key.
-        i = 0;
-        while (i < N) : (i += 3) {
-            const k = (i *% 2654435761) % 5_000_011;
-            root = try remove(&w, root, k);
-            _ = ref_map.remove(k);
-        }
-        w.setRoot(root);
-        _ = try w.commit();
-    }
-    {
-        var db = try Db.open(testing.allocator, path);
-        defer db.deinit();
-        var r = try db.beginRead();
-        try testing.expectEqual(@as(u64, ref_map.count()), try count(&r, r.root()));
-        var it = ref_map.iterator();
-        while (it.next()) |e| {
-            try testing.expectEqual(@as(?u64, e.value_ptr.*), try get(&r, r.root(), e.key_ptr.*));
-        }
-        // Spot-check some removed keys are absent.
-        var j: u64 = 0;
-        while (j < 30) : (j += 3) {
-            const k = (j *% 2654435761) % 5_000_011;
-            if (!ref_map.contains(k)) try testing.expect((try get(&r, r.root(), k)) == null);
-        }
-        r.end();
-    }
+test {
+    _ = @import("indexTests.zig");
 }

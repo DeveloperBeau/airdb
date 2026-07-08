@@ -1,4 +1,6 @@
 const std = @import("std");
+const verification = @import("verification.zig");
+const maintenance = @import("maintenance.zig");
 const testing = std.testing;
 const Io = std.Io;
 const db_mod = @import("db.zig");
@@ -128,7 +130,7 @@ test "verifyIntegrity passes on a freshly committed database" {
     @memcpy(a.bytes, "INTEGER_");
     w.setRoot(a.ref);
     _ = try w.commit();
-    try db.verifyIntegrity(); // void on clean db
+    try verification.verifyIntegrity(&db); // void on clean db
 }
 
 test "verifyIntegrity detects a root reference out of bounds" {
@@ -144,7 +146,7 @@ test "verifyIntegrity detects a root reference out of bounds" {
     w.setRoot(a.ref);
     _ = try w.commit();
     db.active_root = db.store.map.len + 8; // point past the mapped region
-    try testing.expectError(error.RootRefOutOfBounds, db.verifyIntegrity());
+    try testing.expectError(error.RootRefOutOfBounds, verification.verifyIntegrity(&db));
 }
 
 test "verifyIntegrity detects a corrupt header" {
@@ -160,7 +162,7 @@ test "verifyIntegrity detects a corrupt header" {
     w.setRoot(a.ref);
     _ = try w.commit();
     db.store.header_checksum_ok = false; // simulate an unreadable header
-    try testing.expectError(error.HeaderCorrupt, db.verifyIntegrity());
+    try testing.expectError(error.HeaderCorrupt, verification.verifyIntegrity(&db));
 }
 
 test "verifyIntegrity detects a free-list node reference out of bounds" {
@@ -177,7 +179,7 @@ test "verifyIntegrity detects a free-list node reference out of bounds" {
     _ = try w.commit();
     db.free_list_node_ref = @intCast(db.store.map.len + 8); // past the mapped region (8-aligned)
     db.free_list_node_len = 16;
-    try testing.expectError(error.FreeListCorrupt, db.verifyIntegrity());
+    try testing.expectError(error.FreeListCorrupt, verification.verifyIntegrity(&db));
 }
 
 test "verifyIntegrity detects a free extent out of bounds" {
@@ -194,7 +196,7 @@ test "verifyIntegrity detects a free extent out of bounds" {
     _ = try w.commit();
     // Inject an extent whose offset is past the mapped region.
     try db.free_list.extents.append(db.store.allocator, .{ .offset = @intCast(db.store.map.len + 8), .len = 8, .freed_version = 1 });
-    try testing.expectError(error.FreeExtentOutOfBounds, db.verifyIntegrity());
+    try testing.expectError(error.FreeExtentOutOfBounds, verification.verifyIntegrity(&db));
 }
 
 test "verifyIntegrity passes after churn on an indexed type" {
@@ -252,7 +254,7 @@ test "verifyIntegrity passes after churn on an indexed type" {
         _ = try w.commit();
     }
 
-    try db.verifyIntegrity(); // forward + backward audit must find no divergence
+    try verification.verifyIntegrity(&db); // forward + backward audit must find no divergence
 }
 
 test "verifyIntegrity detects a corrupted value index" {
@@ -275,7 +277,7 @@ test "verifyIntegrity detects a corrupted value index" {
         w.setRoot(dir);
         _ = try w.commit();
     }
-    try db.verifyIntegrity(); // clean before corruption
+    try verification.verifyIntegrity(&db); // clean before corruption
 
     // White-box corruption: register an existing live okey under a value that no
     // row actually has. The forward direction still holds (every row stays
@@ -297,7 +299,7 @@ test "verifyIntegrity detects a corrupted value index" {
         _ = try w.commit();
     }
 
-    try testing.expectError(error.ValueIndexStaleEntry, db.verifyIntegrity());
+    try testing.expectError(error.ValueIndexStaleEntry, verification.verifyIntegrity(&db));
 }
 
 test "verifyIntegrity passes on a clean link graph after churn" {
@@ -329,7 +331,7 @@ test "verifyIntegrity passes on a clean link graph after churn" {
         w.setRoot(dir);
         _ = try w.commit();
     }
-    try db.verifyIntegrity(); // forward + backward backlink audit finds no divergence
+    try verification.verifyIntegrity(&db); // forward + backward backlink audit finds no divergence
 }
 
 test "verifyIntegrity detects a corrupted backlink index" {
@@ -353,7 +355,7 @@ test "verifyIntegrity detects a corrupted backlink index" {
         w.setRoot(dir);
         _ = try w.commit();
     }
-    try db.verifyIntegrity(); // clean before corruption
+    try verification.verifyIntegrity(&db); // clean before corruption
 
     // White-box corruption: drop the target's backlink entry while the source's
     // link column still points at it. Forward audit must flag the divergence.
@@ -368,7 +370,7 @@ test "verifyIntegrity detects a corrupted backlink index" {
         w.setRoot(new_dir);
         _ = try w.commit();
     }
-    try testing.expectError(error.BacklinkMissingEntry, db.verifyIntegrity());
+    try testing.expectError(error.BacklinkMissingEntry, verification.verifyIntegrity(&db));
 }
 
 test "verifyIntegrity passes on a non-indexed type" {
@@ -391,7 +393,7 @@ test "verifyIntegrity passes on a non-indexed type" {
         _ = try w.commit();
     }
 
-    try db.verifyIntegrity(); // no indexed prop -> audit must not false-positive
+    try verification.verifyIntegrity(&db); // no indexed prop -> audit must not false-positive
 }
 
 test "the 65th attach is refused rather than reading with invisible pins" {
@@ -772,7 +774,7 @@ test "a retried commit's ring entry wins over the aborted duplicate" {
 }
 
 test "beginReadAt opens a past version within the retention window" {
-    const objects = @import("objects.zig");
+    const rows = @import("rows.zig");
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try tmpFilePath(testing.allocator, &tmp, "pit.airdb");
@@ -788,19 +790,19 @@ test "beginReadAt opens a past version within the retention window" {
     {
         var w = try db.beginWrite();
         var cat = try catalog.create(&w, 2);
-        cat = (try objects.insert(&w, cat, &.{ 1, 100 })).cat;
+        cat = (try rows.insert(&w, cat, &.{ 1, 100 })).cat;
         w.setRoot(cat);
         va = try w.commit();
     }
     {
         var w = try db.beginWrite();
-        const cat = (try objects.insert(&w, w.new_root, &.{ 2, 200 })).cat;
+        const cat = (try rows.insert(&w, w.new_root, &.{ 2, 200 })).cat;
         w.setRoot(cat);
         vb = try w.commit();
     }
     {
         var w = try db.beginWrite();
-        const cat = (try objects.insert(&w, w.new_root, &.{ 3, 300 })).cat;
+        const cat = (try rows.insert(&w, w.new_root, &.{ 3, 300 })).cat;
         w.setRoot(cat);
         vc = try w.commit();
     }
@@ -811,8 +813,8 @@ test "beginReadAt opens a past version within the retention window" {
         var r = try db.beginReadAt(va);
         defer r.end();
         try testing.expectEqual(@as(u64, 1), try compaction.liveCount(&r, r.root()));
-        try testing.expect((try objects.getByPk(&r, r.root(), 1, &out)) != null);
-        try testing.expectEqual(@as(?u64, null), try objects.getByPk(&r, r.root(), 2, &out));
+        try testing.expect((try rows.getByPk(&r, r.root(), 1, &out)) != null);
+        try testing.expectEqual(@as(?u64, null), try rows.getByPk(&r, r.root(), 2, &out));
     }
     // Past snapshot at v_b: pk 1 and 2.
     {
@@ -898,7 +900,7 @@ test "a writer honors a retention floor raised by another instance" {
 }
 
 test "beginReadAt rejects a version aged out of the retention window" {
-    const objects = @import("objects.zig");
+    const rows = @import("rows.zig");
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try tmpFilePath(testing.allocator, &tmp, "pit2.airdb");
@@ -910,13 +912,13 @@ test "beginReadAt rejects a version aged out of the retention window" {
     {
         var w = try db.beginWrite();
         var cat = try catalog.create(&w, 2);
-        cat = (try objects.insert(&w, cat, &.{ 1, 100 })).cat;
+        cat = (try rows.insert(&w, cat, &.{ 1, 100 })).cat;
         w.setRoot(cat);
         va = try w.commit();
     }
     {
         var w = try db.beginWrite();
-        const cat = (try objects.insert(&w, w.new_root, &.{ 2, 200 })).cat;
+        const cat = (try rows.insert(&w, w.new_root, &.{ 2, 200 })).cat;
         w.setRoot(cat);
         _ = try w.commit();
     }
@@ -986,7 +988,7 @@ fn churnNetZero(path: []const u8, live: u64, iters: u64, auto: bool) !struct { n
         // Opt-in: drive the incremental step loop so the type stays packed.
         if (db.auto_compact) {
             while (true) {
-                const res = try db.maybeCompactStep(tid, 4);
+                const res = try maintenance.maybeCompactStep(&db, tid, 4);
                 if (!res.ran or res.done) break;
             }
         }
@@ -1081,7 +1083,7 @@ test "a failed commit inside maybeCompactStep neither crashes nor wedges the wri
     }
 
     // The compaction step's commit fails its data barrier.
-    try testing.expectError(error.Durability, db.maybeCompactStep(tid, 100));
+    try testing.expectError(error.Durability, maintenance.maybeCompactStep(&db, tid, 100));
 
     // The write lock must be free and the data intact.
     var w = try db.beginWriteTry();
@@ -1136,13 +1138,13 @@ test "the compaction cursor never resumes across types" {
     }
 
     // Partial step on type 0 persists a cursor; type 1 must NOT resume it.
-    _ = try db.maybeCompactStep(0, 1);
+    _ = try maintenance.maybeCompactStep(&db, 0, 1);
     while (true) {
-        const res = try db.maybeCompactStep(1, 2);
+        const res = try maintenance.maybeCompactStep(&db, 1, 2);
         if (!res.ran or res.done) break;
     }
     while (true) {
-        const res = try db.maybeCompactStep(0, 2);
+        const res = try maintenance.maybeCompactStep(&db, 0, 2);
         if (!res.ran or res.done) break;
     }
 
@@ -1236,7 +1238,7 @@ test "maybeCompactStep is a no-op when nothing to compact" {
         _ = try w.commit();
     }
 
-    const res = try db.maybeCompactStep(tid, 4);
+    const res = try maintenance.maybeCompactStep(&db, tid, 4);
     try testing.expect(!res.ran);
     try testing.expectEqual(@as(usize, 0), res.moved);
     try testing.expect(!res.done);
@@ -1288,7 +1290,7 @@ test "a free list spanning multiple chunks survives commit and reopen" {
     var db2 = try Db.open(testing.allocator, path);
     defer db2.deinit();
     try testing.expect(db2.freeListLenForTest() >= n_extents);
-    try db2.verifyIntegrity();
+    try verification.verifyIntegrity(&db2);
 }
 
 test "a free-list chain whose next ref points up-chain is rejected as corrupt" {

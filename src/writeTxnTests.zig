@@ -6,7 +6,7 @@ const Ref = @import("ref.zig").Ref;
 
 const catalog = @import("catalog.zig");
 
-const objects = @import("objects.zig");
+const rows = @import("rows.zig");
 
 fn tmpFilePath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const u8) ![]const u8 {
     var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
@@ -36,7 +36,7 @@ fn churnLogicalSize(path: []const u8, retain: u64, n: u64) !u64 {
         {
             var w = try db.beginWrite();
             cat = db.active_root; // reload the committed catalog ref
-            const r = try objects.insert(&w, cat, &.{i});
+            const r = try rows.insert(&w, cat, &.{i});
             cat = r.cat;
             w.setRoot(cat);
             _ = try w.commit();
@@ -45,8 +45,8 @@ fn churnLogicalSize(path: []const u8, retain: u64, n: u64) !u64 {
             var w = try db.beginWrite();
             cat = db.active_root;
             var out: [1]u64 = undefined;
-            const ver = (try objects.getByPk(&w, cat, i, &out)).?;
-            cat = switch (try objects.delete(&w, cat, i, ver)) {
+            const ver = (try rows.getByPk(&w, cat, i, &out)).?;
+            cat = switch (try rows.delete(&w, cat, i, ver)) {
                 .ok => |c| c,
                 else => unreachable,
             };
@@ -84,7 +84,7 @@ test "steady-state batched inserts keep the free list bounded" {
         var cat = w.new_root;
         var i: usize = 0;
         while (i < inserts_per_batch) : (i += 1) {
-            cat = (try objects.insert(&w, cat, &.{ pk, pk })).cat;
+            cat = (try rows.insert(&w, cat, &.{ pk, pk })).cat;
             pk += 1;
         }
         w.setRoot(cat);

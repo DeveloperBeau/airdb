@@ -16,7 +16,7 @@ const harness = @import("../harness.zig");
 const Io = std.Io;
 const Ref = airdb.Ref;
 const catalog = airdb.catalog;
-const objects = airdb.objects;
+const rawRows = airdb.rows;
 const bulk = airdb.bulk;
 
 pub const name = "bulk_import";
@@ -108,7 +108,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         var j: usize = 0;
         while (j < this_batch) : (j += 1) {
             const pk: u64 = inserted + j;
-            const r = try objects.insert(&w, cat, &.{ pk, pk });
+            const r = try rawRows.insert(&w, cat, &.{ pk, pk });
             cat = r.cat;
         }
         w.setRoot(cat);

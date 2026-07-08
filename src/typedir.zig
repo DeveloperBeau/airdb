@@ -10,6 +10,7 @@ const WriteTxn = @import("db.zig").WriteTxn;
 const Db = @import("db.zig").Db;
 const Ref = @import("ref.zig").Ref;
 const Objects = @import("objects.zig");
+const rows = @import("rows.zig");
 const catalog = @import("catalog.zig");
 const collections = @import("collections.zig");
 const links = @import("links.zig");
@@ -290,7 +291,7 @@ pub fn deleteNullifyX(txn: *WriteTxn, dir: Ref, type_id: u16, pk: u64, expected_
     const cat0 = try catalogRef(txn, dir, type_id);
     const pc = (try catalog.loadCatalog(txn, cat0)).prop_count;
     var buf: [256]u64 = undefined;
-    const ver = (try Objects.getByPk(txn, cat0, pk, buf[0..pc])) orelse return .not_found;
+    const ver = (try rows.getByPk(txn, cat0, pk, buf[0..pc])) orelse return .not_found;
     if (ver != expected_version) return .{ .conflict = .{ .current_version = ver } };
     const okey = (try catalog.pkToOkey(txn, cat0, pk)) orelse return .not_found;
 
@@ -335,7 +336,7 @@ fn deleteWorker(txn: *WriteTxn, dir: Ref, type_id: u16, okey: u64, visited: *std
     var rbuf: [256]u64 = undefined;
     const cat_t0 = try catalogRef(txn, cur, type_id);
     const pc = (try catalog.loadCatalog(txn, cat_t0)).prop_count;
-    if ((try Objects.getByObjectKey(txn, cat_t0, okey, rbuf[0..pc])) == null) return cur; // already gone
+    if ((try rows.getByObjectKey(txn, cat_t0, okey, rbuf[0..pc])) == null) return cur; // already gone
     const pk = rbuf[0];
 
     // Snapshot the cascade-relevant schema BEFORE any mutation. Catalog nodes
@@ -401,12 +402,12 @@ fn deleteWorker(txn: *WriteTxn, dir: Ref, type_id: u16, okey: u64, visited: *std
     //    every cascade-deleted child -- leaked its blobs and collection trees.
     {
         const t_cat = try catalogRef(txn, cur, type_id);
-        const cur_ver = (try Objects.getByObjectKey(txn, t_cat, okey, rbuf[0..pc])) orelse return cur;
-        const dres = try Objects.delete(txn, t_cat, pk, cur_ver);
+        const cur_ver = (try rows.getByObjectKey(txn, t_cat, okey, rbuf[0..pc])) orelse return cur;
+        const dres = try rows.delete(txn, t_cat, pk, cur_ver);
         switch (dres) {
             .ok => |new_cat| {
                 cur = try setCatalogRef(txn, cur, type_id, new_cat);
-                try Objects.freeRowStorage(txn, kinds[0..pc], elems[0..pc], rbuf[0..pc]);
+                try rows.freeRowStorage(txn, kinds[0..pc], elems[0..pc], rbuf[0..pc]);
             },
             else => {},
         }
@@ -435,7 +436,7 @@ pub fn insertEmbedded(txn: *WriteTxn, dir: Ref, owner_type: u16, owner_pk: u64, 
         const child_cat = try catalogRef(txn, cur, child_type);
         const pc = (try catalog.loadCatalog(txn, child_cat)).prop_count;
         var buf: [256]u64 = undefined;
-        if (try Objects.getByObjectKey(txn, child_cat, old_okey, buf[0..pc])) |old_ver| {
+        if (try rows.getByObjectKey(txn, child_cat, old_okey, buf[0..pc])) |old_ver| {
             const old_pk = buf[0];
             const dres = try deleteNullifyX(txn, cur, child_type, old_pk, old_ver);
             switch (dres) {
@@ -459,7 +460,7 @@ pub fn clearEmbedded(txn: *WriteTxn, dir: Ref, owner_type: u16, owner_pk: u64, p
     const child_cat = try catalogRef(txn, dir, child_type);
     const pc = (try catalog.loadCatalog(txn, child_cat)).prop_count;
     var buf: [256]u64 = undefined;
-    const child_ver = (try Objects.getByObjectKey(txn, child_cat, child_okey, buf[0..pc])) orelse return dir;
+    const child_ver = (try rows.getByObjectKey(txn, child_cat, child_okey, buf[0..pc])) orelse return dir;
     const child_pk = buf[0];
     const dres = try deleteNullifyX(txn, dir, child_type, child_pk, child_ver);
     return switch (dres) {
@@ -469,10 +470,6 @@ pub fn clearEmbedded(txn: *WriteTxn, dir: Ref, owner_type: u16, owner_pk: u64, p
         else => error.Blocked,
     };
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 test {
     _ = @import("typedirTests.zig");

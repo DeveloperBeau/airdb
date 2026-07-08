@@ -1,5 +1,5 @@
 const std = @import("std");
-const WriteTxn = @import("db.zig").WriteTxn;
+const WriteTxn = @import("write_txn.zig").WriteTxn;
 const Ref = @import("ref.zig").Ref;
 const Column = @import("column.zig");
 const Index = @import("index.zig");
@@ -251,10 +251,6 @@ pub fn dictCollect(
     };
     try bindex.forEachEntry(txn, dict_root, Sink{ .list = out, .alloc = allocator }, Sink.onEntry);
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 test {
     _ = @import("collectionsTests.zig");

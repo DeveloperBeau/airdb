@@ -6,7 +6,7 @@ const Index = @import("index.zig");
 const cnode = @import("column_node.zig");
 const inode = @import("index_node.zig");
 const catalog = @import("catalog.zig");
-const objects = @import("objects.zig");
+const rawRows = @import("rows.zig");
 
 const PropKind = catalog.PropKind;
 const ElemKind = catalog.ElemKind;
@@ -451,7 +451,7 @@ pub fn columnAppendRun(txn: *WriteTxn, root: Ref, values: []const u64) !Ref {
 
 /// Build a value index (value -> inner okey-set) from `entries`, sorted by
 /// value, each with ascending okeys. Each inner set maps okey -> 1, matching
-/// the shape objects.viAdd maintains (value -> Index{okey -> 1}).
+/// the shape rows.viAdd maintains (value -> Index{okey -> 1}).
 pub fn bulkValueIndex(txn: *WriteTxn, entries: []const ValueOkeys) !Ref {
     if (entries.len == 0) return Index.create(txn);
     const al = txn.db.store.allocator;
@@ -485,7 +485,7 @@ pub fn bulkValueIndex(txn: *WriteTxn, entries: []const ValueOkeys) !Ref {
 // version/live columns, pk index, key->row index, and per-indexed-property value
 // indexes are all built directly from the sorted input.
 //
-// Object-key convention (matched to objects.insert): a fresh insert takes the
+// Object-key convention (matched to rows.insert): a fresh insert takes the
 // catalog's current next_key as the new row's okey and assigns physical row =
 // next_row, then bumps both by one. Inserting the rows in ascending-pk order
 // therefore gives the r-th-smallest pk an okey of (start_next_key + r) and a
@@ -578,7 +578,7 @@ pub fn bulkImport(
     }
 
     // Version and live columns: one stamp per row. The version stamp matches
-    // objects.insert (txn.new_version), so a bulk row carries the same version a
+    // rows.insert (txn.new_version), so a bulk row carries the same version a
     // single-insert twin committed in the same transaction would; live = 1.
     const stamps = try al.alloc(u64, n);
     defer al.free(stamps);
@@ -621,7 +621,7 @@ pub fn bulkImport(
 
 // Build the value index for indexed property `p`: emit (value -> {okey -> 1})
 // with values ascending and each inner okey set ascending, matching the shape
-// objects.viAdd maintains. okeys are assigned in sorted-pk order (okey_r =
+// rows.viAdd maintains. okeys are assigned in sorted-pk order (okey_r =
 // old_next_key + r), so sorting (value, okey) pairs yields ascending okeys
 // within each value group.
 fn buildPropValueIndex(
@@ -670,7 +670,7 @@ fn buildPropValueIndex(
 // without touching any left subtree. The result is byte-identical to inserting
 // the same rows one at a time in ascending-pk order: each new row gets the next
 // physical row and object key in batch order, the version stamp matches
-// objects.insert (txn.new_version), live = 1, and the pk and key->row indexes
+// rows.insert (txn.new_version), live = 1, and the pk and key->row indexes
 // grow only along their rightmost path.
 //
 // A batch only qualifies when nothing about it would force a non-right-edge
@@ -765,7 +765,7 @@ pub fn bulkAppend(txn: *WriteTxn, cat: Ref, rows: []const []const u64) !Ref {
         }
     }
 
-    // Version and live columns: one stamp per row, matching objects.insert.
+    // Version and live columns: one stamp per row, matching rows.insert.
     const stamps = try al.alloc(u64, n);
     defer al.free(stamps);
     @memset(stamps, txn.new_version);
@@ -785,7 +785,7 @@ pub fn bulkAppend(txn: *WriteTxn, cat: Ref, rows: []const []const u64) !Ref {
 }
 
 // Try the right-edge fast path; on NotAppendable, fall back to row-by-row
-// objects.insert, which handles any schema and detects duplicate keys per row.
+// rows.insert, which handles any schema and detects duplicate keys per row.
 pub fn bulkAppendOrInsert(txn: *WriteTxn, cat: Ref, rows: []const []const u64) !Ref {
     return bulkAppend(txn, cat, rows) catch |e| switch (e) {
         error.NotAppendable => fallbackInsert(txn, cat, rows),
@@ -794,9 +794,9 @@ pub fn bulkAppendOrInsert(txn: *WriteTxn, cat: Ref, rows: []const []const u64) !
 }
 
 // Insert every row one at a time, threading the catalog ref. A DuplicateKey from
-// objects.insert propagates to the caller. Empty rows return cat unchanged.
+// rows.insert propagates to the caller. Empty rows return cat unchanged.
 //
-// Link-bearing schemas are rejected outright: objects.insert writes raw column
+// Link-bearing schemas are rejected outright: rows.insert writes raw column
 // values without backlink maintenance (that is insertTyped's job), so silently
 // accepting them here would corrupt the link graph -- the same reason
 // bulkImport refuses them.
@@ -812,28 +812,13 @@ fn fallbackInsert(txn: *WriteTxn, cat: Ref, rows: []const []const u64) !Ref {
     }
     var c = cat;
     for (rows) |row| {
-        c = (try objects.insert(txn, c, row)).cat;
+        c = (try rawRows.insert(txn, c, row)).cat;
     }
     return c;
 }
 
 // ---------------------------------------------------------------------------
 // Tests
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// indexAppendRun: right-edge run append, asserted equivalent to sequential
-// Index.insert of the same keys.
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// columnAppendRun: right-edge run append, asserted equivalent to sequential
-// Column.append of the same values.
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// bulkAppend / bulkAppendOrInsert: right-edge batch append with a row-by-row
-// fallback, asserted equivalent to sequential objects.insert.
 // ---------------------------------------------------------------------------
 
 test {

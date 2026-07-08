@@ -1,5 +1,5 @@
 const std = @import("std");
-const WriteTxn = @import("db.zig").WriteTxn;
+const WriteTxn = @import("write_txn.zig").WriteTxn;
 const Ref = @import("ref.zig").Ref;
 const Column = @import("column.zig");
 const Index = @import("index.zig");
@@ -318,10 +318,6 @@ pub fn fixBacklinksForDelete(txn: *WriteTxn, cat: Ref, okey: u64) !Ref {
     const c1 = try nullifyInboundInCatalog(txn, cat, okey, 0, true);
     return try cleanOutboundInCatalog(txn, c1, okey);
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 test {
     _ = @import("linksTests.zig");

@@ -1,10 +1,12 @@
 const std = @import("std");
+const verification = @import("verification.zig");
 const Io = std.Io;
 const compaction = @import("compaction.zig");
 const catalog = @import("catalog.zig");
 const links = @import("links.zig");
 const typedir = @import("typedir.zig");
 const objects = @import("objects.zig");
+const rows = @import("rows.zig");
 const blob = @import("blob.zig");
 const liveCount = compaction.liveCount;
 const shouldCompact = compaction.shouldCompact;
@@ -40,14 +42,14 @@ test "compactType packs live rows and drops dead ones" {
     var cat = try catalog.create(&w, 2);
     var pk: u64 = 0;
     while (pk < 10) : (pk += 1) {
-        const r = try objects.insert(&w, cat, &.{ pk, pk * 10 });
+        const r = try rows.insert(&w, cat, &.{ pk, pk * 10 });
         cat = r.cat;
     }
 
     for ([_]u64{ 2, 5, 8 }) |dpk| {
         var out: [2]u64 = undefined;
-        const ver = (try objects.getByPk(&w, cat, dpk, &out)).?;
-        cat = switch (try objects.delete(&w, cat, dpk, ver)) {
+        const ver = (try rows.getByPk(&w, cat, dpk, &out)).?;
+        cat = switch (try rows.delete(&w, cat, dpk, ver)) {
             .ok => |c| c,
             else => unreachable,
         };
@@ -61,7 +63,7 @@ test "compactType packs live rows and drops dead ones" {
     pk = 0;
     while (pk < 10) : (pk += 1) {
         var out: [2]u64 = undefined;
-        const got = try objects.getByPk(&w, cat, pk, &out);
+        const got = try rows.getByPk(&w, cat, pk, &out);
         if (pk == 2 or pk == 5 or pk == 8) {
             try testing.expect(got == null);
         } else {
@@ -84,12 +86,12 @@ test "compactType frees the replaced column set" {
         var w = try db.beginWrite();
         var cat = try catalog.create(&w, 2);
         var pk: u64 = 0;
-        while (pk < 100) : (pk += 1) cat = (try objects.insert(&w, cat, &.{ pk, pk * 10 })).cat;
+        while (pk < 100) : (pk += 1) cat = (try rows.insert(&w, cat, &.{ pk, pk * 10 })).cat;
         pk = 0;
         while (pk < 100) : (pk += 5) {
             var out: [2]u64 = undefined;
-            const ver = (try objects.getByPk(&w, cat, pk, &out)).?;
-            cat = (try objects.delete(&w, cat, pk, ver)).ok;
+            const ver = (try rows.getByPk(&w, cat, pk, &out)).?;
+            cat = (try rows.delete(&w, cat, pk, ver)).ok;
         }
         w.setRoot(cat);
         _ = try w.commit();
@@ -125,8 +127,8 @@ test "object keys and links survive compaction" {
 
     // delete B (pk 2) -- creates a hole
     var out: [2]u64 = undefined;
-    const ver = (try objects.getByPk(&w, cat, 2, &out)).?;
-    cat = switch (try objects.delete(&w, cat, 2, ver)) {
+    const ver = (try rows.getByPk(&w, cat, 2, &out)).?;
+    cat = switch (try rows.delete(&w, cat, 2, ver)) {
         .ok => |x| x,
         else => unreachable,
     };
@@ -137,7 +139,7 @@ test "object keys and links survive compaction" {
     try testing.expectEqual(a_okey, (try links.getLink(&w, cat, 3, 1)).?);
     // A is still resolvable by its object key
     var ao: [2]u64 = undefined;
-    try testing.expect((try objects.getByObjectKey(&w, cat, a_okey, &ao)) != null);
+    try testing.expect((try rows.getByObjectKey(&w, cat, a_okey, &ao)) != null);
     try testing.expectEqual(@as(u64, 1), ao[0]);
     // backlink from C -> A survived
     try testing.expectEqual(@as(u64, 1), try links.backlinkCount(&w, cat, 1, a_okey));
@@ -156,7 +158,7 @@ test "shouldCompact reflects dead ratio" {
     var cat = try catalog.create(&w, 1);
     var pk: u64 = 0;
     while (pk < 10) : (pk += 1) {
-        const r = try objects.insert(&w, cat, &.{pk});
+        const r = try rows.insert(&w, cat, &.{pk});
         cat = r.cat;
     }
     try testing.expect(!(try shouldCompact(&w, cat)));
@@ -164,8 +166,8 @@ test "shouldCompact reflects dead ratio" {
     pk = 0;
     while (pk < 6) : (pk += 1) {
         var out: [1]u64 = undefined;
-        const ver = (try objects.getByPk(&w, cat, pk, &out)).?;
-        cat = switch (try objects.delete(&w, cat, pk, ver)) {
+        const ver = (try rows.getByPk(&w, cat, pk, &out)).?;
+        cat = switch (try rows.delete(&w, cat, pk, ver)) {
             .ok => |c| c,
             else => unreachable,
         };
@@ -187,14 +189,14 @@ test "compaction reclaims under churn (scale)" {
     var cat = try catalog.create(&w, 2);
     var i: u64 = 0;
     while (i < n) : (i += 1) {
-        const r = try objects.insert(&w, cat, &.{ i, i });
+        const r = try rows.insert(&w, cat, &.{ i, i });
         cat = r.cat;
     }
 
     // delete every even pk; all rows carry version == w.new_version this txn
     i = 0;
     while (i < n) : (i += 2) {
-        cat = switch (try objects.delete(&w, cat, i, w.new_version)) {
+        cat = switch (try rows.delete(&w, cat, i, w.new_version)) {
             .ok => |c| c,
             else => unreachable,
         };
@@ -206,13 +208,13 @@ test "compaction reclaims under churn (scale)" {
     try testing.expectEqual(@as(u64, 100_000), try liveCount(&w, cat));
 
     var out: [2]u64 = undefined;
-    try testing.expect((try objects.getByPk(&w, cat, 1, &out)) != null);
+    try testing.expect((try rows.getByPk(&w, cat, 1, &out)) != null);
     try testing.expectEqual(@as(u64, 1), out[1]);
-    try testing.expect((try objects.getByPk(&w, cat, 99_999, &out)) != null);
+    try testing.expect((try rows.getByPk(&w, cat, 99_999, &out)) != null);
     try testing.expectEqual(@as(u64, 99_999), out[1]);
-    try testing.expect((try objects.getByPk(&w, cat, 100_001, &out)) != null);
+    try testing.expect((try rows.getByPk(&w, cat, 100_001, &out)) != null);
     try testing.expectEqual(@as(u64, 100_001), out[1]);
-    try testing.expect((try objects.getByPk(&w, cat, 2, &out)) == null);
+    try testing.expect((try rows.getByPk(&w, cat, 2, &out)) == null);
 }
 
 test "all value kinds deep-copy across databases preserving keys" {
@@ -309,7 +311,7 @@ test "all value kinds deep-copy across databases preserving keys" {
         // The link on pk 2 still equals pk 1's original object key and resolves to pk 1.
         try testing.expectEqual(@as(?u64, pk1_okey), try links.getLink(&r, cat, 2, 4));
         var ob: [5]u64 = undefined;
-        try testing.expect((try objects.getByObjectKey(&r, cat, pk1_okey, &ob)) != null);
+        try testing.expect((try rows.getByObjectKey(&r, cat, pk1_okey, &ob)) != null);
         try testing.expectEqual(@as(u64, 1), ob[0]);
 
         // Backlink rebuilt from the copied forward link.
@@ -568,7 +570,7 @@ test "compactStep packs a delete-heavy type across several small steps" {
     var okeys: [12]u64 = undefined;
     var pk: u64 = 0;
     while (pk < 12) : (pk += 1) {
-        const r = try objects.insert(&w, cat, &.{ pk, pk * 100 });
+        const r = try rows.insert(&w, cat, &.{ pk, pk * 100 });
         cat = r.cat;
         okeys[@intCast(pk)] = r.row;
     }
@@ -576,8 +578,8 @@ test "compactStep packs a delete-heavy type across several small steps" {
     const dels = [_]u64{ 0, 2, 3, 5, 7, 8, 11 };
     for (dels) |dpk| {
         var out: [2]u64 = undefined;
-        const ver = (try objects.getByPk(&w, cat, dpk, &out)).?;
-        cat = switch (try objects.delete(&w, cat, dpk, ver)) {
+        const ver = (try rows.getByPk(&w, cat, dpk, &out)).?;
+        cat = switch (try rows.delete(&w, cat, dpk, ver)) {
             .ok => |c| c,
             else => unreachable,
         };
@@ -629,14 +631,14 @@ test "compactStep on an all-dead type truncates to zero" {
     var cat = try catalog.create(&w, 2);
     var pk: u64 = 0;
     while (pk < 6) : (pk += 1) {
-        const r = try objects.insert(&w, cat, &.{ pk, pk });
+        const r = try rows.insert(&w, cat, &.{ pk, pk });
         cat = r.cat;
     }
     pk = 0;
     while (pk < 6) : (pk += 1) {
         var out: [2]u64 = undefined;
-        const ver = (try objects.getByPk(&w, cat, pk, &out)).?;
-        cat = switch (try objects.delete(&w, cat, pk, ver)) {
+        const ver = (try rows.getByPk(&w, cat, pk, &out)).?;
+        cat = switch (try rows.delete(&w, cat, pk, ver)) {
             .ok => |c| c,
             else => unreachable,
         };
@@ -669,7 +671,7 @@ test "compactStep is a no-op on an already-packed type" {
     var okeys: [5]u64 = undefined;
     var pk: u64 = 0;
     while (pk < 5) : (pk += 1) {
-        const r = try objects.insert(&w, cat, &.{ pk, pk * 7 });
+        const r = try rows.insert(&w, cat, &.{ pk, pk * 7 });
         cat = r.cat;
         okeys[@intCast(pk)] = r.row;
     }
@@ -723,18 +725,18 @@ test "compactStep cursor path packs identically to the scan path" {
     var step_okeys: [20]u64 = undefined;
     var pk: u64 = 0;
     while (pk < 20) : (pk += 1) {
-        const rs = try objects.insert(&step_w, step_cat, &.{ pk, pk * 100 });
+        const rs = try rows.insert(&step_w, step_cat, &.{ pk, pk * 100 });
         step_cat = rs.cat;
         step_okeys[@intCast(pk)] = rs.row;
-        const rc = try objects.insert(&ctrl_w, ctrl_cat, &.{ pk, pk * 100 });
+        const rc = try rows.insert(&ctrl_w, ctrl_cat, &.{ pk, pk * 100 });
         ctrl_cat = rc.cat;
     }
     for (dels) |dpk| {
         var out: [2]u64 = undefined;
-        const vs = (try objects.getByPk(&step_w, step_cat, dpk, &out)).?;
-        step_cat = (try objects.delete(&step_w, step_cat, dpk, vs)).ok;
-        const vc = (try objects.getByPk(&ctrl_w, ctrl_cat, dpk, &out)).?;
-        ctrl_cat = (try objects.delete(&ctrl_w, ctrl_cat, dpk, vc)).ok;
+        const vs = (try rows.getByPk(&step_w, step_cat, dpk, &out)).?;
+        step_cat = (try rows.delete(&step_w, step_cat, dpk, vs)).ok;
+        const vc = (try rows.getByPk(&ctrl_w, ctrl_cat, dpk, &out)).?;
+        ctrl_cat = (try rows.delete(&ctrl_w, ctrl_cat, dpk, vc)).ok;
     }
 
     // Control: one full-pass compaction.
@@ -764,7 +766,7 @@ test "compactStep cursor path packs identically to the scan path" {
         var so: [2]catalog.Value = undefined;
         const sg = try objects.getTypedByOkey(&step_w, step_cat, step_okeys[@intCast(pk)], &so);
         var co: [2]u64 = undefined;
-        const cg = try objects.getByPk(&ctrl_w, ctrl_cat, pk, &co);
+        const cg = try rows.getByPk(&ctrl_w, ctrl_cat, pk, &co);
         if (isDel(pk)) {
             try testing.expect(sg == null);
             try testing.expect(cg == null);
@@ -775,7 +777,7 @@ test "compactStep cursor path packs identically to the scan path" {
             try testing.expectEqual(pk * 100, so[1].int);
             // Same primary key reads back in the control (survivor sets match).
             var sp: [2]u64 = undefined;
-            try testing.expect((try objects.getByPk(&step_w, step_cat, pk, &sp)) != null);
+            try testing.expect((try rows.getByPk(&step_w, step_cat, pk, &sp)) != null);
             try testing.expectEqual(pk * 100, sp[1]);
         }
     }
@@ -798,15 +800,15 @@ test "compactStep truncation never drops a live row at the top" {
     var okeys: [10]u64 = undefined;
     var pk: u64 = 0;
     while (pk < 10) : (pk += 1) {
-        const r = try objects.insert(&w, cat, &.{ pk, pk * 1000 });
+        const r = try rows.insert(&w, cat, &.{ pk, pk * 1000 });
         cat = r.cat;
         okeys[@intCast(pk)] = r.row;
     }
     pk = 0;
     while (pk < 5) : (pk += 1) {
         var out: [2]u64 = undefined;
-        const ver = (try objects.getByPk(&w, cat, pk, &out)).?;
-        cat = (try objects.delete(&w, cat, pk, ver)).ok;
+        const ver = (try rows.getByPk(&w, cat, pk, &out)).?;
+        cat = (try rows.delete(&w, cat, pk, ver)).ok;
     }
     try testing.expectEqual(@as(u64, 5), try liveCount(&w, cat));
 
@@ -848,13 +850,13 @@ test "compactStep moves at most budget rows per call" {
     var cat = try catalog.create(&w, 2);
     var pk: u64 = 0;
     while (pk < n) : (pk += 1) {
-        const r = try objects.insert(&w, cat, &.{ pk, pk });
+        const r = try rows.insert(&w, cat, &.{ pk, pk });
         cat = r.cat;
     }
     // Delete every even pk -> ~200 holes scattered through the low half.
     pk = 0;
     while (pk < n) : (pk += 2) {
-        cat = switch (try objects.delete(&w, cat, pk, w.new_version)) {
+        cat = switch (try rows.delete(&w, cat, pk, w.new_version)) {
             .ok => |c| c,
             else => unreachable,
         };
@@ -906,7 +908,7 @@ test "compactInPlace preserves value indexes and passes verifyIntegrity" {
 
     var db = try Db.open(testing.allocator, path);
     defer db.deinit();
-    try db.verifyIntegrity(); // the audit must agree the indexes are intact
+    try verification.verifyIntegrity(&db); // the audit must agree the indexes are intact
     var r = try db.beginRead();
     defer r.end();
     const cat = try typedir.catalogRef(&r, r.root(), 0);
