@@ -76,8 +76,8 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     // Build the directory: non-embedded owner + embedded child.
     {
         var writeTransaction = try database.beginWrite();
-        const dir = try typeDirectory.createTypes(&writeTransaction, &ownerSchema, &.{ false, true });
-        writeTransaction.setRoot(dir);
+        const directoryReference = try typeDirectory.createTypes(&writeTransaction, &ownerSchema, &.{ false, true });
+        writeTransaction.setRoot(directoryReference);
         _ = try writeTransaction.commit();
     }
 
@@ -101,18 +101,18 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         while (inserted < owners) {
             const thisBatch = @min(batchSize, owners - inserted);
             var writeTransaction = try database.beginWrite();
-            var dir = writeTransaction.newRoot;
+            var directoryReference = writeTransaction.newRoot;
             var innerIndex: usize = 0;
             while (innerIndex < thisBatch) : (innerIndex += 1) {
                 const primaryKey: u64 = inserted + innerIndex;
                 const startNs = nowNs(io);
-                dir = (try typeRouting.insert(&writeTransaction, dir, ownerType, &.{ .{ .int = primaryKey }, .{ .link = null } })).dir;
-                dir = try typeDirectory.insertEmbedded(&writeTransaction, dir, ownerType, primaryKey, embeddedProperty, &.{ .{ .int = primaryKey }, .{ .int = primaryKey *% 2654435761 } });
+                directoryReference = (try typeRouting.insert(&writeTransaction, directoryReference, ownerType, &.{ .{ .int = primaryKey }, .{ .link = null } })).directoryReference;
+                directoryReference = try typeDirectory.insertEmbedded(&writeTransaction, directoryReference, ownerType, primaryKey, embeddedProperty, &.{ .{ .int = primaryKey }, .{ .int = primaryKey *% 2654435761 } });
                 const elapsedNs: u64 = @intCast(nowNs(io) - startNs);
                 try createLat.add(alloc, elapsedNs);
                 try combined.add(alloc, elapsedNs);
             }
-            writeTransaction.setRoot(dir);
+            writeTransaction.setRoot(directoryReference);
             _ = try writeTransaction.commit();
             inserted += thisBatch;
         }
@@ -131,13 +131,13 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     {
         const phaseStart = nowNs(io);
         var readTransaction = try database.beginRead();
-        const dir = readTransaction.root();
+        const directoryReference = readTransaction.root();
         var out: [childProperties]Value = undefined;
         var key: usize = 0;
         while (key < readN) : (key += 1) {
             const primaryKey: u64 = (key * readStride) % owners;
             const startNs = nowNs(io);
-            _ = try typeRouting.getLinked(&readTransaction, dir, ownerType, primaryKey, embeddedProperty, &out);
+            _ = try typeRouting.getLinked(&readTransaction, directoryReference, ownerType, primaryKey, embeddedProperty, &out);
             const elapsedNs: u64 = @intCast(nowNs(io) - startNs);
             try readLat.add(alloc, elapsedNs);
             try combined.add(alloc, elapsedNs);
@@ -153,18 +153,18 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         while (done < updateN) {
             const thisBatch = @min(batchSize, updateN - done);
             var writeTransaction = try database.beginWrite();
-            var dir = writeTransaction.newRoot;
+            var directoryReference = writeTransaction.newRoot;
             var innerIndex: usize = 0;
             while (innerIndex < thisBatch) : (innerIndex += 1) {
                 const primaryKey: u64 = ((done + innerIndex) * updateStride) % owners;
                 const startNs = nowNs(io);
-                dir = try typeDirectory.clearEmbedded(&writeTransaction, dir, ownerType, primaryKey, embeddedProperty);
-                dir = try typeDirectory.insertEmbedded(&writeTransaction, dir, ownerType, primaryKey, embeddedProperty, &.{ .{ .int = primaryKey }, .{ .int = primaryKey *% 40503 } });
+                directoryReference = try typeDirectory.clearEmbedded(&writeTransaction, directoryReference, ownerType, primaryKey, embeddedProperty);
+                directoryReference = try typeDirectory.insertEmbedded(&writeTransaction, directoryReference, ownerType, primaryKey, embeddedProperty, &.{ .{ .int = primaryKey }, .{ .int = primaryKey *% 40503 } });
                 const elapsedNs: u64 = @intCast(nowNs(io) - startNs);
                 try updateLat.add(alloc, elapsedNs);
                 try combined.add(alloc, elapsedNs);
             }
-            writeTransaction.setRoot(dir);
+            writeTransaction.setRoot(directoryReference);
             _ = try writeTransaction.commit();
             done += thisBatch;
         }
@@ -179,13 +179,13 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         while (done < deleteN) {
             const thisBatch = @min(batchSize, deleteN - done);
             var writeTransaction = try database.beginWrite();
-            var dir = writeTransaction.newRoot;
+            var directoryReference = writeTransaction.newRoot;
             var innerIndex: usize = 0;
             while (innerIndex < thisBatch) : (innerIndex += 1) {
                 const primaryKey: u64 = ((done + innerIndex) * deleteStride) % owners;
-                const hadChild = (try typeRouting.getLink(&writeTransaction, dir, ownerType, primaryKey, embeddedProperty)) != null;
+                const hadChild = (try typeRouting.getLink(&writeTransaction, directoryReference, ownerType, primaryKey, embeddedProperty)) != null;
                 const startNs = nowNs(io);
-                dir = try typeDirectory.clearEmbedded(&writeTransaction, dir, ownerType, primaryKey, embeddedProperty);
+                directoryReference = try typeDirectory.clearEmbedded(&writeTransaction, directoryReference, ownerType, primaryKey, embeddedProperty);
                 const elapsedNs: u64 = @intCast(nowNs(io) - startNs);
                 if (hadChild) {
                     deleted += 1;
@@ -193,7 +193,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
                     try combined.add(alloc, elapsedNs);
                 }
             }
-            writeTransaction.setRoot(dir);
+            writeTransaction.setRoot(directoryReference);
             _ = try writeTransaction.commit();
             done += thisBatch;
         }

@@ -5,13 +5,13 @@
 //     bookkeeping, the result table, and JSON output.
 //   - Individual scenarios (added in later tasks) own opening a Database, inserting
 //     rows, and measuring. The harness never opens a Database itself; it only hands a
-//     `Ctx` (allocator, row count, scratch dir) to each scenario.
+//     `Ctx` (allocator, row count, scratch directory) to each scenario.
 //
 // Zig 0.16 idioms used here (mirrors src/fileStore.zig):
 //   - Io instance       -> std.Io.Threaded.global_single_threaded.io()
 //   - stdout writer     -> Io.File.Writer over Io.File.stdout()
 //   - file create/open  -> Io.Dir.cwd().createFile(io, ...)
-//   - dir create/delete -> Io.Dir.cwd().createDirPath / deleteTree
+//   - directory create/delete -> Io.Dir.cwd().createDirPath / deleteTree
 //   - JSON              -> std.json.fmt(value, .{}) via the "{f}" placeholder
 
 const std = @import("std");
@@ -19,7 +19,7 @@ const airdb = @import("airdb");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
-// Returns the blocking Io instance used for all file/dir operations. Always
+// Returns the blocking Io instance used for all file/directory operations. Always
 // initialized (compile-time vtable), matching the convention in fileStore.zig.
 inline fn sysIo() Io {
     return std.Io.Threaded.global_single_threaded.io();
@@ -51,11 +51,11 @@ pub const Opts = struct {
     }
 };
 
-/// Per-scenario context. Scenarios open their own Database under `tmpDir`.
+/// Per-scenario context. Scenarios open their own Database under `scratchDirectoryPath`.
 pub const Ctx = struct {
     alloc: Allocator,
     rowCount: usize,
-    tmpDir: []const u8,
+    scratchDirectoryPath: []const u8,
 };
 
 // ---------------------------------------------------------------------------
@@ -217,9 +217,9 @@ pub fn appendJson(path: []const u8, scale: Scale, results: []const Result, alloc
 // Scratch-file helpers
 // ---------------------------------------------------------------------------
 
-/// Joins `ctx.tmpDir` and `name` into an absolute path. Caller frees.
+/// Joins `ctx.scratchDirectoryPath` and `name` into an absolute path. Caller frees.
 pub fn scratchPath(ctx: Ctx, name: []const u8) ![]const u8 {
-    return std.fs.path.join(ctx.alloc, &.{ ctx.tmpDir, name });
+    return std.fs.path.join(ctx.alloc, &.{ ctx.scratchDirectoryPath, name });
 }
 
 /// Deletes a scratch file, ignoring any error (best-effort cleanup).
@@ -299,7 +299,7 @@ pub fn runAll(alloc: Allocator, opts: Opts) !void {
     const count: usize = if (opts.scale == .m1) 1_000_000 else 10_000_000;
 
     const io = sysIo();
-    const scratch = scratchDir();
+    const scratch = scratchDirectoryPath();
     // Start from a clean slate, then guarantee removal on the way out.
     Io.Dir.cwd().deleteTree(io, scratch) catch {};
     try Io.Dir.cwd().createDirPath(io, scratch);
@@ -334,7 +334,7 @@ pub fn runAll(alloc: Allocator, opts: Opts) !void {
         if (opts.only) |only| {
             if (!std.mem.eql(u8, only, scenario.name)) continue;
         }
-        var ctx = Ctx{ .alloc = alloc, .rowCount = count, .tmpDir = scratch };
+        var ctx = Ctx{ .alloc = alloc, .rowCount = count, .scratchDirectoryPath = scratch };
         try results.append(alloc, try scenario.run(&ctx));
     }
 
@@ -351,7 +351,7 @@ pub fn runAll(alloc: Allocator, opts: Opts) !void {
 
 // POSIX scratch directory. The repo's C smoke test already assumes a fixed
 // "/tmp" path for POSIX hosts; we follow that convention here.
-fn scratchDir() []const u8 {
+fn scratchDirectoryPath() []const u8 {
     return "/tmp/airdb-bench";
 }
 

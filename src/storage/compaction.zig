@@ -358,13 +358,13 @@ fn checkRowProperties(
 // Proves, per type: identical type count, identical live count, identical primaryKey set
 // (order-independent fold), every source object readable in dst by its original
 // key, and identical to-one forward links. Any divergence aborts the compaction.
-fn verifyEquivalent(allocator: std.mem.Allocator, source: anytype, srcDir: Reference, destination: anytype, dstDir: Reference) !void {
-    const typeCount = try typeDirectory.typeCount(source, srcDir);
-    if ((try typeDirectory.typeCount(destination, dstDir)) != typeCount) return error.CompactionMismatch;
+fn verifyEquivalent(allocator: std.mem.Allocator, source: anytype, sourceDirectoryReference: Reference, destination: anytype, destinationDirectoryReference: Reference) !void {
+    const typeCount = try typeDirectory.typeCount(source, sourceDirectoryReference);
+    if ((try typeDirectory.typeCount(destination, destinationDirectoryReference)) != typeCount) return error.CompactionMismatch;
     var typeId: u16 = 0;
     while (typeId < typeCount) : (typeId += 1) {
-        const sourceCatalog = try typeDirectory.catalogRef(source, srcDir, typeId);
-        const destinationCatalog = try typeDirectory.catalogRef(destination, dstDir, typeId);
+        const sourceCatalog = try typeDirectory.catalogRef(source, sourceDirectoryReference, typeId);
+        const destinationCatalog = try typeDirectory.catalogRef(destination, destinationDirectoryReference, typeId);
 
         // 1. live count.
         if ((try liveCount(source, sourceCatalog)) != (try liveCount(destination, destinationCatalog))) return error.CompactionMismatch;
@@ -391,8 +391,8 @@ pub fn compactToNewFile(allocator: std.mem.Allocator, srcPath: []const u8, dstPa
     defer sourceDatabase.deinit();
     var srcR = try sourceDatabase.beginRead();
     defer srcR.end();
-    const srcDir = srcR.root();
-    const typeCount = try typeDirectory.typeCount(&srcR, srcDir);
+    const sourceDirectoryReference = srcR.root();
+    const typeCount = try typeDirectory.typeCount(&srcR, sourceDirectoryReference);
 
     var destinationDatabase = try @import("../database.zig").Database.create(allocator, dstPath);
     var destinationDatabaseAlive = true;
@@ -412,7 +412,7 @@ pub fn compactToNewFile(allocator: std.mem.Allocator, srcPath: []const u8, dstPa
     {
         var typeId: u16 = 0;
         while (typeId < typeCount) : (typeId += 1) {
-            const sourceCatalog = try typeDirectory.catalogRef(&srcR, srcDir, typeId);
+            const sourceCatalog = try typeDirectory.catalogRef(&srcR, sourceDirectoryReference, typeId);
             const view = try catalog.loadCatalog(&srcR, sourceCatalog);
             const definitions = try allocator.alloc(catalog.PropertyDefinition, view.propertyCount);
             var propertyIndex: usize = 0;
@@ -420,26 +420,26 @@ pub fn compactToNewFile(allocator: std.mem.Allocator, srcPath: []const u8, dstPa
                 definitions[propertyIndex] = .{ .kind = view.kind(propertyIndex), .element = view.elementKind(propertyIndex), .linkTarget = view.linkTarget(propertyIndex), .deletionRule = view.deletionRule(propertyIndex), .indexed = view.indexed(propertyIndex) };
             }
             try schema.append(allocator, definitions);
-            try embedded.append(allocator, try typeDirectory.isEmbedded(&srcR, srcDir, typeId));
+            try embedded.append(allocator, try typeDirectory.isEmbedded(&srcR, sourceDirectoryReference, typeId));
         }
     }
-    var dstDir = try typeDirectory.createTypes(&dstW, schema.items, embedded.items);
+    var destinationDirectoryReference = try typeDirectory.createTypes(&dstW, schema.items, embedded.items);
 
     // Copy each type's live rows, then rebuild its backlinks.
     {
         var typeId: u16 = 0;
         while (typeId < typeCount) : (typeId += 1) {
-            const sourceCatalog = try typeDirectory.catalogRef(&srcR, srcDir, typeId);
+            const sourceCatalog = try typeDirectory.catalogRef(&srcR, sourceDirectoryReference, typeId);
             var destinationCatalog = try copyTypeRows(&srcR, sourceCatalog, &dstW);
             destinationCatalog = try rebuildBacklinks(&dstW, destinationCatalog);
-            dstDir = try typeDirectory.setCatalogRef(&dstW, dstDir, typeId, destinationCatalog);
+            destinationDirectoryReference = try typeDirectory.setCatalogRef(&dstW, destinationDirectoryReference, typeId, destinationCatalog);
         }
     }
 
     // VERIFY before publishing. On any mismatch, abort (no commit) -> dst discarded.
-    try verifyEquivalent(allocator, &srcR, srcDir, &dstW, dstDir);
+    try verifyEquivalent(allocator, &srcR, sourceDirectoryReference, &dstW, destinationDirectoryReference);
 
-    dstW.setRoot(dstDir);
+    dstW.setRoot(destinationDirectoryReference);
     _ = try dstW.commit();
     dstCommitted = true;
     destinationDatabase.deinit();
@@ -489,7 +489,7 @@ pub fn compactInPlace(allocator: std.mem.Allocator, path: []const u8) !void {
 
     // 4) Make the rename durable across power loss by fsync'ing the parent
     //    directory. The data file is F_FULLFSYNC'd by compactToNewFile and the
-    //    rename is atomic; this dir fsync hardens the directory ENTRY itself.
+    //    rename is atomic; this directory fsync hardens the directory ENTRY itself.
     //    Restored portably via libc fsync on the directory fd (the std.Io File
     //    sync wrapper panics with BADF on a directory handle on Linux).
     //    Best-effort: a failure here cannot un-publish the already-renamed file.

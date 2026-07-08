@@ -11,8 +11,8 @@ const rows = @import("../records/rows.zig");
 fn tmpFilePath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const u8) ![]const u8 {
     var pathBuffer: [Io.Dir.max_path_bytes]u8 = undefined;
     const pathLen = try tmp.dir.realPath(testing.io, &pathBuffer);
-    const dirPath = pathBuffer[0..pathLen];
-    return std.fs.path.join(allocator, &.{ dirPath, name });
+    const directoryPath = pathBuffer[0..pathLen];
+    return std.fs.path.join(allocator, &.{ directoryPath, name });
 }
 
 // Churn a single-row int type across `n` commits: each iteration commits an insert

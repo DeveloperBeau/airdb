@@ -347,31 +347,31 @@ test "compactToNewFile produces a verified, smaller, equivalent file" {
             &.{ .{ .kind = .int }, .{ .kind = .blob } }, // 0: Author{int primaryKey, blob name}
             &.{ .{ .kind = .int }, .{ .kind = .link, .linkTarget = 0 }, .{ .kind = .set, .element = .int } }, // 1: Book{int primaryKey, link author, set tags}
         };
-        var dir = try typeDirectory.createTypes(&writeTransaction, &schema, &.{ false, false });
+        var directoryReference = try typeDirectory.createTypes(&writeTransaction, &schema, &.{ false, false });
 
         var index: u64 = 0;
         var nbuf: [32]u8 = undefined;
         while (index < 300) : (index += 1) {
             const authorName = try std.fmt.bufPrint(&nbuf, "author-{d}", .{index});
-            const inserted = try typeRouting.insert(&writeTransaction, dir, 0, &.{ .{ .int = index }, .{ .bytes = authorName } });
-            dir = inserted.dir;
+            const inserted = try typeRouting.insert(&writeTransaction, directoryReference, 0, &.{ .{ .int = index }, .{ .bytes = authorName } });
+            directoryReference = inserted.directoryReference;
             authorObjectKeys[@intCast(index)] = inserted.objectKey;
         }
         index = 0;
         while (index < 300) : (index += 1) {
             const objectKeyA = authorObjectKeys[@intCast(index % 300)];
-            const inserted = try typeRouting.insert(&writeTransaction, dir, 1, &.{ .{ .int = index }, .{ .link = objectKeyA }, .{ .setInt = &.{ index, index + 1000 } } });
-            dir = inserted.dir;
+            const inserted = try typeRouting.insert(&writeTransaction, directoryReference, 1, &.{ .{ .int = index }, .{ .link = objectKeyA }, .{ .setInt = &.{ index, index + 1000 } } });
+            directoryReference = inserted.directoryReference;
         }
         // Delete every third book (~100): primaryKeys 0,3,...,297.
         index = 0;
         while (index < 300) : (index += 3) {
             var out: [3]catalog.Value = undefined;
-            const version = (try typeRouting.get(&writeTransaction, dir, 1, index, &out)).?;
-            const dres = try typeRouting.deleteNullifyCrossType(&writeTransaction, dir, 1, index, version);
-            dir = dres.ok;
+            const version = (try typeRouting.get(&writeTransaction, directoryReference, 1, index, &out)).?;
+            const dres = try typeRouting.deleteNullifyCrossType(&writeTransaction, directoryReference, 1, index, version);
+            directoryReference = dres.ok;
         }
-        writeTransaction.setRoot(dir);
+        writeTransaction.setRoot(directoryReference);
         _ = try writeTransaction.commit();
     }
 
@@ -398,29 +398,29 @@ test "compactToNewFile produces a verified, smaller, equivalent file" {
     defer reopenedDestination.deinit();
     var readTransaction = try reopenedDestination.beginRead();
     defer readTransaction.end();
-    const dir = readTransaction.root();
+    const directoryReference = readTransaction.root();
 
-    try testing.expectEqual(@as(u64, 300), try typeRouting.liveCount(&readTransaction, dir, 0));
-    try testing.expectEqual(@as(u64, 200), try typeRouting.liveCount(&readTransaction, dir, 1));
+    try testing.expectEqual(@as(u64, 300), try typeRouting.liveCount(&readTransaction, directoryReference, 0));
+    try testing.expectEqual(@as(u64, 200), try typeRouting.liveCount(&readTransaction, directoryReference, 1));
 
     // A surviving author reads back with identical values.
     var valuesA: [2]catalog.Value = undefined;
-    _ = (try typeRouting.get(&readTransaction, dir, 0, 42, &valuesA)).?;
+    _ = (try typeRouting.get(&readTransaction, directoryReference, 0, 42, &valuesA)).?;
     try testing.expectEqual(@as(u64, 42), valuesA[0].int);
     try testing.expectEqualStrings("author-42", valuesA[1].bytes);
 
     // A surviving book (primaryKey 1, not divisible by 3) keeps its author link, and the
     // link resolves to the same author object.
     var valuesB: [3]catalog.Value = undefined;
-    _ = (try typeRouting.get(&readTransaction, dir, 1, 1, &valuesB)).?;
-    try testing.expectEqual(@as(?u64, authorObjectKeys[1]), try typeRouting.getLink(&readTransaction, dir, 1, 1, 1));
+    _ = (try typeRouting.get(&readTransaction, directoryReference, 1, 1, &valuesB)).?;
+    try testing.expectEqual(@as(?u64, authorObjectKeys[1]), try typeRouting.getLink(&readTransaction, directoryReference, 1, 1, 1));
     var linkValues: [2]catalog.Value = undefined;
-    _ = (try typeRouting.getLinked(&readTransaction, dir, 1, 1, 1, &linkValues)).?;
+    _ = (try typeRouting.getLinked(&readTransaction, directoryReference, 1, 1, 1, &linkValues)).?;
     try testing.expectEqual(@as(u64, 1), linkValues[0].int);
 
     // A deleted book (primaryKey 3) is absent.
     var valuesB3: [3]catalog.Value = undefined;
-    try testing.expectEqual(@as(?u64, null), try typeRouting.get(&readTransaction, dir, 1, 3, &valuesB3));
+    try testing.expectEqual(@as(?u64, null), try typeRouting.get(&readTransaction, directoryReference, 1, 3, &valuesB3));
 }
 
 test "compaction preserves dict and set-of-blob" {
@@ -442,28 +442,28 @@ test "compaction preserves dict and set-of-blob" {
         const schema = [_][]const PD{
             &.{ .{ .kind = .int }, .{ .kind = .dict }, .{ .kind = .set, .element = .blob } },
         };
-        var dir = try typeDirectory.createTypes(&writeTransaction, &schema, &.{false});
+        var directoryReference = try typeDirectory.createTypes(&writeTransaction, &schema, &.{false});
 
-        const inserted1 = try typeRouting.insert(&writeTransaction, dir, 0, &.{
+        const inserted1 = try typeRouting.insert(&writeTransaction, directoryReference, 0, &.{
             .{ .int = 1 },
             .{ .dictInt = &.{ .{ .key = "a", .value = 1 }, .{ .key = "b", .value = 2 } } },
             .{ .setBlob = &.{ "x", "yy" } },
         });
-        dir = inserted1.dir;
-        const inserted2 = try typeRouting.insert(&writeTransaction, dir, 0, &.{
+        directoryReference = inserted1.directoryReference;
+        const inserted2 = try typeRouting.insert(&writeTransaction, directoryReference, 0, &.{
             .{ .int = 2 },
             .{ .dictInt = &.{.{ .key = "c", .value = 3 }} },
             .{ .setBlob = &.{"zzz"} },
         });
-        dir = inserted2.dir;
+        directoryReference = inserted2.directoryReference;
 
         // Delete primaryKey 2 -- leaves a gap in the source.
         var out: [3]catalog.Value = undefined;
-        const version = (try typeRouting.get(&writeTransaction, dir, 0, 2, &out)).?;
-        const dres = try typeRouting.deleteNullifyCrossType(&writeTransaction, dir, 0, 2, version);
-        dir = dres.ok;
+        const version = (try typeRouting.get(&writeTransaction, directoryReference, 0, 2, &out)).?;
+        const dres = try typeRouting.deleteNullifyCrossType(&writeTransaction, directoryReference, 0, 2, version);
+        directoryReference = dres.ok;
 
-        writeTransaction.setRoot(dir);
+        writeTransaction.setRoot(directoryReference);
         _ = try writeTransaction.commit();
     }
 
@@ -476,10 +476,10 @@ test "compaction preserves dict and set-of-blob" {
         defer reopenedDestination.deinit();
         var readTransaction = try reopenedDestination.beginRead();
         defer readTransaction.end();
-        const dir = readTransaction.root();
-        const catalogRef = try typeDirectory.catalogRef(&readTransaction, dir, 0);
+        const directoryReference = readTransaction.root();
+        const catalogRef = try typeDirectory.catalogRef(&readTransaction, directoryReference, 0);
 
-        try testing.expectEqual(@as(u64, 1), try typeRouting.liveCount(&readTransaction, dir, 0));
+        try testing.expectEqual(@as(u64, 1), try typeRouting.liveCount(&readTransaction, directoryReference, 0));
 
         // Surviving row primaryKey 1: dict entries preserved.
         try testing.expectEqual(@as(?u64, 2), try collections.dictCount(&readTransaction, catalogRef, 1, 1));
@@ -495,7 +495,7 @@ test "compaction preserves dict and set-of-blob" {
 
         // Deleted row primaryKey 2 is absent.
         var values2: [3]catalog.Value = undefined;
-        try testing.expectEqual(@as(?u64, null), try typeRouting.get(&readTransaction, dir, 0, 2, &values2));
+        try testing.expectEqual(@as(?u64, null), try typeRouting.get(&readTransaction, directoryReference, 0, 2, &values2));
     }
 }
 
@@ -523,10 +523,10 @@ test "compaction preserves a large (chunked) blob" {
         const schema = [_][]const PD{
             &.{ .{ .kind = .int }, .{ .kind = .blob } },
         };
-        var dir = try typeDirectory.createTypes(&writeTransaction, &schema, &.{false});
-        dir = (try typeRouting.insert(&writeTransaction, dir, 0, &.{ .{ .int = 1 }, .{ .bytes = big } })).dir;
-        dir = (try typeRouting.insert(&writeTransaction, dir, 0, &.{ .{ .int = 2 }, .{ .bytes = "small" } })).dir;
-        writeTransaction.setRoot(dir);
+        var directoryReference = try typeDirectory.createTypes(&writeTransaction, &schema, &.{false});
+        directoryReference = (try typeRouting.insert(&writeTransaction, directoryReference, 0, &.{ .{ .int = 1 }, .{ .bytes = big } })).directoryReference;
+        directoryReference = (try typeRouting.insert(&writeTransaction, directoryReference, 0, &.{ .{ .int = 2 }, .{ .bytes = "small" } })).directoryReference;
+        writeTransaction.setRoot(directoryReference);
         _ = try writeTransaction.commit();
     }
 
@@ -539,11 +539,11 @@ test "compaction preserves a large (chunked) blob" {
         defer reopenedDestination.deinit();
         var readTransaction = try reopenedDestination.beginRead();
         defer readTransaction.end();
-        const dir = readTransaction.root();
+        const directoryReference = readTransaction.root();
 
         // The large blob materializes byte-identical via its ref.
         var values1: [2]catalog.Value = undefined;
-        try testing.expect((try typeRouting.get(&readTransaction, dir, 0, 1, &values1)) != null);
+        try testing.expect((try typeRouting.get(&readTransaction, directoryReference, 0, 1, &values1)) != null);
         try testing.expect(values1[1] == .blobRef);
         const got = try blob.getAlloc(&readTransaction, values1[1].blobRef, testing.allocator);
         defer testing.allocator.free(got);
@@ -551,7 +551,7 @@ test "compaction preserves a large (chunked) blob" {
 
         // The small blob still reads via a zero-copy slice.
         var values2: [2]catalog.Value = undefined;
-        try testing.expect((try typeRouting.get(&readTransaction, dir, 0, 2, &values2)) != null);
+        try testing.expect((try typeRouting.get(&readTransaction, directoryReference, 0, 2, &values2)) != null);
         try testing.expect(values2[1] == .bytes);
         try testing.expectEqualStrings("small", values2[1].bytes);
     }
@@ -893,14 +893,14 @@ test "compactInPlace preserves value indexes and passes verifyIntegrity" {
     {
         var database = try Database.create(testing.allocator, path);
         var writeTransaction = try database.beginWrite();
-        var dir = try typeDirectory.createTypes(&writeTransaction, &.{
+        var directoryReference = try typeDirectory.createTypes(&writeTransaction, &.{
             &.{ .{ .kind = .int }, .{ .kind = .int, .indexed = true } },
         }, &.{false});
         var primaryKey: u64 = 0;
         while (primaryKey < 50) : (primaryKey += 1) {
-            dir = (try typeRouting.insert(&writeTransaction, dir, 0, &.{ .{ .int = primaryKey }, .{ .int = primaryKey % 5 } })).dir;
+            directoryReference = (try typeRouting.insert(&writeTransaction, directoryReference, 0, &.{ .{ .int = primaryKey }, .{ .int = primaryKey % 5 } })).directoryReference;
         }
-        writeTransaction.setRoot(dir);
+        writeTransaction.setRoot(directoryReference);
         _ = try writeTransaction.commit();
         database.deinit();
     }
@@ -939,30 +939,30 @@ test "compactInPlace shrinks and preserves data" {
             &.{ .{ .kind = .int }, .{ .kind = .blob } }, // 0: Author{int primaryKey, blob name}
             &.{ .{ .kind = .int }, .{ .kind = .link, .linkTarget = 0 } }, // 1: Book{int primaryKey, link author}
         };
-        var dir = try typeDirectory.createTypes(&writeTransaction, &schema, &.{ false, false });
+        var directoryReference = try typeDirectory.createTypes(&writeTransaction, &schema, &.{ false, false });
 
         var index: u64 = 0;
         var nbuf: [32]u8 = undefined;
         while (index < 200) : (index += 1) {
             const authorName = try std.fmt.bufPrint(&nbuf, "author-{d}", .{index});
-            const inserted = try typeRouting.insert(&writeTransaction, dir, 0, &.{ .{ .int = index }, .{ .bytes = authorName } });
-            dir = inserted.dir;
+            const inserted = try typeRouting.insert(&writeTransaction, directoryReference, 0, &.{ .{ .int = index }, .{ .bytes = authorName } });
+            directoryReference = inserted.directoryReference;
             authorObjectKeys[@intCast(index)] = inserted.objectKey;
         }
         index = 0;
         while (index < 200) : (index += 1) {
-            const inserted = try typeRouting.insert(&writeTransaction, dir, 1, &.{ .{ .int = index }, .{ .link = authorObjectKeys[@intCast(index)] } });
-            dir = inserted.dir;
+            const inserted = try typeRouting.insert(&writeTransaction, directoryReference, 1, &.{ .{ .int = index }, .{ .link = authorObjectKeys[@intCast(index)] } });
+            directoryReference = inserted.directoryReference;
         }
         // Churn: delete every even-primaryKey book (~100 holes).
         index = 0;
         while (index < 200) : (index += 2) {
             var out: [2]catalog.Value = undefined;
-            const version = (try typeRouting.get(&writeTransaction, dir, 1, index, &out)).?;
-            const dres = try typeRouting.deleteNullifyCrossType(&writeTransaction, dir, 1, index, version);
-            dir = dres.ok;
+            const version = (try typeRouting.get(&writeTransaction, directoryReference, 1, index, &out)).?;
+            const dres = try typeRouting.deleteNullifyCrossType(&writeTransaction, directoryReference, 1, index, version);
+            directoryReference = dres.ok;
         }
-        writeTransaction.setRoot(dir);
+        writeTransaction.setRoot(directoryReference);
         _ = try writeTransaction.commit();
 
         preTop = database.arena.top;
@@ -989,27 +989,27 @@ test "compactInPlace shrinks and preserves data" {
 
     var readTransaction = try database.beginRead();
     defer readTransaction.end();
-    const dir = readTransaction.root();
+    const directoryReference = readTransaction.root();
 
     // All 200 authors survive; only the 100 odd-primaryKey books remain.
-    try testing.expectEqual(@as(u64, 200), try typeRouting.liveCount(&readTransaction, dir, 0));
-    try testing.expectEqual(@as(u64, 100), try typeRouting.liveCount(&readTransaction, dir, 1));
+    try testing.expectEqual(@as(u64, 200), try typeRouting.liveCount(&readTransaction, directoryReference, 0));
+    try testing.expectEqual(@as(u64, 100), try typeRouting.liveCount(&readTransaction, directoryReference, 1));
 
     // A surviving author reads back identically.
     var valuesA: [2]catalog.Value = undefined;
-    _ = (try typeRouting.get(&readTransaction, dir, 0, 137, &valuesA)).?;
+    _ = (try typeRouting.get(&readTransaction, directoryReference, 0, 137, &valuesA)).?;
     try testing.expectEqual(@as(u64, 137), valuesA[0].int);
     try testing.expectEqualStrings("author-137", valuesA[1].bytes);
 
     // A surviving (odd-primaryKey) book keeps its author link, resolving to the same author.
     var valuesB: [2]catalog.Value = undefined;
-    _ = (try typeRouting.get(&readTransaction, dir, 1, 137, &valuesB)).?;
-    try testing.expectEqual(@as(?u64, authorObjectKeys[137]), try typeRouting.getLink(&readTransaction, dir, 1, 137, 1));
+    _ = (try typeRouting.get(&readTransaction, directoryReference, 1, 137, &valuesB)).?;
+    try testing.expectEqual(@as(?u64, authorObjectKeys[137]), try typeRouting.getLink(&readTransaction, directoryReference, 1, 137, 1));
     var linkValues: [2]catalog.Value = undefined;
-    _ = (try typeRouting.getLinked(&readTransaction, dir, 1, 137, 1, &linkValues)).?;
+    _ = (try typeRouting.getLinked(&readTransaction, directoryReference, 1, 137, 1, &linkValues)).?;
     try testing.expectEqual(@as(u64, 137), linkValues[0].int);
 
     // A deleted (even-primaryKey) book is absent.
     var valuesB2: [2]catalog.Value = undefined;
-    try testing.expectEqual(@as(?u64, null), try typeRouting.get(&readTransaction, dir, 1, 42, &valuesB2));
+    try testing.expectEqual(@as(?u64, null), try typeRouting.get(&readTransaction, directoryReference, 1, 42, &valuesB2));
 }

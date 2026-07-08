@@ -378,11 +378,11 @@ test "bulkImport equals row-by-row for a scalar indexed type" {
         var database = try Database.create(testing.allocator, pathA);
         defer database.deinit();
         var writeTransaction = try database.beginWrite();
-        const dir = try typeDirectory.createTypes(&writeTransaction, &.{&importDefinitions}, &.{false});
-        const catalog0 = try typeDirectory.catalogRef(&writeTransaction, dir, 0);
+        const directoryReference = try typeDirectory.createTypes(&writeTransaction, &.{&importDefinitions}, &.{false});
+        const catalog0 = try typeDirectory.catalogRef(&writeTransaction, directoryReference, 0);
         const newCatalog = try bulkImport(&writeTransaction, catalog0, rowSlices, .{});
-        const newDir = try typeDirectory.setCatalogRef(&writeTransaction, dir, 0, newCatalog);
-        writeTransaction.setRoot(newDir);
+        const newDirectoryReference = try typeDirectory.setCatalogRef(&writeTransaction, directoryReference, 0, newCatalog);
+        writeTransaction.setRoot(newDirectoryReference);
         _ = try writeTransaction.commit();
         try verification.verifyIntegrity(&database); // both value-index directions, in memory
     }
@@ -540,11 +540,11 @@ test "bulkImport edge sizes: empty, single, leafCap" {
         defer database.deinit();
         {
             var writeTransaction = try database.beginWrite();
-            const dir = try typeDirectory.createTypes(&writeTransaction, &.{&importDefinitions}, &.{false});
-            const catalog0 = try typeDirectory.catalogRef(&writeTransaction, dir, 0);
+            const directoryReference = try typeDirectory.createTypes(&writeTransaction, &.{&importDefinitions}, &.{false});
+            const catalog0 = try typeDirectory.catalogRef(&writeTransaction, directoryReference, 0);
             const newCatalog = try bulkImport(&writeTransaction, catalog0, rowSlices, .{ .presorted = true });
-            const newDir = try typeDirectory.setCatalogRef(&writeTransaction, dir, 0, newCatalog);
-            writeTransaction.setRoot(newDir);
+            const newDirectoryReference = try typeDirectory.setCatalogRef(&writeTransaction, directoryReference, 0, newCatalog);
+            writeTransaction.setRoot(newDirectoryReference);
             _ = try writeTransaction.commit();
         }
         try verification.verifyIntegrity(&database);
@@ -602,13 +602,13 @@ test "bulkAppend equals row-by-row for a contiguous monotonic batch" {
         var database = try Database.create(testing.allocator, pathA);
         defer database.deinit();
         var writeTransaction = try database.beginWrite();
-        const dir = try typeDirectory.createTypes(&writeTransaction, &.{&appendDefinitions}, &.{false});
-        var catalogRef = try typeDirectory.catalogRef(&writeTransaction, dir, 0);
+        const directoryReference = try typeDirectory.createTypes(&writeTransaction, &.{&appendDefinitions}, &.{false});
+        var catalogRef = try typeDirectory.catalogRef(&writeTransaction, directoryReference, 0);
         var primaryKey: u64 = 0;
         while (primaryKey < BASE) : (primaryKey += 1) catalogRef = (try rawRows.insert(&writeTransaction, catalogRef, &.{ primaryKey, primaryKey * 3 })).catalogRef;
         const newCatalog = try bulkAppend(&writeTransaction, catalogRef, batch);
-        const newDir = try typeDirectory.setCatalogRef(&writeTransaction, dir, 0, newCatalog);
-        writeTransaction.setRoot(newDir);
+        const newDirectoryReference = try typeDirectory.setCatalogRef(&writeTransaction, directoryReference, 0, newCatalog);
+        writeTransaction.setRoot(newDirectoryReference);
         _ = try writeTransaction.commit();
         try verification.verifyIntegrity(&database);
     }
@@ -777,13 +777,13 @@ test "bulkAppendOrInsert falls back and equals row-by-row for a scattered batch"
         var database = try Database.create(testing.allocator, pathA);
         defer database.deinit();
         var writeTransaction = try database.beginWrite();
-        const dir = try typeDirectory.createTypes(&writeTransaction, &.{&appendDefinitions}, &.{false});
-        var catalogRef = try typeDirectory.catalogRef(&writeTransaction, dir, 0);
+        const directoryReference = try typeDirectory.createTypes(&writeTransaction, &.{&appendDefinitions}, &.{false});
+        var catalogRef = try typeDirectory.catalogRef(&writeTransaction, directoryReference, 0);
         var primaryKey: u64 = 0;
         while (primaryKey < BASE) : (primaryKey += 1) catalogRef = (try rawRows.insert(&writeTransaction, catalogRef, &.{ primaryKey, primaryKey * 3 })).catalogRef;
         const newCatalog = try bulkAppendOrInsert(&writeTransaction, catalogRef, &batch);
-        const newDir = try typeDirectory.setCatalogRef(&writeTransaction, dir, 0, newCatalog);
-        writeTransaction.setRoot(newDir);
+        const newDirectoryReference = try typeDirectory.setCatalogRef(&writeTransaction, directoryReference, 0, newCatalog);
+        writeTransaction.setRoot(newDirectoryReference);
         _ = try writeTransaction.commit();
         try verification.verifyIntegrity(&database);
     }

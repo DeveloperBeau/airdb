@@ -18,8 +18,8 @@ const Index = @import("trees/index.zig");
 fn tmpFilePath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const u8) ![]const u8 {
     var pathBuffer: [Io.Dir.max_path_bytes]u8 = undefined;
     const pathLen = try tmp.dir.realPath(testing.io, &pathBuffer);
-    const dirPath = pathBuffer[0..pathLen];
-    return std.fs.path.join(allocator, &.{ dirPath, name });
+    const directoryPath = pathBuffer[0..pathLen];
+    return std.fs.path.join(allocator, &.{ directoryPath, name });
 }
 
 test "commit then reopen sees the committed root" {
@@ -212,46 +212,46 @@ test "verifyIntegrity passes after churn on an indexed type" {
     // One type: int primaryKey + one indexed int property.
     {
         var writeTransaction = try database.beginWrite();
-        const dir = try typeDirectory.createTypes(&writeTransaction, &.{&.{ .{ .kind = .int }, .{ .kind = .int, .indexed = true } }}, &.{false});
-        writeTransaction.setRoot(dir);
+        const directoryReference = try typeDirectory.createTypes(&writeTransaction, &.{&.{ .{ .kind = .int }, .{ .kind = .int, .indexed = true } }}, &.{false});
+        writeTransaction.setRoot(directoryReference);
         _ = try writeTransaction.commit();
     }
 
     // Seed 200 rows; value = primaryKey % 16 so many rows share each inner set.
     {
         var writeTransaction = try database.beginWrite();
-        var dir = database.activeRoot;
+        var directoryReference = database.activeRoot;
         var primaryKey: u64 = 0;
         while (primaryKey < 200) : (primaryKey += 1) {
-            dir = (try typeRouting.insert(&writeTransaction, dir, tid, &.{ .{ .int = primaryKey }, .{ .int = primaryKey % 16 } })).dir;
+            directoryReference = (try typeRouting.insert(&writeTransaction, directoryReference, tid, &.{ .{ .int = primaryKey }, .{ .int = primaryKey % 16 } })).directoryReference;
         }
-        writeTransaction.setRoot(dir);
+        writeTransaction.setRoot(directoryReference);
         _ = try writeTransaction.commit();
     }
 
     // Churn: update the value of every even primaryKey, delete every 5th primaryKey.
     {
         var writeTransaction = try database.beginWrite();
-        var dir = database.activeRoot;
+        var directoryReference = database.activeRoot;
         var primaryKey: u64 = 0;
         while (primaryKey < 200) : (primaryKey += 1) {
             var out: [2]catalog.Value = undefined;
-            const version = (try typeRouting.get(&writeTransaction, dir, tid, primaryKey, &out)).?;
+            const version = (try typeRouting.get(&writeTransaction, directoryReference, tid, primaryKey, &out)).?;
             if (primaryKey % 5 == 0) {
-                dir = switch (try typeRouting.delete(&writeTransaction, dir, tid, primaryKey, version)) {
-                    .ok => |newDir| newDir,
+                directoryReference = switch (try typeRouting.delete(&writeTransaction, directoryReference, tid, primaryKey, version)) {
+                    .ok => |newDirectoryReference| newDirectoryReference,
                     else => unreachable,
                 };
             } else if (primaryKey % 2 == 0) {
-                const updateResult = try typeRouting.update(&writeTransaction, dir, tid, primaryKey, &.{ .{ .int = primaryKey }, .{ .int = (primaryKey + 7) % 16 } }, version);
-                dir = updateResult.ok.dir;
+                const updateResult = try typeRouting.update(&writeTransaction, directoryReference, tid, primaryKey, &.{ .{ .int = primaryKey }, .{ .int = (primaryKey + 7) % 16 } }, version);
+                directoryReference = updateResult.ok.directoryReference;
             }
         }
         // Insert a fresh batch with reused values.
         while (primaryKey < 260) : (primaryKey += 1) {
-            dir = (try typeRouting.insert(&writeTransaction, dir, tid, &.{ .{ .int = primaryKey }, .{ .int = primaryKey % 16 } })).dir;
+            directoryReference = (try typeRouting.insert(&writeTransaction, directoryReference, tid, &.{ .{ .int = primaryKey }, .{ .int = primaryKey % 16 } })).directoryReference;
         }
-        writeTransaction.setRoot(dir);
+        writeTransaction.setRoot(directoryReference);
         _ = try writeTransaction.commit();
     }
 
@@ -270,12 +270,12 @@ test "verifyIntegrity detects a corrupted value index" {
 
     {
         var writeTransaction = try database.beginWrite();
-        var dir = try typeDirectory.createTypes(&writeTransaction, &.{&.{ .{ .kind = .int }, .{ .kind = .int, .indexed = true } }}, &.{false});
+        var directoryReference = try typeDirectory.createTypes(&writeTransaction, &.{&.{ .{ .kind = .int }, .{ .kind = .int, .indexed = true } }}, &.{false});
         var primaryKey: u64 = 0;
         while (primaryKey < 8) : (primaryKey += 1) {
-            dir = (try typeRouting.insert(&writeTransaction, dir, tid, &.{ .{ .int = primaryKey }, .{ .int = primaryKey } })).dir;
+            directoryReference = (try typeRouting.insert(&writeTransaction, directoryReference, tid, &.{ .{ .int = primaryKey }, .{ .int = primaryKey } })).directoryReference;
         }
-        writeTransaction.setRoot(dir);
+        writeTransaction.setRoot(directoryReference);
         _ = try writeTransaction.commit();
     }
     try verification.verifyIntegrity(&database); // clean before corruption
@@ -286,8 +286,8 @@ test "verifyIntegrity detects a corrupted value index" {
     // a live row whose property value differs from the indexed value.
     {
         var writeTransaction = try database.beginWrite();
-        const dir = database.activeRoot;
-        const catalogRef = try typeDirectory.catalogRef(&writeTransaction, dir, tid);
+        const directoryReference = database.activeRoot;
+        const catalogRef = try typeDirectory.catalogRef(&writeTransaction, directoryReference, tid);
         const view = try catalog.loadCatalog(&writeTransaction, catalogRef);
         const objectKey = (try catalog.primaryKeyToObjectKey(&writeTransaction, catalogRef, 0)).?; // row primaryKey 0 has value 0
         const bogusValue: u64 = 999_999; // no row carries this value
@@ -295,8 +295,8 @@ test "verifyIntegrity detects a corrupted value index" {
         setRoot = try Index.insert(&writeTransaction, setRoot, objectKey, 1);
         const newVi = try Index.insert(&writeTransaction, view.valueIndexRef(propertyIndex), bogusValue, setRoot);
         const newCatalog = try catalog.setValueIndexRef(&writeTransaction, catalogRef, propertyIndex, newVi);
-        const newDir = try typeDirectory.setCatalogRef(&writeTransaction, dir, tid, newCatalog);
-        writeTransaction.setRoot(newDir);
+        const newDirectoryReference = try typeDirectory.setCatalogRef(&writeTransaction, directoryReference, tid, newCatalog);
+        writeTransaction.setRoot(newDirectoryReference);
         _ = try writeTransaction.commit();
     }
 
@@ -314,22 +314,22 @@ test "verifyIntegrity passes on a clean link graph after churn" {
 
     {
         var writeTransaction = try database.beginWrite();
-        var dir = try typeDirectory.createTypes(&writeTransaction, &.{
+        var directoryReference = try typeDirectory.createTypes(&writeTransaction, &.{
             &.{ .{ .kind = .int }, .{ .kind = .blob } }, // 0: target type
             &.{ .{ .kind = .int }, .{ .kind = .link, .linkTarget = 0 }, .{ .kind = .linkSet, .linkTarget = 0 } }, // 1: source
         }, &.{ false, false });
-        const insertedA = try typeRouting.insert(&writeTransaction, dir, 0, &.{ .{ .int = 1 }, .{ .bytes = "A" } });
-        dir = insertedA.dir;
-        const insertedB = try typeRouting.insert(&writeTransaction, dir, 0, &.{ .{ .int = 2 }, .{ .bytes = "B" } });
-        dir = insertedB.dir;
-        dir = (try typeRouting.insert(&writeTransaction, dir, 1, &.{ .{ .int = 1 }, .{ .link = insertedA.objectKey }, .{ .linkSet = &.{ insertedA.objectKey, insertedB.objectKey } } })).dir;
-        dir = (try typeRouting.insert(&writeTransaction, dir, 1, &.{ .{ .int = 2 }, .{ .link = insertedB.objectKey }, .{ .linkSet = &.{} } })).dir;
+        const insertedA = try typeRouting.insert(&writeTransaction, directoryReference, 0, &.{ .{ .int = 1 }, .{ .bytes = "A" } });
+        directoryReference = insertedA.directoryReference;
+        const insertedB = try typeRouting.insert(&writeTransaction, directoryReference, 0, &.{ .{ .int = 2 }, .{ .bytes = "B" } });
+        directoryReference = insertedB.directoryReference;
+        directoryReference = (try typeRouting.insert(&writeTransaction, directoryReference, 1, &.{ .{ .int = 1 }, .{ .link = insertedA.objectKey }, .{ .linkSet = &.{ insertedA.objectKey, insertedB.objectKey } } })).directoryReference;
+        directoryReference = (try typeRouting.insert(&writeTransaction, directoryReference, 1, &.{ .{ .int = 2 }, .{ .link = insertedB.objectKey }, .{ .linkSet = &.{} } })).directoryReference;
         // Churn: move source 1's to-one link, drop one set member.
-        dir = try typeRouting.setLink(&writeTransaction, dir, 1, 1, 1, insertedB.objectKey);
-        const sourceCatalog = try typeDirectory.catalogRef(&writeTransaction, dir, 1);
+        directoryReference = try typeRouting.setLink(&writeTransaction, directoryReference, 1, 1, 1, insertedB.objectKey);
+        const sourceCatalog = try typeDirectory.catalogRef(&writeTransaction, directoryReference, 1);
         const newCatalog = try links.linkSetRemove(&writeTransaction, sourceCatalog, 1, 2, insertedA.objectKey);
-        dir = try typeDirectory.setCatalogRef(&writeTransaction, dir, 1, newCatalog);
-        writeTransaction.setRoot(dir);
+        directoryReference = try typeDirectory.setCatalogRef(&writeTransaction, directoryReference, 1, newCatalog);
+        writeTransaction.setRoot(directoryReference);
         _ = try writeTransaction.commit();
     }
     try verification.verifyIntegrity(&database); // forward + backward backlink audit finds no divergence
@@ -346,14 +346,14 @@ test "verifyIntegrity detects a corrupted backlink index" {
 
     {
         var writeTransaction = try database.beginWrite();
-        var dir = try typeDirectory.createTypes(&writeTransaction, &.{
+        var directoryReference = try typeDirectory.createTypes(&writeTransaction, &.{
             &.{ .{ .kind = .int }, .{ .kind = .link, .linkTarget = 0 } },
         }, &.{false});
-        const insertedA = try typeRouting.insert(&writeTransaction, dir, 0, &.{ .{ .int = 1 }, .{ .link = null } });
-        dir = insertedA.dir;
+        const insertedA = try typeRouting.insert(&writeTransaction, directoryReference, 0, &.{ .{ .int = 1 }, .{ .link = null } });
+        directoryReference = insertedA.directoryReference;
         targetObjectKey = insertedA.objectKey;
-        dir = (try typeRouting.insert(&writeTransaction, dir, 0, &.{ .{ .int = 2 }, .{ .link = targetObjectKey } })).dir;
-        writeTransaction.setRoot(dir);
+        directoryReference = (try typeRouting.insert(&writeTransaction, directoryReference, 0, &.{ .{ .int = 2 }, .{ .link = targetObjectKey } })).directoryReference;
+        writeTransaction.setRoot(directoryReference);
         _ = try writeTransaction.commit();
     }
     try verification.verifyIntegrity(&database); // clean before corruption
@@ -362,13 +362,13 @@ test "verifyIntegrity detects a corrupted backlink index" {
     // link column still points at it. Forward audit must flag the divergence.
     {
         var writeTransaction = try database.beginWrite();
-        const dir = database.activeRoot;
-        const catalogRef = try typeDirectory.catalogRef(&writeTransaction, dir, 0);
+        const directoryReference = database.activeRoot;
+        const catalogRef = try typeDirectory.catalogRef(&writeTransaction, directoryReference, 0);
         const view = try catalog.loadCatalog(&writeTransaction, catalogRef);
         const newBl = try Index.remove(&writeTransaction, view.backlinkRef(1), targetObjectKey);
         const newCatalog = try catalog.setBacklinkRef(&writeTransaction, catalogRef, 1, newBl);
-        const newDir = try typeDirectory.setCatalogRef(&writeTransaction, dir, 0, newCatalog);
-        writeTransaction.setRoot(newDir);
+        const newDirectoryReference = try typeDirectory.setCatalogRef(&writeTransaction, directoryReference, 0, newCatalog);
+        writeTransaction.setRoot(newDirectoryReference);
         _ = try writeTransaction.commit();
     }
     try testing.expectError(error.BacklinkMissingEntry, verification.verifyIntegrity(&database));
@@ -385,12 +385,12 @@ test "verifyIntegrity passes on a non-indexed type" {
 
     {
         var writeTransaction = try database.beginWrite();
-        var dir = try typeDirectory.createTypes(&writeTransaction, &.{&.{ .{ .kind = .int }, .{ .kind = .int } }}, &.{false});
+        var directoryReference = try typeDirectory.createTypes(&writeTransaction, &.{&.{ .{ .kind = .int }, .{ .kind = .int } }}, &.{false});
         var primaryKey: u64 = 0;
         while (primaryKey < 50) : (primaryKey += 1) {
-            dir = (try typeRouting.insert(&writeTransaction, dir, tid, &.{ .{ .int = primaryKey }, .{ .int = primaryKey * 3 } })).dir;
+            directoryReference = (try typeRouting.insert(&writeTransaction, directoryReference, tid, &.{ .{ .int = primaryKey }, .{ .int = primaryKey * 3 } })).directoryReference;
         }
-        writeTransaction.setRoot(dir);
+        writeTransaction.setRoot(directoryReference);
         _ = try writeTransaction.commit();
     }
 
@@ -943,8 +943,8 @@ fn churnNetZero(path: []const u8, live: u64, iters: u64, auto: bool) !struct { n
     // Single type: int primaryKey + one int property.
     {
         var writeTransaction = try database.beginWrite();
-        const dir = try typeDirectory.createTypes(&writeTransaction, &.{&.{ .{ .kind = .int }, .{ .kind = .int } }}, &.{false});
-        writeTransaction.setRoot(dir);
+        const directoryReference = try typeDirectory.createTypes(&writeTransaction, &.{&.{ .{ .kind = .int }, .{ .kind = .int } }}, &.{false});
+        writeTransaction.setRoot(directoryReference);
         _ = try writeTransaction.commit();
     }
 
@@ -952,11 +952,11 @@ fn churnNetZero(path: []const u8, live: u64, iters: u64, auto: bool) !struct { n
     var high: u64 = 0;
     {
         var writeTransaction = try database.beginWrite();
-        var dir = database.activeRoot;
+        var directoryReference = database.activeRoot;
         while (high < live) : (high += 1) {
-            dir = (try typeRouting.insert(&writeTransaction, dir, tid, &.{ .{ .int = high }, .{ .int = high } })).dir;
+            directoryReference = (try typeRouting.insert(&writeTransaction, directoryReference, tid, &.{ .{ .int = high }, .{ .int = high } })).directoryReference;
         }
-        writeTransaction.setRoot(dir);
+        writeTransaction.setRoot(directoryReference);
         _ = try writeTransaction.commit();
     }
 
@@ -965,25 +965,25 @@ fn churnNetZero(path: []const u8, live: u64, iters: u64, auto: bool) !struct { n
     while (iter < iters) : (iter += 1) {
         {
             var writeTransaction = try database.beginWrite();
-            var dir = database.activeRoot;
+            var directoryReference = database.activeRoot;
             // Insert `live` fresh rows.
             var key: u64 = 0;
             while (key < live) : (key += 1) {
-                dir = (try typeRouting.insert(&writeTransaction, dir, tid, &.{ .{ .int = high }, .{ .int = high } })).dir;
+                directoryReference = (try typeRouting.insert(&writeTransaction, directoryReference, tid, &.{ .{ .int = high }, .{ .int = high } })).directoryReference;
                 high += 1;
             }
             // Delete the `live` oldest live rows.
             key = 0;
             while (key < live) : (key += 1) {
                 var out: [2]catalog.Value = undefined;
-                const version = (try typeRouting.get(&writeTransaction, dir, tid, low, &out)).?;
-                dir = switch (try typeRouting.delete(&writeTransaction, dir, tid, low, version)) {
-                    .ok => |newDir| newDir,
+                const version = (try typeRouting.get(&writeTransaction, directoryReference, tid, low, &out)).?;
+                directoryReference = switch (try typeRouting.delete(&writeTransaction, directoryReference, tid, low, version)) {
+                    .ok => |newDirectoryReference| newDirectoryReference,
                     else => unreachable,
                 };
                 low += 1;
             }
-            writeTransaction.setRoot(dir);
+            writeTransaction.setRoot(directoryReference);
             _ = try writeTransaction.commit();
         }
         // Opt-in: drive the incremental step loop so the type stays packed.
@@ -1061,25 +1061,25 @@ test "a failed commit inside maybeCompactStep neither crashes nor wedges the wri
     const tid: u16 = 0;
     {
         var writeTransaction = try database.beginWrite();
-        const dir = try typeDirectory.createTypes(&writeTransaction, &.{&.{ .{ .kind = .int }, .{ .kind = .int } }}, &.{false});
-        writeTransaction.setRoot(dir);
+        const directoryReference = try typeDirectory.createTypes(&writeTransaction, &.{&.{ .{ .kind = .int }, .{ .kind = .int } }}, &.{false});
+        writeTransaction.setRoot(directoryReference);
         _ = try writeTransaction.commit();
     }
     {
         var writeTransaction = try database.beginWrite();
-        var dir = database.activeRoot;
+        var directoryReference = database.activeRoot;
         var primaryKey: u64 = 0;
-        while (primaryKey < 10) : (primaryKey += 1) dir = (try typeRouting.insert(&writeTransaction, dir, tid, &.{ .{ .int = primaryKey }, .{ .int = primaryKey } })).dir;
+        while (primaryKey < 10) : (primaryKey += 1) directoryReference = (try typeRouting.insert(&writeTransaction, directoryReference, tid, &.{ .{ .int = primaryKey }, .{ .int = primaryKey } })).directoryReference;
         var out: [2]catalog.Value = undefined;
         primaryKey = 0;
         while (primaryKey < 8) : (primaryKey += 1) {
-            const version = (try typeRouting.get(&writeTransaction, dir, tid, primaryKey, &out)).?;
-            dir = switch (try typeRouting.delete(&writeTransaction, dir, tid, primaryKey, version)) {
-                .ok => |newDir| newDir,
+            const version = (try typeRouting.get(&writeTransaction, directoryReference, tid, primaryKey, &out)).?;
+            directoryReference = switch (try typeRouting.delete(&writeTransaction, directoryReference, tid, primaryKey, version)) {
+                .ok => |newDirectoryReference| newDirectoryReference,
                 else => unreachable,
             };
         }
-        writeTransaction.setRoot(dir);
+        writeTransaction.setRoot(directoryReference);
         _ = try writeTransaction.commit();
     }
 
@@ -1110,30 +1110,30 @@ test "the compaction cursor never resumes across types" {
     // live=4, nextRow=12 and dead tails.
     {
         var writeTransaction = try database.beginWrite();
-        const dir = try typeDirectory.createTypes(&writeTransaction, &.{
+        const directoryReference = try typeDirectory.createTypes(&writeTransaction, &.{
             &.{ .{ .kind = .int }, .{ .kind = .int } },
             &.{ .{ .kind = .int }, .{ .kind = .int } },
         }, &.{ false, false });
-        writeTransaction.setRoot(dir);
+        writeTransaction.setRoot(directoryReference);
         _ = try writeTransaction.commit();
     }
     {
         var writeTransaction = try database.beginWrite();
-        var dir = database.activeRoot;
+        var directoryReference = database.activeRoot;
         var typeId: u16 = 0;
         while (typeId < 2) : (typeId += 1) {
             var primaryKey: u64 = 0;
-            while (primaryKey < 12) : (primaryKey += 1) dir = (try typeRouting.insert(&writeTransaction, dir, typeId, &.{ .{ .int = primaryKey }, .{ .int = primaryKey } })).dir;
+            while (primaryKey < 12) : (primaryKey += 1) directoryReference = (try typeRouting.insert(&writeTransaction, directoryReference, typeId, &.{ .{ .int = primaryKey }, .{ .int = primaryKey } })).directoryReference;
             var out: [2]catalog.Value = undefined;
             primaryKey = 0;
             while (primaryKey < 8) : (primaryKey += 1) {
-                const version = (try typeRouting.get(&writeTransaction, dir, typeId, primaryKey, &out)).?;
-                dir = switch (try typeRouting.delete(&writeTransaction, dir, typeId, primaryKey, version)) {
-                    .ok => |newDir| newDir,
+                const version = (try typeRouting.get(&writeTransaction, directoryReference, typeId, primaryKey, &out)).?;
+                directoryReference = switch (try typeRouting.delete(&writeTransaction, directoryReference, typeId, primaryKey, version)) {
+                    .ok => |newDirectoryReference| newDirectoryReference,
                     else => unreachable,
                 };
             }
-            writeTransaction.setRoot(dir);
+            writeTransaction.setRoot(directoryReference);
         }
         _ = try writeTransaction.commit();
     }
@@ -1230,12 +1230,12 @@ test "maybeCompactStep is a no-op when nothing to compact" {
     const tid: u16 = 0;
     {
         var writeTransaction = try database.beginWrite();
-        var dir = try typeDirectory.createTypes(&writeTransaction, &.{&.{ .{ .kind = .int }, .{ .kind = .int } }}, &.{false});
+        var directoryReference = try typeDirectory.createTypes(&writeTransaction, &.{&.{ .{ .kind = .int }, .{ .kind = .int } }}, &.{false});
         var primaryKey: u64 = 0;
         while (primaryKey < 3) : (primaryKey += 1) {
-            dir = (try typeRouting.insert(&writeTransaction, dir, tid, &.{ .{ .int = primaryKey }, .{ .int = primaryKey } })).dir;
+            directoryReference = (try typeRouting.insert(&writeTransaction, directoryReference, tid, &.{ .{ .int = primaryKey }, .{ .int = primaryKey } })).directoryReference;
         }
-        writeTransaction.setRoot(dir);
+        writeTransaction.setRoot(directoryReference);
         _ = try writeTransaction.commit();
     }
 

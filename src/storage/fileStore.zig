@@ -329,10 +329,10 @@ pub fn deleteAbsoluteIgnoreMissing(io: Io, absPath: []const u8) void {
 pub fn syncParentDirectory(path: []const u8) void {
     if (@import("builtin").os.tag == .windows) return;
     const io = std.Io.Threaded.global_single_threaded.io();
-    const dirPath = std.fs.path.dirname(path) orelse return;
-    var dir = std.Io.Dir.openDirAbsolute(io, dirPath, .{}) catch return;
-    defer dir.close(io);
-    _ = std.c.fsync(dir.handle);
+    const directoryPath = std.fs.path.dirname(path) orelse return;
+    var parentDirectory = std.Io.Dir.openDirAbsolute(io, directoryPath, .{}) catch return;
+    defer parentDirectory.close(io);
+    _ = std.c.fsync(parentDirectory.handle);
 }
 
 // ---------------------------------------------------------------------------
@@ -344,8 +344,8 @@ test "real syncer flush succeeds (exercises the platform durability path)" {
     defer tmp.cleanup();
     var pathBuffer: [Io.Dir.max_path_bytes]u8 = undefined;
     const pathLen = try tmp.dir.realPath(testing.io, &pathBuffer);
-    const dirPath = pathBuffer[0..pathLen];
-    const filePath = try std.fs.path.join(testing.allocator, &.{ dirPath, "fsync.airdb" });
+    const directoryPath = pathBuffer[0..pathLen];
+    const filePath = try std.fs.path.join(testing.allocator, &.{ directoryPath, "fsync.airdb" });
     defer testing.allocator.free(filePath);
     var store = try FileStore.create(testing.allocator, filePath, FileSyncer.any());
     defer store.deinit();
@@ -382,9 +382,9 @@ test "create writes a header that reopen reads back" {
     // Use Dir.realPath(io, buffer) with a stack buffer instead.
     var pathBuffer: [Io.Dir.max_path_bytes]u8 = undefined;
     const pathLen = try tmp.dir.realPath(testing.io, &pathBuffer);
-    const dirPath = pathBuffer[0..pathLen];
+    const directoryPath = pathBuffer[0..pathLen];
 
-    const filePath = try std.fs.path.join(testing.allocator, &.{ dirPath, "wsk.airdb" });
+    const filePath = try std.fs.path.join(testing.allocator, &.{ directoryPath, "wsk.airdb" });
     defer testing.allocator.free(filePath);
 
     {

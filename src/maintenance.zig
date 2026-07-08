@@ -23,15 +23,15 @@ pub const CompactStepResult = struct { ran: bool, moved: usize, done: bool };
 pub fn maybeCompactStep(database: *Database, typeId: u16, budget: usize) !CompactStepResult {
     var writeTransaction = try database.beginWrite();
     errdefer writeTransaction.deinit();
-    const dir = database.activeRoot;
-    const catalogRef = try typeDirectory.catalogRef(&writeTransaction, dir, typeId);
+    const directoryReference = database.activeRoot;
+    const catalogRef = try typeDirectory.catalogRef(&writeTransaction, directoryReference, typeId);
     if (!try compaction.shouldCompact(&writeTransaction, catalogRef)) {
         writeTransaction.deinit();
         return .{ .ran = false, .moved = 0, .done = false };
     }
     const step = try compaction.compactStep(&writeTransaction, catalogRef, typeId, budget);
-    const newDir = try typeDirectory.setCatalogRef(&writeTransaction, dir, typeId, step.catalogRef);
-    writeTransaction.setRoot(newDir);
+    const newDirectoryReference = try typeDirectory.setCatalogRef(&writeTransaction, directoryReference, typeId, step.catalogRef);
+    writeTransaction.setRoot(newDirectoryReference);
     _ = try writeTransaction.commit();
     return .{ .ran = true, .moved = step.moved, .done = step.done };
 }

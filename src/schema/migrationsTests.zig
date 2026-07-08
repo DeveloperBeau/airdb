@@ -141,13 +141,13 @@ test "addProperty(linkSet) leaves pre-migration rows deletable" {
     defer database.deinit();
     {
         var writeTransaction = try database.beginWrite();
-        var dir = try typeDirectory.createTypes(&writeTransaction, &.{&.{.{ .kind = .int }}}, &.{false});
-        dir = (try typeRouting.insert(&writeTransaction, dir, 0, &.{.{ .int = 1 }})).dir;
+        var directoryReference = try typeDirectory.createTypes(&writeTransaction, &.{&.{.{ .kind = .int }}}, &.{false});
+        directoryReference = (try typeRouting.insert(&writeTransaction, directoryReference, 0, &.{.{ .int = 1 }})).directoryReference;
         // Migrate: add a linkSet property targeting the same type.
-        const catalogRef = try typeDirectory.catalogRef(&writeTransaction, dir, 0);
+        const catalogRef = try typeDirectory.catalogRef(&writeTransaction, directoryReference, 0);
         const newCatalog = try addProperty(&writeTransaction, catalogRef, .{ .kind = .linkSet, .linkTarget = 0 }, 0);
-        dir = try typeDirectory.setCatalogRef(&writeTransaction, dir, 0, newCatalog);
-        writeTransaction.setRoot(dir);
+        directoryReference = try typeDirectory.setCatalogRef(&writeTransaction, directoryReference, 0, newCatalog);
+        writeTransaction.setRoot(directoryReference);
         _ = try writeTransaction.commit();
     }
     try verification.verifyIntegrity(&database); // the audit must not trip over the backfilled roots
