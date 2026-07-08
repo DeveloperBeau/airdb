@@ -143,7 +143,7 @@ pub fn printTable(results: []const Result, writer: anytype) !void {
                 .{
                     result.name,                     result.ops,
                     result.throughputPerSec(),       "-",
-                    "-",                        "-",
+                    "-",                             "-",
                     bytesToMib(result.fileBytes),    bytesToMib(result.logicalBytes),
                     bytesToMib(result.peakRssBytes),
                 },
