@@ -5,11 +5,11 @@
 // the "low_key" of an inner pair is a blob ref to the smallest key in that
 // subtree. All ordering compares the dereferenced bytes with std.mem.order;
 // keys live in the blob heap. See bTreeCore.zig for the transaction
-// capability the `txn` parameters must satisfy (WriteTxn in production;
-// ReadTxn for the read-only subset).
+// capability the `transaction` parameters must satisfy (WriteTransaction in production;
+// ReadTransaction for the read-only subset).
 
 const std = @import("std");
-const Ref = @import("../storage/reference.zig").Ref;
+const Reference = @import("../storage/reference.zig").Reference;
 const blob = @import("../records/blob.zig");
 const bTreeCore = @import("bTreeCore.zig");
 
@@ -47,7 +47,7 @@ const BlobKeying = struct {
 
 const Tree = bTreeCore.BTreeCore(BlobKeying);
 
-/// Create a new empty leaf node and return its Ref.
+/// Create a new empty leaf node and return its Reference.
 pub const create = Tree.create;
 
 /// Look up `key` in the tree rooted at `root`. Returns the value on exact
@@ -58,9 +58,9 @@ pub const get = Tree.get;
 /// exists (exact bytes), its value is overwritten in place and no duplicate is
 /// added; otherwise the key bytes are stored in the blob heap and a new entry
 /// is inserted in byte-sorted order. Returns the (possibly new) root.
-pub fn insert(txn: anytype, root: Ref, key: []const u8, val: u64) !Ref {
-    const key_ref = try blob.put(txn, key);
-    return Tree.insert(txn, root, key, key_ref, val);
+pub fn insert(transaction: anytype, root: Reference, key: []const u8, value: u64) !Reference {
+    const key_ref = try blob.put(transaction, key);
+    return Tree.insert(transaction, root, key, key_ref, value);
 }
 
 /// Remove `key` from the tree rooted at `root`. Frees the key's blob node when
@@ -82,15 +82,15 @@ pub const count = Tree.count;
 /// The key slice points into mapped storage and is only valid for the duration
 /// of the callback; copy it if it must outlive the call.
 pub fn forEachEntry(
-    txn: anytype,
-    root: Ref,
+    transaction: anytype,
+    root: Reference,
     ctx: anytype,
-    comptime onEntry: fn (@TypeOf(ctx), key: []const u8, val: u64) anyerror!void,
+    comptime onEntry: fn (@TypeOf(ctx), key: []const u8, value: u64) anyerror!void,
 ) !void {
     // Adapt the core's raw (storedKey, value) walker: each stored key is a
     // blob ref, dereferenced here before reaching the caller's callback.
     const KeyDereferencing = struct {
-        transaction: @TypeOf(txn),
+        transaction: @TypeOf(transaction),
         context: @TypeOf(ctx),
         fn visit(self: @This(), storedKeyRef: u64, value: u64) anyerror!void {
             const keyBytes = try blob.get(self.transaction, storedKeyRef);
@@ -98,9 +98,9 @@ pub fn forEachEntry(
         }
     };
     return Tree.forEachEntry(
-        txn,
+        transaction,
         root,
-        KeyDereferencing{ .transaction = txn, .context = ctx },
+        KeyDereferencing{ .transaction = transaction, .context = ctx },
         KeyDereferencing.visit,
     );
 }

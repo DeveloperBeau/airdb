@@ -2,21 +2,21 @@ const std = @import("std");
 const testing = std.testing;
 const typedir = @import("typeDirectory.zig");
 const typeRouting = @import("typeRouting.zig");
-const Db = @import("../database.zig").Db;
+const Database = @import("../database.zig").Database;
 const catalog = @import("catalog.zig");
 const collections = @import("../records/collections.zig");
 const links = @import("../records/links.zig");
 const Objects = @import("../records/objects.zig");
 const rows = @import("../records/rows.zig");
-const PropKind = catalog.PropKind;
+const PropertyKind = catalog.PropertyKind;
 const Value = typedir.Value;
 const createTypes = typedir.createTypes;
-const createWithDefs = typedir.createWithDefs;
+const createWithDefinitions = typedir.createWithDefinitions;
 const create = typedir.create;
 const typeCount = typedir.typeCount;
 const catalogRef = typedir.catalogRef;
 const setCatalogRef = typedir.setCatalogRef;
-const addTypeDefs = typedir.addTypeDefs;
+const addTypeDefinitions = typedir.addTypeDefinitions;
 const addType = typedir.addType;
 const isEmbedded = typedir.isEmbedded;
 const validate = typedir.validate;
@@ -37,9 +37,9 @@ const insertEmbedded = typedir.insertEmbedded;
 const clearEmbedded = typedir.clearEmbedded;
 
 fn tdTmpPath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const u8) ![]const u8 {
-    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const dlen = try tmp.dir.realPath(testing.io, &path_buf);
-    return std.fs.path.join(allocator, &.{ path_buf[0..dlen], name });
+    var pathBuffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dlen = try tmp.dir.realPath(testing.io, &pathBuffer);
+    return std.fs.path.join(allocator, &.{ pathBuffer[0..dlen], name });
 }
 
 test "create builds a directory with one catalog per type" {
@@ -47,10 +47,10 @@ test "create builds a directory with one catalog per type" {
     defer tmp.cleanup();
     const path = try tdTmpPath(testing.allocator, &tmp, "td1.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
-    const schema = [_][]const catalog.PropKind{
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
+    const schema = [_][]const catalog.PropertyKind{
         &.{ .int, .blob },
         &.{ .int, .int, .int },
     };
@@ -59,8 +59,8 @@ test "create builds a directory with one catalog per type" {
     const c0 = try catalogRef(&w, dir, 0);
     const c1 = try catalogRef(&w, dir, 1);
     try testing.expect(c0 != 0 and c1 != 0 and c0 != c1);
-    try testing.expectEqual(@as(catalog.PropCount, 2), (try catalog.loadCatalog(&w, c0)).prop_count);
-    try testing.expectEqual(@as(catalog.PropCount, 3), (try catalog.loadCatalog(&w, c1)).prop_count);
+    try testing.expectEqual(@as(catalog.PropertyCount, 2), (try catalog.loadCatalog(&w, c0)).propertyCount);
+    try testing.expectEqual(@as(catalog.PropertyCount, 3), (try catalog.loadCatalog(&w, c1)).propertyCount);
     w.deinit();
 }
 
@@ -69,10 +69,10 @@ test "catalogRef rejects an out-of-range type id" {
     defer tmp.cleanup();
     const path = try tdTmpPath(testing.allocator, &tmp, "td1b.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
-    const schema = [_][]const catalog.PropKind{&.{ .int, .int }};
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
+    const schema = [_][]const catalog.PropertyKind{&.{ .int, .int }};
     const dir = try create(&w, &schema);
     try testing.expectError(error.NoSuchType, catalogRef(&w, dir, 5));
     w.deinit();
@@ -83,25 +83,25 @@ test "validate accepts a matching schema and rejects a mismatch" {
     defer tmp.cleanup();
     const path = try tdTmpPath(testing.allocator, &tmp, "td2.airdb");
     defer testing.allocator.free(path);
-    const schema = [_][]const catalog.PropKind{ &.{ .int, .blob }, &.{ .int, .int, .int } };
+    const schema = [_][]const catalog.PropertyKind{ &.{ .int, .blob }, &.{ .int, .int, .int } };
     {
-        var db = try Db.create(testing.allocator, path);
-        defer db.deinit();
-        var w = try db.beginWrite();
+        var database = try Database.create(testing.allocator, path);
+        defer database.deinit();
+        var w = try database.beginWrite();
         const dir = try create(&w, &schema);
         w.setRoot(dir);
         _ = try w.commit();
     }
     {
-        var db = try Db.open(testing.allocator, path);
-        defer db.deinit();
-        var r = try db.beginRead();
+        var database = try Database.open(testing.allocator, path);
+        defer database.deinit();
+        var r = try database.beginRead();
         try validate(&r, r.root(), &schema); // matches
-        const fewer = [_][]const catalog.PropKind{&.{ .int, .blob }};
+        const fewer = [_][]const catalog.PropertyKind{&.{ .int, .blob }};
         try testing.expectError(error.SchemaMismatch, validate(&r, r.root(), &fewer));
-        const wrong_kind = [_][]const catalog.PropKind{ &.{ .int, .int }, &.{ .int, .int, .int } };
+        const wrong_kind = [_][]const catalog.PropertyKind{ &.{ .int, .int }, &.{ .int, .int, .int } };
         try testing.expectError(error.SchemaMismatch, validate(&r, r.root(), &wrong_kind));
-        const wrong_count = [_][]const catalog.PropKind{ &.{ .int, .blob }, &.{ .int, .int } };
+        const wrong_count = [_][]const catalog.PropertyKind{ &.{ .int, .blob }, &.{ .int, .int } };
         try testing.expectError(error.SchemaMismatch, validate(&r, r.root(), &wrong_count));
         r.end();
     }
@@ -112,10 +112,10 @@ test "two types route independently through the directory" {
     defer tmp.cleanup();
     const path = try tdTmpPath(testing.allocator, &tmp, "td3.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
-    const schema = [_][]const PropKind{ &.{ .int, .blob }, &.{ .int, .int } };
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
+    const schema = [_][]const PropertyKind{ &.{ .int, .blob }, &.{ .int, .int } };
     var dir = try create(&w, &schema);
 
     dir = (try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .bytes = "Ada" } })).dir;
@@ -150,16 +150,16 @@ test "multiple types persist across reopen and validate" {
     defer tmp.cleanup();
     const path = try tdTmpPath(testing.allocator, &tmp, "td4.airdb");
     defer testing.allocator.free(path);
-    const schema = [_][]const PropKind{ &.{ .int, .blob }, &.{ .int, .int } };
+    const schema = [_][]const PropertyKind{ &.{ .int, .blob }, &.{ .int, .int } };
     {
-        var db = try Db.create(testing.allocator, path);
-        defer db.deinit();
-        var w = try db.beginWrite();
+        var database = try Database.create(testing.allocator, path);
+        defer database.deinit();
+        var w = try database.beginWrite();
         var dir = try create(&w, &schema);
         var i: u64 = 0;
-        var buf: [16]u8 = undefined;
+        var buffer: [16]u8 = undefined;
         while (i < 300) : (i += 1) {
-            const s = try std.fmt.bufPrint(&buf, "p{d}", .{i});
+            const s = try std.fmt.bufPrint(&buffer, "p{d}", .{i});
             dir = (try insert(&w, dir, 0, &.{ .{ .int = i }, .{ .bytes = s } })).dir;
             dir = (try insert(&w, dir, 1, &.{ .{ .int = i }, .{ .int = i * 10 } })).dir;
         }
@@ -167,9 +167,9 @@ test "multiple types persist across reopen and validate" {
         _ = try w.commit();
     }
     {
-        var db = try Db.open(testing.allocator, path);
-        defer db.deinit();
-        var r = try db.beginRead();
+        var database = try Database.open(testing.allocator, path);
+        defer database.deinit();
+        var r = try database.beginRead();
         try validate(&r, r.root(), &schema);
         try testing.expectEqual(@as(u64, 300), try liveCount(&r, r.root(), 0));
         try testing.expectEqual(@as(u64, 300), try liveCount(&r, r.root(), 1));
@@ -188,10 +188,10 @@ test "addType grows the directory and routes the new type" {
     defer tmp.cleanup();
     const path = try tdTmpPath(testing.allocator, &tmp, "td5.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
-    const schema = [_][]const PropKind{&.{ .int, .blob }};
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
+    const schema = [_][]const PropertyKind{&.{ .int, .blob }};
     var dir = try create(&w, &schema);
     try testing.expectEqual(@as(u16, 1), try typeCount(&w, dir));
     const added = try addType(&w, dir, &.{ .int, .int, .int });
@@ -214,33 +214,33 @@ test "multi-type directory carries links and collections via createWithDefs" {
     defer tmp.cleanup();
     const path = try tdTmpPath(testing.allocator, &tmp, "td6.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
-    const PD = catalog.PropDef;
-    // type 0: scalar (int pk, blob name); type 1: int pk + a to-one link + a to-many link_set
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
+    const PD = catalog.PropertyDefinition;
+    // type 0: scalar (int primaryKey, blob name); type 1: int primaryKey + a to-one link + a to-many link_set
     const schema = [_][]const PD{
         &.{ .{ .kind = .int }, .{ .kind = .blob } },
         &.{ .{ .kind = .int }, .{ .kind = .link }, .{ .kind = .link_set } },
     };
-    var dir = try createWithDefs(&w, &schema);
+    var dir = try createWithDefinitions(&w, &schema);
     try testing.expectEqual(@as(u16, 2), try typeCount(&w, dir));
 
     // insert two type-1 rows; row a links to nothing, b's set links to a.
     const a = try Objects.insertTyped(&w, try catalogRef(&w, dir, 1), &.{ .{ .int = 10 }, .{ .link = null }, .{ .link_set = &.{} } });
-    dir = try setCatalogRef(&w, dir, 1, a.cat);
+    dir = try setCatalogRef(&w, dir, 1, a.catalogRef);
     const b = try Objects.insertTyped(&w, try catalogRef(&w, dir, 1), &.{ .{ .int = 20 }, .{ .link = a.row }, .{ .link_set = &.{a.row} } });
-    dir = try setCatalogRef(&w, dir, 1, b.cat);
+    dir = try setCatalogRef(&w, dir, 1, b.catalogRef);
 
     // route a to-many add through the directory
     dir = try linkSetAdd(&w, dir, 1, 20, 2, a.row); // already member -> no-op
     try testing.expect(try linkSetContains(&w, dir, 1, 20, 2, a.row));
     try testing.expectEqual(@as(?u64, a.row), try getLink(&w, dir, 1, 20, 1));
-    // a has 2 inbound to-one? no: only b's to-one links a -> backlink on prop 1 == 1
+    // a has 2 inbound to-one? no: only b's to-one links a -> backlink on property 1 == 1
     try testing.expectEqual(@as(u64, 1), try backlinkCount(&w, dir, 1, 1, a.row));
 
-    // addTypeDefs: append a type with a list property
-    const added = try addTypeDefs(&w, dir, &.{ .{ .kind = .int }, .{ .kind = .list, .elem = .int } });
+    // addTypeDefinitions: append a type with a list property
+    const added = try addTypeDefinitions(&w, dir, &.{ .{ .kind = .int }, .{ .kind = .list, .element = .int } });
     dir = added.dir;
     try testing.expectEqual(@as(u16, 2), added.type_id);
     dir = (try insert(&w, dir, 2, &.{ .{ .int = 1 }, .{ .list_int = &.{ 7, 8, 9 } } })).dir;
@@ -253,24 +253,24 @@ test "a cross-type link resolves to the target type's object" {
     defer tmp.cleanup();
     const path = try tdTmpPath(testing.allocator, &tmp, "tdx1.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
-    const PD = catalog.PropDef;
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
+    const PD = catalog.PropertyDefinition;
     const schema = [_][]const PD{
         &.{ .{ .kind = .int }, .{ .kind = .blob } }, // 0: Author
         &.{ .{ .kind = .int }, .{ .kind = .link, .link_target = 0 } }, // 1: Book.author -> Author
     };
-    var dir = try createWithDefs(&w, &schema);
+    var dir = try createWithDefinitions(&w, &schema);
 
     const ains = try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .bytes = "Ada" } });
     dir = ains.dir;
-    const author_okey = ains.row;
-    dir = (try insert(&w, dir, 1, &.{ .{ .int = 1 }, .{ .link = author_okey } })).dir;
+    const authorObjectKey = ains.row;
+    dir = (try insert(&w, dir, 1, &.{ .{ .int = 1 }, .{ .link = authorObjectKey } })).dir;
 
     const r = (try resolveLink(&w, dir, 1, 1, 1)).?;
     try testing.expectEqual(@as(u16, 0), r.target_type);
-    try testing.expectEqual(author_okey, r.okey);
+    try testing.expectEqual(authorObjectKey, r.objectKey);
 
     var out: [2]Value = undefined;
     _ = (try getLinked(&w, dir, 1, 1, 1, &out)).?;
@@ -283,32 +283,32 @@ test "deleting a target nullifies inbound links from another type" {
     defer tmp.cleanup();
     const path = try tdTmpPath(testing.allocator, &tmp, "tdx2.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
-    const PD = catalog.PropDef;
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
+    const PD = catalog.PropertyDefinition;
     const schema = [_][]const PD{
         &.{ .{ .kind = .int }, .{ .kind = .blob } }, // 0: Author
         &.{ .{ .kind = .int }, .{ .kind = .link, .link_target = 0 } }, // 1: Book.author -> Author
     };
-    var dir = try createWithDefs(&w, &schema);
+    var dir = try createWithDefinitions(&w, &schema);
 
     const ains = try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .bytes = "Ada" } });
     dir = ains.dir;
-    const author_okey = ains.row;
-    dir = (try insert(&w, dir, 1, &.{ .{ .int = 1 }, .{ .link = author_okey } })).dir;
-    dir = (try insert(&w, dir, 1, &.{ .{ .int = 2 }, .{ .link = author_okey } })).dir;
+    const authorObjectKey = ains.row;
+    dir = (try insert(&w, dir, 1, &.{ .{ .int = 1 }, .{ .link = authorObjectKey } })).dir;
+    dir = (try insert(&w, dir, 1, &.{ .{ .int = 2 }, .{ .link = authorObjectKey } })).dir;
 
-    try testing.expectEqual(@as(u64, 2), try backlinkCount(&w, dir, 1, 1, author_okey));
+    try testing.expectEqual(@as(u64, 2), try backlinkCount(&w, dir, 1, 1, authorObjectKey));
 
     var abuf: [2]Value = undefined;
-    const author_ver = (try get(&w, dir, 0, 1, &abuf)).?;
-    const dres = try deleteNullifyX(&w, dir, 0, 1, author_ver);
+    const authorVersion = (try get(&w, dir, 0, 1, &abuf)).?;
+    const dres = try deleteNullifyX(&w, dir, 0, 1, authorVersion);
     dir = dres.ok;
 
     try testing.expectEqual(@as(?u64, null), try getLink(&w, dir, 1, 1, 1));
     try testing.expectEqual(@as(?u64, null), try getLink(&w, dir, 1, 2, 1));
-    try testing.expectEqual(@as(u64, 0), try backlinkCount(&w, dir, 1, 1, author_okey));
+    try testing.expectEqual(@as(u64, 0), try backlinkCount(&w, dir, 1, 1, authorObjectKey));
     w.deinit();
 }
 
@@ -317,35 +317,35 @@ test "cross-type links persist across reopen" {
     defer tmp.cleanup();
     const path = try tdTmpPath(testing.allocator, &tmp, "tdx3.airdb");
     defer testing.allocator.free(path);
-    const PD = catalog.PropDef;
+    const PD = catalog.PropertyDefinition;
     const schema = [_][]const PD{
         &.{ .{ .kind = .int }, .{ .kind = .blob } }, // 0: Author
         &.{ .{ .kind = .int }, .{ .kind = .link, .link_target = 0 } }, // 1: Book.author -> Author
     };
-    var author_okey: u64 = undefined;
+    var authorObjectKey: u64 = undefined;
     {
-        var db = try Db.create(testing.allocator, path);
-        defer db.deinit();
-        var w = try db.beginWrite();
-        var dir = try createWithDefs(&w, &schema);
+        var database = try Database.create(testing.allocator, path);
+        defer database.deinit();
+        var w = try database.beginWrite();
+        var dir = try createWithDefinitions(&w, &schema);
         const ains = try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .bytes = "Ada" } });
         dir = ains.dir;
-        author_okey = ains.row;
+        authorObjectKey = ains.row;
         var i: u64 = 1;
         while (i <= 20) : (i += 1) {
-            dir = (try insert(&w, dir, 1, &.{ .{ .int = i }, .{ .link = author_okey } })).dir;
+            dir = (try insert(&w, dir, 1, &.{ .{ .int = i }, .{ .link = authorObjectKey } })).dir;
         }
         w.setRoot(dir);
         _ = try w.commit();
     }
     {
-        var db = try Db.open(testing.allocator, path);
-        defer db.deinit();
-        var r = try db.beginRead();
-        try testing.expectEqual(@as(u64, 20), try backlinkCount(&r, r.root(), 1, 1, author_okey));
+        var database = try Database.open(testing.allocator, path);
+        defer database.deinit();
+        var r = try database.beginRead();
+        try testing.expectEqual(@as(u64, 20), try backlinkCount(&r, r.root(), 1, 1, authorObjectKey));
         const res = (try resolveLink(&r, r.root(), 1, 7, 1)).?;
         try testing.expectEqual(@as(u16, 0), res.target_type);
-        try testing.expectEqual(author_okey, res.okey);
+        try testing.expectEqual(authorObjectKey, res.objectKey);
         var out: [2]Value = undefined;
         _ = (try getLinked(&r, r.root(), 1, 13, 1, &out)).?;
         try testing.expectEqualStrings("Ada", out[1].bytes);
@@ -358,15 +358,15 @@ test "block prevents deleting a referenced object" {
     defer tmp.cleanup();
     const path = try tdTmpPath(testing.allocator, &tmp, "block1.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
-    const PD = catalog.PropDef;
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
+    const PD = catalog.PropertyDefinition;
     const schema = [_][]const PD{
         &.{ .{ .kind = .int }, .{ .kind = .blob } }, // Author
         &.{ .{ .kind = .int }, .{ .kind = .link, .link_target = 0, .del_rule = .block } }, // Book.author (block)
     };
-    var dir = try createWithDefs(&w, &schema);
+    var dir = try createWithDefinitions(&w, &schema);
     const author = try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .bytes = "Ada" } });
     dir = author.dir;
     const book = try insert(&w, dir, 1, &.{ .{ .int = 1 }, .{ .link = author.row } });
@@ -380,8 +380,8 @@ test "block prevents deleting a referenced object" {
 
     // Remove the book, then the author deletes fine.
     var bv: [2]Value = undefined;
-    const bver = (try get(&w, dir, 1, 1, &bv)).?;
-    const dbk = try deleteNullifyX(&w, dir, 1, 1, bver);
+    const versionB = (try get(&w, dir, 1, 1, &bv)).?;
+    const dbk = try deleteNullifyX(&w, dir, 1, 1, versionB);
     dir = dbk.ok;
     const aver2 = (try get(&w, dir, 0, 1, &av)).?;
     const da = try deleteNullifyX(&w, dir, 0, 1, aver2);
@@ -396,15 +396,15 @@ test "cascade deletes owned children" {
     defer tmp.cleanup();
     const path = try tdTmpPath(testing.allocator, &tmp, "cascade1.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
-    const PD = catalog.PropDef;
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
+    const PD = catalog.PropertyDefinition;
     const schema = [_][]const PD{
         &.{ .{ .kind = .int }, .{ .kind = .link_set, .link_target = 1, .del_rule = .cascade } }, // Parent.children
         &.{.{ .kind = .int }}, // Child
     };
-    var dir = try createWithDefs(&w, &schema);
+    var dir = try createWithDefinitions(&w, &schema);
     const c1 = try insert(&w, dir, 1, &.{.{ .int = 10 }});
     dir = c1.dir;
     const c2 = try insert(&w, dir, 1, &.{.{ .int = 20 }});
@@ -429,10 +429,10 @@ test "directory records per-type embedded flags" {
     defer tmp.cleanup();
     const path = try tdTmpPath(testing.allocator, &tmp, "emb1.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
-    const PD = catalog.PropDef;
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
+    const PD = catalog.PropertyDefinition;
     const schema = [_][]const PD{
         &.{ .{ .kind = .int }, .{ .kind = .blob } },
         &.{ .{ .kind = .int }, .{ .kind = .int } },
@@ -448,7 +448,7 @@ test "directory records per-type embedded flags" {
     w.deinit();
 }
 
-const embedded_owner_schema = [_][]const catalog.PropDef{
+const embedded_owner_schema = [_][]const catalog.PropertyDefinition{
     &.{ .{ .kind = .int }, .{ .kind = .link, .link_target = 1, .del_rule = .cascade } }, // 0: owner
     &.{ .{ .kind = .int }, .{ .kind = .blob } }, // 1: embedded child
 };
@@ -458,9 +458,9 @@ test "insertEmbedded creates an owned child reachable from the owner" {
     defer tmp.cleanup();
     const path = try tdTmpPath(testing.allocator, &tmp, "emb2.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     var dir = try createTypes(&w, &embedded_owner_schema, &.{ false, true });
 
     dir = (try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .link = null } })).dir;
@@ -478,9 +478,9 @@ test "clearEmbedded deletes the owned child" {
     defer tmp.cleanup();
     const path = try tdTmpPath(testing.allocator, &tmp, "emb3.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     var dir = try createTypes(&w, &embedded_owner_schema, &.{ false, true });
 
     dir = (try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .link = null } })).dir;
@@ -497,9 +497,9 @@ test "replacing an embedded child deletes the old one" {
     defer tmp.cleanup();
     const path = try tdTmpPath(testing.allocator, &tmp, "emb4.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     var dir = try createTypes(&w, &embedded_owner_schema, &.{ false, true });
 
     dir = (try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .link = null } })).dir;
@@ -518,17 +518,17 @@ test "deleting the owner cascades to the embedded child" {
     defer tmp.cleanup();
     const path = try tdTmpPath(testing.allocator, &tmp, "emb5.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     var dir = try createTypes(&w, &embedded_owner_schema, &.{ false, true });
 
     dir = (try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .link = null } })).dir;
     dir = try insertEmbedded(&w, dir, 0, 1, 1, &.{ .{ .int = 100 }, .{ .bytes = "note" } });
 
     var ov: [2]Value = undefined;
-    const owner_ver = (try get(&w, dir, 0, 1, &ov)).?;
-    const dres = try deleteNullifyX(&w, dir, 0, 1, owner_ver);
+    const ownerVersion = (try get(&w, dir, 0, 1, &ov)).?;
+    const dres = try deleteNullifyX(&w, dir, 0, 1, ownerVersion);
     dir = dres.ok;
     try testing.expectEqual(@as(?u64, null), try get(&w, dir, 0, 1, &ov));
     try testing.expectEqual(@as(u64, 0), try liveCount(&w, dir, 1));
@@ -540,44 +540,44 @@ test "directory delete works after relocating the target" {
     defer tmp.cleanup();
     const path = try tdTmpPath(testing.allocator, &tmp, "reloc_del.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
-    const PD = catalog.PropDef;
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
+    const PD = catalog.PropertyDefinition;
     const schema = [_][]const PD{
         &.{ .{ .kind = .int }, .{ .kind = .blob } }, // 0: Author
         &.{ .{ .kind = .int }, .{ .kind = .link, .link_target = 0 } }, // 1: Book.author -> Author
     };
-    var dir = try createWithDefs(&w, &schema);
+    var dir = try createWithDefinitions(&w, &schema);
 
     // A throwaway author opens a dead slot for the real author to move into.
     const throwaway = try insert(&w, dir, 0, &.{ .{ .int = 99 }, .{ .bytes = "tmp" } });
     dir = throwaway.dir;
-    const throwaway_okey = throwaway.row;
+    const throwawayObjectKey = throwaway.row;
 
     const author = try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .bytes = "Ada" } });
     dir = author.dir;
-    const author_okey = author.row;
+    const authorObjectKey = author.row;
 
-    // A book links the real author by its stable okey.
-    dir = (try insert(&w, dir, 1, &.{ .{ .int = 1 }, .{ .link = author_okey } })).dir;
-    try testing.expectEqual(@as(?u64, author_okey), try getLink(&w, dir, 1, 1, 1));
+    // A book links the real author by its stable objectKey.
+    dir = (try insert(&w, dir, 1, &.{ .{ .int = 1 }, .{ .link = authorObjectKey } })).dir;
+    try testing.expectEqual(@as(?u64, authorObjectKey), try getLink(&w, dir, 1, 1, 1));
 
     // Free the throwaway's physical slot, then relocate the author into it.
-    const author_cat = try catalogRef(&w, dir, 0);
-    const dead_row = (try catalog.okeyToRow(&w, author_cat, throwaway_okey)).?;
+    const authorCatalog = try catalogRef(&w, dir, 0);
+    const dead_row = (try catalog.objectKeyToRow(&w, authorCatalog, throwawayObjectKey)).?;
     var vbuf: [2]Value = undefined;
     const tv = (try get(&w, dir, 0, 99, &vbuf)).?;
     const dthrow = try delete(&w, dir, 0, 99, tv);
     dir = dthrow.ok;
-    const relocated = try relocation.relocateRow(&w, try catalogRef(&w, dir, 0), author_okey, dead_row);
+    const relocated = try relocation.relocateRow(&w, try catalogRef(&w, dir, 0), authorObjectKey, dead_row);
     dir = try setCatalogRef(&w, dir, 0, relocated);
 
     // Deleting the author must nullify the book's link, proving the delete used
     // the object key rather than a stale physical row.
     var abuf: [2]Value = undefined;
-    const author_ver = (try get(&w, dir, 0, 1, &abuf)).?;
-    const dres = try deleteNullifyX(&w, dir, 0, 1, author_ver);
+    const authorVersion = (try get(&w, dir, 0, 1, &abuf)).?;
+    const dres = try deleteNullifyX(&w, dir, 0, 1, authorVersion);
     dir = dres.ok;
     try testing.expectEqual(@as(?u64, null), try getLink(&w, dir, 1, 1, 1));
     w.deinit();
@@ -594,13 +594,13 @@ test "a self-linked object is deletable across transactions" {
     defer tmp.cleanup();
     const path = try tdTmpPath(testing.allocator, &tmp, "selflink.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
 
     // Commit a row that links to ITSELF via a block-rule property.
     {
-        var w = try db.beginWrite();
-        var dir = try createWithDefs(&w, &.{
+        var w = try database.beginWrite();
+        var dir = try createWithDefinitions(&w, &.{
             &.{ .{ .kind = .int }, .{ .kind = .link, .link_target = 0, .del_rule = .block } },
         });
         const a = try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .link = null } });
@@ -612,15 +612,15 @@ test "a self-linked object is deletable across transactions" {
     // Deleting it in a LATER transaction must succeed: the self-link neither
     // blocks nor invalidates the version the caller read.
     {
-        var w = try db.beginWrite();
+        var w = try database.beginWrite();
         var out: [2]Value = undefined;
-        const ver = (try get(&w, w.new_root, 0, 1, &out)).?;
-        const res = try deleteNullifyX(&w, w.new_root, 0, 1, ver);
+        const version = (try get(&w, w.new_root, 0, 1, &out)).?;
+        const res = try deleteNullifyX(&w, w.new_root, 0, 1, version);
         try testing.expect(res == .ok);
         w.setRoot(res.ok);
         _ = try w.commit();
     }
-    var r = try db.beginRead();
+    var r = try database.beginRead();
     defer r.end();
     try testing.expectEqual(@as(u64, 0), try liveCount(&r, r.root(), 0));
     // A FOREIGN block-rule source must still block, self-exemption or not.
@@ -632,14 +632,14 @@ test "cascade is cycle-safe" {
     defer tmp.cleanup();
     const path = try tdTmpPath(testing.allocator, &tmp, "cascade2.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
-    const PD = catalog.PropDef;
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
+    const PD = catalog.PropertyDefinition;
     const schema = [_][]const PD{
         &.{ .{ .kind = .int }, .{ .kind = .link, .link_target = 0, .del_rule = .cascade } }, // Node.next (self type)
     };
-    var dir = try createWithDefs(&w, &schema);
+    var dir = try createWithDefinitions(&w, &schema);
     const a = try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .link = null } });
     dir = a.dir;
     const b = try insert(&w, dir, 0, &.{ .{ .int = 2 }, .{ .link = a.row } }); // b -> a
@@ -663,29 +663,29 @@ test "a directory delete of a self-referencing link_set row frees its set root e
     defer tmp.cleanup();
     const path = try tdTmpPath(testing.allocator, &tmp, "selfset_dir.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
 
     {
-        var w = try db.beginWrite();
-        var dir = try createWithDefs(&w, &.{
+        var w = try database.beginWrite();
+        var dir = try createWithDefinitions(&w, &.{
             &.{ .{ .kind = .int }, .{ .kind = .link_set, .link_target = 0 } },
         });
         const ins = try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .link_set = &.{} } });
         dir = ins.dir;
-        dir = try linkSetAdd(&w, dir, 0, 1, 1, ins.row); // set contains own okey
+        dir = try linkSetAdd(&w, dir, 0, 1, 1, ins.row); // set contains own objectKey
         w.setRoot(dir);
         _ = try w.commit();
     }
-    var w = try db.beginWrite();
+    var w = try database.beginWrite();
     defer w.deinit();
     var out: [2]Value = undefined;
-    const ver = (try get(&w, w.new_root, 0, 1, &out)).?;
-    const res = try deleteNullifyX(&w, w.new_root, 0, 1, ver);
+    const version = (try get(&w, w.new_root, 0, 1, &out)).?;
+    const res = try deleteNullifyX(&w, w.new_root, 0, 1, version);
     try testing.expect(res == .ok);
     var seen = std.AutoHashMap(u64, void).init(testing.allocator);
     defer seen.deinit();
-    for (w.txn_reuse.extents.items) |e| {
+    for (w.transactionReuse.extents.items) |e| {
         const gop = try seen.getOrPut(e.offset);
         try testing.expect(!gop.found_existing); // duplicate free
     }
@@ -703,25 +703,25 @@ test "a directory delete frees the row's collection storage" {
     defer tmp.cleanup();
     const path = try tdTmpPath(testing.allocator, &tmp, "dircoll.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
 
     {
-        var w = try db.beginWrite();
-        var dir = try createWithDefs(&w, &.{
-            &.{ .{ .kind = .int }, .{ .kind = .set, .elem = .int }, .{ .kind = .list, .elem = .int } },
+        var w = try database.beginWrite();
+        var dir = try createWithDefinitions(&w, &.{
+            &.{ .{ .kind = .int }, .{ .kind = .set, .element = .int }, .{ .kind = .list, .element = .int } },
         });
         dir = (try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .set_int = &.{ 1, 2, 3 } }, .{ .list_int = &.{ 7, 8, 9 } } })).dir;
         w.setRoot(dir);
         _ = try w.commit();
     }
-    var w = try db.beginWrite();
+    var w = try database.beginWrite();
     defer w.deinit();
     var raw: [3]u64 = undefined;
-    _ = (try rows.getByPk(&w, try catalogRef(&w, w.new_root, 0), 1, &raw)).?;
+    _ = (try rows.getByPrimaryKey(&w, try catalogRef(&w, w.new_root, 0), 1, &raw)).?;
     var out: [3]Value = undefined;
-    const ver = (try get(&w, w.new_root, 0, 1, &out)).?;
-    const res = try deleteNullifyX(&w, w.new_root, 0, 1, ver);
+    const version = (try get(&w, w.new_root, 0, 1, &out)).?;
+    const res = try deleteNullifyX(&w, w.new_root, 0, 1, version);
     try testing.expect(res == .ok);
     var freed_set = false;
     var freed_list = false;
@@ -729,7 +729,7 @@ test "a directory delete frees the row's collection storage" {
         if (e.offset == raw[1]) freed_set = true;
         if (e.offset == raw[2]) freed_list = true;
     }
-    for (w.txn_reuse.extents.items) |e| {
+    for (w.transactionReuse.extents.items) |e| {
         if (e.offset == raw[1]) freed_set = true;
         if (e.offset == raw[2]) freed_list = true;
     }
@@ -744,14 +744,14 @@ test "a cascade delete frees the child's collection storage" {
     defer tmp.cleanup();
     const path = try tdTmpPath(testing.allocator, &tmp, "casccoll.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
 
     {
-        var w = try db.beginWrite();
-        var dir = try createWithDefs(&w, &.{
+        var w = try database.beginWrite();
+        var dir = try createWithDefinitions(&w, &.{
             &.{ .{ .kind = .int }, .{ .kind = .link, .link_target = 1, .del_rule = .cascade } }, // 0: owner
-            &.{ .{ .kind = .int }, .{ .kind = .set, .elem = .int } }, // 1: child
+            &.{ .{ .kind = .int }, .{ .kind = .set, .element = .int } }, // 1: child
         });
         const child = try insert(&w, dir, 1, &.{ .{ .int = 100 }, .{ .set_int = &.{ 1, 2, 3 } } });
         dir = child.dir;
@@ -759,26 +759,26 @@ test "a cascade delete frees the child's collection storage" {
         w.setRoot(dir);
         _ = try w.commit();
     }
-    var w = try db.beginWrite();
+    var w = try database.beginWrite();
     defer w.deinit();
     var raw: [2]u64 = undefined;
-    _ = (try rows.getByPk(&w, try catalogRef(&w, w.new_root, 1), 100, &raw)).?;
+    _ = (try rows.getByPrimaryKey(&w, try catalogRef(&w, w.new_root, 1), 100, &raw)).?;
     var out: [2]Value = undefined;
-    const ver = (try get(&w, w.new_root, 0, 1, &out)).?;
-    const res = try deleteNullifyX(&w, w.new_root, 0, 1, ver);
+    const version = (try get(&w, w.new_root, 0, 1, &out)).?;
+    const res = try deleteNullifyX(&w, w.new_root, 0, 1, version);
     try testing.expect(res == .ok);
     try testing.expectEqual(@as(u64, 0), try liveCount(&w, res.ok, 1)); // child cascaded
     var freed_child_set = false;
     for (w.in_flight_frees.items) |e| {
         if (e.offset == raw[1]) freed_child_set = true;
     }
-    for (w.txn_reuse.extents.items) |e| {
+    for (w.transactionReuse.extents.items) |e| {
         if (e.offset == raw[1]) freed_child_set = true;
     }
     try testing.expect(freed_child_set);
 }
 
-const embedded_block_schema = [_][]const catalog.PropDef{
+const embedded_block_schema = [_][]const catalog.PropertyDefinition{
     &.{ .{ .kind = .int }, .{ .kind = .link, .link_target = 1, .del_rule = .cascade } }, // 0: owner
     &.{ .{ .kind = .int }, .{ .kind = .blob } }, // 1: embedded child
     &.{ .{ .kind = .int }, .{ .kind = .link, .link_target = 1, .del_rule = .block } }, // 2: blocker
@@ -792,20 +792,20 @@ test "replacing an embedded child surfaces a blocked delete" {
     defer tmp.cleanup();
     const path = try tdTmpPath(testing.allocator, &tmp, "embblock1.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     defer w.deinit();
     var dir = try createTypes(&w, &embedded_block_schema, &.{ false, true, false });
 
     dir = (try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .link = null } })).dir;
     dir = try insertEmbedded(&w, dir, 0, 1, 1, &.{ .{ .int = 100 }, .{ .bytes = "old" } });
-    const child_okey = (try getLink(&w, dir, 0, 1, 1)).?;
-    dir = (try insert(&w, dir, 2, &.{ .{ .int = 5 }, .{ .link = child_okey } })).dir;
+    const childObjectKey = (try getLink(&w, dir, 0, 1, 1)).?;
+    dir = (try insert(&w, dir, 2, &.{ .{ .int = 5 }, .{ .link = childObjectKey } })).dir;
 
     try testing.expectError(error.Blocked, insertEmbedded(&w, dir, 0, 1, 1, &.{ .{ .int = 200 }, .{ .bytes = "new" } }));
     // Old child intact and still owned.
-    try testing.expectEqual(@as(?u64, child_okey), try getLink(&w, dir, 0, 1, 1));
+    try testing.expectEqual(@as(?u64, childObjectKey), try getLink(&w, dir, 0, 1, 1));
     try testing.expectEqual(@as(u64, 1), try liveCount(&w, dir, 1));
 }
 
@@ -816,18 +816,18 @@ test "clearing an embedded child surfaces a blocked delete" {
     defer tmp.cleanup();
     const path = try tdTmpPath(testing.allocator, &tmp, "embblock2.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     defer w.deinit();
     var dir = try createTypes(&w, &embedded_block_schema, &.{ false, true, false });
 
     dir = (try insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .link = null } })).dir;
     dir = try insertEmbedded(&w, dir, 0, 1, 1, &.{ .{ .int = 100 }, .{ .bytes = "note" } });
-    const child_okey = (try getLink(&w, dir, 0, 1, 1)).?;
-    dir = (try insert(&w, dir, 2, &.{ .{ .int = 5 }, .{ .link = child_okey } })).dir;
+    const childObjectKey = (try getLink(&w, dir, 0, 1, 1)).?;
+    dir = (try insert(&w, dir, 2, &.{ .{ .int = 5 }, .{ .link = childObjectKey } })).dir;
 
     try testing.expectError(error.Blocked, clearEmbedded(&w, dir, 0, 1, 1));
-    try testing.expectEqual(@as(?u64, child_okey), try getLink(&w, dir, 0, 1, 1));
+    try testing.expectEqual(@as(?u64, childObjectKey), try getLink(&w, dir, 0, 1, 1));
     try testing.expectEqual(@as(u64, 1), try liveCount(&w, dir, 1));
 }

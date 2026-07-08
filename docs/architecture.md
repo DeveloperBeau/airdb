@@ -10,7 +10,7 @@ maintenance (compaction) is driven explicitly by the caller.
 
 | Layer | Files | Responsibility |
 |---|---|---|
-| Platform | `platform.zig`, `storage/syncer.zig` | mmap sections, file locks, pid/incarnation checks, durability barrier (`F_FULLFSYNC` on Darwin, `fsync` elsewhere), injectable `Syncer` for crash tests |
+| Platform | `platform.zig`, `storage/syncer.zig` | mmap sections, file locks, pid/incarnation checks, durability barrier (`F_FULLFSYNC` on Darwin, `fsync` elsewhere), injectable `Syncing` for crash tests |
 | Store | `storage/fileStore.zig`, `storage/slots.zig`, `storage/arena.zig`, `storage/freeList.zig` | CRC-checked header, two CRC-checked commit slots, bump-allocating arena over the mapping, persisted free list with size-class buckets |
 | Transactions | `database.zig`, `transactions/writeTransaction.zig`, `transactions/readTransaction.zig`, `transactions/coordination.zig` | MVCC snapshots and pins, the commit protocol, version→root ring for point-in-time reads, cross-process coordination |
 | Trees | `trees/index.zig`/`trees/indexNode.zig`, `trees/column.zig`/`trees/columnNode.zig`, `trees/byteKeyIndex.zig`, `records/blob.zig` | copy-on-write B+trees (u64-keyed index with subtree counts, row-indexed column, byte-keyed bindex), chunked blob heap |
@@ -22,7 +22,7 @@ maintenance (compaction) is driven explicitly by the caller.
 
 The file is mapped in fixed 16 MiB sections. Growth only appends new
 sections; an existing section is never remapped or moved, so every live
-pointer into the mapping stays valid for the life of the process. A `Ref` is
+pointer into the mapping stays valid for the life of the process. A `Reference` is
 an absolute byte offset; `arena.deref` is the single bounds-checked chokepoint
 every read goes through (null, alignment, section bounds, no cross-section
 spans). No allocation may cross a section boundary, which caps a single
@@ -103,11 +103,11 @@ reclaimed in passing.
 ## The object layer
 
 A **type directory** maps type ids to **catalogs**. A catalog is one node
-describing a type: per-property column roots, kinds, a pk index
-(pk → object key), a key→row index (object key → physical row), version and
+describing a type: per-property column roots, kinds, a primaryKey index
+(primaryKey → object key), a key→row index (object key → physical row), version and
 liveness columns, and per-property backlink/value indexes. Rows live in
-columns addressed by physical row; the **object key** (okey) is the stable
-identity — links and indexes reference okeys, so compaction can relocate rows
+columns addressed by physical row; the **object key** (objectKey) is the stable
+identity — links and indexes reference objectKeys, so compaction can relocate rows
 without breaking anything.
 
 Catalog rewrites go through `CatalogSnapshot`: load every field into an owned
@@ -116,9 +116,9 @@ transaction threads catalog refs exactly like tree roots.
 
 Secondary structures are maintained transactionally with the row:
 
-- **Value indexes** (per indexed property): value → set of okeys. The query
+- **Value indexes** (per indexed property): value → set of objectKeys. The query
   planner drives equality/range predicates off them.
-- **Backlinks** (per link property): target okey → set of source okeys. They
+- **Backlinks** (per link property): target objectKey → set of source objectKeys. They
   power `nullify`/`cascade`/`block` delete rules.
 
 `verifyIntegrity` audits both structures in both directions (every live row
@@ -137,7 +137,7 @@ Deletes tombstone rows; space is reclaimed on two tracks:
   single-node read.
 - **Full file** (`compactInPlace`): copy all live data into a fresh file,
   **verify** the copy is equivalent to the source (type counts, live counts,
-  order-independent pk folds, per-object readability, link identity), then
+  order-independent primaryKey folds, per-object readability, link identity), then
   publish with a single atomic rename hardened by a parent-directory fsync. A
   crash before the rename leaves the original untouched; after it, the new
   file is complete.

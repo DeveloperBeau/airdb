@@ -6,16 +6,16 @@
 // link, and the cascade-delete worker recurses to arbitrary depth). We exploit
 // that with one directory carrying a single 4-type chain:
 //
-//   type 0  root        {int pk, link(cascade -> type 1)}   non-embedded
-//   type 1  child        {int pk, link(cascade -> type 2)}   embedded
-//   type 2  grandchild   {int pk, link(cascade -> type 3)}   embedded
-//   type 3  greatchild   {int pk, int value}                 embedded leaf
+//   type 0  root        {int primaryKey, link(cascade -> type 1)}   non-embedded
+//   type 1  child        {int primaryKey, link(cascade -> type 2)}   embedded
+//   type 2  grandchild   {int primaryKey, link(cascade -> type 3)}   embedded
+//   type 3  greatchild   {int primaryKey, int value}                 embedded leaf
 //
 // Depth d builds a root plus d embedded levels down the chain (depth 1 = one
 // embedded child; depth 2 = child + grandchild; depth 3 = + great-grandchild).
-// Every type owns an independent pk space, so each depth uses key = d*stride + i
+// Every type owns an independent primaryKey space, so each depth uses key = d*stride + i
 // across all its levels to keep rows disjoint across the three depth passes
-// while sharing one directory and one Db.
+// while sharing one directory and one Database.
 //
 // Phase honesty:
 //   CREATE  insert the root row + chain insertEmbedded down d levels (timed as
@@ -47,12 +47,12 @@ const max_rows: usize = 50_000;
 // Root rows committed per write transaction.
 const batch_size: usize = 5_000;
 
-// Disjoint pk band per depth; larger than max_rows so depth passes never alias.
+// Disjoint primaryKey band per depth; larger than max_rows so depth passes never alias.
 const depth_stride: u64 = 1_000_000;
 
 // A 4-type chain: types 0..2 carry a cascade to-one link to the next type;
 // type 3 is the leaf. Type 0 is the non-embedded root, types 1..3 are embedded.
-const chain_schema = [_][]const catalog.PropDef{
+const chain_schema = [_][]const catalog.PropertyDefinition{
     &.{ .{ .kind = .int }, .{ .kind = .link, .link_target = 1, .del_rule = .cascade } },
     &.{ .{ .kind = .int }, .{ .kind = .link, .link_target = 2, .del_rule = .cascade } },
     &.{ .{ .kind = .int }, .{ .kind = .link, .link_target = 3, .del_rule = .cascade } },
@@ -60,8 +60,8 @@ const chain_schema = [_][]const catalog.PropDef{
 };
 const chain_embedded = [_]bool{ false, true, true, true };
 
-// The to-one link prop is index 1 on every chain type.
-const link_prop: usize = 1;
+// The to-one link property is index 1 on every chain type.
+const linkProperty: usize = 1;
 
 inline fn sysIo() Io {
     return std.Io.Threaded.global_single_threaded.io();
@@ -81,11 +81,11 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     defer alloc.free(path);
     defer harness.removeScratch(ctx.*, path);
 
-    var db = try airdb.Db.create(alloc, path);
-    errdefer db.deinit();
+    var database = try airdb.Database.create(alloc, path);
+    errdefer database.deinit();
 
     {
-        var w = try db.beginWrite();
+        var w = try database.beginWrite();
         const dir = try typedir.createTypes(&w, &chain_schema, &chain_embedded);
         w.setRoot(dir);
         _ = try w.commit();
@@ -116,7 +116,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
             var inserted: usize = 0;
             while (inserted < rows) {
                 const this_batch = @min(batch_size, rows - inserted);
-                var w = try db.beginWrite();
+                var w = try database.beginWrite();
                 var dir = w.new_root;
                 var j: usize = 0;
                 while (j < this_batch) : (j += 1) {
@@ -124,7 +124,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
                     const t0 = nowNs(io);
                     // Root row of type 0.
                     dir = (try typeRouting.insert(&w, dir, 0, &.{ .{ .int = key }, .{ .link = null } })).dir;
-                    // Embedded levels 1..d. Each shares `key` in its own pk space.
+                    // Embedded levels 1..d. Each shares `key` in its own primaryKey space.
                     var level: u16 = 0;
                     while (level < d) : (level += 1) {
                         const leaf = level + 1 == max_depth;
@@ -132,7 +132,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
                             .{ .{ .int = key }, .{ .int = key *% 2654435761 } }
                         else
                             .{ .{ .int = key }, .{ .link = null } };
-                        dir = try typedir.insertEmbedded(&w, dir, level, key, link_prop, &child_vals);
+                        dir = try typedir.insertEmbedded(&w, dir, level, key, linkProperty, &child_vals);
                     }
                     const dt: u64 = @intCast(nowNs(io) - t0);
                     try create_lat.add(alloc, dt);
@@ -148,7 +148,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         // --- READ: full descent through all d levels via getLinked ------------
         {
             const phase_start = nowNs(io);
-            var r = try db.beginRead();
+            var r = try database.beginRead();
             const dir = r.root();
             var out: [2]Value = undefined;
             var i: usize = 0;
@@ -157,7 +157,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
                 const t0 = nowNs(io);
                 var level: u16 = 0;
                 while (level < d) : (level += 1) {
-                    _ = try typeRouting.getLinked(&r, dir, level, key, link_prop, &out);
+                    _ = try typeRouting.getLinked(&r, dir, level, key, linkProperty, &out);
                 }
                 const dt: u64 = @intCast(nowNs(io) - t0);
                 try read_lat.add(alloc, dt);
@@ -167,13 +167,13 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
             total_ns += @intCast(nowNs(io) - phase_start);
         }
 
-        create_p50_us[d - 1] = @as(f64, @floatFromInt(create_lat.pct(50))) / 1000.0;
-        read_p50_us[d - 1] = @as(f64, @floatFromInt(read_lat.pct(50))) / 1000.0;
+        create_p50_us[d - 1] = @as(f64, @floatFromInt(create_lat.percentile(50))) / 1000.0;
+        read_p50_us[d - 1] = @as(f64, @floatFromInt(read_lat.percentile(50))) / 1000.0;
         total_built += rows;
     }
 
-    const file_bytes = try db.fileSize();
-    const logical_bytes = db.logicalSize();
+    const file_bytes = try database.fileSize();
+    const logical_bytes = database.logicalSize();
 
     const note = try std.fmt.allocPrint(
         alloc,
@@ -190,15 +190,15 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         .name = name,
         .ops = total_built,
         .wall_ns = total_ns,
-        .p50_ns = combined.pct(50),
-        .p99_ns = combined.pct(99),
-        .max_ns = combined.pct(100),
+        .p50_ns = combined.percentile(50),
+        .p99_ns = combined.percentile(99),
+        .max_ns = combined.percentile(100),
         .file_bytes = file_bytes,
         .logical_bytes = logical_bytes,
         .peak_rss_bytes = airdb.peakResidentBytes(),
         .note = note,
     };
 
-    db.deinit();
+    database.deinit();
     return result;
 }

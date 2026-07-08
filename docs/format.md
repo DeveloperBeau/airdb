@@ -6,7 +6,7 @@ little-endian; the store refuses to open big-endian-tagged files.
 ## File layout
 
 The data file is a sequence of 16 MiB sections (`platform.section_size`),
-mapped individually and never moved. A `Ref` is an absolute byte offset,
+mapped individually and never moved. A `Reference` is an absolute byte offset,
 8-aligned, `0` meaning null. Offset 0 starts the reserved header page
 (4096 bytes); the allocation arena begins at 4096.
 
@@ -36,8 +36,8 @@ previous node's space is recycled through the next list.
 Three node families share the `[kind u8][count u16]` header. Fanout and leaf
 capacity are both 64.
 
-**Index (u64 → u64)** — `trees/indexNode.zig`, used for pk indexes, key→row
-indexes, sets of okeys, and value-index outer/inner trees:
+**Index (u64 → u64)** — `trees/indexNode.zig`, used for primaryKey indexes, key→row
+indexes, sets of objectKeys, and value-index outer/inner trees:
 
 - leaf (1027 B): count × (key u64, value u64), sorted by key
 - inner (1539 B): count × (child_ref u64, low_key u64, subtree_count u64) —
@@ -65,7 +65,7 @@ The empty blob is the null ref; no node is written.
 
 ## Catalog node
 
-Per type: `prop_count u16, next_row u64, pk_index_ref u64,
+Per type: `propertyCount u16, next_row u64, primaryKeyIndexRef u64,
 version_col_ref u64, live_col_ref u64, keyrow_index_ref u64, next_key u64`,
 then per-property parallel arrays in this order: column refs (u64), kinds
 (u8), element kinds (u8), backlink refs (u64), link targets (u16), delete

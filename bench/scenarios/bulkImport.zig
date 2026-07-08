@@ -14,7 +14,7 @@ const airdb = @import("airdb");
 const harness = @import("../harness.zig");
 
 const Io = std.Io;
-const Ref = airdb.Ref;
+const Reference = airdb.Reference;
 const catalog = airdb.catalog;
 const rawRows = airdb.rows;
 const bulk = airdb.bulk;
@@ -44,8 +44,8 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     defer alloc.free(path_b);
     defer harness.removeScratch(ctx.*, path_b);
 
-    // --- Build the rows once, shared by both paths. Two-int type {pk, value};
-    // pk = i, value = i. A flat backing buffer sliced into per-row windows so
+    // --- Build the rows once, shared by both paths. Two-int type {primaryKey, value};
+    // primaryKey = i, value = i. A flat backing buffer sliced into per-row windows so
     // bulkImport sees a []const []const u64.
     const storage = try alloc.alloc([2]u64, ctx.n);
     defer alloc.free(storage);
@@ -57,68 +57,68 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     }
 
     // --- Path A: bulk import in one write transaction -----------------------
-    var db_a = try airdb.Db.create(alloc, path_a);
-    errdefer db_a.deinit();
+    var databaseA = try airdb.Database.create(alloc, path_a);
+    errdefer databaseA.deinit();
 
     // Empty two-int catalog committed as the root, so the bulk write transaction
     // sees it via w.new_root. bulkImport requires the type to be empty.
     {
-        var w = try db_a.beginWrite();
+        var w = try databaseA.beginWrite();
         const c = try catalog.create(&w, 2);
         w.setRoot(c);
         _ = try w.commit();
     }
 
-    const a_commits_before = db_a.metrics().commit_count;
+    const a_commits_before = databaseA.metrics().commit_count;
     const a_pf_before = airdb.pageFaults();
     const bulk_start = nowNs(io);
     {
-        var w = try db_a.beginWrite();
-        const new_cat = try bulk.bulkImport(&w, w.new_root, rows, .{});
-        w.setRoot(new_cat);
+        var w = try databaseA.beginWrite();
+        const newCatalog = try bulk.bulkImport(&w, w.new_root, rows, .{});
+        w.setRoot(newCatalog);
         _ = try w.commit();
     }
     const bulk_ns: u64 = @intCast(nowNs(io) - bulk_start);
     const a_pf_after = airdb.pageFaults();
     const bulk_faults = (a_pf_after.minor - a_pf_before.minor) + (a_pf_after.major - a_pf_before.major);
-    const bulk_commits = db_a.metrics().commit_count - a_commits_before;
+    const bulk_commits = databaseA.metrics().commit_count - a_commits_before;
 
-    const file_bytes = try db_a.fileSize();
-    const logical_bytes = db_a.logicalSize();
+    const file_bytes = try databaseA.fileSize();
+    const logical_bytes = databaseA.logicalSize();
 
     // --- Path B: row-by-row inserts in batched commits ----------------------
-    var db_b = try airdb.Db.create(alloc, path_b);
-    errdefer db_b.deinit();
-    var cat: Ref = blk: {
-        var w = try db_b.beginWrite();
+    var databaseB = try airdb.Database.create(alloc, path_b);
+    errdefer databaseB.deinit();
+    var catalogRef: Reference = blk: {
+        var w = try databaseB.beginWrite();
         const c = try catalog.create(&w, 2);
         w.setRoot(c);
         _ = try w.commit();
         break :blk c;
     };
 
-    const b_commits_before = db_b.metrics().commit_count;
+    const b_commits_before = databaseB.metrics().commit_count;
     const b_pf_before = airdb.pageFaults();
     const rowwise_start = nowNs(io);
     var inserted: usize = 0;
     while (inserted < ctx.n) {
         const this_batch = @min(batch_size, ctx.n - inserted);
-        var w = try db_b.beginWrite();
-        cat = db_b.active_root; // reload the committed catalog ref
+        var w = try databaseB.beginWrite();
+        catalogRef = databaseB.active_root; // reload the committed catalog ref
         var j: usize = 0;
         while (j < this_batch) : (j += 1) {
-            const pk: u64 = inserted + j;
-            const r = try rawRows.insert(&w, cat, &.{ pk, pk });
-            cat = r.cat;
+            const primaryKey: u64 = inserted + j;
+            const r = try rawRows.insert(&w, catalogRef, &.{ primaryKey, primaryKey });
+            catalogRef = r.catalogRef;
         }
-        w.setRoot(cat);
+        w.setRoot(catalogRef);
         _ = try w.commit();
         inserted += this_batch;
     }
     const rowwise_ns: u64 = @intCast(nowNs(io) - rowwise_start);
     const b_pf_after = airdb.pageFaults();
     const rowwise_faults = (b_pf_after.minor - b_pf_before.minor) + (b_pf_after.major - b_pf_before.major);
-    const rowwise_commits = db_b.metrics().commit_count - b_commits_before;
+    const rowwise_commits = databaseB.metrics().commit_count - b_commits_before;
 
     const speedup: f64 = if (bulk_ns == 0)
         0
@@ -139,8 +139,8 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         },
     );
 
-    db_a.deinit();
-    db_b.deinit();
+    databaseA.deinit();
+    databaseB.deinit();
 
     return .{
         .name = name,

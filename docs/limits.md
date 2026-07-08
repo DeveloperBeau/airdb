@@ -3,13 +3,13 @@
 The honest list. Some of these are Phase-1 scoping decisions, some are
 inherent to the design; each says which.
 
-## Threading: one Db instance, one thread
+## Threading: one Database instance, one thread
 
-A `Db` instance has **no internal synchronization**. All transactions on one
+A `Database` instance has **no internal synchronization**. All transactions on one
 instance must come from a single thread. Two threads sharing an instance is a
 data race, full stop.
 
-What is safe: one `Db` instance per thread (or per process), all attached to
+What is safe: one `Database` instance per thread (or per process), all attached to
 the same file. The write lock, reader pins, and reclaim horizon coordinate
 across instances exactly as they do across processes. Scoping decision — a
 thread-safe handle layer is future work.
@@ -67,7 +67,7 @@ newer one. Ship a matched engine with your app.
   start-time query fails (exotic sandboxing), a recycled pid degrades to
   pid-only liveness: safe, but a dead reader's pin then persists until the
   squatting pid itself exits.
-- At most 64 simultaneously attached Db instances per database; the 65th
+- At most 64 simultaneously attached Database instances per database; the 65th
   open fails with TooManyAttachments rather than degrade to reads whose pins
   no writer can see.
 - The coord file must live next to the data file on the same filesystem.
@@ -79,7 +79,7 @@ newer one. Ship a matched engine with your app.
 - A single arena allocation caps at one section (16 MiB); larger blobs chunk
   transparently, but list/set/dict *elements* are u64s (blob elements are refs
   and follow blob rules).
-- `Db.create`/`open` require absolute paths.
+- `Database.create`/`open` require absolute paths.
 
 ## Failed commits
 

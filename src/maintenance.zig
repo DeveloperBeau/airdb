@@ -1,9 +1,9 @@
 // maintenance.zig -- caller-driven background upkeep for a database instance.
 //
 // Edge-level entry points that sequence inner-layer machinery (compaction,
-// the type directory) over a Db. Nothing inner imports this file.
+// the type directory) over a Database. Nothing inner imports this file.
 
-const Db = @import("database.zig").Db;
+const Database = @import("database.zig").Database;
 const typedir = @import("schema/typeDirectory.zig");
 const compaction = @import("storage/compaction.zig");
 
@@ -20,18 +20,18 @@ pub const CompactStepResult = struct { ran: bool, moved: usize, done: bool };
 /// The `auto_compact` flag is consulted by callers to decide whether to drive
 /// this loop; the function itself does not check it. Does I/O: commits a
 /// write transaction when a step runs.
-pub fn maybeCompactStep(db: *Db, type_id: u16, budget: usize) !CompactStepResult {
-    var w = try db.beginWrite();
-    errdefer w.deinit();
-    const dir = db.active_root;
-    const cat = try typedir.catalogRef(&w, dir, type_id);
-    if (!try compaction.shouldCompact(&w, cat)) {
-        w.deinit();
+pub fn maybeCompactStep(database: *Database, type_id: u16, budget: usize) !CompactStepResult {
+    var writeTransaction = try database.beginWrite();
+    errdefer writeTransaction.deinit();
+    const dir = database.active_root;
+    const catalogRef = try typedir.catalogRef(&writeTransaction, dir, type_id);
+    if (!try compaction.shouldCompact(&writeTransaction, catalogRef)) {
+        writeTransaction.deinit();
         return .{ .ran = false, .moved = 0, .done = false };
     }
-    const step = try compaction.compactStep(&w, cat, type_id, budget);
-    const new_dir = try typedir.setCatalogRef(&w, dir, type_id, step.cat);
-    w.setRoot(new_dir);
-    _ = try w.commit();
+    const step = try compaction.compactStep(&writeTransaction, catalogRef, type_id, budget);
+    const new_dir = try typedir.setCatalogRef(&writeTransaction, dir, type_id, step.catalogRef);
+    writeTransaction.setRoot(new_dir);
+    _ = try writeTransaction.commit();
     return .{ .ran = true, .moved = step.moved, .done = step.done };
 }

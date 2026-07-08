@@ -18,7 +18,7 @@ const airdb = @import("airdb");
 const harness = @import("../harness.zig");
 
 const Io = std.Io;
-const Ref = airdb.Ref;
+const Reference = airdb.Reference;
 const catalog = airdb.catalog;
 const rows = airdb.rows;
 const query = airdb.query;
@@ -31,7 +31,7 @@ const batch_size: usize = 10_000;
 // Number of point lookups to sample for latency percentiles.
 const lookup_count: usize = 100_000;
 
-// Distinct category values; each row gets category = pk % category_mod.
+// Distinct category values; each row gets category = primaryKey % category_mod.
 const category_mod: u64 = 100;
 
 // The category the equality query selects on.
@@ -39,7 +39,7 @@ const eq_category: u64 = 42;
 
 // Repetitions of the index-backed equality query used to derive its per-call
 // latency (averaged), small enough to keep the run well under a minute.
-const idx_eq_reps: usize = 1000;
+const indexedEqRepetitions: usize = 1000;
 
 // Monotonic wall-clock instance, matching the convention in fileStore.zig.
 inline fn sysIo() Io {
@@ -59,15 +59,15 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     defer harness.removeScratch(ctx.*, path);
 
     // --- Insert phase (setup only, not timed) --------------------------------
-    var db = try airdb.Db.create(alloc, path);
-    defer db.deinit();
+    var database = try airdb.Database.create(alloc, path);
+    defer database.deinit();
 
-    // Two-int type: {pk, category}. Property 0 is the primary key, property 1
+    // Two-int type: {primaryKey, category}. Property 0 is the primary key, property 1
     // is the low-cardinality category, declared indexed so the equality query
     // is served by its value index rather than a full scan.
-    var cat: Ref = blk: {
-        var w = try db.beginWrite();
-        const c = try catalog.createDefs(&w, &.{
+    var catalogRef: Reference = blk: {
+        var w = try database.beginWrite();
+        const c = try catalog.createFromDefinitions(&w, &.{
             .{ .kind = .int },
             .{ .kind = .int, .indexed = true },
         });
@@ -79,15 +79,15 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     var inserted: usize = 0;
     while (inserted < ctx.n) {
         const this_batch = @min(batch_size, ctx.n - inserted);
-        var w = try db.beginWrite();
-        cat = db.active_root; // reload the committed catalog ref
+        var w = try database.beginWrite();
+        catalogRef = database.active_root; // reload the committed catalog ref
         var j: usize = 0;
         while (j < this_batch) : (j += 1) {
-            const pk: u64 = inserted + j;
-            const r = try rows.insert(&w, cat, &.{ pk, pk % category_mod });
-            cat = r.cat;
+            const primaryKey: u64 = inserted + j;
+            const r = try rows.insert(&w, catalogRef, &.{ primaryKey, primaryKey % category_mod });
+            catalogRef = r.catalogRef;
         }
-        w.setRoot(cat);
+        w.setRoot(catalogRef);
         _ = try w.commit();
         inserted += this_batch;
     }
@@ -96,8 +96,8 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     var lat = harness.Latencies.init();
     defer lat.deinit(alloc);
 
-    var rd = try db.beginRead();
-    cat = rd.root();
+    var rd = try database.beginRead();
+    catalogRef = rd.root();
 
     // Deterministic xorshift64 over a fixed seed; index = x % n keeps every
     // lookup inside [0, n). No clock/RNG dependency, so the run is reproducible.
@@ -110,10 +110,10 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         x ^= x << 13;
         x ^= x >> 7;
         x ^= x << 17;
-        const pk: u64 = x % n_u64;
+        const primaryKey: u64 = x % n_u64;
         var out: [2]u64 = undefined;
         const t0 = nowNs(io);
-        _ = try rows.getByPk(&rd, cat, pk, &out);
+        _ = try rows.getByPrimaryKey(&rd, catalogRef, primaryKey, &out);
         const dt: u64 = @intCast(nowNs(io) - t0);
         try lat.add(alloc, dt);
     }
@@ -126,20 +126,20 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     var rows_eq: u64 = 0;
     const eq_start = nowNs(io);
     var e: usize = 0;
-    while (e < idx_eq_reps) : (e += 1) {
+    while (e < indexedEqRepetitions) : (e += 1) {
         rows_eq = try query.countWhere(
             &rd,
-            cat,
-            &.{.{ .prop = 1, .op = .eq, .value = eq_category }},
+            catalogRef,
+            &.{.{ .property = 1, .operator = .eq, .value = eq_category }},
             alloc,
         );
     }
     const eq_total_ns: u64 = @intCast(nowNs(io) - eq_start);
-    const idx_eq_ns: u64 = eq_total_ns / idx_eq_reps;
+    const indexedEqNs: u64 = eq_total_ns / indexedEqRepetitions;
 
     // Full scan: no predicate matches every live row.
     const full_start = nowNs(io);
-    _ = try query.countWhere(&rd, cat, &.{}, alloc);
+    _ = try query.countWhere(&rd, catalogRef, &.{}, alloc);
     const full_ns: u64 = @intCast(nowNs(io) - full_start);
 
     rd.end();
@@ -148,9 +148,9 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         alloc,
         "eq={d}us full={d}ms idx_eq_us={d} rows_eq={d}",
         .{
-            idx_eq_ns / std.time.ns_per_us,
+            indexedEqNs / std.time.ns_per_us,
             full_ns / std.time.ns_per_ms,
-            idx_eq_ns / std.time.ns_per_us,
+            indexedEqNs / std.time.ns_per_us,
             rows_eq,
         },
     );
@@ -159,11 +159,11 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         .name = name,
         .ops = lookup_count,
         .wall_ns = lookup_ns,
-        .p50_ns = lat.pct(50),
-        .p99_ns = lat.pct(99),
-        .max_ns = lat.pct(100),
-        .file_bytes = try db.fileSize(),
-        .logical_bytes = db.logicalSize(),
+        .p50_ns = lat.percentile(50),
+        .p99_ns = lat.percentile(99),
+        .max_ns = lat.percentile(100),
+        .file_bytes = try database.fileSize(),
+        .logical_bytes = database.logicalSize(),
         .peak_rss_bytes = airdb.peakResidentBytes(),
         .note = note,
     };

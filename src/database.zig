@@ -1,4 +1,4 @@
-// database.zig -- Db, ReadTxn, WriteTxn, and the two-slot atomic durable commit.
+// database.zig -- Database, ReadTransaction, WriteTransaction, and the two-slot atomic durable commit.
 //
 // Slot A byte range in the header page: [64, 64+Slot.size).
 // Slot B byte range in the header page: [128, 128+Slot.size).
@@ -9,15 +9,15 @@ const testing = std.testing;
 const Io = std.Io;
 const platform = @import("platform.zig");
 const FileStore = @import("storage/fileStore.zig").FileStore;
-const RealSyncer = @import("storage/syncer.zig").RealSyncer;
-const Syncer = @import("storage/syncer.zig").Syncer;
+const FileSyncer = @import("storage/syncer.zig").FileSyncer;
+const Syncing = @import("storage/syncer.zig").Syncing;
 const default_page_size = @import("storage/fileStore.zig").default_page_size;
 const Arena = @import("storage/arena.zig").Arena;
 const Allocation = @import("storage/arena.zig").Allocation;
-const Ref = @import("storage/reference.zig").Ref;
+const Reference = @import("storage/reference.zig").Reference;
 const Slot = @import("storage/slots.zig").Slot;
 const FreeList = @import("storage/freeList.zig").FreeList;
-const Coord = @import("transactions/coordination.zig").Coord;
+const Coordination = @import("transactions/coordination.zig").Coordination;
 const coord_mod = @import("transactions/coordination.zig");
 const versioning = @import("transactions/versioning.zig");
 const freeListRecovery = @import("storage/freeListRecovery.zig");
@@ -51,11 +51,11 @@ pub const ring_capacity: u32 = 128;
 pub const retain_off: usize = 192;
 
 // ---------------------------------------------------------------------------
-// Db
+// Database
 // ---------------------------------------------------------------------------
 
 /// Two-pointer packing cursor for one in-flight incremental-compaction run.
-/// Owned by the Db (it persists across the write transactions that drive the
+/// Owned by the Database (it persists across the write transactions that drive the
 /// run) but read and advanced exclusively by compaction.compactStep, which
 /// documents the resume/reset rules. live_count and next_row pin the run to a
 /// specific catalog shape; hole_lo scans upward for dead relocation targets
@@ -69,28 +69,28 @@ pub const CompactCursor = struct {
     /// a foreign cursor would leave rows unexamined ahead of the tail
     /// truncate -- silent live-row loss in release builds.
     type_id: u16,
-    cat: Ref,
+    catalogRef: Reference,
     live_count: u64,
     next_row: u64,
     hole_lo: u64,
     high_hi: u64,
 };
 
-pub const Db = struct {
+pub const Database = struct {
     store: FileStore,
     arena: Arena,
     active_version: u64,
-    active_root: Ref,
+    active_root: Reference,
     pins: std.AutoHashMap(u64, u32),
-    /// Currently-committed free list. Owns its memory; deinit'd in Db.deinit.
+    /// Currently-committed free list. Owns its memory; deinit'd in Database.deinit.
     free_list: FreeList,
     /// Offset of the live free-list node on disk (0 if none).
-    free_list_node_ref: Ref,
+    free_list_node_ref: Reference,
     /// Byte length of the live free-list node on disk (0 if none).
     free_list_node_len: usize,
     /// Coordination file for multi-process attach count and latest-version signal.
-    coord: Coord,
-    /// Index into the coord participant slot array claimed by this Db instance, or null
+    coord: Coordination,
+    /// Index into the coord participant slot array claimed by this Database instance, or null
     /// if all 64 slots were occupied at open/create time.
     participant_slot: ?usize,
     // NOTE: the retention window is NOT an in-memory field. It lives in the
@@ -134,12 +134,12 @@ pub const Db = struct {
     fl_clone_ns: u64 = 0,
 
     /// Create a new database file at the given absolute path.
-    pub fn create(allocator: std.mem.Allocator, path: []const u8) !Db {
-        return createWith(allocator, path, RealSyncer.any());
+    pub fn create(allocator: std.mem.Allocator, path: []const u8) !Database {
+        return createWith(allocator, path, FileSyncer.any());
     }
 
-    /// Like create, but with an injectable Syncer (used for testing).
-    pub fn createWith(allocator: std.mem.Allocator, path: []const u8, syncer: Syncer) !Db {
+    /// Like create, but with an injectable Syncing (used for testing).
+    pub fn createWith(allocator: std.mem.Allocator, path: []const u8, syncer: Syncing) !Database {
         var store = try FileStore.create(allocator, path, syncer);
         errdefer store.deinit();
 
@@ -162,10 +162,10 @@ pub const Db = struct {
         // Coord setup -- done last so the errdefer has no further try-s after it.
         const coord_path = try std.fmt.allocPrint(allocator, "{s}.coord", .{path});
         defer allocator.free(coord_path);
-        var coord = try Coord.openOrCreate(coord_path);
+        var coord = try Coordination.openOrCreate(coord_path);
         var slot: ?usize = null;
         errdefer {
-            if (slot) |s| coord.releaseSlot(s);
+            if (slot) |claimed| coord.releaseSlot(claimed);
             _ = coord.detach();
             coord.deinit();
         }
@@ -176,7 +176,7 @@ pub const Db = struct {
         // the attach rather than silently degrade to corruptible reads.
         slot = (try coord.claimSlot()) orelse return error.TooManyAttachments;
 
-        return Db{
+        return Database{
             .store = store,
             .arena = Arena.init(store.sectionsView(), default_page_size),
             .active_version = 1,
@@ -192,26 +192,26 @@ pub const Db = struct {
     }
 
     /// Open an existing database file at the given absolute path.
-    pub fn open(allocator: std.mem.Allocator, path: []const u8) !Db {
-        return openWith(allocator, path, RealSyncer.any());
+    pub fn open(allocator: std.mem.Allocator, path: []const u8) !Database {
+        return openWith(allocator, path, FileSyncer.any());
     }
 
-    /// Like open, but with an injectable Syncer (used for testing).
-    pub fn openWith(allocator: std.mem.Allocator, path: []const u8, syncer: Syncer) !Db {
+    /// Like open, but with an injectable Syncing (used for testing).
+    pub fn openWith(allocator: std.mem.Allocator, path: []const u8, syncer: Syncing) !Database {
         var store = try FileStore.open(allocator, path, syncer);
         errdefer store.deinit();
-        // Capture the section table before store is copied into the partial Db below.
+        // Capture the section table before store is copied into the partial Database below.
         // The slice points at heap memory owned by store.sections, which survives the
-        // by-value move of store into db.store.
+        // by-value move of store into database.store.
         const store_sections = store.sectionsView();
 
-        // Build a partial Db so versioning.selectActiveSlot and
+        // Build a partial Database so versioning.selectActiveSlot and
         // freeListRecovery.loadFreeList can run against it.
         // coord is left undefined; it is set at the very end.
         // On any error path, errdefer store.deinit() (above) frees the file+mmap,
-        // and errdefer db.free_list.deinit() (below) frees any allocated extents.
-        // db.pins is always empty here (no allocation), so it is safe to drop.
-        var db: Db = .{
+        // and errdefer database.free_list.deinit() (below) frees any allocated extents.
+        // database.pins is always empty here (no allocation), so it is safe to drop.
+        var database: Database = .{
             .store = store,
             .arena = Arena.init(store_sections, default_page_size),
             .active_version = 0,
@@ -224,21 +224,21 @@ pub const Db = struct {
             .participant_slot = null,
             .auto_compact = false,
         };
-        errdefer db.free_list.deinit();
+        errdefer database.free_list.deinit();
 
-        const active = try versioning.selectActiveSlot(&db);
-        db.active_version = active.version;
-        db.active_root = active.root_ref;
-        db.arena.top = @intCast(active.logical_size);
-        if (active.free_list_ref != 0) try freeListRecovery.loadFreeList(&db, active.free_list_ref);
+        const active = try versioning.selectActiveSlot(&database);
+        database.active_version = active.version;
+        database.active_root = active.root_ref;
+        database.arena.top = @intCast(active.logical_size);
+        if (active.free_list_ref != 0) try freeListRecovery.loadFreeList(&database, active.free_list_ref);
 
         // Coord setup -- done last so the errdefer has no further try-s after it.
         const coord_path = try std.fmt.allocPrint(allocator, "{s}.coord", .{path});
         defer allocator.free(coord_path);
-        var coord = try Coord.openOrCreate(coord_path);
+        var coord = try Coordination.openOrCreate(coord_path);
         var slot: ?usize = null;
         errdefer {
-            if (slot) |s| coord.releaseSlot(s);
+            if (slot) |claimed| coord.releaseSlot(claimed);
             _ = coord.detach();
             coord.deinit();
         }
@@ -247,13 +247,13 @@ pub const Db = struct {
         // corruptible snapshots.
         slot = (try coord.claimSlot()) orelse return error.TooManyAttachments;
 
-        db.coord = coord;
-        db.participant_slot = slot;
-        return db;
+        database.coord = coord;
+        database.participant_slot = slot;
+        return database;
     }
 
-    pub fn deinit(self: *Db) void {
-        if (self.participant_slot) |idx| self.coord.releaseSlot(idx);
+    pub fn deinit(self: *Database) void {
+        if (self.participant_slot) |slotIndex| self.coord.releaseSlot(slotIndex);
         _ = self.coord.detach();
         self.coord.deinit();
         self.free_list.deinit();
@@ -262,11 +262,11 @@ pub const Db = struct {
     }
 
     /// Publish the local minimum pinned version to our participant slot (if we have one).
-    pub fn publishPins(self: *Db) void {
+    pub fn publishPins(self: *Database) void {
         versioning.publishPins(self);
     }
 
-    pub fn beginRead(self: *Db) !ReadTxn {
+    pub fn beginRead(self: *Database) !ReadTransaction {
         // Pin-then-validate loop. Between refreshing to the latest published
         // version and this process's pin becoming visible in the coord slot, a
         // writer in another process may commit a NEWER version and compute a
@@ -280,27 +280,27 @@ pub const Db = struct {
         var prev_v: ?u64 = null;
         while (true) {
             try versioning.refreshToLatest(self);
-            const v = self.active_version;
+            const activeVersion = self.active_version;
             const root = self.active_root;
             // A retry that made no progress means the published version keeps
             // running ahead of anything this instance can adopt (e.g. newer
             // slots do not decode). Fail rather than spin forever.
-            if (prev_v != null and prev_v.? == v) return error.Corrupt;
-            prev_v = v;
-            if (self.pins.getPtr(v)) |ptr| {
+            if (prev_v != null and prev_v.? == activeVersion) return error.Corrupt;
+            prev_v = activeVersion;
+            if (self.pins.getPtr(activeVersion)) |ptr| {
                 ptr.* += 1;
             } else {
-                try self.pins.put(v, 1);
+                try self.pins.put(activeVersion, 1);
             }
             self.publishPins();
-            const lv = self.coord.latestVersion();
+            const latestVersion = self.coord.latestVersion();
             const retain = self.retainVersions();
-            const floor = if (retain == coord_mod.sentinel_max) 0 else lv -| retain;
-            if (v >= floor) {
-                return ReadTxn{ .db = self, .root_ref = root, .version = v };
+            const floor = if (retain == coord_mod.sentinel_max) 0 else latestVersion -| retain;
+            if (activeVersion >= floor) {
+                return ReadTransaction{ .database = self, .root_ref = root, .version = activeVersion };
             }
             // The pin landed too late; release it and pin the newer version.
-            var stale = ReadTxn{ .db = self, .root_ref = root, .version = v };
+            var stale = ReadTransaction{ .database = self, .root_ref = root, .version = activeVersion };
             stale.end();
         }
     }
@@ -309,7 +309,7 @@ pub const Db = struct {
     /// error.VersionUnavailable if the version is not in the durable ring or has
     /// aged out of the retention window (its nodes may have been reclaimed).
     /// Pins the version so its nodes are held for the life of the read.
-    pub fn beginReadAt(self: *Db, version: u64) !ReadTxn {
+    pub fn beginReadAt(self: *Database, version: u64) !ReadTransaction {
         try versioning.refreshToLatest(self);
         if (version > self.active_version) return error.VersionUnavailable;
         // Must be inside the retention window: older versions' nodes may already
@@ -337,77 +337,77 @@ pub const Db = struct {
         // writer can have reused a node this snapshot references. Otherwise
         // unpin and refuse the read rather than risk a corrupt snapshot.
         if (retain != coord_mod.sentinel_max) {
-            const lv = self.coord.latestVersion();
-            if (version < lv -| retain) {
-                var txn = ReadTxn{ .db = self, .root_ref = root, .version = version };
-                txn.end(); // unpin
+            const latestVersion = self.coord.latestVersion();
+            if (version < latestVersion -| retain) {
+                var transaction = ReadTransaction{ .database = self, .root_ref = root, .version = version };
+                transaction.end(); // unpin
                 return error.VersionUnavailable;
             }
         }
-        return ReadTxn{ .db = self, .root_ref = root, .version = version };
+        return ReadTransaction{ .database = self, .root_ref = root, .version = version };
     }
 
     /// The minimum version pinned by a live reader in this process, or the
     /// active version if no reader is open.
-    pub fn horizon(self: *Db) u64 {
+    pub fn horizon(self: *Database) u64 {
         return versioning.horizon(self);
     }
 
     /// Oldest version still pinned by a live reader in this process, or the
     /// active version if no reader is open.
-    pub fn oldestPinnedVersion(self: *Db) u64 {
+    pub fn oldestPinnedVersion(self: *Database) u64 {
         return self.horizon();
     }
 
     /// Number of processes currently attached to this database.
-    pub fn attachedProcesses(self: *Db) u32 {
+    pub fn attachedProcesses(self: *Database) u32 {
         return self.coord.attachCount();
     }
 
     /// Logical size: the high-water mark of allocated arena bytes.
-    pub fn logicalSize(self: *Db) u64 {
+    pub fn logicalSize(self: *Database) u64 {
         return @intCast(self.arena.top);
     }
 
     /// Physical size of the backing file on disk.
-    pub fn fileSize(self: *Db) !u64 {
+    pub fn fileSize(self: *Database) !u64 {
         return self.store.fileLen();
     }
 
     /// The shared retention window: recently-freed space is withheld from reuse
     /// for the most recent `retainVersions()` versions, across ALL processes.
-    pub fn retainVersions(self: *Db) u64 {
+    pub fn retainVersions(self: *Database) u64 {
         return versioning.retainVersions(self);
     }
 
     /// Withhold recently-freed space from reuse for the most recent `n` versions.
     /// Shared and durable; see versioning.setRetainVersions for the safety rules.
-    pub fn setRetainVersions(self: *Db, n: u64) void {
-        versioning.setRetainVersions(self, n);
+    pub fn setRetainVersions(self: *Database, count: u64) void {
+        versioning.setRetainVersions(self, count);
     }
 
     /// Root ref for a committed version, or null if not retained / not yet
     /// committed. See versioning.versionRoot for the ring-scan rules.
-    pub fn versionRoot(self: *Db, version: u64) ?u64 {
+    pub fn versionRoot(self: *Database, version: u64) ?u64 {
         return versioning.versionRoot(self, version);
     }
 
     /// Oldest version still recorded in the ring, or active_version if the
     /// ring is empty.
-    pub fn oldestRetainedVersion(self: *Db) u64 {
+    pub fn oldestRetainedVersion(self: *Database) u64 {
         return versioning.oldestRetainedVersion(self);
     }
 
     /// Oldest version `beginReadAt` can open: the later of the oldest ring
     /// entry and the retention-window floor.
-    pub fn oldestReadableVersion(self: *Db) u64 {
+    pub fn oldestReadableVersion(self: *Database) u64 {
         return versioning.oldestReadableVersion(self);
     }
 
     /// Shared body for beginWrite and beginWriteTry. Caller must hold the coord
     /// lock before calling; an errdefer in the caller releases the lock if this
     /// function returns an error.
-    fn beginWriteLocked(self: *Db) !WriteTxn {
+    fn beginWriteLocked(self: *Database) !WriteTransaction {
         // A failed commit-point flush left the on-disk header indeterminate;
         // writing further could corrupt the version that may in fact have been
         // published. Reopen to resolve.
@@ -415,33 +415,33 @@ pub const Db = struct {
         // Refresh under the lock so the writer sees the truly-latest committed version.
         try versioning.refreshToLatest(self);
         // Clone the committed free list into work_freelist so the transaction
-        // can reuse extents from it. db.free_list is untouched during the txn;
+        // can reuse extents from it. database.free_list is untouched during the transaction;
         // work_freelist is the mutable clone that reuse() shrinks.
         var work_freelist = FreeList.init(self.store.allocator);
         errdefer work_freelist.deinit();
         // Measurement only: time the O(extent count) clone of the committed free
-        // list. No behavior change; counter lives on the Db.
+        // list. No behavior change; counter lives on the Database.
         const clone_io = std.Io.Threaded.global_single_threaded.io();
         const clone_start = Io.Clock.now(.awake, clone_io).nanoseconds;
-        for (self.free_list.extents.items) |e| {
-            try work_freelist.add(e);
+        for (self.free_list.extents.items) |extent| {
+            try work_freelist.add(extent);
         }
         self.fl_clone_ns += @intCast(Io.Clock.now(.awake, clone_io).nanoseconds - clone_start);
-        return WriteTxn{
-            .db = self,
+        return WriteTransaction{
+            .database = self,
             .new_root = self.active_root,
             .new_version = self.active_version + 1,
             .in_flight_frees = .empty,
             .work_freelist = work_freelist,
-            .txn_reuse = FreeList.init(self.store.allocator),
-            .txn_start_top = self.arena.top,
+            .transactionReuse = FreeList.init(self.store.allocator),
+            .transactionStartTop = self.arena.top,
         };
     }
 
     /// Begin a write transaction, blocking until the cross-process write lock is
-    /// acquired. The lock is released when the returned WriteTxn is committed or
+    /// acquired. The lock is released when the returned WriteTransaction is committed or
     /// abandoned via deinit.
-    pub fn beginWrite(self: *Db) !WriteTxn {
+    pub fn beginWrite(self: *Database) !WriteTransaction {
         try self.coord.lockExclusive();
         errdefer self.coord.unlock(); // release if refresh or setup fails
         return self.beginWriteLocked();
@@ -449,7 +449,7 @@ pub const Db = struct {
 
     /// Like beginWrite but returns error.WouldBlock immediately if another writer
     /// currently holds the lock.
-    pub fn beginWriteTry(self: *Db) !WriteTxn {
+    pub fn beginWriteTry(self: *Database) !WriteTransaction {
         try self.coord.tryLockExclusive();
         errdefer self.coord.unlock(); // release if refresh or setup fails
         return self.beginWriteLocked();
@@ -459,12 +459,12 @@ pub const Db = struct {
     /// `error.AllocTooLarge` (size > section_size) is propagated; `error.OutOfSpace`
     /// maps one more section and retries. Each retry adds exactly one section, which is
     /// always enough: a single allocation never crosses more than one section boundary.
-    pub fn bumpGrowing(self: *Db, size: usize) !Allocation {
+    pub fn bumpGrowing(self: *Database, size: usize) !Allocation {
         while (true) {
-            if (self.arena.alloc(size)) |a| {
-                return a;
-            } else |e| switch (e) {
-                error.AllocTooLarge => return e,
+            if (self.arena.alloc(size)) |allocation| {
+                return allocation;
+            } else |err| switch (err) {
+                error.AllocTooLarge => return err,
                 error.OutOfSpace => {
                     const target = (self.store.sectionsView().len + 1) << platform.section_shift;
                     try self.store.ensureMapped(target);
@@ -475,7 +475,7 @@ pub const Db = struct {
     }
 
     /// Test-only accessor: number of extents in the committed free list.
-    pub fn freeListLenForTest(self: *Db) usize {
+    pub fn freeListLenForTest(self: *Database) usize {
         return self.free_list.extents.items.len;
     }
 
@@ -501,9 +501,9 @@ pub const Db = struct {
         poisoned: bool,
     };
 
-    pub fn metrics(self: *Db) Metrics {
+    pub fn metrics(self: *Database) Metrics {
         var reclaimable: u64 = 0;
-        for (self.free_list.extents.items) |e| reclaimable += e.len;
+        for (self.free_list.extents.items) |extent| reclaimable += extent.len;
         return .{
             .mapped_len = @intCast(self.store.sectionsView().len * platform.section_size),
             .latest_version = self.active_version,
@@ -525,11 +525,11 @@ pub const Db = struct {
 
 // ---------------------------------------------------------------------------
 // Transaction types (defined in their own modules; re-exported here so existing
-// call sites that do @import("database.zig").ReadTxn / .WriteTxn keep working).
+// call sites that do @import("database.zig").ReadTransaction / .WriteTransaction keep working).
 // ---------------------------------------------------------------------------
 
-pub const ReadTxn = @import("transactions/readTransaction.zig").ReadTxn;
-pub const WriteTxn = @import("transactions/writeTransaction.zig").WriteTxn;
+pub const ReadTransaction = @import("transactions/readTransaction.zig").ReadTransaction;
+pub const WriteTransaction = @import("transactions/writeTransaction.zig").WriteTransaction;
 
 test {
     _ = @import("databaseTests.zig");

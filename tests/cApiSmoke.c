@@ -19,65 +19,65 @@ int main(void) {
     remove(path);
     remove("/tmp/airdb_capi_smoke_test.airdb.coord");
 
-    AirdbDatabase *db = airdb_open(path, 3);
-    CHECK(db != NULL);
-    CHECK(airdb_prop_count(db) == 3);
+    AirdbDatabase *database = airdb_open(path, 3);
+    CHECK(database != NULL);
+    CHECK(airdb_prop_count(database) == 3);
 
     uint64_t a[3] = {100, 7, 1};
     uint64_t b[3] = {200, 8, 0};
-    CHECK(airdb_insert(db, a, 3) >= 0);
-    CHECK(airdb_insert(db, b, 3) >= 0);
-    CHECK(airdb_count(db) == 2);
-    CHECK(airdb_insert(db, a, 3) == AIRDB_E_DUPLICATE);
+    CHECK(airdb_insert(database, a, 3) >= 0);
+    CHECK(airdb_insert(database, b, 3) >= 0);
+    CHECK(airdb_count(database) == 2);
+    CHECK(airdb_insert(database, a, 3) == AIRDB_E_DUPLICATE);
 
     uint64_t out[3] = {0, 0, 0};
-    CHECK(airdb_get(db, 200, out, 3) >= 1);
+    CHECK(airdb_get(database, 200, out, 3) >= 1);
     CHECK(out[0] == 200 && out[1] == 8);
-    CHECK(airdb_get(db, 999, out, 3) == AIRDB_E_NOT_FOUND);
+    CHECK(airdb_get(database, 999, out, 3) == AIRDB_E_NOT_FOUND);
 
     uint64_t upd[3] = {200, 88, 0};
-    CHECK(airdb_update(db, upd, 3) == AIRDB_OK);
-    CHECK(airdb_get(db, 200, out, 3) >= 1);
+    CHECK(airdb_update(database, upd, 3) == AIRDB_OK);
+    CHECK(airdb_get(database, 200, out, 3) >= 1);
     CHECK(out[1] == 88);
 
-    CHECK(airdb_delete(db, 100) == AIRDB_OK);
-    CHECK(airdb_count(db) == 1);
+    CHECK(airdb_delete(database, 100) == AIRDB_OK);
+    CHECK(airdb_count(database) == 1);
 
-    airdb_close(db);
+    airdb_close(database);
 
     /* Reopen and confirm persistence. */
-    AirdbDatabase *db2 = airdb_open(path, 3);
-    CHECK(db2 != NULL);
-    CHECK(airdb_count(db2) == 1);
-    CHECK(airdb_get(db2, 200, out, 3) >= 1);
+    AirdbDatabase *database2 = airdb_open(path, 3);
+    CHECK(database2 != NULL);
+    CHECK(airdb_count(database2) == 1);
+    CHECK(airdb_get(database2, 200, out, 3) >= 1);
     CHECK(out[1] == 88);
-    airdb_close(db2);
+    airdb_close(database2);
 
     /* Explicit transaction: two staged inserts commit as one durable batch. */
-    AirdbDatabase *db3 = airdb_open(path, 3);
-    CHECK(db3 != NULL);
-    AirdbTxn *txn = airdb_begin(db3);
-    CHECK(txn != NULL);
+    AirdbDatabase *database3 = airdb_open(path, 3);
+    CHECK(database3 != NULL);
+    AirdbTxn *transaction = airdb_begin(database3);
+    CHECK(transaction != NULL);
     uint64_t t1[3] = {300, 1, 1};
     uint64_t t2[3] = {400, 2, 2};
-    CHECK(airdb_txn_insert(txn, t1, 3) >= 0);
-    CHECK(airdb_txn_insert(txn, t2, 3) >= 0);
-    CHECK(airdb_commit(txn) == AIRDB_OK);
-    CHECK(airdb_count(db3) == 3);
+    CHECK(airdb_txn_insert(transaction, t1, 3) >= 0);
+    CHECK(airdb_txn_insert(transaction, t2, 3) >= 0);
+    CHECK(airdb_commit(transaction) == AIRDB_OK);
+    CHECK(airdb_count(database3) == 3);
 
     /* Abort makes nothing durable. */
-    AirdbTxn *txn2 = airdb_begin(db3);
-    CHECK(txn2 != NULL);
+    AirdbTxn *transaction2 = airdb_begin(database3);
+    CHECK(transaction2 != NULL);
     uint64_t t3[3] = {500, 3, 3};
-    CHECK(airdb_txn_insert(txn2, t3, 3) >= 0);
-    airdb_abort(txn2);
-    CHECK(airdb_count(db3) == 3);
+    CHECK(airdb_txn_insert(transaction2, t3, 3) >= 0);
+    airdb_abort(transaction2);
+    CHECK(airdb_count(database3) == 3);
 
     /* Bulk append: ascending keys above the current max, one commit. */
     uint64_t batch[2 * 3] = {600, 6, 6, 700, 7, 7};
-    CHECK(airdb_bulk_append(db3, batch, 2, 3) == 2);
-    CHECK(airdb_count(db3) == 5);
-    airdb_close(db3);
+    CHECK(airdb_bulk_append(database3, batch, 2, 3) == 2);
+    CHECK(airdb_count(database3) == 5);
+    airdb_close(database3);
 
     /* Bulk import requires an empty type: use a fresh file. */
     const char *bulk_path = "/tmp/airdb_capi_smoke_bulk.airdb";

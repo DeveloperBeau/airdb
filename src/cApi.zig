@@ -11,9 +11,9 @@
 // failure.
 
 const std = @import("std");
-const Db = @import("database.zig").Db;
-const WriteTxn = @import("database.zig").WriteTxn;
-const Ref = @import("storage/reference.zig").Ref;
+const Database = @import("database.zig").Database;
+const WriteTransaction = @import("database.zig").WriteTransaction;
+const Reference = @import("storage/reference.zig").Reference;
 const rows = @import("records/rows.zig");
 const catalog = @import("schema/catalog.zig");
 const bulk = @import("records/bulk.zig");
@@ -30,37 +30,37 @@ pub const AIRDB_E_UNSUPPORTED: i64 = -7;
 /// the handle refuses further writes. Close and reopen the database to resolve.
 pub const AIRDB_E_INDETERMINATE: i64 = -8;
 
-const MAX_PROPS: usize = catalog.max_prop_count;
+const maxProperties: usize = catalog.maxPropertyCount;
 
-const Database = struct {
-    db: Db,
-    prop_count: u16,
+const DatabaseHandle = struct {
+    database: Database,
+    propertyCount: u16,
 };
 
-const alloc = std.heap.c_allocator;
+const allocator = std.heap.c_allocator;
 
 // Distinguish a retryable commit failure from an indeterminate one (the
 // commit-point flush failed and the instance is poisoned until reopen).
-fn commitErrCode(self: *Database) i64 {
-    return if (self.db.poisoned) AIRDB_E_INDETERMINATE else AIRDB_E_GENERIC;
+fn commitErrCode(self: *DatabaseHandle) i64 {
+    return if (self.database.poisoned) AIRDB_E_INDETERMINATE else AIRDB_E_GENERIC;
 }
 
 // Open the database at `path`, creating it with an int-property object type of
-// `prop_count` properties (property 0 is the primary key) if it does not exist.
+// `propertyCount` properties (property 0 is the primary key) if it does not exist.
 // On an existing database the stored property count is used. Returns null on
 // failure.
-export fn airdb_open(path_ptr: [*:0]const u8, prop_count: u16) ?*Database {
+export fn airdb_open(path_ptr: [*:0]const u8, propertyCount: u16) ?*DatabaseHandle {
     const path = std.mem.span(path_ptr);
     // The storage layer requires an absolute path. Reject anything else here so
     // a relative path returns a clean error instead of aborting the host.
     if (!std.fs.path.isAbsolute(path)) return null;
-    // A C ABI must not trust its arguments: prop_count 0 trips an internal
+    // A C ABI must not trust its arguments: propertyCount 0 trips an internal
     // assert (abort in safe builds), and > 256 would overflow fixed-size
     // per-property buffers in release builds. Reject both cleanly.
-    if (prop_count == 0 or prop_count > MAX_PROPS) return null;
-    const self = alloc.create(Database) catch return null;
+    if (propertyCount == 0 or propertyCount > maxProperties) return null;
+    const self = allocator.create(DatabaseHandle) catch return null;
 
-    if (Db.open(alloc, path)) |opened| {
+    if (Database.open(allocator, path)) |opened| {
         return adoptExisting(self, opened);
     } else |open_err| {
         // Create only when the file genuinely does not exist. Any other open
@@ -68,201 +68,201 @@ export fn airdb_open(path_ptr: [*:0]const u8, prop_count: u16) ?*Database {
         // create: FileStore.create truncates, which would destroy a database
         // that may still be recoverable.
         if (open_err != error.FileNotFound) {
-            alloc.destroy(self);
+            allocator.destroy(self);
             return null;
         }
-        return createFresh(self, path, prop_count);
+        return createFresh(self, path, propertyCount);
     }
 }
 
 // Tear down a partially-opened handle after a failed open/create step and
 // return the null that airdb_open reports to the host.
-fn abandonHandle(self: *Database) ?*Database {
-    self.db.deinit();
-    alloc.destroy(self);
+fn abandonHandle(self: *DatabaseHandle) ?*DatabaseHandle {
+    self.database.deinit();
+    allocator.destroy(self);
     return null;
 }
 
 // airdb_open, existing-file path: adopt the opened database and read the
 // stored property count from its catalog. Any failure tears the handle down
 // and returns null.
-fn adoptExisting(self: *Database, opened: Db) ?*Database {
-    self.db = opened;
-    var r = self.db.beginRead() catch return abandonHandle(self);
-    const pc = catalog.propCount(&r, r.root()) catch {
-        r.end();
+fn adoptExisting(self: *DatabaseHandle, opened: Database) ?*DatabaseHandle {
+    self.database = opened;
+    var readTransaction = self.database.beginRead() catch return abandonHandle(self);
+    const propertyCount = catalog.loadPropertyCount(&readTransaction, readTransaction.root()) catch {
+        readTransaction.end();
         return abandonHandle(self);
     };
-    r.end();
-    self.prop_count = pc;
+    readTransaction.end();
+    self.propertyCount = propertyCount;
     return self;
 }
 
 // airdb_open, fresh-file path: create the database and commit an int-property
-// object type of `prop_count` properties. Any failure tears the handle down
+// object type of `propertyCount` properties. Any failure tears the handle down
 // and returns null.
-fn createFresh(self: *Database, path: []const u8, prop_count: u16) ?*Database {
-    self.db = Db.create(alloc, path) catch {
-        alloc.destroy(self);
+fn createFresh(self: *DatabaseHandle, path: []const u8, propertyCount: u16) ?*DatabaseHandle {
+    self.database = Database.create(allocator, path) catch {
+        allocator.destroy(self);
         return null;
     };
-    var w = self.db.beginWrite() catch return abandonHandle(self);
-    const cat = catalog.create(&w, prop_count) catch {
-        w.deinit();
+    var writeTransaction = self.database.beginWrite() catch return abandonHandle(self);
+    const catalogRef = catalog.create(&writeTransaction, propertyCount) catch {
+        writeTransaction.deinit();
         return abandonHandle(self);
     };
-    w.setRoot(cat);
-    _ = w.commit() catch return abandonHandle(self);
-    self.prop_count = prop_count;
+    writeTransaction.setRoot(catalogRef);
+    _ = writeTransaction.commit() catch return abandonHandle(self);
+    self.propertyCount = propertyCount;
     return self;
 }
 
 // Close the database and free the handle. Safe to call with null.
-export fn airdb_close(handle: ?*Database) void {
+export fn airdb_close(handle: ?*DatabaseHandle) void {
     const self = handle orelse return;
-    self.db.deinit();
-    alloc.destroy(self);
+    self.database.deinit();
+    allocator.destroy(self);
 }
 
 // Number of properties of the object type (property 0 is the primary key).
-export fn airdb_prop_count(handle: ?*Database) i64 {
+export fn airdb_prop_count(handle: ?*DatabaseHandle) i64 {
     const self = handle orelse return AIRDB_E_GENERIC;
-    return @intCast(self.prop_count);
+    return @intCast(self.propertyCount);
 }
 
-// Insert a row of `len` u64 values (must equal prop_count; vals[0] is the
+// Insert a row of `length` u64 values (must equal propertyCount; vals[0] is the
 // primary key). Returns the new object key on success.
-export fn airdb_insert(handle: ?*Database, vals: [*]const u64, len: usize) i64 {
+export fn airdb_insert(handle: ?*DatabaseHandle, values: [*]const u64, length: usize) i64 {
     const self = handle orelse return AIRDB_E_GENERIC;
-    if (len != self.prop_count) return AIRDB_E_BAD_ARGS;
-    var w = self.db.beginWrite() catch return commitErrCode(self);
-    const r = rows.insert(&w, w.new_root, vals[0..len]) catch |e| {
-        w.deinit();
-        return if (e == error.DuplicateKey) AIRDB_E_DUPLICATE else AIRDB_E_GENERIC;
+    if (length != self.propertyCount) return AIRDB_E_BAD_ARGS;
+    var writeTransaction = self.database.beginWrite() catch return commitErrCode(self);
+    const result = rows.insert(&writeTransaction, writeTransaction.new_root, values[0..length]) catch |err| {
+        writeTransaction.deinit();
+        return if (err == error.DuplicateKey) AIRDB_E_DUPLICATE else AIRDB_E_GENERIC;
     };
-    w.setRoot(r.cat);
-    _ = w.commit() catch return commitErrCode(self);
-    return @intCast(r.row);
+    writeTransaction.setRoot(result.catalogRef);
+    _ = writeTransaction.commit() catch return commitErrCode(self);
+    return @intCast(result.row);
 }
 
-// Read the row with primary key `pk` into `out` (len must equal prop_count).
+// Read the row with primary key `primaryKey` into `out` (length must equal propertyCount).
 // Returns the row version (>= 1) on success, AIRDB_E_NOT_FOUND if absent.
-export fn airdb_get(handle: ?*Database, pk: u64, out: [*]u64, len: usize) i64 {
+export fn airdb_get(handle: ?*DatabaseHandle, primaryKey: u64, out: [*]u64, length: usize) i64 {
     const self = handle orelse return AIRDB_E_GENERIC;
-    if (len != self.prop_count) return AIRDB_E_BAD_ARGS;
-    var r = self.db.beginRead() catch return AIRDB_E_GENERIC;
-    defer r.end();
-    const ver = rows.getByPk(&r, r.root(), pk, out[0..len]) catch return AIRDB_E_GENERIC;
-    return if (ver) |v| @intCast(v) else AIRDB_E_NOT_FOUND;
+    if (length != self.propertyCount) return AIRDB_E_BAD_ARGS;
+    var readTransaction = self.database.beginRead() catch return AIRDB_E_GENERIC;
+    defer readTransaction.end();
+    const version = rows.getByPrimaryKey(&readTransaction, readTransaction.root(), primaryKey, out[0..length]) catch return AIRDB_E_GENERIC;
+    return if (version) |found| @intCast(found) else AIRDB_E_NOT_FOUND;
 }
 
 // Number of live rows. Returns the count or a negative error code.
-export fn airdb_count(handle: ?*Database) i64 {
+export fn airdb_count(handle: ?*DatabaseHandle) i64 {
     const self = handle orelse return AIRDB_E_GENERIC;
-    var r = self.db.beginRead() catch return AIRDB_E_GENERIC;
-    defer r.end();
-    const c = catalog.liveCount(&r, r.root()) catch return AIRDB_E_GENERIC;
-    return @intCast(c);
+    var readTransaction = self.database.beginRead() catch return AIRDB_E_GENERIC;
+    defer readTransaction.end();
+    const count = catalog.liveCount(&readTransaction, readTransaction.root()) catch return AIRDB_E_GENERIC;
+    return @intCast(count);
 }
 
-// Update the row with primary key `pk` to `vals` (len must equal prop_count,
-// vals[0] must equal pk). Auto-reads the current version, so it always applies
+// Update the row with primary key `primaryKey` to `vals` (length must equal propertyCount,
+// vals[0] must equal primaryKey). Auto-reads the current version, so it always applies
 // (no optimistic check at this layer). Returns AIRDB_OK or an error code.
-export fn airdb_update(handle: ?*Database, vals: [*]const u64, len: usize) i64 {
+export fn airdb_update(handle: ?*DatabaseHandle, values: [*]const u64, length: usize) i64 {
     const self = handle orelse return AIRDB_E_GENERIC;
-    if (len != self.prop_count) return AIRDB_E_BAD_ARGS;
-    const pk = vals[0];
-    var w = self.db.beginWrite() catch return commitErrCode(self);
-    var cur: [MAX_PROPS]u64 = undefined;
-    const ver = rows.getByPk(&w, w.new_root, pk, cur[0..len]) catch {
-        w.deinit();
+    if (length != self.propertyCount) return AIRDB_E_BAD_ARGS;
+    const primaryKey = values[0];
+    var writeTransaction = self.database.beginWrite() catch return commitErrCode(self);
+    var currentValues: [maxProperties]u64 = undefined;
+    const version = rows.getByPrimaryKey(&writeTransaction, writeTransaction.new_root, primaryKey, currentValues[0..length]) catch {
+        writeTransaction.deinit();
         return AIRDB_E_GENERIC;
     };
-    if (ver == null) {
-        w.deinit();
+    if (version == null) {
+        writeTransaction.deinit();
         return AIRDB_E_NOT_FOUND;
     }
-    const res = rows.update(&w, w.new_root, pk, vals[0..len], ver.?) catch {
-        w.deinit();
+    const result = rows.update(&writeTransaction, writeTransaction.new_root, primaryKey, values[0..length], version.?) catch {
+        writeTransaction.deinit();
         return AIRDB_E_GENERIC;
     };
-    switch (res) {
+    switch (result) {
         .ok => |ok| {
-            w.setRoot(ok.cat);
-            _ = w.commit() catch return commitErrCode(self);
+            writeTransaction.setRoot(ok.catalogRef);
+            _ = writeTransaction.commit() catch return commitErrCode(self);
             return AIRDB_OK;
         },
         .conflict => {
-            w.deinit();
+            writeTransaction.deinit();
             return AIRDB_E_CONFLICT;
         },
         .not_found => {
-            w.deinit();
+            writeTransaction.deinit();
             return AIRDB_E_NOT_FOUND;
         },
     }
 }
 
-// Delete the row with primary key `pk`. Returns AIRDB_OK or an error code.
-export fn airdb_delete(handle: ?*Database, pk: u64) i64 {
+// Delete the row with primary key `primaryKey`. Returns AIRDB_OK or an error code.
+export fn airdb_delete(handle: ?*DatabaseHandle, primaryKey: u64) i64 {
     const self = handle orelse return AIRDB_E_GENERIC;
-    var w = self.db.beginWrite() catch return commitErrCode(self);
-    var cur: [MAX_PROPS]u64 = undefined;
-    const ver = rows.getByPk(&w, w.new_root, pk, cur[0..self.prop_count]) catch {
-        w.deinit();
+    var writeTransaction = self.database.beginWrite() catch return commitErrCode(self);
+    var currentValues: [maxProperties]u64 = undefined;
+    const version = rows.getByPrimaryKey(&writeTransaction, writeTransaction.new_root, primaryKey, currentValues[0..self.propertyCount]) catch {
+        writeTransaction.deinit();
         return AIRDB_E_GENERIC;
     };
-    if (ver == null) {
-        w.deinit();
+    if (version == null) {
+        writeTransaction.deinit();
         return AIRDB_E_NOT_FOUND;
     }
-    const res = rows.delete(&w, w.new_root, pk, ver.?) catch {
-        w.deinit();
+    const result = rows.delete(&writeTransaction, writeTransaction.new_root, primaryKey, version.?) catch {
+        writeTransaction.deinit();
         return AIRDB_E_GENERIC;
     };
-    switch (res) {
-        .ok => |new_cat| {
-            w.setRoot(new_cat);
-            _ = w.commit() catch return commitErrCode(self);
+    switch (result) {
+        .ok => |newCatalog| {
+            writeTransaction.setRoot(newCatalog);
+            _ = writeTransaction.commit() catch return commitErrCode(self);
             return AIRDB_OK;
         },
         .conflict => {
-            w.deinit();
+            writeTransaction.deinit();
             return AIRDB_E_CONFLICT;
         },
         .not_found => {
-            w.deinit();
+            writeTransaction.deinit();
             return AIRDB_E_NOT_FOUND;
         },
     }
 }
 
-// Bulk-load `row_count` rows of `prop_count` u64 values each from the flat,
-// row-major buffer `rows_flat` (row i occupies rows_flat[i*prop_count ..][0..
-// prop_count]; element 0 of each row is the primary key) into an EMPTY type, in
+// Bulk-load `row_count` rows of `propertyCount` u64 values each from the flat,
+// row-major buffer `rows_flat` (row i occupies rows_flat[i*propertyCount ..][0..
+// propertyCount]; element 0 of each row is the primary key) into an EMPTY type, in
 // a single durable commit. The whole import succeeds atomically or nothing
 // becomes durable. Returns the number of rows loaded on success, or a negative
 // error code: AIRDB_E_NOT_EMPTY if the type already holds rows, AIRDB_E_DUPLICATE
 // on a repeated primary key, AIRDB_E_UNSUPPORTED for a type bulk import cannot
-// build (e.g. links), AIRDB_E_BAD_ARGS on a prop_count mismatch. On every error
+// build (e.g. links), AIRDB_E_BAD_ARGS on a propertyCount mismatch. On every error
 // the write lock is released and nothing is made durable.
-export fn airdb_bulk_insert(handle: ?*Database, rows_flat: [*]const u64, row_count: usize, prop_count: usize) i64 {
+export fn airdb_bulk_insert(handle: ?*DatabaseHandle, rows_flat: [*]const u64, row_count: usize, propertyCount: usize) i64 {
     const self = handle orelse return AIRDB_E_GENERIC;
-    if (prop_count != self.prop_count) return AIRDB_E_BAD_ARGS;
+    if (propertyCount != self.propertyCount) return AIRDB_E_BAD_ARGS;
     if (row_count > std.math.maxInt(i64)) return AIRDB_E_BAD_ARGS; // return value is i64
 
     // Build a []const []const u64 view over the flat buffer: each row slice
-    // points at its prop_count-wide window. Freed regardless of outcome.
-    const rows_slices = alloc.alloc([]const u64, row_count) catch return AIRDB_E_GENERIC;
-    defer alloc.free(rows_slices);
-    for (rows_slices, 0..) |*row, i| {
-        row.* = rows_flat[i * prop_count ..][0..prop_count];
+    // points at its propertyCount-wide window. Freed regardless of outcome.
+    const rows_slices = allocator.alloc([]const u64, row_count) catch return AIRDB_E_GENERIC;
+    defer allocator.free(rows_slices);
+    for (rows_slices, 0..) |*row, rowIndex| {
+        row.* = rows_flat[rowIndex * propertyCount ..][0..propertyCount];
     }
 
-    var w = self.db.beginWrite() catch return commitErrCode(self);
-    const newcat = bulk.bulkImport(&w, w.new_root, rows_slices, .{}) catch |e| {
-        w.deinit(); // releases the write lock; nothing was made durable
-        return switch (e) {
+    var writeTransaction = self.database.beginWrite() catch return commitErrCode(self);
+    const newCatalog = bulk.bulkImport(&writeTransaction, writeTransaction.new_root, rows_slices, .{}) catch |err| {
+        writeTransaction.deinit(); // releases the write lock; nothing was made durable
+        return switch (err) {
             error.TypeNotEmpty => AIRDB_E_NOT_EMPTY,
             error.DuplicateKey => AIRDB_E_DUPLICATE,
             error.UnsupportedForBulk => AIRDB_E_UNSUPPORTED,
@@ -270,143 +270,143 @@ export fn airdb_bulk_insert(handle: ?*Database, rows_flat: [*]const u64, row_cou
             else => AIRDB_E_GENERIC,
         };
     };
-    w.setRoot(newcat);
+    writeTransaction.setRoot(newCatalog);
     // commit releases the lock on BOTH its success and its own error paths, so
     // do not unlock again here.
-    _ = w.commit() catch return commitErrCode(self);
+    _ = writeTransaction.commit() catch return commitErrCode(self);
     return @intCast(row_count);
 }
 
-// Append `row_count` rows of `prop_count` u64 values each from the flat,
-// row-major buffer `rows_flat` (row i occupies rows_flat[i*prop_count ..][0..
-// prop_count]; element 0 of each row is the primary key) to a POPULATED type in
+// Append `row_count` rows of `propertyCount` u64 values each from the flat,
+// row-major buffer `rows_flat` (row i occupies rows_flat[i*propertyCount ..][0..
+// propertyCount]; element 0 of each row is the primary key) to a POPULATED type in
 // a single durable commit. A batch whose primary keys are strictly ascending and
 // all clear the type's current max key lands on the right edge via the fast path;
 // any other shape falls back to a row-by-row insert. The whole batch becomes
 // durable atomically or nothing does. Returns the number of rows appended on
 // success, or a negative error code: AIRDB_E_DUPLICATE on a repeated primary key
-// (from the fallback), AIRDB_E_BAD_ARGS on a prop_count mismatch. On every error
+// (from the fallback), AIRDB_E_BAD_ARGS on a propertyCount mismatch. On every error
 // the write lock is released and nothing is made durable. A row_count of 0 is a
 // no-op that commits no change and returns 0.
-export fn airdb_bulk_append(handle: ?*Database, rows_flat: [*]const u64, row_count: usize, prop_count: usize) i64 {
+export fn airdb_bulk_append(handle: ?*DatabaseHandle, rows_flat: [*]const u64, row_count: usize, propertyCount: usize) i64 {
     const self = handle orelse return AIRDB_E_GENERIC;
-    if (prop_count != self.prop_count) return AIRDB_E_BAD_ARGS;
+    if (propertyCount != self.propertyCount) return AIRDB_E_BAD_ARGS;
     if (row_count > std.math.maxInt(i64)) return AIRDB_E_BAD_ARGS; // return value is i64
 
     // Build a []const []const u64 view over the flat buffer: each row slice
-    // points at its prop_count-wide window. Freed regardless of outcome.
-    const rows_slices = alloc.alloc([]const u64, row_count) catch return AIRDB_E_GENERIC;
-    defer alloc.free(rows_slices);
-    for (rows_slices, 0..) |*row, i| {
-        row.* = rows_flat[i * prop_count ..][0..prop_count];
+    // points at its propertyCount-wide window. Freed regardless of outcome.
+    const rows_slices = allocator.alloc([]const u64, row_count) catch return AIRDB_E_GENERIC;
+    defer allocator.free(rows_slices);
+    for (rows_slices, 0..) |*row, rowIndex| {
+        row.* = rows_flat[rowIndex * propertyCount ..][0..propertyCount];
     }
 
-    var w = self.db.beginWrite() catch return commitErrCode(self);
-    const newcat = bulk.bulkAppendOrInsert(&w, w.new_root, rows_slices) catch |e| {
-        w.deinit(); // releases the write lock; nothing was made durable
-        return switch (e) {
+    var writeTransaction = self.database.beginWrite() catch return commitErrCode(self);
+    const newCatalog = bulk.bulkAppendOrInsert(&writeTransaction, writeTransaction.new_root, rows_slices) catch |err| {
+        writeTransaction.deinit(); // releases the write lock; nothing was made durable
+        return switch (err) {
             error.BadRow => AIRDB_E_BAD_ARGS,
             error.DuplicateKey => AIRDB_E_DUPLICATE,
             else => AIRDB_E_GENERIC,
         };
     };
-    w.setRoot(newcat);
+    writeTransaction.setRoot(newCatalog);
     // commit releases the lock on BOTH its success and its own error paths, so
     // do not unlock again here.
-    _ = w.commit() catch return commitErrCode(self);
+    _ = writeTransaction.commit() catch return commitErrCode(self);
     return @intCast(row_count);
 }
 
 // ---------------------------------------------------------------------------
 // Explicit multi-operation write transactions.
 //
-// A Txn holds one open WriteTxn and threads the catalog ref across operations,
+// A Transaction holds one open WriteTransaction and threads the catalog ref across operations,
 // so a burst of writes commits as a SINGLE durable barrier instead of one
 // commit per call. The auto-commit functions above are unchanged.
 //
-// Lifecycle: a Txn handle returned by airdb_begin must be committed
+// Lifecycle: a Transaction handle returned by airdb_begin must be committed
 // (airdb_commit) or aborted (airdb_abort) exactly once. Both paths free the
 // handle and release the write lock; using the handle after either is undefined
-// behavior. A handle is single-threaded: do not drive one Txn from two threads.
+// behavior. A handle is single-threaded: do not drive one Transaction from two threads.
 //
 // The write lock is acquired in airdb_begin and released exactly once: by
-// airdb_commit (via WriteTxn.commit, which unlocks on both its success and its
-// own error/revert paths) or by airdb_abort (via WriteTxn.deinit).
+// airdb_commit (via WriteTransaction.commit, which unlocks on both its success and its
+// own error/revert paths) or by airdb_abort (via WriteTransaction.deinit).
 //
 // BENIGN op results (duplicate, not-found, conflict) are decided before any
-// mutation and leave the txn fully usable. A STRUCTURAL op failure (generic
+// mutation and leave the transaction fully usable. A STRUCTURAL op failure (generic
 // error mid-mutation) is different: the op may have freed tree nodes that the
 // unadvanced catalog ref still references, so committing afterwards would hand
-// live nodes to the free list. Such a failure poisons the txn -- only
+// live nodes to the free list. Such a failure poisons the transaction -- only
 // airdb_abort is accepted; airdb_commit refuses and aborts instead.
 // ---------------------------------------------------------------------------
 
-const Txn = struct {
-    dbh: *Database,
-    w: WriteTxn,
-    cat: Ref, // current catalog ref, threaded across operations
+const Transaction = struct {
+    databaseHandle: *DatabaseHandle,
+    writeTransaction: WriteTransaction,
+    catalogRef: Reference, // current catalog ref, threaded across operations
     poisoned: bool = false, // structural op failure: commit must not proceed
 };
 
 // Begin an explicit write transaction. Acquires the write lock. Returns null on
-// failure (null handle, or the write lock / txn could not be started). The
+// failure (null handle, or the write lock / transaction could not be started). The
 // returned handle must be passed to exactly one of airdb_commit / airdb_abort.
-export fn airdb_begin(handle: ?*Database) ?*Txn {
+export fn airdb_begin(handle: ?*DatabaseHandle) ?*Transaction {
     const self = handle orelse return null;
-    const t = alloc.create(Txn) catch return null;
-    t.dbh = self;
-    t.w = self.db.beginWrite() catch {
-        alloc.destroy(t);
+    const created = allocator.create(Transaction) catch return null;
+    created.databaseHandle = self;
+    created.writeTransaction = self.database.beginWrite() catch {
+        allocator.destroy(created);
         return null;
     };
-    t.cat = t.w.new_root;
-    t.poisoned = false;
-    return t;
+    created.catalogRef = created.writeTransaction.new_root;
+    created.poisoned = false;
+    return created;
 }
 
 // Abort an open transaction: release the write lock without making anything
 // durable, then free the handle. Safe to call with null (no-op).
-export fn airdb_abort(txn: ?*Txn) void {
-    const t = txn orelse return;
-    t.w.deinit(); // releases the write lock; makes nothing durable
-    alloc.destroy(t);
+export fn airdb_abort(transaction: ?*Transaction) void {
+    const handle = transaction orelse return;
+    handle.writeTransaction.deinit(); // releases the write lock; makes nothing durable
+    allocator.destroy(handle);
 }
 
-// Stage an insert in the open transaction (no commit). vals has `len` u64
-// values (must equal prop_count; vals[0] is the primary key). Returns the new
-// object key on success. On error the txn stays open and the catalog ref is not
+// Stage an insert in the open transaction (no commit). vals has `length` u64
+// values (must equal propertyCount; vals[0] is the primary key). Returns the new
+// object key on success. On error the transaction stays open and the catalog ref is not
 // advanced, so the batch remains consistent.
-export fn airdb_txn_insert(txn: ?*Txn, vals: [*]const u64, len: usize) i64 {
-    const t = txn orelse return AIRDB_E_GENERIC;
-    if (t.poisoned) return AIRDB_E_GENERIC;
-    if (len != t.dbh.prop_count) return AIRDB_E_BAD_ARGS;
-    const r = rows.insert(&t.w, t.cat, vals[0..len]) catch |e| {
-        if (e == error.DuplicateKey) return AIRDB_E_DUPLICATE; // pre-mutation check: txn stays usable
-        t.poisoned = true; // mid-mutation failure: the batch may reference freed nodes
+export fn airdb_txn_insert(transaction: ?*Transaction, values: [*]const u64, length: usize) i64 {
+    const handle = transaction orelse return AIRDB_E_GENERIC;
+    if (handle.poisoned) return AIRDB_E_GENERIC;
+    if (length != handle.databaseHandle.propertyCount) return AIRDB_E_BAD_ARGS;
+    const result = rows.insert(&handle.writeTransaction, handle.catalogRef, values[0..length]) catch |err| {
+        if (err == error.DuplicateKey) return AIRDB_E_DUPLICATE; // pre-mutation check: transaction stays usable
+        handle.poisoned = true; // mid-mutation failure: the batch may reference freed nodes
         return AIRDB_E_GENERIC;
     };
-    t.cat = r.cat; // thread the new catalog ref; do NOT commit
-    return @intCast(r.row);
+    handle.catalogRef = result.catalogRef; // thread the new catalog ref; do NOT commit
+    return @intCast(result.row);
 }
 
 // Stage an update in the open transaction (no commit). Mirrors airdb_update
 // against the threaded catalog ref. Returns AIRDB_OK or an error code; on error
-// the txn stays open and the catalog ref is not advanced.
-export fn airdb_txn_update(txn: ?*Txn, vals: [*]const u64, len: usize) i64 {
-    const t = txn orelse return AIRDB_E_GENERIC;
-    if (t.poisoned) return AIRDB_E_GENERIC;
-    if (len != t.dbh.prop_count) return AIRDB_E_BAD_ARGS;
-    const pk = vals[0];
-    var cur: [MAX_PROPS]u64 = undefined;
-    const ver = rows.getByPk(&t.w, t.cat, pk, cur[0..len]) catch return AIRDB_E_GENERIC;
-    if (ver == null) return AIRDB_E_NOT_FOUND;
-    const res = rows.update(&t.w, t.cat, pk, vals[0..len], ver.?) catch {
-        t.poisoned = true; // mid-mutation failure
+// the transaction stays open and the catalog ref is not advanced.
+export fn airdb_txn_update(transaction: ?*Transaction, values: [*]const u64, length: usize) i64 {
+    const handle = transaction orelse return AIRDB_E_GENERIC;
+    if (handle.poisoned) return AIRDB_E_GENERIC;
+    if (length != handle.databaseHandle.propertyCount) return AIRDB_E_BAD_ARGS;
+    const primaryKey = values[0];
+    var currentValues: [maxProperties]u64 = undefined;
+    const version = rows.getByPrimaryKey(&handle.writeTransaction, handle.catalogRef, primaryKey, currentValues[0..length]) catch return AIRDB_E_GENERIC;
+    if (version == null) return AIRDB_E_NOT_FOUND;
+    const result = rows.update(&handle.writeTransaction, handle.catalogRef, primaryKey, values[0..length], version.?) catch {
+        handle.poisoned = true; // mid-mutation failure
         return AIRDB_E_GENERIC;
     };
-    switch (res) {
+    switch (result) {
         .ok => |ok| {
-            t.cat = ok.cat;
+            handle.catalogRef = ok.catalogRef;
             return AIRDB_OK;
         },
         .conflict => return AIRDB_E_CONFLICT,
@@ -416,20 +416,20 @@ export fn airdb_txn_update(txn: ?*Txn, vals: [*]const u64, len: usize) i64 {
 
 // Stage a delete in the open transaction (no commit). Mirrors airdb_delete
 // against the threaded catalog ref. Returns AIRDB_OK or an error code; on error
-// the txn stays open and the catalog ref is not advanced.
-export fn airdb_txn_delete(txn: ?*Txn, pk: u64) i64 {
-    const t = txn orelse return AIRDB_E_GENERIC;
-    if (t.poisoned) return AIRDB_E_GENERIC;
-    var cur: [MAX_PROPS]u64 = undefined;
-    const ver = rows.getByPk(&t.w, t.cat, pk, cur[0..t.dbh.prop_count]) catch return AIRDB_E_GENERIC;
-    if (ver == null) return AIRDB_E_NOT_FOUND;
-    const res = rows.delete(&t.w, t.cat, pk, ver.?) catch {
-        t.poisoned = true; // mid-mutation failure
+// the transaction stays open and the catalog ref is not advanced.
+export fn airdb_txn_delete(transaction: ?*Transaction, primaryKey: u64) i64 {
+    const handle = transaction orelse return AIRDB_E_GENERIC;
+    if (handle.poisoned) return AIRDB_E_GENERIC;
+    var currentValues: [maxProperties]u64 = undefined;
+    const version = rows.getByPrimaryKey(&handle.writeTransaction, handle.catalogRef, primaryKey, currentValues[0..handle.databaseHandle.propertyCount]) catch return AIRDB_E_GENERIC;
+    if (version == null) return AIRDB_E_NOT_FOUND;
+    const result = rows.delete(&handle.writeTransaction, handle.catalogRef, primaryKey, version.?) catch {
+        handle.poisoned = true; // mid-mutation failure
         return AIRDB_E_GENERIC;
     };
-    switch (res) {
-        .ok => |new_cat| {
-            t.cat = new_cat;
+    switch (result) {
+        .ok => |newCatalog| {
+            handle.catalogRef = newCatalog;
             return AIRDB_OK;
         },
         .conflict => return AIRDB_E_CONFLICT,
@@ -439,29 +439,29 @@ export fn airdb_txn_delete(txn: ?*Txn, pk: u64) i64 {
 
 // Commit the open transaction: make the entire batch durable in one barrier and
 // release the write lock, then free the handle. Returns AIRDB_OK on success or
-// AIRDB_E_GENERIC if the durable commit failed. WriteTxn.commit already releases
+// AIRDB_E_GENERIC if the durable commit failed. WriteTransaction.commit already releases
 // the lock on BOTH its success and its error/revert paths, so this must NOT
 // unlock again; it only frees the handle. Safe with null (returns
 // AIRDB_E_GENERIC).
-export fn airdb_commit(txn: ?*Txn) i64 {
-    const t = txn orelse return AIRDB_E_GENERIC;
-    if (t.poisoned) {
+export fn airdb_commit(transaction: ?*Transaction) i64 {
+    const handle = transaction orelse return AIRDB_E_GENERIC;
+    if (handle.poisoned) {
         // A structural op failure may have freed nodes the batch's tree still
         // references; committing would hand live nodes to the durable free
         // list. Abort on the caller's behalf.
-        t.w.deinit();
-        alloc.destroy(t);
+        handle.writeTransaction.deinit();
+        allocator.destroy(handle);
         return AIRDB_E_GENERIC;
     }
-    t.w.setRoot(t.cat);
-    _ = t.w.commit() catch {
-        // commit already released the lock per WriteTxn.commit's contract; just
+    handle.writeTransaction.setRoot(handle.catalogRef);
+    _ = handle.writeTransaction.commit() catch {
+        // commit already released the lock per WriteTransaction.commit's contract; just
         // free the handle. Do NOT double-unlock.
-        const code = commitErrCode(t.dbh);
-        alloc.destroy(t);
+        const code = commitErrCode(handle.databaseHandle);
+        allocator.destroy(handle);
         return code;
     };
-    alloc.destroy(t);
+    allocator.destroy(handle);
     return AIRDB_OK;
 }
 
@@ -471,12 +471,12 @@ export fn airdb_commit(txn: ?*Txn) i64 {
 
 const testing = std.testing;
 
-fn ffiTmpPathZ(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const u8) ![:0]u8 {
-    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const dlen = try tmp.dir.realPath(testing.io, &path_buf);
-    const joined = try std.fs.path.join(allocator, &.{ path_buf[0..dlen], name });
-    defer allocator.free(joined);
-    return allocator.dupeZ(u8, joined);
+fn ffiTmpPathZ(pathAllocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const u8) ![:0]u8 {
+    var pathBuffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dlen = try tmp.dir.realPath(testing.io, &pathBuffer);
+    const joined = try std.fs.path.join(pathAllocator, &.{ pathBuffer[0..dlen], name });
+    defer pathAllocator.free(joined);
+    return pathAllocator.dupeZ(u8, joined);
 }
 
 test "ffi: open, insert, get, count, update, delete, reopen" {
@@ -485,40 +485,40 @@ test "ffi: open, insert, get, count, update, delete, reopen" {
     const path = try ffiTmpPathZ(testing.allocator, &tmp, "ffi.airdb");
     defer testing.allocator.free(path);
 
-    const h = airdb_open(path.ptr, 3) orelse return error.OpenFailed;
-    try testing.expectEqual(@as(i64, 3), airdb_prop_count(h));
+    const handle = airdb_open(path.ptr, 3) orelse return error.OpenFailed;
+    try testing.expectEqual(@as(i64, 3), airdb_prop_count(handle));
 
     // insert two rows
-    try testing.expect(airdb_insert(h, &[_]u64{ 100, 7, 1 }, 3) >= 0);
-    try testing.expect(airdb_insert(h, &[_]u64{ 200, 8, 0 }, 3) >= 0);
-    try testing.expectEqual(@as(i64, 2), airdb_count(h));
-    // duplicate pk rejected
-    try testing.expectEqual(AIRDB_E_DUPLICATE, airdb_insert(h, &[_]u64{ 100, 9, 9 }, 3));
+    try testing.expect(airdb_insert(handle, &[_]u64{ 100, 7, 1 }, 3) >= 0);
+    try testing.expect(airdb_insert(handle, &[_]u64{ 200, 8, 0 }, 3) >= 0);
+    try testing.expectEqual(@as(i64, 2), airdb_count(handle));
+    // duplicate primaryKey rejected
+    try testing.expectEqual(AIRDB_E_DUPLICATE, airdb_insert(handle, &[_]u64{ 100, 9, 9 }, 3));
     // bad arity
-    try testing.expectEqual(AIRDB_E_BAD_ARGS, airdb_insert(h, &[_]u64{ 1, 2 }, 2));
+    try testing.expectEqual(AIRDB_E_BAD_ARGS, airdb_insert(handle, &[_]u64{ 1, 2 }, 2));
 
     // get
     var out: [3]u64 = undefined;
-    const ver = airdb_get(h, 200, &out, 3);
-    try testing.expect(ver >= 1);
+    const version = airdb_get(handle, 200, &out, 3);
+    try testing.expect(version >= 1);
     try testing.expectEqual(@as(u64, 200), out[0]);
     try testing.expectEqual(@as(u64, 8), out[1]);
-    try testing.expectEqual(AIRDB_E_NOT_FOUND, airdb_get(h, 999, &out, 3));
+    try testing.expectEqual(AIRDB_E_NOT_FOUND, airdb_get(handle, 999, &out, 3));
 
     // update
-    try testing.expectEqual(AIRDB_OK, airdb_update(h, &[_]u64{ 200, 88, 0 }, 3));
-    _ = airdb_get(h, 200, &out, 3);
+    try testing.expectEqual(AIRDB_OK, airdb_update(handle, &[_]u64{ 200, 88, 0 }, 3));
+    _ = airdb_get(handle, 200, &out, 3);
     try testing.expectEqual(@as(u64, 88), out[1]);
-    try testing.expectEqual(AIRDB_E_NOT_FOUND, airdb_update(h, &[_]u64{ 555, 0, 0 }, 3));
+    try testing.expectEqual(AIRDB_E_NOT_FOUND, airdb_update(handle, &[_]u64{ 555, 0, 0 }, 3));
 
     // delete
-    try testing.expectEqual(AIRDB_OK, airdb_delete(h, 100));
-    try testing.expectEqual(@as(i64, 1), airdb_count(h));
-    try testing.expectEqual(AIRDB_E_NOT_FOUND, airdb_delete(h, 100));
+    try testing.expectEqual(AIRDB_OK, airdb_delete(handle, 100));
+    try testing.expectEqual(@as(i64, 1), airdb_count(handle));
+    try testing.expectEqual(AIRDB_E_NOT_FOUND, airdb_delete(handle, 100));
 
-    airdb_close(h);
+    airdb_close(handle);
 
-    // reopen: data persisted, prop count adopted from catalog
+    // reopen: data persisted, property count adopted from catalog
     const h2 = airdb_open(path.ptr, 3) orelse return error.OpenFailed;
     defer airdb_close(h2);
     try testing.expectEqual(@as(i64, 3), airdb_prop_count(h2));
@@ -537,7 +537,7 @@ test "ffi: relative path is rejected without aborting" {
     try testing.expect(airdb_open("relative/path.airdb", 2) == null);
 }
 
-test "ffi: hostile prop_count is rejected without aborting" {
+test "ffi: hostile propertyCount is rejected without aborting" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try ffiTmpPathZ(testing.allocator, &tmp, "badpc.airdb");
@@ -556,86 +556,86 @@ test "ffi: open of a corrupt database returns null and never truncates the file"
 
     // Create a real database with one row, then close it.
     {
-        const h = airdb_open(path.ptr, 2) orelse return error.OpenFailed;
-        try testing.expect(airdb_insert(h, &[_]u64{ 1, 42 }, 2) >= 0);
-        airdb_close(h);
+        const handle = airdb_open(path.ptr, 2) orelse return error.OpenFailed;
+        try testing.expect(airdb_insert(handle, &[_]u64{ 1, 42 }, 2) >= 0);
+        airdb_close(handle);
     }
 
-    // Corrupt the magic so Db.open fails with something other than FileNotFound.
+    // Corrupt the magic so Database.open fails with something other than FileNotFound.
     const io = std.Io.Threaded.global_single_threaded.io();
     var len_before: u64 = 0;
     {
-        var f = try std.Io.Dir.openFileAbsolute(io, path, .{ .mode = .read_write });
-        defer f.close(io);
-        len_before = try f.length(io);
-        try f.writePositionalAll(io, &[_]u8{ 0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF }, 0);
-        try f.sync(io);
+        var file = try std.Io.Dir.openFileAbsolute(io, path, .{ .mode = .read_write });
+        defer file.close(io);
+        len_before = try file.length(io);
+        try file.writePositionalAll(io, &[_]u8{ 0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF }, 0);
+        try file.sync(io);
     }
 
     // Open must fail cleanly -- and must NOT truncate/recreate the file.
     try testing.expect(airdb_open(path.ptr, 2) == null);
 
-    var f = try std.Io.Dir.openFileAbsolute(io, path, .{ .mode = .read_only });
-    defer f.close(io);
-    try testing.expectEqual(len_before, try f.length(io));
+    var file = try std.Io.Dir.openFileAbsolute(io, path, .{ .mode = .read_only });
+    defer file.close(io);
+    try testing.expectEqual(len_before, try file.length(io));
     var magic: [8]u8 = undefined;
-    _ = try f.readPositionalAll(io, &magic, 0);
+    _ = try file.readPositionalAll(io, &magic, 0);
     // The corrupted magic is still there: nothing rewrote the header.
     try testing.expectEqualSlices(u8, &[_]u8{ 0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF }, &magic);
 }
 
-test "ffi txn: begin then abort releases the write lock" {
+test "ffi transaction: begin then abort releases the write lock" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try ffiTmpPathZ(testing.allocator, &tmp, "txn_beginabort.airdb");
     defer testing.allocator.free(path);
-    const h = airdb_open(path.ptr, 2) orelse return error.OpenFailed;
-    defer airdb_close(h);
+    const handle = airdb_open(path.ptr, 2) orelse return error.OpenFailed;
+    defer airdb_close(handle);
 
-    const txn = airdb_begin(h) orelse return error.BeginFailed;
-    airdb_abort(txn); // must release the lock without crashing
+    const transaction = airdb_begin(handle) orelse return error.BeginFailed;
+    airdb_abort(transaction); // must release the lock without crashing
 
     // A subsequent begin proves the lock was released.
-    const txn2 = airdb_begin(h) orelse return error.BeginFailed;
-    airdb_abort(txn2);
+    const transaction2 = airdb_begin(handle) orelse return error.BeginFailed;
+    airdb_abort(transaction2);
 }
 
-test "ffi txn: staged inserts are not durable after abort" {
+test "ffi transaction: staged inserts are not durable after abort" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try ffiTmpPathZ(testing.allocator, &tmp, "txn_abort.airdb");
     defer testing.allocator.free(path);
-    const h = airdb_open(path.ptr, 2) orelse return error.OpenFailed;
-    defer airdb_close(h);
+    const handle = airdb_open(path.ptr, 2) orelse return error.OpenFailed;
+    defer airdb_close(handle);
 
-    const txn = airdb_begin(h) orelse return error.BeginFailed;
-    try testing.expect(airdb_txn_insert(txn, &[_]u64{ 1, 10 }, 2) >= 0);
-    try testing.expect(airdb_txn_insert(txn, &[_]u64{ 2, 20 }, 2) >= 0);
-    airdb_abort(txn);
+    const transaction = airdb_begin(handle) orelse return error.BeginFailed;
+    try testing.expect(airdb_txn_insert(transaction, &[_]u64{ 1, 10 }, 2) >= 0);
+    try testing.expect(airdb_txn_insert(transaction, &[_]u64{ 2, 20 }, 2) >= 0);
+    airdb_abort(transaction);
 
     // Nothing was committed, so a fresh read sees zero rows.
-    try testing.expectEqual(@as(i64, 0), airdb_count(h));
+    try testing.expectEqual(@as(i64, 0), airdb_count(handle));
 }
 
-test "ffi txn: commit makes the whole batch durable in one commit" {
+test "ffi transaction: commit makes the whole batch durable in one commit" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try ffiTmpPathZ(testing.allocator, &tmp, "txn_commit.airdb");
     defer testing.allocator.free(path);
     {
-        const h = airdb_open(path.ptr, 2) orelse return error.OpenFailed;
-        defer airdb_close(h);
+        const handle = airdb_open(path.ptr, 2) orelse return error.OpenFailed;
+        defer airdb_close(handle);
 
-        const txn = airdb_begin(h) orelse return error.BeginFailed;
-        try testing.expect(airdb_txn_insert(txn, &[_]u64{ 1, 10 }, 2) >= 0);
-        try testing.expect(airdb_txn_insert(txn, &[_]u64{ 2, 20 }, 2) >= 0);
-        try testing.expectEqual(AIRDB_OK, airdb_commit(txn));
+        const transaction = airdb_begin(handle) orelse return error.BeginFailed;
+        try testing.expect(airdb_txn_insert(transaction, &[_]u64{ 1, 10 }, 2) >= 0);
+        try testing.expect(airdb_txn_insert(transaction, &[_]u64{ 2, 20 }, 2) >= 0);
+        try testing.expectEqual(AIRDB_OK, airdb_commit(transaction));
 
-        try testing.expectEqual(@as(i64, 2), airdb_count(h));
+        try testing.expectEqual(@as(i64, 2), airdb_count(handle));
         var out: [2]u64 = undefined;
-        try testing.expect(airdb_get(h, 1, &out, 2) >= 1);
+        try testing.expect(airdb_get(handle, 1, &out, 2) >= 1);
         try testing.expectEqual(@as(u64, 10), out[1]);
-        try testing.expect(airdb_get(h, 2, &out, 2) >= 1);
+        try testing.expect(airdb_get(handle, 2, &out, 2) >= 1);
         try testing.expectEqual(@as(u64, 20), out[1]);
     }
     // Reopen from the same path: both rows persisted (durability).
@@ -649,57 +649,57 @@ test "ffi txn: commit makes the whole batch durable in one commit" {
     try testing.expectEqual(@as(u64, 20), out[1]);
 }
 
-test "ffi txn: update and delete apply within one batch" {
+test "ffi transaction: update and delete apply within one batch" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try ffiTmpPathZ(testing.allocator, &tmp, "txn_upddel.airdb");
     defer testing.allocator.free(path);
-    const h = airdb_open(path.ptr, 2) orelse return error.OpenFailed;
-    defer airdb_close(h);
+    const handle = airdb_open(path.ptr, 2) orelse return error.OpenFailed;
+    defer airdb_close(handle);
 
     // Seed two rows in one batch.
     {
-        const txn = airdb_begin(h) orelse return error.BeginFailed;
-        try testing.expect(airdb_txn_insert(txn, &[_]u64{ 1, 10 }, 2) >= 0);
-        try testing.expect(airdb_txn_insert(txn, &[_]u64{ 2, 20 }, 2) >= 0);
-        try testing.expectEqual(AIRDB_OK, airdb_commit(txn));
+        const transaction = airdb_begin(handle) orelse return error.BeginFailed;
+        try testing.expect(airdb_txn_insert(transaction, &[_]u64{ 1, 10 }, 2) >= 0);
+        try testing.expect(airdb_txn_insert(transaction, &[_]u64{ 2, 20 }, 2) >= 0);
+        try testing.expectEqual(AIRDB_OK, airdb_commit(transaction));
     }
     // Update row 1 and delete row 2 in a single batch.
     {
-        const txn = airdb_begin(h) orelse return error.BeginFailed;
-        try testing.expectEqual(AIRDB_OK, airdb_txn_update(txn, &[_]u64{ 1, 99 }, 2));
-        try testing.expectEqual(AIRDB_OK, airdb_txn_delete(txn, 2));
-        try testing.expectEqual(AIRDB_OK, airdb_commit(txn));
+        const transaction = airdb_begin(handle) orelse return error.BeginFailed;
+        try testing.expectEqual(AIRDB_OK, airdb_txn_update(transaction, &[_]u64{ 1, 99 }, 2));
+        try testing.expectEqual(AIRDB_OK, airdb_txn_delete(transaction, 2));
+        try testing.expectEqual(AIRDB_OK, airdb_commit(transaction));
     }
-    try testing.expectEqual(@as(i64, 1), airdb_count(h));
+    try testing.expectEqual(@as(i64, 1), airdb_count(handle));
     var out: [2]u64 = undefined;
-    try testing.expect(airdb_get(h, 1, &out, 2) >= 1);
+    try testing.expect(airdb_get(handle, 1, &out, 2) >= 1);
     try testing.expectEqual(@as(u64, 99), out[1]);
-    try testing.expectEqual(AIRDB_E_NOT_FOUND, airdb_get(h, 2, &out, 2));
+    try testing.expectEqual(AIRDB_E_NOT_FOUND, airdb_get(handle, 2, &out, 2));
 }
 
-test "ffi txn: abort after a failed op releases the lock" {
+test "ffi transaction: abort after a failed op releases the lock" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try ffiTmpPathZ(testing.allocator, &tmp, "txn_failop.airdb");
     defer testing.allocator.free(path);
-    const h = airdb_open(path.ptr, 2) orelse return error.OpenFailed;
-    defer airdb_close(h);
+    const handle = airdb_open(path.ptr, 2) orelse return error.OpenFailed;
+    defer airdb_close(handle);
 
-    const txn = airdb_begin(h) orelse return error.BeginFailed;
-    try testing.expect(airdb_txn_insert(txn, &[_]u64{ 1, 10 }, 2) >= 0);
-    // Duplicate pk fails but leaves the txn open.
-    try testing.expectEqual(AIRDB_E_DUPLICATE, airdb_txn_insert(txn, &[_]u64{ 1, 11 }, 2));
-    airdb_abort(txn);
+    const transaction = airdb_begin(handle) orelse return error.BeginFailed;
+    try testing.expect(airdb_txn_insert(transaction, &[_]u64{ 1, 10 }, 2) >= 0);
+    // Duplicate primaryKey fails but leaves the transaction open.
+    try testing.expectEqual(AIRDB_E_DUPLICATE, airdb_txn_insert(transaction, &[_]u64{ 1, 11 }, 2));
+    airdb_abort(transaction);
 
     // The lock was released, so a new begin succeeds.
-    const txn2 = airdb_begin(h) orelse return error.BeginFailed;
-    airdb_abort(txn2);
+    const transaction2 = airdb_begin(handle) orelse return error.BeginFailed;
+    airdb_abort(transaction2);
     // And nothing was made durable.
-    try testing.expectEqual(@as(i64, 0), airdb_count(h));
+    try testing.expectEqual(@as(i64, 0), airdb_count(handle));
 }
 
-test "ffi txn: null handle is rejected, not crashed" {
+test "ffi transaction: null handle is rejected, not crashed" {
     try testing.expectEqual(AIRDB_E_GENERIC, airdb_txn_insert(null, &[_]u64{ 1, 2 }, 2));
     try testing.expectEqual(AIRDB_E_GENERIC, airdb_txn_update(null, &[_]u64{ 1, 2 }, 2));
     try testing.expectEqual(AIRDB_E_GENERIC, airdb_txn_delete(null, 1));
@@ -713,19 +713,19 @@ test "airdb_bulk_insert loads a flat buffer in one commit" {
     const path = try ffiTmpPathZ(testing.allocator, &tmp, "bulk_load.airdb");
     defer testing.allocator.free(path);
     {
-        const h = airdb_open(path.ptr, 2) orelse return error.OpenFailed;
-        defer airdb_close(h);
+        const handle = airdb_open(path.ptr, 2) orelse return error.OpenFailed;
+        defer airdb_close(handle);
 
         const flat = [_]u64{ 1, 10, 2, 20, 3, 30 };
-        try testing.expectEqual(@as(i64, 3), airdb_bulk_insert(h, &flat, 3, 2));
-        try testing.expectEqual(@as(i64, 3), airdb_count(h));
+        try testing.expectEqual(@as(i64, 3), airdb_bulk_insert(handle, &flat, 3, 2));
+        try testing.expectEqual(@as(i64, 3), airdb_count(handle));
 
         var out: [2]u64 = undefined;
-        try testing.expect(airdb_get(h, 1, &out, 2) >= 1);
+        try testing.expect(airdb_get(handle, 1, &out, 2) >= 1);
         try testing.expectEqual(@as(u64, 10), out[1]);
-        try testing.expect(airdb_get(h, 2, &out, 2) >= 1);
+        try testing.expect(airdb_get(handle, 2, &out, 2) >= 1);
         try testing.expectEqual(@as(u64, 20), out[1]);
-        try testing.expect(airdb_get(h, 3, &out, 2) >= 1);
+        try testing.expect(airdb_get(handle, 3, &out, 2) >= 1);
         try testing.expectEqual(@as(u64, 30), out[1]);
     }
     // Reopen from the same path: all rows persisted (durability).
@@ -742,58 +742,58 @@ test "airdb_bulk_insert on a non-empty type returns AIRDB_E_NOT_EMPTY" {
     defer tmp.cleanup();
     const path = try ffiTmpPathZ(testing.allocator, &tmp, "bulk_nonempty.airdb");
     defer testing.allocator.free(path);
-    const h = airdb_open(path.ptr, 2) orelse return error.OpenFailed;
-    defer airdb_close(h);
+    const handle = airdb_open(path.ptr, 2) orelse return error.OpenFailed;
+    defer airdb_close(handle);
 
     // Seed one row so the type is non-empty.
-    try testing.expect(airdb_insert(h, &[_]u64{ 1, 10 }, 2) >= 0);
+    try testing.expect(airdb_insert(handle, &[_]u64{ 1, 10 }, 2) >= 0);
 
     const flat = [_]u64{ 2, 20, 3, 30 };
-    try testing.expectEqual(AIRDB_E_NOT_EMPTY, airdb_bulk_insert(h, &flat, 2, 2));
+    try testing.expectEqual(AIRDB_E_NOT_EMPTY, airdb_bulk_insert(handle, &flat, 2, 2));
 
     // Existing data is intact.
-    try testing.expectEqual(@as(i64, 1), airdb_count(h));
+    try testing.expectEqual(@as(i64, 1), airdb_count(handle));
     var out: [2]u64 = undefined;
-    try testing.expect(airdb_get(h, 1, &out, 2) >= 1);
+    try testing.expect(airdb_get(handle, 1, &out, 2) >= 1);
     try testing.expectEqual(@as(u64, 10), out[1]);
 
     // The write lock was released: a subsequent insert succeeds.
-    try testing.expect(airdb_insert(h, &[_]u64{ 4, 40 }, 2) >= 0);
-    try testing.expectEqual(@as(i64, 2), airdb_count(h));
+    try testing.expect(airdb_insert(handle, &[_]u64{ 4, 40 }, 2) >= 0);
+    try testing.expectEqual(@as(i64, 2), airdb_count(handle));
 }
 
-test "airdb_bulk_insert wrong prop_count returns AIRDB_E_BAD_ARGS" {
+test "airdb_bulk_insert wrong propertyCount returns AIRDB_E_BAD_ARGS" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try ffiTmpPathZ(testing.allocator, &tmp, "bulk_badargs.airdb");
     defer testing.allocator.free(path);
-    const h = airdb_open(path.ptr, 2) orelse return error.OpenFailed;
-    defer airdb_close(h);
+    const handle = airdb_open(path.ptr, 2) orelse return error.OpenFailed;
+    defer airdb_close(handle);
 
     const flat = [_]u64{ 1, 10, 100, 2, 20, 200 };
-    try testing.expectEqual(AIRDB_E_BAD_ARGS, airdb_bulk_insert(h, &flat, 2, 3));
+    try testing.expectEqual(AIRDB_E_BAD_ARGS, airdb_bulk_insert(handle, &flat, 2, 3));
     // Nothing was written and the lock is free.
-    try testing.expectEqual(@as(i64, 0), airdb_count(h));
-    try testing.expect(airdb_insert(h, &[_]u64{ 1, 10 }, 2) >= 0);
+    try testing.expectEqual(@as(i64, 0), airdb_count(handle));
+    try testing.expect(airdb_insert(handle, &[_]u64{ 1, 10 }, 2) >= 0);
 }
 
-test "airdb_bulk_insert duplicate pk returns AIRDB_E_DUPLICATE, type still empty, lock released" {
+test "airdb_bulk_insert duplicate primaryKey returns AIRDB_E_DUPLICATE, type still empty, lock released" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try ffiTmpPathZ(testing.allocator, &tmp, "bulk_dup.airdb");
     defer testing.allocator.free(path);
-    const h = airdb_open(path.ptr, 2) orelse return error.OpenFailed;
-    defer airdb_close(h);
+    const handle = airdb_open(path.ptr, 2) orelse return error.OpenFailed;
+    defer airdb_close(handle);
 
     const flat = [_]u64{ 5, 50, 6, 60, 5, 55 };
-    try testing.expectEqual(AIRDB_E_DUPLICATE, airdb_bulk_insert(h, &flat, 3, 2));
+    try testing.expectEqual(AIRDB_E_DUPLICATE, airdb_bulk_insert(handle, &flat, 3, 2));
 
     // Nothing was committed: the type is still empty.
-    try testing.expectEqual(@as(i64, 0), airdb_count(h));
+    try testing.expectEqual(@as(i64, 0), airdb_count(handle));
 
     // The write lock was released: a subsequent insert succeeds.
-    try testing.expect(airdb_insert(h, &[_]u64{ 1, 10 }, 2) >= 0);
-    try testing.expectEqual(@as(i64, 1), airdb_count(h));
+    try testing.expect(airdb_insert(handle, &[_]u64{ 1, 10 }, 2) >= 0);
+    try testing.expectEqual(@as(i64, 1), airdb_count(handle));
 }
 
 test "airdb_bulk_append appends a contiguous batch in one commit" {
@@ -802,24 +802,24 @@ test "airdb_bulk_append appends a contiguous batch in one commit" {
     const path = try ffiTmpPathZ(testing.allocator, &tmp, "bulk_append.airdb");
     defer testing.allocator.free(path);
     {
-        const h = airdb_open(path.ptr, 2) orelse return error.OpenFailed;
-        defer airdb_close(h);
+        const handle = airdb_open(path.ptr, 2) orelse return error.OpenFailed;
+        defer airdb_close(handle);
 
-        // Seed a populated type with pks 0,1,2.
+        // Seed a populated type with primaryKeys 0,1,2.
         const seed = [_]u64{ 0, 0, 1, 10, 2, 20 };
-        try testing.expectEqual(@as(i64, 3), airdb_bulk_insert(h, &seed, 3, 2));
+        try testing.expectEqual(@as(i64, 3), airdb_bulk_insert(handle, &seed, 3, 2));
 
-        // Append a contiguous, strictly-ascending batch above the current max pk.
+        // Append a contiguous, strictly-ascending batch above the current max primaryKey.
         const batch = [_]u64{ 3, 30, 4, 40, 5, 50 };
-        try testing.expectEqual(@as(i64, 3), airdb_bulk_append(h, &batch, 3, 2));
-        try testing.expectEqual(@as(i64, 6), airdb_count(h));
+        try testing.expectEqual(@as(i64, 3), airdb_bulk_append(handle, &batch, 3, 2));
+        try testing.expectEqual(@as(i64, 6), airdb_count(handle));
 
         var out: [2]u64 = undefined;
-        try testing.expect(airdb_get(h, 3, &out, 2) >= 1);
+        try testing.expect(airdb_get(handle, 3, &out, 2) >= 1);
         try testing.expectEqual(@as(u64, 30), out[1]);
-        try testing.expect(airdb_get(h, 4, &out, 2) >= 1);
+        try testing.expect(airdb_get(handle, 4, &out, 2) >= 1);
         try testing.expectEqual(@as(u64, 40), out[1]);
-        try testing.expect(airdb_get(h, 5, &out, 2) >= 1);
+        try testing.expect(airdb_get(handle, 5, &out, 2) >= 1);
         try testing.expectEqual(@as(u64, 50), out[1]);
     }
     // Reopen: the appended rows persisted (durability).
@@ -836,68 +836,68 @@ test "airdb_bulk_append falls back for a scattered batch" {
     defer tmp.cleanup();
     const path = try ffiTmpPathZ(testing.allocator, &tmp, "bulk_append_scatter.airdb");
     defer testing.allocator.free(path);
-    const h = airdb_open(path.ptr, 2) orelse return error.OpenFailed;
-    defer airdb_close(h);
+    const handle = airdb_open(path.ptr, 2) orelse return error.OpenFailed;
+    defer airdb_close(handle);
 
-    // Seed pks 0,1,2 (current max pk is 2).
+    // Seed primaryKeys 0,1,2 (current max primaryKey is 2).
     const seed = [_]u64{ 0, 0, 1, 10, 2, 20 };
-    try testing.expectEqual(@as(i64, 3), airdb_bulk_insert(h, &seed, 3, 2));
+    try testing.expectEqual(@as(i64, 3), airdb_bulk_insert(handle, &seed, 3, 2));
 
     // A descending batch does not qualify for the right-edge fast path, but both
-    // pks are fresh, so the row-by-row fallback inserts them successfully.
+    // primaryKeys are fresh, so the row-by-row fallback inserts them successfully.
     const scattered = [_]u64{ 5, 50, 4, 40 };
-    try testing.expectEqual(@as(i64, 2), airdb_bulk_append(h, &scattered, 2, 2));
-    try testing.expectEqual(@as(i64, 5), airdb_count(h));
+    try testing.expectEqual(@as(i64, 2), airdb_bulk_append(handle, &scattered, 2, 2));
+    try testing.expectEqual(@as(i64, 5), airdb_count(handle));
     var out: [2]u64 = undefined;
-    try testing.expect(airdb_get(h, 4, &out, 2) >= 1);
+    try testing.expect(airdb_get(handle, 4, &out, 2) >= 1);
     try testing.expectEqual(@as(u64, 40), out[1]);
-    try testing.expect(airdb_get(h, 5, &out, 2) >= 1);
+    try testing.expect(airdb_get(handle, 5, &out, 2) >= 1);
     try testing.expectEqual(@as(u64, 50), out[1]);
 
-    // A non-qualifying batch carrying an existing pk surfaces the fallback's
+    // A non-qualifying batch carrying an existing primaryKey surfaces the fallback's
     // DuplicateKey as AIRDB_E_DUPLICATE; nothing is made durable.
     const dup = [_]u64{ 6, 60, 1, 11 };
-    try testing.expectEqual(AIRDB_E_DUPLICATE, airdb_bulk_append(h, &dup, 2, 2));
-    try testing.expectEqual(@as(i64, 5), airdb_count(h));
+    try testing.expectEqual(AIRDB_E_DUPLICATE, airdb_bulk_append(handle, &dup, 2, 2));
+    try testing.expectEqual(@as(i64, 5), airdb_count(handle));
 
     // The write lock was released: a subsequent insert succeeds.
-    try testing.expect(airdb_insert(h, &[_]u64{ 7, 70 }, 2) >= 0);
-    try testing.expectEqual(@as(i64, 6), airdb_count(h));
+    try testing.expect(airdb_insert(handle, &[_]u64{ 7, 70 }, 2) >= 0);
+    try testing.expectEqual(@as(i64, 6), airdb_count(handle));
 }
 
-test "airdb_bulk_append wrong prop_count returns AIRDB_E_BAD_ARGS" {
+test "airdb_bulk_append wrong propertyCount returns AIRDB_E_BAD_ARGS" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try ffiTmpPathZ(testing.allocator, &tmp, "bulk_append_badargs.airdb");
     defer testing.allocator.free(path);
-    const h = airdb_open(path.ptr, 2) orelse return error.OpenFailed;
-    defer airdb_close(h);
+    const handle = airdb_open(path.ptr, 2) orelse return error.OpenFailed;
+    defer airdb_close(handle);
 
     const flat = [_]u64{ 1, 10, 100, 2, 20, 200 };
-    try testing.expectEqual(AIRDB_E_BAD_ARGS, airdb_bulk_append(h, &flat, 2, 3));
+    try testing.expectEqual(AIRDB_E_BAD_ARGS, airdb_bulk_append(handle, &flat, 2, 3));
     // Nothing was written and the lock is free.
-    try testing.expectEqual(@as(i64, 0), airdb_count(h));
-    try testing.expect(airdb_insert(h, &[_]u64{ 1, 10 }, 2) >= 0);
+    try testing.expectEqual(@as(i64, 0), airdb_count(handle));
+    try testing.expect(airdb_insert(handle, &[_]u64{ 1, 10 }, 2) >= 0);
 }
 
-test "ffi txn: a poisoned txn refuses commit and releases the lock" {
+test "ffi transaction: a poisoned transaction refuses commit and releases the lock" {
     // Regression: a structural op failure mid-batch can free tree nodes the
-    // unadvanced catalog ref still references; committing such a txn handed
+    // unadvanced catalog ref still references; committing such a transaction handed
     // live nodes to the durable free list. Commit must abort instead.
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try ffiTmpPathZ(testing.allocator, &tmp, "poisontxn.airdb");
     defer testing.allocator.free(path);
-    const h = airdb_open(path.ptr, 2) orelse return error.OpenFailed;
-    defer airdb_close(h);
+    const handle = airdb_open(path.ptr, 2) orelse return error.OpenFailed;
+    defer airdb_close(handle);
 
-    const t = airdb_begin(h) orelse return error.BeginFailed;
-    try testing.expect(airdb_txn_insert(t, &[_]u64{ 1, 10 }, 2) >= 0);
-    t.poisoned = true; // simulate a structural op failure
-    try testing.expectEqual(AIRDB_E_GENERIC, airdb_commit(t));
+    const transaction = airdb_begin(handle) orelse return error.BeginFailed;
+    try testing.expect(airdb_txn_insert(transaction, &[_]u64{ 1, 10 }, 2) >= 0);
+    transaction.poisoned = true; // simulate a structural op failure
+    try testing.expectEqual(AIRDB_E_GENERIC, airdb_commit(transaction));
     // Nothing became durable and the write lock was released.
-    try testing.expectEqual(@as(i64, 0), airdb_count(h));
-    const t2 = airdb_begin(h) orelse return error.BeginFailed;
+    try testing.expectEqual(@as(i64, 0), airdb_count(handle));
+    const t2 = airdb_begin(handle) orelse return error.BeginFailed;
     airdb_abort(t2);
 }
 
@@ -909,11 +909,11 @@ test "ffi: a poisoned handle reports AIRDB_E_INDETERMINATE, not generic failure"
     defer tmp.cleanup();
     const path = try ffiTmpPathZ(testing.allocator, &tmp, "poisonedh.airdb");
     defer testing.allocator.free(path);
-    const h = airdb_open(path.ptr, 2) orelse return error.OpenFailed;
-    defer airdb_close(h);
+    const handle = airdb_open(path.ptr, 2) orelse return error.OpenFailed;
+    defer airdb_close(handle);
 
-    h.db.poisoned = true; // simulate a failed commit-point flush
-    try testing.expectEqual(AIRDB_E_INDETERMINATE, airdb_insert(h, &[_]u64{ 1, 10 }, 2));
-    try testing.expectEqual(AIRDB_E_INDETERMINATE, airdb_update(h, &[_]u64{ 1, 11 }, 2));
-    try testing.expectEqual(AIRDB_E_INDETERMINATE, airdb_delete(h, 1));
+    handle.database.poisoned = true; // simulate a failed commit-point flush
+    try testing.expectEqual(AIRDB_E_INDETERMINATE, airdb_insert(handle, &[_]u64{ 1, 10 }, 2));
+    try testing.expectEqual(AIRDB_E_INDETERMINATE, airdb_update(handle, &[_]u64{ 1, 11 }, 2));
+    try testing.expectEqual(AIRDB_E_INDETERMINATE, airdb_delete(handle, 1));
 }

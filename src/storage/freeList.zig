@@ -9,8 +9,8 @@ const extent_bytes: usize = 24;
 /// extent unifies the free pool into 8-byte size classes. That keeps exact
 /// matching effective (a 1027-byte leaf and a 1027-byte request both become
 /// 1032) and keeps carved remainders 8-aligned and class-sized.
-fn round8(n: u64) u64 {
-    return (n + 7) & ~@as(u64, 7);
+fn round8(size: u64) u64 {
+    return (size + 7) & ~@as(u64, 7);
 }
 
 pub const FreeList = struct {
@@ -22,7 +22,7 @@ pub const FreeList = struct {
     /// O(bucket length) per removal and turned delete-heavy transactions
     /// quadratic once buckets reached tens of thousands of entries.
     bucket_pos: std.ArrayList(usize),
-    /// size class -> indices into `extents` with that exact (rounded) len.
+    /// size class -> indices into `extents` with that exact (rounded) length.
     /// Makes reuseExact a bucket probe instead of a linear scan over every
     /// extent -- the free-pool lookup sits on the hot allocation path of every
     /// copy-on-write node write.
@@ -38,18 +38,18 @@ pub const FreeList = struct {
     }
 
     pub fn deinit(self: *FreeList) void {
-        var it = self.by_size.valueIterator();
-        while (it.next()) |list| list.deinit(self.allocator);
+        var iterator = self.by_size.valueIterator();
+        while (iterator.next()) |list| list.deinit(self.allocator);
         self.by_size.deinit();
         self.bucket_pos.deinit(self.allocator);
         self.extents.deinit(self.allocator);
     }
 
-    fn bucketAdd(self: *FreeList, size: u64, idx: usize) !void {
+    fn bucketAdd(self: *FreeList, size: u64, extentIndex: usize) !void {
         const gop = try self.by_size.getOrPut(size);
         if (!gop.found_existing) gop.value_ptr.* = .empty;
-        try gop.value_ptr.append(self.allocator, idx);
-        self.bucket_pos.items[idx] = gop.value_ptr.items.len - 1;
+        try gop.value_ptr.append(self.allocator, extentIndex);
+        self.bucket_pos.items[extentIndex] = gop.value_ptr.items.len - 1;
     }
 
     // Remove the bucket entry at `pos` inside the `class` bucket, repairing the
@@ -63,27 +63,27 @@ pub const FreeList = struct {
         }
     }
 
-    // Swap-remove extent `idx` (whose bucket entry is already gone), repairing
+    // Swap-remove extent `extentIndex` (whose bucket entry is already gone), repairing
     // the moved (former last) extent's bucket entry via its back-pointer. O(1).
-    fn removeExtentAt(self: *FreeList, idx: usize) FreeExtent {
-        const removed = self.extents.swapRemove(idx);
-        _ = self.bucket_pos.swapRemove(idx);
-        if (idx < self.extents.items.len) {
-            const moved = self.extents.items[idx];
-            const pos = self.bucket_pos.items[idx];
-            self.by_size.getPtr(moved.len).?.items[pos] = idx;
+    fn removeExtentAt(self: *FreeList, extentIndex: usize) FreeExtent {
+        const removed = self.extents.swapRemove(extentIndex);
+        _ = self.bucket_pos.swapRemove(extentIndex);
+        if (extentIndex < self.extents.items.len) {
+            const moved = self.extents.items[extentIndex];
+            const pos = self.bucket_pos.items[extentIndex];
+            self.by_size.getPtr(moved.len).?.items[pos] = extentIndex;
         }
         return removed;
     }
 
     fn clearBuckets(self: *FreeList) void {
-        var it = self.by_size.valueIterator();
-        while (it.next()) |list| list.clearRetainingCapacity();
+        var iterator = self.by_size.valueIterator();
+        while (iterator.next()) |list| list.clearRetainingCapacity();
     }
 
-    pub fn add(self: *FreeList, e: FreeExtent) !void {
-        if (e.len == 0) return;
-        const rounded = FreeExtent{ .offset = e.offset, .len = round8(e.len), .freed_version = e.freed_version };
+    pub fn add(self: *FreeList, extent: FreeExtent) !void {
+        if (extent.len == 0) return;
+        const rounded = FreeExtent{ .offset = extent.offset, .len = round8(extent.len), .freed_version = extent.freed_version };
         try self.extents.append(self.allocator, rounded);
         errdefer _ = self.extents.pop();
         try self.bucket_pos.append(self.allocator, 0); // set by bucketAdd
@@ -97,7 +97,7 @@ pub const FreeList = struct {
     // died with error.AllocTooLarge -- an unrecoverable commit failure.
     //
     // Chunk layout: [count u32 LE][next_ref u64 LE] then
-    // count * ([offset u64][len u64][freed_version u64]) LE.
+    // count * ([offset u64][length u64][freed_version u64]) LE.
     pub const chunk_header_bytes: usize = 12;
     /// Extents per chunk: 12 + 65_536 * 24 bytes keeps every chunk allocation
     /// near 1.5 MiB, far below the section size.
@@ -109,18 +109,18 @@ pub const FreeList = struct {
         return chunk_header_bytes + count * extent_bytes;
     }
 
-    pub fn encodeChunk(extents: []const FreeExtent, next_ref: u64, buf: []u8) usize {
-        std.debug.assert(buf.len >= chunkByteLen(extents.len));
-        std.mem.writeInt(u32, buf[0..4], @intCast(extents.len), .little);
-        std.mem.writeInt(u64, buf[4..12], next_ref, .little);
-        var off: usize = chunk_header_bytes;
-        for (extents) |e| {
-            std.mem.writeInt(u64, buf[off..][0..8], e.offset, .little);
-            std.mem.writeInt(u64, buf[off + 8 ..][0..8], e.len, .little);
-            std.mem.writeInt(u64, buf[off + 16 ..][0..8], e.freed_version, .little);
-            off += extent_bytes;
+    pub fn encodeChunk(extents: []const FreeExtent, next_ref: u64, buffer: []u8) usize {
+        std.debug.assert(buffer.len >= chunkByteLen(extents.len));
+        std.mem.writeInt(u32, buffer[0..4], @intCast(extents.len), .little);
+        std.mem.writeInt(u64, buffer[4..12], next_ref, .little);
+        var offset: usize = chunk_header_bytes;
+        for (extents) |extent| {
+            std.mem.writeInt(u64, buffer[offset..][0..8], extent.offset, .little);
+            std.mem.writeInt(u64, buffer[offset + 8 ..][0..8], extent.len, .little);
+            std.mem.writeInt(u64, buffer[offset + 16 ..][0..8], extent.freed_version, .little);
+            offset += extent_bytes;
         }
-        return off;
+        return offset;
     }
 
     /// Clear this list in preparation for decoding a chain of chunks.
@@ -132,20 +132,20 @@ pub const FreeList = struct {
 
     /// Append one decoded chunk's extents to this list; returns the chunk's
     /// next_ref (0 for the last chunk in the chain).
-    pub fn decodeChunkAppend(self: *FreeList, buf: []const u8) !u64 {
-        if (buf.len < chunk_header_bytes) return error.Corrupt;
-        const count = std.mem.readInt(u32, buf[0..4], .little);
-        const next = std.mem.readInt(u64, buf[4..12], .little);
-        if (buf.len < chunkByteLen(count)) return error.Corrupt;
-        var off: usize = chunk_header_bytes;
-        var i: u32 = 0;
-        while (i < count) : (i += 1) {
+    pub fn decodeChunkAppend(self: *FreeList, buffer: []const u8) !u64 {
+        if (buffer.len < chunk_header_bytes) return error.Corrupt;
+        const count = std.mem.readInt(u32, buffer[0..4], .little);
+        const next = std.mem.readInt(u64, buffer[4..12], .little);
+        if (buffer.len < chunkByteLen(count)) return error.Corrupt;
+        var offset: usize = chunk_header_bytes;
+        var entryIndex: u32 = 0;
+        while (entryIndex < count) : (entryIndex += 1) {
             try self.add(.{
-                .offset = std.mem.readInt(u64, buf[off..][0..8], .little),
-                .len = std.mem.readInt(u64, buf[off + 8 ..][0..8], .little),
-                .freed_version = std.mem.readInt(u64, buf[off + 16 ..][0..8], .little),
+                .offset = std.mem.readInt(u64, buffer[offset..][0..8], .little),
+                .len = std.mem.readInt(u64, buffer[offset + 8 ..][0..8], .little),
+                .freed_version = std.mem.readInt(u64, buffer[offset + 16 ..][0..8], .little),
             });
-            off += extent_bytes;
+            offset += extent_bytes;
         }
         return next;
     }
@@ -161,12 +161,12 @@ pub const FreeList = struct {
     pub fn reuseExact(self: *FreeList, size: u64, horizon: u64) ?u64 {
         const want = round8(size);
         const list = self.by_size.getPtr(want) orelse return null;
-        for (list.items, 0..) |idx, i| {
-            if (self.extents.items[idx].freed_version <= horizon) {
-                const off = self.extents.items[idx].offset;
-                self.bucketRemoveAt(want, i);
-                _ = self.removeExtentAt(idx);
-                return off;
+        for (list.items, 0..) |extentIndex, bucketPosition| {
+            if (self.extents.items[extentIndex].freed_version <= horizon) {
+                const offset = self.extents.items[extentIndex].offset;
+                self.bucketRemoveAt(want, bucketPosition);
+                _ = self.removeExtentAt(extentIndex);
+                return offset;
             }
         }
         return null;
@@ -182,15 +182,15 @@ test "extent chunks encode and decode round-trip, preserving the chain link" {
     try list.add(.{ .offset = 4096, .len = 64, .freed_version = 2 });
     try list.add(.{ .offset = 8192, .len = 128, .freed_version = 3 });
     try list.add(.{ .offset = 16384, .len = 8, .freed_version = 4 });
-    var buf: [4096]u8 = undefined;
+    var buffer: [4096]u8 = undefined;
     // Split across two chunks; the first names the second's ref.
-    const n1 = FreeList.encodeChunk(list.extents.items[0..2], 0xDEAD_BEE8, buf[0..]);
-    const n2 = FreeList.encodeChunk(list.extents.items[2..], 0, buf[n1..]);
+    const firstChunkLength = FreeList.encodeChunk(list.extents.items[0..2], 0xDEAD_BEE8, buffer[0..]);
+    const secondChunkLength = FreeList.encodeChunk(list.extents.items[2..], 0, buffer[firstChunkLength..]);
     var list2 = FreeList.init(allocator);
     defer list2.deinit();
     list2.reset();
-    try testing.expectEqual(@as(u64, 0xDEAD_BEE8), try list2.decodeChunkAppend(buf[0..n1]));
-    try testing.expectEqual(@as(u64, 0), try list2.decodeChunkAppend(buf[n1 .. n1 + n2]));
+    try testing.expectEqual(@as(u64, 0xDEAD_BEE8), try list2.decodeChunkAppend(buffer[0..firstChunkLength]));
+    try testing.expectEqual(@as(u64, 0), try list2.decodeChunkAppend(buffer[firstChunkLength .. firstChunkLength + secondChunkLength]));
     try testing.expectEqual(@as(usize, 3), list2.extents.items.len);
     try testing.expectEqual(@as(u64, 4096), list2.extents.items[0].offset);
     try testing.expectEqual(@as(u64, 16384), list2.extents.items[2].offset);
@@ -202,8 +202,8 @@ test "reuseExact returns an extent only when freed_version <= horizon" {
     defer list.deinit();
     try list.add(.{ .offset = 4096, .len = 64, .freed_version = 5 });
     try testing.expect(list.reuseExact(64, 4) == null);
-    const r = list.reuseExact(64, 5).?;
-    try testing.expectEqual(@as(u64, 4096), r);
+    const reused = list.reuseExact(64, 5).?;
+    try testing.expectEqual(@as(u64, 4096), reused);
     try testing.expectEqual(@as(usize, 0), list.extents.items.len);
 }
 

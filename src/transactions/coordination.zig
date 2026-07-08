@@ -4,7 +4,7 @@
 //   [0..8]   magic        u64 LE  (coord_magic)
 //   [8..12]  attach_count u32     (atomic, 4-aligned)
 //   [12..16] reserved     (zero)
-//   [16..24] latest_ver   u64     (atomic, 8-aligned)
+//   [16..24] latestVersion   u64     (atomic, 8-aligned)
 //   [24..64] reserved     (zero)
 //   [64..1088] participant slots  64 x 16 bytes each
 //              slot layout: [pid u32 @+0][start_token u32 @+4][min_pinned u64 @+8]
@@ -48,7 +48,7 @@ fn pidAlive(pid: u32) bool {
     return platform.processAlive(pid);
 }
 
-pub const Coord = struct {
+pub const Coordination = struct {
     file: std.Io.File,
     section: platform.Section,
     map: []align(std.heap.page_size_min) u8,
@@ -57,7 +57,7 @@ pub const Coord = struct {
     /// Does not truncate an existing file.
     /// If the file is new (magic absent), zeroes the mapping and writes the magic.
     /// If the file already has the magic, leaves all fields intact.
-    pub fn openOrCreate(path: []const u8) !Coord {
+    pub fn openOrCreate(path: []const u8) !Coordination {
         const io = coordIo();
 
         // Try open first; create only on FileNotFound.
@@ -68,8 +68,8 @@ pub const Coord = struct {
         };
         errdefer file.close(io);
 
-        const len = try file.length(io);
-        if (len < coord_size) try file.setLength(io, coord_size);
+        const length = try file.length(io);
+        if (length < coord_size) try file.setLength(io, coord_size);
 
         // Fixed-size coord file: a single section covering the whole page. No growth.
         var section = try platform.mapSection(file, 0, coord_size);
@@ -98,73 +98,73 @@ pub const Coord = struct {
         }
         // Existing file with correct magic: leave all fields as-is.
 
-        return Coord{ .file = file, .section = section, .map = map };
+        return Coordination{ .file = file, .section = section, .map = map };
     }
 
-    pub fn deinit(self: *Coord) void {
+    pub fn deinit(self: *Coordination) void {
         self.section.unmap();
         self.file.close(coordIo());
     }
 
-    fn attachPtr(self: *Coord) *u32 {
+    fn attachPtr(self: *Coordination) *u32 {
         return @ptrCast(@alignCast(&self.map[off_attach]));
     }
 
-    fn latestPtr(self: *Coord) *u64 {
+    fn latestPtr(self: *Coordination) *u64 {
         return @ptrCast(@alignCast(&self.map[off_latest]));
     }
 
     /// Atomically increment attach count, return new value.
-    pub fn attach(self: *Coord) u32 {
+    pub fn attach(self: *Coordination) u32 {
         return @atomicRmw(u32, self.attachPtr(), .Add, 1, .seq_cst) + 1;
     }
 
     /// Atomically decrement attach count, return new value.
-    pub fn detach(self: *Coord) u32 {
+    pub fn detach(self: *Coordination) u32 {
         return @atomicRmw(u32, self.attachPtr(), .Sub, 1, .seq_cst) - 1;
     }
 
     /// Read the current attach count.
-    pub fn attachCount(self: *Coord) u32 {
+    pub fn attachCount(self: *Coordination) u32 {
         return @atomicLoad(u32, self.attachPtr(), .seq_cst);
     }
 
     /// Store the latest committed version (release ordering).
-    pub fn setLatestVersion(self: *Coord, v: u64) void {
-        @atomicStore(u64, self.latestPtr(), v, .release);
+    pub fn setLatestVersion(self: *Coordination, version: u64) void {
+        @atomicStore(u64, self.latestPtr(), version, .release);
     }
 
     /// Load the latest committed version (acquire ordering).
-    pub fn latestVersion(self: *Coord) u64 {
+    pub fn latestVersion(self: *Coordination) u64 {
         return @atomicLoad(u64, self.latestPtr(), .acquire);
     }
 
     /// Block until this process/thread holds an exclusive flock on the coord file.
-    pub fn lockExclusive(self: *Coord) !void {
+    pub fn lockExclusive(self: *Coordination) !void {
         _ = try platform.lockFileExclusive(self.file, true);
     }
 
     /// Non-blocking exclusive flock attempt.
     /// Returns error.WouldBlock immediately if another holder holds the lock.
-    pub fn tryLockExclusive(self: *Coord) !void {
+    pub fn tryLockExclusive(self: *Coordination) !void {
         if (!try platform.lockFileExclusive(self.file, false)) return error.WouldBlock;
     }
 
     /// Release the flock held by this file description.
-    pub fn unlock(self: *Coord) void {
+    pub fn unlock(self: *Coordination) void {
         platform.unlockFile(self.file);
     }
 
-    fn slotPidPtr(self: *Coord, idx: usize) *u32 {
-        return @ptrCast(@alignCast(&self.map[participants_off + idx * slot_stride]));
+    fn slotPidPtr(self: *Coordination, slotIndex: usize) *u32 {
+        return @ptrCast(@alignCast(&self.map[participants_off + slotIndex * slot_stride]));
     }
 
-    fn slotTokenPtr(self: *Coord, idx: usize) *u32 {
-        return @ptrCast(@alignCast(&self.map[participants_off + idx * slot_stride + 4]));
+    fn slotTokenPtr(self: *Coordination, slotIndex: usize) *u32 {
+        return @ptrCast(@alignCast(&self.map[participants_off + slotIndex * slot_stride + 4]));
     }
 
-    fn slotMinPtr(self: *Coord, idx: usize) *u64 {
-        return @ptrCast(@alignCast(&self.map[participants_off + idx * slot_stride + 8]));
+    fn slotMinPtr(self: *Coordination, slotIndex: usize) *u64 {
+        return @ptrCast(@alignCast(&self.map[participants_off + slotIndex * slot_stride + 8]));
     }
 
     // The (pid, token) pair viewed as one aligned u64 (LE: low 32 bits pid,
@@ -173,18 +173,18 @@ pub const Coord = struct {
     // globalHorizon read as a recycled pid and reclaimed -- after which a
     // third process could re-claim the slot and the two owners overwrote each
     // other's pins, hiding a live reader from the reclaim horizon.
-    fn slotClaimPtr(self: *Coord, idx: usize) *u64 {
-        return @ptrCast(@alignCast(&self.map[participants_off + idx * slot_stride]));
+    fn slotClaimPtr(self: *Coordination, slotIndex: usize) *u64 {
+        return @ptrCast(@alignCast(&self.map[participants_off + slotIndex * slot_stride]));
     }
 
     /// Claim a free participant slot. Returns the slot index on success,
     /// or null if all 64 slots are occupied. Uses CAS to avoid races.
-    pub fn claimSlot(self: *Coord) !?usize {
+    pub fn claimSlot(self: *Coordination) !?usize {
         const my_pid: u32 = @intCast(currentPid());
         const my_token: u32 = @truncate(platform.processStartToken(my_pid) orelse 0);
         const claim: u64 = (@as(u64, my_token) << 32) | my_pid;
-        var i: usize = 0;
-        while (i < participant_slots) : (i += 1) {
+        var slotIndex: usize = 0;
+        while (slotIndex < participant_slots) : (slotIndex += 1) {
             // The sentinel store below is LOAD-BEARING: a release-freed slot's
             // min is already sentinel, but a RECLAIM-freed slot keeps its dead
             // owner's min (reclaim touches only the claim word). Without the
@@ -192,9 +192,9 @@ pub const Coord = struct {
             // reclaim horizon with a stale low pin for as long as this claim
             // lives. Between the CAS and the store a horizon scan can read the
             // stale min -- a too-low horizon, which is merely conservative.
-            if (@cmpxchgStrong(u64, self.slotClaimPtr(i), 0, claim, .seq_cst, .seq_cst) == null) {
-                @atomicStore(u64, self.slotMinPtr(i), sentinel_max, .seq_cst);
-                return i;
+            if (@cmpxchgStrong(u64, self.slotClaimPtr(slotIndex), 0, claim, .seq_cst, .seq_cst) == null) {
+                @atomicStore(u64, self.slotMinPtr(slotIndex), sentinel_max, .seq_cst);
+                return slotIndex;
             }
         }
         return null;
@@ -203,9 +203,9 @@ pub const Coord = struct {
     /// Release a previously claimed slot. Resets min_pinned first, then clears
     /// pid+token in one store, so no reader observes a stale min_pinned after
     /// the slot appears free.
-    pub fn releaseSlot(self: *Coord, idx: usize) void {
-        @atomicStore(u64, self.slotMinPtr(idx), sentinel_max, .seq_cst);
-        @atomicStore(u64, self.slotClaimPtr(idx), 0, .seq_cst);
+    pub fn releaseSlot(self: *Coordination, slotIndex: usize) void {
+        @atomicStore(u64, self.slotMinPtr(slotIndex), sentinel_max, .seq_cst);
+        @atomicStore(u64, self.slotClaimPtr(slotIndex), 0, .seq_cst);
     }
 
     /// Publish the minimum pinned version for this slot. seq_cst, not release:
@@ -216,16 +216,16 @@ pub const Coord = struct {
     /// writer's horizon miss the pin while the reader's validation misses the
     /// new version. The seq_cst store compiles to a fenced exchange on x86 and
     /// closes it. (The writer side is fenced by the lock/unlock syscalls.)
-    pub fn publishMinPinned(self: *Coord, idx: usize, v: u64) void {
-        @atomicStore(u64, self.slotMinPtr(idx), v, .seq_cst);
+    pub fn publishMinPinned(self: *Coordination, slotIndex: usize, version: u64) void {
+        @atomicStore(u64, self.slotMinPtr(slotIndex), version, .seq_cst);
     }
 
-    pub fn slotMinPinnedForTest(self: *Coord, idx: usize) u64 {
-        return @atomicLoad(u64, self.slotMinPtr(idx), .acquire);
+    pub fn slotMinPinnedForTest(self: *Coordination, slotIndex: usize) u64 {
+        return @atomicLoad(u64, self.slotMinPtr(slotIndex), .acquire);
     }
 
-    pub fn slotPidForTest(self: *Coord, idx: usize) u32 {
-        return @atomicLoad(u32, self.slotPidPtr(idx), .seq_cst);
+    pub fn slotPidForTest(self: *Coordination, slotIndex: usize) u32 {
+        return @atomicLoad(u32, self.slotPidPtr(slotIndex), .seq_cst);
     }
 
     /// Compute the global reclaim horizon: the minimum min_pinned across all
@@ -245,22 +245,22 @@ pub const Coord = struct {
     // alone: a free slot's min is never read (word == 0 is skipped), and the
     // next claimant sentinels it itself. Residual ABA -- the same pid AND the
     // same 32-bit start token re-claimed within the window -- is accepted.
-    fn reclaimSlot(self: *Coord, idx: usize, sampled_word: u64) void {
-        _ = @cmpxchgStrong(u64, self.slotClaimPtr(idx), sampled_word, 0, .seq_cst, .seq_cst);
+    fn reclaimSlot(self: *Coordination, slotIndex: usize, sampled_word: u64) void {
+        _ = @cmpxchgStrong(u64, self.slotClaimPtr(slotIndex), sampled_word, 0, .seq_cst, .seq_cst);
     }
 
-    pub fn globalHorizon(self: *Coord, fallback: u64) u64 {
+    pub fn globalHorizon(self: *Coordination, fallback: u64) u64 {
         var min_v: u64 = fallback;
-        var i: usize = 0;
-        while (i < participant_slots) : (i += 1) {
+        var slotIndex: usize = 0;
+        while (slotIndex < participant_slots) : (slotIndex += 1) {
             // Sample pid and token as ONE word so the liveness verdict and the
             // guarded reclaim below all refer to the same claim -- separate
             // loads could pair one owner's pid with its successor's token.
-            const word = @atomicLoad(u64, self.slotClaimPtr(i), .seq_cst);
+            const word = @atomicLoad(u64, self.slotClaimPtr(slotIndex), .seq_cst);
             if (word == 0) continue;
             const pid: u32 = @truncate(word);
             if (!pidAlive(pid)) {
-                self.reclaimSlot(i, word);
+                self.reclaimSlot(slotIndex, word);
                 continue;
             }
             // The pid is alive, but pids are recycled: verify the incarnation.
@@ -272,13 +272,13 @@ pub const Coord = struct {
             if (stored_token != 0) {
                 if (platform.processStartToken(pid)) |tok| {
                     if (@as(u32, @truncate(tok)) != stored_token) {
-                        self.reclaimSlot(i, word); // recycled pid
+                        self.reclaimSlot(slotIndex, word); // recycled pid
                         continue;
                     }
                 }
             }
-            const mp = @atomicLoad(u64, self.slotMinPtr(i), .acquire);
-            if (mp < min_v) min_v = mp;
+            const minPinned = @atomicLoad(u64, self.slotMinPtr(slotIndex), .acquire);
+            if (minPinned < min_v) min_v = minPinned;
         }
         return min_v;
     }
@@ -286,10 +286,10 @@ pub const Coord = struct {
     /// Test helper: write a slot directly without going through claimSlot.
     /// Allows tests to simulate a slot owned by an arbitrary (possibly dead or
     /// recycled) pid with an arbitrary incarnation token.
-    pub fn forgeSlotForTest(self: *Coord, idx: usize, pid: u32, token: u32, min_pinned: u64) void {
-        @atomicStore(u64, self.slotMinPtr(idx), min_pinned, .seq_cst);
-        @atomicStore(u32, self.slotTokenPtr(idx), token, .seq_cst);
-        @atomicStore(u32, self.slotPidPtr(idx), pid, .seq_cst);
+    pub fn forgeSlotForTest(self: *Coordination, slotIndex: usize, pid: u32, token: u32, min_pinned: u64) void {
+        @atomicStore(u64, self.slotMinPtr(slotIndex), min_pinned, .seq_cst);
+        @atomicStore(u32, self.slotTokenPtr(slotIndex), token, .seq_cst);
+        @atomicStore(u32, self.slotPidPtr(slotIndex), pid, .seq_cst);
     }
 };
 
@@ -305,20 +305,20 @@ test "claimSlot publishes pid and incarnation token in one atomic word" {
     // single u64 CAS of (token << 32) | pid; both fields must land together.
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const dlen = try tmp.dir.realPath(coordIo(), &path_buf);
-    const cpath = try std.fs.path.join(testing.allocator, &.{ path_buf[0..dlen], "packedclaim.coord" });
-    defer testing.allocator.free(cpath);
-    var c = try Coord.openOrCreate(cpath);
-    defer c.deinit();
+    var pathBuffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dlen = try tmp.dir.realPath(coordIo(), &pathBuffer);
+    const coordinationPath = try std.fs.path.join(testing.allocator, &.{ pathBuffer[0..dlen], "packedclaim.coord" });
+    defer testing.allocator.free(coordinationPath);
+    var coordination = try Coordination.openOrCreate(coordinationPath);
+    defer coordination.deinit();
 
-    const idx = (try c.claimSlot()).?;
-    defer c.releaseSlot(idx);
+    const slotIndex = (try coordination.claimSlot()).?;
+    defer coordination.releaseSlot(slotIndex);
     const my_pid: u32 = @intCast(platform.currentPid());
     const my_token: u32 = @truncate(platform.processStartToken(my_pid) orelse 0);
-    const word = @atomicLoad(u64, c.slotClaimPtr(idx), .seq_cst);
+    const word = @atomicLoad(u64, coordination.slotClaimPtr(slotIndex), .seq_cst);
     try testing.expectEqual((@as(u64, my_token) << 32) | my_pid, word);
-    try testing.expectEqual(sentinel_max, @atomicLoad(u64, c.slotMinPtr(idx), .seq_cst));
+    try testing.expectEqual(sentinel_max, @atomicLoad(u64, coordination.slotMinPtr(slotIndex), .seq_cst));
 }
 
 test "a reclaimed slot becomes claimable again" {
@@ -328,21 +328,21 @@ test "a reclaimed slot becomes claimable again" {
     // burned a slot until the table was exhausted.
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const dlen = try tmp.dir.realPath(coordIo(), &path_buf);
-    const cpath = try std.fs.path.join(testing.allocator, &.{ path_buf[0..dlen], "reclaimable.coord" });
-    defer testing.allocator.free(cpath);
-    var c = try Coord.openOrCreate(cpath);
-    defer c.deinit();
+    var pathBuffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dlen = try tmp.dir.realPath(coordIo(), &pathBuffer);
+    const coordinationPath = try std.fs.path.join(testing.allocator, &.{ pathBuffer[0..dlen], "reclaimable.coord" });
+    defer testing.allocator.free(coordinationPath);
+    var coordination = try Coordination.openOrCreate(coordinationPath);
+    defer coordination.deinit();
 
-    c.forgeSlotForTest(0, 0x7fffffff, 0xdead, 3); // dead pid, nonzero token
-    try testing.expectEqual(@as(u64, 50), c.globalHorizon(50));
-    try testing.expectEqual(@as(u64, 0), @atomicLoad(u64, c.slotClaimPtr(0), .seq_cst));
+    coordination.forgeSlotForTest(0, 0x7fffffff, 0xdead, 3); // dead pid, nonzero token
+    try testing.expectEqual(@as(u64, 50), coordination.globalHorizon(50));
+    try testing.expectEqual(@as(u64, 0), @atomicLoad(u64, coordination.slotClaimPtr(0), .seq_cst));
     // Fill the whole table: every slot, including the reclaimed one, must land.
     var claimed: [participant_slots]usize = undefined;
-    for (&claimed) |*slot| slot.* = (try c.claimSlot()) orelse return error.SlotLeaked;
-    try testing.expectEqual(@as(?usize, null), try c.claimSlot());
-    for (claimed) |idx| c.releaseSlot(idx);
+    for (&claimed) |*slot| slot.* = (try coordination.claimSlot()) orelse return error.SlotLeaked;
+    try testing.expectEqual(@as(?usize, null), try coordination.claimSlot());
+    for (claimed) |slotIndex| coordination.releaseSlot(slotIndex);
 }
 
 test "reclaim leaves a slot alone when its claim word changed since the sample" {
@@ -352,25 +352,25 @@ test "reclaim leaves a slot alone when its claim word changed since the sample" 
     // now exchanges against the sampled word and must fail on a mismatch.
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const dlen = try tmp.dir.realPath(coordIo(), &path_buf);
-    const cpath = try std.fs.path.join(testing.allocator, &.{ path_buf[0..dlen], "guardedreclaim.coord" });
-    defer testing.allocator.free(cpath);
-    var c = try Coord.openOrCreate(cpath);
-    defer c.deinit();
+    var pathBuffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dlen = try tmp.dir.realPath(coordIo(), &pathBuffer);
+    const coordinationPath = try std.fs.path.join(testing.allocator, &.{ pathBuffer[0..dlen], "guardedreclaim.coord" });
+    defer testing.allocator.free(coordinationPath);
+    var coordination = try Coordination.openOrCreate(coordinationPath);
+    defer coordination.deinit();
 
-    c.forgeSlotForTest(2, 0x7fffffff, 0xbeef, 9); // the dead owner we sampled
-    const sampled = @atomicLoad(u64, c.slotClaimPtr(2), .seq_cst);
+    coordination.forgeSlotForTest(2, 0x7fffffff, 0xbeef, 9); // the dead owner we sampled
+    const sampled = @atomicLoad(u64, coordination.slotClaimPtr(2), .seq_cst);
     // The slot changes hands before the reclaim lands.
     const my_pid: u32 = @intCast(platform.currentPid());
-    c.forgeSlotForTest(2, my_pid, 0xf00d, 5);
-    c.reclaimSlot(2, sampled);
-    try testing.expectEqual(my_pid, c.slotPidForTest(2)); // new owner intact
-    try testing.expectEqual(@as(u64, 5), @atomicLoad(u64, c.slotMinPtr(2), .seq_cst));
+    coordination.forgeSlotForTest(2, my_pid, 0xf00d, 5);
+    coordination.reclaimSlot(2, sampled);
+    try testing.expectEqual(my_pid, coordination.slotPidForTest(2)); // new owner intact
+    try testing.expectEqual(@as(u64, 5), @atomicLoad(u64, coordination.slotMinPtr(2), .seq_cst));
     // With the matching word, the reclaim goes through.
-    const word2 = @atomicLoad(u64, c.slotClaimPtr(2), .seq_cst);
-    c.reclaimSlot(2, word2);
-    try testing.expectEqual(@as(u64, 0), @atomicLoad(u64, c.slotClaimPtr(2), .seq_cst));
+    const word2 = @atomicLoad(u64, coordination.slotClaimPtr(2), .seq_cst);
+    coordination.reclaimSlot(2, word2);
+    try testing.expectEqual(@as(u64, 0), @atomicLoad(u64, coordination.slotClaimPtr(2), .seq_cst));
 }
 
 test {

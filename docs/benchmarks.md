@@ -20,7 +20,7 @@ zig build bench -- --only=NAME     # single scenario
 | Scenario | What it measures |
 |---|---|
 | `insert_recovery` | 1M sequential inserts across batched commits; reopen time and first-read latency after a cold open |
-| `lookup_query` | point reads by pk (p50/p99), indexed equality query vs full scan |
+| `lookup_query` | point reads by primaryKey (p50/p99), indexed equality query vs full scan |
 | `churn_compaction` | steady-state insert+delete churn with the incremental compaction loop holding the dead-row bound |
 | `blobs_pitr` | multi-chunk 24 MiB blobs: put/get bandwidth, latest reads vs point-in-time historical reads |
 | `types_crud` | full-type CRUD over int/bool/blob/link/dict/set properties |
@@ -75,4 +75,4 @@ Highlights from the notes lines:
   kept dead rows under its bound during the run — the scenario fails loudly
   if it doesn't.
 - Free-list and setLength counters (`fl_*`, `setlength_*`) come from
-  measurement-only counters on the Db and never affect behavior.
+  measurement-only counters on the Database and never affect behavior.

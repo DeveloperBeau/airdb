@@ -4,29 +4,29 @@ const migrations = @import("migrations.zig");
 const catalog = @import("catalog.zig");
 const objects = @import("../records/objects.zig");
 const blob = @import("../records/blob.zig");
-const PropKind = catalog.PropKind;
-const PropCount = catalog.PropCount;
+const PropertyKind = catalog.PropertyKind;
+const PropertyCount = catalog.PropertyCount;
 const addProperty = migrations.addProperty;
 const removeProperty = migrations.removeProperty;
 
 const testing = std.testing;
 
-const Db = @import("../database.zig").Db;
+const Database = @import("../database.zig").Database;
 
 const create = catalog.create;
 
-const propCount = catalog.propCount;
+const loadPropertyCount = catalog.loadPropertyCount;
 
 const insert = @import("../records/rows.zig").insert;
 
-const getByPk = @import("../records/rows.zig").getByPk;
+const getByPrimaryKey = @import("../records/rows.zig").getByPrimaryKey;
 
 const getLink = @import("../records/links.zig").getLink;
 
 fn objTmpPath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const u8) ![]const u8 {
-    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const dlen = try tmp.dir.realPath(testing.io, &path_buf);
-    return std.fs.path.join(allocator, &.{ path_buf[0..dlen], name });
+    var pathBuffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dlen = try tmp.dir.realPath(testing.io, &pathBuffer);
+    return std.fs.path.join(allocator, &.{ pathBuffer[0..dlen], name });
 }
 
 test "addProperty backfills the default for existing rows" {
@@ -34,18 +34,18 @@ test "addProperty backfills the default for existing rows" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "mig1_backfill.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
-    // start with pk + one value
-    var cat = try create(&w, 2);
-    cat = (try insert(&w, cat, &.{ 1, 10 })).cat;
-    cat = (try insert(&w, cat, &.{ 2, 20 })).cat;
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
+    // start with primaryKey + one value
+    var catalogRef = try create(&w, 2);
+    catalogRef = (try insert(&w, catalogRef, &.{ 1, 10 })).catalogRef;
+    catalogRef = (try insert(&w, catalogRef, &.{ 2, 20 })).catalogRef;
     // add a third int property defaulting to 7
-    cat = try addProperty(&w, cat, .{ .kind = .int }, 7);
-    try testing.expectEqual(@as(PropCount, 3), try propCount(&w, cat));
+    catalogRef = try addProperty(&w, catalogRef, .{ .kind = .int }, 7);
+    try testing.expectEqual(@as(PropertyCount, 3), try loadPropertyCount(&w, catalogRef));
     var out: [3]u64 = undefined;
-    _ = (try getByPk(&w, cat, 1, &out)).?;
+    _ = (try getByPrimaryKey(&w, catalogRef, 1, &out)).?;
     try testing.expectEqual(@as(u64, 10), out[1]);
     try testing.expectEqual(@as(u64, 7), out[2]); // backfilled
     w.deinit();
@@ -56,17 +56,17 @@ test "addProperty: new inserts supply the added property" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "mig1_newinsert.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
-    var cat = try create(&w, 2);
-    cat = (try insert(&w, cat, &.{ 1, 10 })).cat;
-    cat = (try insert(&w, cat, &.{ 2, 20 })).cat;
-    cat = try addProperty(&w, cat, .{ .kind = .int }, 7);
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
+    var catalogRef = try create(&w, 2);
+    catalogRef = (try insert(&w, catalogRef, &.{ 1, 10 })).catalogRef;
+    catalogRef = (try insert(&w, catalogRef, &.{ 2, 20 })).catalogRef;
+    catalogRef = try addProperty(&w, catalogRef, .{ .kind = .int }, 7);
     // new inserts provide all three
-    cat = (try insert(&w, cat, &.{ 3, 30, 99 })).cat;
+    catalogRef = (try insert(&w, catalogRef, &.{ 3, 30, 99 })).catalogRef;
     var out: [3]u64 = undefined;
-    _ = (try getByPk(&w, cat, 3, &out)).?;
+    _ = (try getByPrimaryKey(&w, catalogRef, 3, &out)).?;
     try testing.expectEqual(@as(u64, 99), out[2]);
     w.deinit();
 }
@@ -76,20 +76,20 @@ test "removeProperty drops a property and shifts the rest" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "mig1_remove.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
-    var cat = try create(&w, 2);
-    cat = (try insert(&w, cat, &.{ 1, 10 })).cat;
-    cat = try addProperty(&w, cat, .{ .kind = .int }, 7);
-    cat = (try insert(&w, cat, &.{ 3, 30, 99 })).cat;
-    // remove the middle property (index 1); now pk + the added prop
-    cat = try removeProperty(&w, cat, 1);
-    try testing.expectEqual(@as(PropCount, 2), try propCount(&w, cat));
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
+    var catalogRef = try create(&w, 2);
+    catalogRef = (try insert(&w, catalogRef, &.{ 1, 10 })).catalogRef;
+    catalogRef = try addProperty(&w, catalogRef, .{ .kind = .int }, 7);
+    catalogRef = (try insert(&w, catalogRef, &.{ 3, 30, 99 })).catalogRef;
+    // remove the middle property (index 1); now primaryKey + the added property
+    catalogRef = try removeProperty(&w, catalogRef, 1);
+    try testing.expectEqual(@as(PropertyCount, 2), try loadPropertyCount(&w, catalogRef));
     var out2: [2]u64 = undefined;
-    _ = (try getByPk(&w, cat, 3, &out2)).?;
-    try testing.expectEqual(@as(u64, 3), out2[0]); // pk preserved
-    try testing.expectEqual(@as(u64, 99), out2[1]); // the formerly-third prop shifted to index 1
+    _ = (try getByPrimaryKey(&w, catalogRef, 3, &out2)).?;
+    try testing.expectEqual(@as(u64, 3), out2[0]); // primaryKey preserved
+    try testing.expectEqual(@as(u64, 99), out2[1]); // the formerly-third property shifted to index 1
     w.deinit();
 }
 
@@ -101,28 +101,28 @@ test "addProperty(indexed) backfills the value index for existing rows" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "mig_vidx.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
     {
-        var w = try db.beginWrite();
-        var cat = try create(&w, 2);
-        cat = (try insert(&w, cat, &.{ 1, 10 })).cat;
-        cat = (try insert(&w, cat, &.{ 2, 20 })).cat;
-        cat = try addProperty(&w, cat, .{ .kind = .int, .indexed = true }, 7);
+        var w = try database.beginWrite();
+        var catalogRef = try create(&w, 2);
+        catalogRef = (try insert(&w, catalogRef, &.{ 1, 10 })).catalogRef;
+        catalogRef = (try insert(&w, catalogRef, &.{ 2, 20 })).catalogRef;
+        catalogRef = try addProperty(&w, catalogRef, .{ .kind = .int, .indexed = true }, 7);
         // A post-migration insert supplies its own value.
-        cat = (try insert(&w, cat, &.{ 3, 30, 9 })).cat;
-        w.setRoot(cat);
+        catalogRef = (try insert(&w, catalogRef, &.{ 3, 30, 9 })).catalogRef;
+        w.setRoot(catalogRef);
         _ = try w.commit();
     }
-    try verification.verifyIntegrity(&db);
-    var r = try db.beginRead();
+    try verification.verifyIntegrity(&database);
+    var r = try database.beginRead();
     defer r.end();
     var hits = std.ArrayList(u64).empty;
     defer hits.deinit(testing.allocator);
-    try query.where(&r, r.root(), &.{.{ .prop = 2, .op = .eq, .value = 7 }}, &hits, testing.allocator);
+    try query.where(&r, r.root(), &.{.{ .property = 2, .operator = .eq, .value = 7 }}, &hits, testing.allocator);
     try testing.expectEqual(@as(usize, 2), hits.items.len); // both pre-migration rows
     hits.clearRetainingCapacity();
-    try query.where(&r, r.root(), &.{.{ .prop = 2, .op = .eq, .value = 9 }}, &hits, testing.allocator);
+    try query.where(&r, r.root(), &.{.{ .property = 2, .operator = .eq, .value = 9 }}, &hits, testing.allocator);
     try testing.expectEqual(@as(usize, 1), hits.items.len);
 }
 
@@ -137,25 +137,25 @@ test "addProperty(link_set) leaves pre-migration rows deletable" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "mig_collroot.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
     {
-        var w = try db.beginWrite();
+        var w = try database.beginWrite();
         var dir = try typedir.createTypes(&w, &.{&.{.{ .kind = .int }}}, &.{false});
         dir = (try typeRouting.insert(&w, dir, 0, &.{.{ .int = 1 }})).dir;
         // Migrate: add a link_set property targeting the same type.
-        const cat = try typedir.catalogRef(&w, dir, 0);
-        const new_cat = try addProperty(&w, cat, .{ .kind = .link_set, .link_target = 0 }, 0);
-        dir = try typedir.setCatalogRef(&w, dir, 0, new_cat);
+        const catalogRef = try typedir.catalogRef(&w, dir, 0);
+        const newCatalog = try addProperty(&w, catalogRef, .{ .kind = .link_set, .link_target = 0 }, 0);
+        dir = try typedir.setCatalogRef(&w, dir, 0, newCatalog);
         w.setRoot(dir);
         _ = try w.commit();
     }
-    try verification.verifyIntegrity(&db); // the audit must not trip over the backfilled roots
+    try verification.verifyIntegrity(&database); // the audit must not trip over the backfilled roots
     {
-        var w = try db.beginWrite();
+        var w = try database.beginWrite();
         var out: [2]catalog.Value = undefined;
-        const ver = (try typeRouting.get(&w, w.new_root, 0, 1, &out)).?;
-        const res = try typeRouting.deleteNullifyX(&w, w.new_root, 0, 1, ver);
+        const version = (try typeRouting.get(&w, w.new_root, 0, 1, &out)).?;
+        const res = try typeRouting.deleteNullifyX(&w, w.new_root, 0, 1, version);
         try testing.expect(res == .ok); // previously error.BadRef
         w.setRoot(res.ok);
         _ = try w.commit();
@@ -167,12 +167,12 @@ test "addProperty rejects an indexed collection" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "mig_idxcoll.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
     defer w.deinit();
-    const cat = try create(&w, 1);
-    try testing.expectError(error.Unsupported, addProperty(&w, cat, .{ .kind = .list, .indexed = true }, 0));
+    const catalogRef = try create(&w, 1);
+    try testing.expectError(error.Unsupported, addProperty(&w, catalogRef, .{ .kind = .list, .indexed = true }, 0));
 }
 
 test "addProperty link type gets a backlink index" {
@@ -180,17 +180,17 @@ test "addProperty link type gets a backlink index" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "mig2.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
-    var w = try db.beginWrite();
-    var cat = try create(&w, 1); // just a pk
-    cat = (try insert(&w, cat, &.{1})).cat;
-    cat = try addProperty(&w, cat, .{ .kind = .link }, 0); // 0 == null link
-    const v = try catalog.loadCatalog(&w, cat);
-    try testing.expectEqual(PropKind.link, v.kind(1));
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var w = try database.beginWrite();
+    var catalogRef = try create(&w, 1); // just a primaryKey
+    catalogRef = (try insert(&w, catalogRef, &.{1})).catalogRef;
+    catalogRef = try addProperty(&w, catalogRef, .{ .kind = .link }, 0); // 0 == null link
+    const v = try catalog.loadCatalog(&w, catalogRef);
+    try testing.expectEqual(PropertyKind.link, v.kind(1));
     try testing.expect(v.backlinkRef(1) != 0);
     // a row created before the migration reads as a null link
-    try testing.expectEqual(@as(?u64, null), try getLink(&w, cat, 1, 1));
+    try testing.expectEqual(@as(?u64, null), try getLink(&w, catalogRef, 1, 1));
     w.deinit();
 }
 
@@ -203,42 +203,42 @@ test "addProperty copies a blob default per row instead of sharing one node" {
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "blobdefault.airdb");
     defer testing.allocator.free(path);
-    var db = try Db.create(testing.allocator, path);
-    defer db.deinit();
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
 
     {
-        var w = try db.beginWrite();
-        var cat = try catalog.createTyped(&w, &.{ .int, .int });
-        cat = (try insert(&w, cat, &.{ 1, 10 })).cat;
-        cat = (try insert(&w, cat, &.{ 2, 20 })).cat;
+        var w = try database.beginWrite();
+        var catalogRef = try catalog.createTyped(&w, &.{ .int, .int });
+        catalogRef = (try insert(&w, catalogRef, &.{ 1, 10 })).catalogRef;
+        catalogRef = (try insert(&w, catalogRef, &.{ 2, 20 })).catalogRef;
         const dflt = try blob.put(&w, "default-bytes");
-        cat = try addProperty(&w, cat, .{ .kind = .blob }, dflt);
-        w.setRoot(cat);
+        catalogRef = try addProperty(&w, catalogRef, .{ .kind = .blob }, dflt);
+        w.setRoot(catalogRef);
         _ = try w.commit();
     }
-    var w = try db.beginWrite();
+    var w = try database.beginWrite();
     defer w.deinit();
     // Every row reads the default bytes, but from its OWN node.
     var raw1: [3]u64 = undefined;
     var raw2: [3]u64 = undefined;
-    const v1 = (try getByPk(&w, w.new_root, 1, &raw1)).?;
-    const v2 = (try getByPk(&w, w.new_root, 2, &raw2)).?;
+    const v1 = (try getByPrimaryKey(&w, w.new_root, 1, &raw1)).?;
+    const v2 = (try getByPrimaryKey(&w, w.new_root, 2, &raw2)).?;
     try testing.expectEqualStrings("default-bytes", try blob.get(&w, raw1[2]));
     try testing.expectEqualStrings("default-bytes", try blob.get(&w, raw2[2]));
     try testing.expect(raw1[2] != raw2[2]);
     // Deleting both rows must not free any extent twice.
-    var cat = w.new_root;
-    switch (try objects.deleteTyped(&w, cat, 1, v1)) {
-        .ok => |c| cat = c,
+    var catalogRef = w.new_root;
+    switch (try objects.deleteTyped(&w, catalogRef, 1, v1)) {
+        .ok => |c| catalogRef = c,
         else => return error.TestUnexpectedResult,
     }
-    switch (try objects.deleteTyped(&w, cat, 2, v2)) {
-        .ok => |c| cat = c,
+    switch (try objects.deleteTyped(&w, catalogRef, 2, v2)) {
+        .ok => |c| catalogRef = c,
         else => return error.TestUnexpectedResult,
     }
     var seen = std.AutoHashMap(u64, void).init(testing.allocator);
     defer seen.deinit();
-    for (w.txn_reuse.extents.items) |e| {
+    for (w.transactionReuse.extents.items) |e| {
         const gop = try seen.getOrPut(e.offset);
         try testing.expect(!gop.found_existing); // duplicate free
     }

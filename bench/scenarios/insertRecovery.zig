@@ -2,7 +2,7 @@
 // measure the cost of closing and reopening the database (the recovery signal).
 //
 // There is no crash-injection hook in the public API, so "recovery" here is the
-// honest reopen path: Db.open re-reads the header and remaps the file, and the
+// honest reopen path: Database.open re-reads the header and remaps the file, and the
 // first beginRead refreshes to the latest committed version and pins it. Both
 // are timed and reported in Result.note, labeled for what they actually are.
 
@@ -11,7 +11,7 @@ const airdb = @import("airdb");
 const harness = @import("../harness.zig");
 
 const Io = std.Io;
-const Ref = airdb.Ref;
+const Reference = airdb.Reference;
 const catalog = airdb.catalog;
 const rows = airdb.rows;
 
@@ -41,12 +41,12 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     const pf_before = airdb.pageFaults();
     const insert_start = nowNs(io);
 
-    var db = try airdb.Db.create(alloc, path);
-    errdefer db.deinit();
+    var database = try airdb.Database.create(alloc, path);
+    errdefer database.deinit();
 
-    // Simple two-int type: {pk, value}. The first value is the primary key.
-    var cat: Ref = blk: {
-        var w = try db.beginWrite();
+    // Simple two-int type: {primaryKey, value}. The first value is the primary key.
+    var catalogRef: Reference = blk: {
+        var w = try database.beginWrite();
         const c = try catalog.create(&w, 2);
         w.setRoot(c);
         _ = try w.commit();
@@ -56,15 +56,15 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     var inserted: usize = 0;
     while (inserted < ctx.n) {
         const this_batch = @min(batch_size, ctx.n - inserted);
-        var w = try db.beginWrite();
-        cat = db.active_root; // reload the committed catalog ref
+        var w = try database.beginWrite();
+        catalogRef = database.active_root; // reload the committed catalog ref
         var j: usize = 0;
         while (j < this_batch) : (j += 1) {
-            const pk: u64 = inserted + j;
-            const r = try rows.insert(&w, cat, &.{ pk, pk });
-            cat = r.cat;
+            const primaryKey: u64 = inserted + j;
+            const r = try rows.insert(&w, catalogRef, &.{ primaryKey, primaryKey });
+            catalogRef = r.catalogRef;
         }
-        w.setRoot(cat);
+        w.setRoot(catalogRef);
         _ = try w.commit();
         inserted += this_batch;
     }
@@ -75,13 +75,13 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     const majflt_delta = pf_after.major - pf_before.major;
 
     // --- Recovery signal: close, reopen, first read --------------------------
-    const file_bytes = try db.fileSize();
-    const logical_bytes = db.logicalSize();
-    const m = db.metrics(); // measurement-only commit/file-growth cost counters
-    db.deinit();
+    const file_bytes = try database.fileSize();
+    const logical_bytes = database.logicalSize();
+    const m = database.metrics(); // measurement-only commit/file-growth cost counters
+    database.deinit();
 
     const reopen_start = nowNs(io);
-    var reopened = try airdb.Db.open(alloc, path);
+    var reopened = try airdb.Database.open(alloc, path);
     defer reopened.deinit();
     const reopen_ns: u64 = @intCast(nowNs(io) - reopen_start);
 
@@ -89,9 +89,9 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     // forcing the freshly reopened mapping live. Time a single lookup with it.
     const read_start = nowNs(io);
     var r = try reopened.beginRead();
-    cat = r.root();
+    catalogRef = r.root();
     var out: [2]u64 = undefined;
-    _ = try rows.getByPk(&r, cat, 0, &out);
+    _ = try rows.getByPrimaryKey(&r, catalogRef, 0, &out);
     const first_read_ns: u64 = @intCast(nowNs(io) - read_start);
     r.end();
 

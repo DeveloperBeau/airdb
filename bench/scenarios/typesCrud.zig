@@ -3,7 +3,7 @@
 // each kind, then the four CRUD phases (create / read / update / delete) are run
 // over a capped dataset and their per-op latencies folded into a single mix.
 //
-// Prop layout (single catalog, type id 0 so the link can be a self-link):
+// Property layout (single catalog, type id 0 so the link can be a self-link):
 //   0  int   primary key
 //   1  int   a plain int value
 //   2  int   a bool stored as 0/1 (the engine has no distinct bool kind, so a
@@ -11,15 +11,15 @@
 //   3  blob  a 32-byte inline string
 //   4  link  self-link (link_target = 0) to another row's object key, or null
 //   5  dict  a few string -> int entries
-//   6  set   a few ints (elem = int)
-//   7  set   a few byte members (elem = blob): the set-of-blob kind
+//   6  set   a few ints (element = int)
+//   7  set   a few byte members (element = blob): the set-of-blob kind
 //
 // Kinds exercised: int, bool (as int), blob, link, dict, set, set_blob.
 // Omitted by design: list and link_set. The task's kind list does not include
 // them, and every other supported kind is covered above, so nothing is faked.
 //
 // Update phase note: Objects.updateTyped is `unreachable` for collection-bearing
-// props, so a full-row typed update cannot run on this multi-kind type. The
+// properties, so a full-row typed update cannot run on this multi-kind type. The
 // update phase instead mutates through the per-property collection mutators and
 // the link setter (setAddInt + dictPut + setLink), which are the engine's real
 // update path for those kinds and each bump the row version.
@@ -29,7 +29,7 @@ const airdb = @import("airdb");
 const harness = @import("../harness.zig");
 
 const Io = std.Io;
-const Ref = airdb.Ref;
+const Reference = airdb.Reference;
 const catalog = airdb.catalog;
 const objects = airdb.objects;
 const rawRows = airdb.rows;
@@ -57,7 +57,7 @@ const p_link = 4;
 const p_dict = 5;
 const p_set_int = 6;
 const p_set_blob = 7;
-const prop_count = 8;
+const propertyCount = 8;
 
 inline fn sysIo() Io {
     return std.Io.Threaded.global_single_threaded.io();
@@ -87,23 +87,23 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     defer alloc.free(path);
     defer harness.removeScratch(ctx.*, path);
 
-    var db = try airdb.Db.create(alloc, path);
-    errdefer db.deinit();
+    var database = try airdb.Database.create(alloc, path);
+    errdefer database.deinit();
 
     // One type carrying a property of each exercised kind.
     {
-        var w = try db.beginWrite();
-        const cat = try catalog.createDefs(&w, &.{
-            .{ .kind = .int }, // 0 pk
+        var w = try database.beginWrite();
+        const catalogRef = try catalog.createFromDefinitions(&w, &.{
+            .{ .kind = .int }, // 0 primaryKey
             .{ .kind = .int }, // 1 int
             .{ .kind = .int }, // 2 bool (0/1)
             .{ .kind = .blob }, // 3 string
             .{ .kind = .link, .link_target = 0 }, // 4 self-link
             .{ .kind = .dict }, // 5 dict
-            .{ .kind = .set, .elem = .int }, // 6 set of int
-            .{ .kind = .set, .elem = .blob }, // 7 set of blob
+            .{ .kind = .set, .element = .int }, // 6 set of int
+            .{ .kind = .set, .element = .blob }, // 7 set of blob
         });
-        w.setRoot(cat);
+        w.setRoot(catalogRef);
         _ = try w.commit();
     }
 
@@ -126,45 +126,45 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         var inserted: usize = 0;
         while (inserted < rows) {
             const this_batch = @min(batch_size, rows - inserted);
-            var w = try db.beginWrite();
-            var cat = w.new_root;
+            var w = try database.beginWrite();
+            var catalogRef = w.new_root;
             var j: usize = 0;
             while (j < this_batch) : (j += 1) {
-                const pk: u64 = inserted + j;
-                // okeys are assigned 0,1,2,... so okey == pk for a fresh insert.
-                var rng: u64 = pk +% 0x9E3779B97F4A7C15;
+                const primaryKey: u64 = inserted + j;
+                // objectKeys are assigned 0,1,2,... so objectKey == primaryKey for a fresh insert.
+                var rng: u64 = primaryKey +% 0x9E3779B97F4A7C15;
                 const iv = xorshift(&rng);
 
-                var blob_buf: [32]u8 = undefined;
-                for (&blob_buf, 0..) |*b, k| b.* = @truncate(iv +% k);
+                var blobBuffer: [32]u8 = undefined;
+                for (&blobBuffer, 0..) |*b, k| b.* = @truncate(iv +% k);
 
                 const dict_entries = [_]catalog.DictEntry{
-                    .{ .key = "alpha", .val = iv & 0xffff },
-                    .{ .key = "beta", .val = (iv >> 16) & 0xffff },
-                    .{ .key = "gamma", .val = (iv >> 32) & 0xffff },
+                    .{ .key = "alpha", .value = iv & 0xffff },
+                    .{ .key = "beta", .value = (iv >> 16) & 0xffff },
+                    .{ .key = "gamma", .value = (iv >> 32) & 0xffff },
                 };
                 const set_ints = [_]u64{ iv % 1000, (iv >> 10) % 1000, (iv >> 20) % 1000 };
                 const set_blobs = [_][]const u8{ "m0", "m1", "m2" };
 
-                const row = [prop_count]Value{
-                    .{ .int = pk },
+                const row = [propertyCount]Value{
+                    .{ .int = primaryKey },
                     .{ .int = iv },
-                    .{ .int = pk & 1 }, // bool
-                    .{ .bytes = &blob_buf },
-                    .{ .link = if (pk == 0) null else pk - 1 }, // self-link to prior okey
+                    .{ .int = primaryKey & 1 }, // bool
+                    .{ .bytes = &blobBuffer },
+                    .{ .link = if (primaryKey == 0) null else primaryKey - 1 }, // self-link to prior objectKey
                     .{ .dict_int = &dict_entries },
                     .{ .set_int = &set_ints },
                     .{ .set_blob = &set_blobs },
                 };
 
                 const t0 = nowNs(io);
-                const r = try objects.insertTyped(&w, cat, &row);
+                const r = try objects.insertTyped(&w, catalogRef, &row);
                 const dt: u64 = @intCast(nowNs(io) - t0);
-                cat = r.cat;
+                catalogRef = r.catalogRef;
                 try create_lat.add(alloc, dt);
                 try combined.add(alloc, dt);
             }
-            w.setRoot(cat);
+            w.setRoot(catalogRef);
             _ = try w.commit();
             inserted += this_batch;
         }
@@ -179,22 +179,22 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     const update_stride = @max(@as(usize, 1), rows / update_n);
     const delete_stride = @max(@as(usize, 1), rows / delete_n);
 
-    // --- READ phase: materialize every prop kind -----------------------------
+    // --- READ phase: materialize every property kind -----------------------------
     {
         const phase_start = nowNs(io);
-        var r = try db.beginRead();
-        const cat = r.root();
-        var out: [prop_count]Value = undefined;
+        var r = try database.beginRead();
+        const catalogRef = r.root();
+        var out: [propertyCount]Value = undefined;
         var k: usize = 0;
         while (k < read_n) : (k += 1) {
-            const pk: u64 = (k * read_stride) % rows;
+            const primaryKey: u64 = (k * read_stride) % rows;
             const t0 = nowNs(io);
-            _ = try objects.getTyped(&r, cat, pk, &out); // int/bool/blob/link
-            _ = try collections.dictCount(&r, cat, pk, p_dict);
-            _ = try collections.dictGet(&r, cat, pk, p_dict, "alpha");
-            _ = try collections.setCountInt(&r, cat, pk, p_set_int);
-            _ = try collections.setCountBlob(&r, cat, pk, p_set_blob);
-            _ = try collections.setContainsBlob(&r, cat, pk, p_set_blob, "m1");
+            _ = try objects.getTyped(&r, catalogRef, primaryKey, &out); // int/bool/blob/link
+            _ = try collections.dictCount(&r, catalogRef, primaryKey, p_dict);
+            _ = try collections.dictGet(&r, catalogRef, primaryKey, p_dict, "alpha");
+            _ = try collections.setCountInt(&r, catalogRef, primaryKey, p_set_int);
+            _ = try collections.setCountBlob(&r, catalogRef, primaryKey, p_set_blob);
+            _ = try collections.setContainsBlob(&r, catalogRef, primaryKey, p_set_blob, "m1");
             const dt: u64 = @intCast(nowNs(io) - t0);
             try read_lat.add(alloc, dt);
             try combined.add(alloc, dt);
@@ -209,21 +209,21 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         var done: usize = 0;
         while (done < update_n) {
             const this_batch = @min(batch_size, update_n - done);
-            var w = try db.beginWrite();
-            var cat = w.new_root;
+            var w = try database.beginWrite();
+            var catalogRef = w.new_root;
             var j: usize = 0;
             while (j < this_batch) : (j += 1) {
-                const pk: u64 = ((done + j) * update_stride) % rows;
-                const target: u64 = (pk + 7) % rows;
+                const primaryKey: u64 = ((done + j) * update_stride) % rows;
+                const target: u64 = (primaryKey + 7) % rows;
                 const t0 = nowNs(io);
-                cat = try collections.setAddInt(&w, cat, pk, p_set_int, 1_000_000 + pk);
-                cat = try collections.dictPut(&w, cat, pk, p_dict, "delta", pk);
-                cat = try links.setLink(&w, cat, pk, p_link, target);
+                catalogRef = try collections.setAddInt(&w, catalogRef, primaryKey, p_set_int, 1_000_000 + primaryKey);
+                catalogRef = try collections.dictPut(&w, catalogRef, primaryKey, p_dict, "delta", primaryKey);
+                catalogRef = try links.setLink(&w, catalogRef, primaryKey, p_link, target);
                 const dt: u64 = @intCast(nowNs(io) - t0);
                 try update_lat.add(alloc, dt);
                 try combined.add(alloc, dt);
             }
-            w.setRoot(cat);
+            w.setRoot(catalogRef);
             _ = try w.commit();
             done += this_batch;
         }
@@ -237,19 +237,19 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         var done: usize = 0;
         while (done < delete_n) {
             const this_batch = @min(batch_size, delete_n - done);
-            var w = try db.beginWrite();
-            var cat = w.new_root;
-            var raw: [prop_count]u64 = undefined;
+            var w = try database.beginWrite();
+            var catalogRef = w.new_root;
+            var raw: [propertyCount]u64 = undefined;
             var j: usize = 0;
             while (j < this_batch) : (j += 1) {
-                const pk: u64 = ((done + j) * delete_stride) % rows;
-                const ver = (try rawRows.getByPk(&w, cat, pk, &raw)) orelse continue;
+                const primaryKey: u64 = ((done + j) * delete_stride) % rows;
+                const version = (try rawRows.getByPrimaryKey(&w, catalogRef, primaryKey, &raw)) orelse continue;
                 const t0 = nowNs(io);
-                const dres = try objects.deleteTyped(&w, cat, pk, ver);
+                const dres = try objects.deleteTyped(&w, catalogRef, primaryKey, version);
                 const dt: u64 = @intCast(nowNs(io) - t0);
                 switch (dres) {
                     .ok => |c| {
-                        cat = c;
+                        catalogRef = c;
                         deleted += 1;
                         try delete_lat.add(alloc, dt);
                         try combined.add(alloc, dt);
@@ -257,15 +257,15 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
                     else => {},
                 }
             }
-            w.setRoot(cat);
+            w.setRoot(catalogRef);
             _ = try w.commit();
             done += this_batch;
         }
         total_ns += @intCast(nowNs(io) - phase_start);
     }
 
-    const file_bytes = try db.fileSize();
-    const logical_bytes = db.logicalSize();
+    const file_bytes = try database.fileSize();
+    const logical_bytes = database.logicalSize();
 
     const ops: u64 = @as(u64, rows) + read_n + update_n + deleted;
 
@@ -273,10 +273,10 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         alloc,
         "create_p50_us={d:.1} read_p50_us={d:.1} update_p50_us={d:.1} delete_p50_us={d:.1} rows={d} kinds=int,bool,blob,link,dict,set,set_blob",
         .{
-            @as(f64, @floatFromInt(create_lat.pct(50))) / 1000.0,
-            @as(f64, @floatFromInt(read_lat.pct(50))) / 1000.0,
-            @as(f64, @floatFromInt(update_lat.pct(50))) / 1000.0,
-            @as(f64, @floatFromInt(delete_lat.pct(50))) / 1000.0,
+            @as(f64, @floatFromInt(create_lat.percentile(50))) / 1000.0,
+            @as(f64, @floatFromInt(read_lat.percentile(50))) / 1000.0,
+            @as(f64, @floatFromInt(update_lat.percentile(50))) / 1000.0,
+            @as(f64, @floatFromInt(delete_lat.percentile(50))) / 1000.0,
             rows,
         },
     );
@@ -285,15 +285,15 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         .name = name,
         .ops = ops,
         .wall_ns = total_ns,
-        .p50_ns = combined.pct(50),
-        .p99_ns = combined.pct(99),
-        .max_ns = combined.pct(100),
+        .p50_ns = combined.percentile(50),
+        .p99_ns = combined.percentile(99),
+        .max_ns = combined.percentile(100),
         .file_bytes = file_bytes,
         .logical_bytes = logical_bytes,
         .peak_rss_bytes = airdb.peakResidentBytes(),
         .note = note,
     };
 
-    db.deinit();
+    database.deinit();
     return result;
 }

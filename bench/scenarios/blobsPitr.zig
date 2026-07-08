@@ -21,7 +21,7 @@ const airdb = @import("airdb");
 const harness = @import("../harness.zig");
 
 const Io = std.Io;
-const Ref = airdb.Ref;
+const Reference = airdb.Reference;
 const blob = airdb.blob;
 const catalog = airdb.catalog;
 const rows = airdb.rows;
@@ -36,7 +36,7 @@ const blob_count: usize = 8;
 
 // --- Part B knobs -----------------------------------------------------------
 // Rows committed per write transaction during the (untimed) insert phase. The
-// first batch establishes the historical version, so only pks in [0, pitr_batch)
+// first batch establishes the historical version, so only primaryKeys in [0, pitr_batch)
 // are guaranteed to exist at v_old; lookups stay inside that range.
 const pitr_batch: usize = 100;
 const pitr_rows: usize = 1_000;
@@ -68,22 +68,22 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     defer harness.removeScratch(ctx.*, blob_path);
 
     // One deterministic 24 MiB source buffer, reused for every blob.
-    const buf = try alloc.alloc(u8, blob_bytes);
-    defer alloc.free(buf);
-    for (buf, 0..) |*b, i| b.* = @truncate(i *% 2654435761);
+    const buffer = try alloc.alloc(u8, blob_bytes);
+    defer alloc.free(buffer);
+    for (buffer, 0..) |*b, i| b.* = @truncate(i *% 2654435761);
 
-    var db = try airdb.Db.create(alloc, blob_path);
-    errdefer db.deinit();
+    var database = try airdb.Database.create(alloc, blob_path);
+    errdefer database.deinit();
 
-    var refs: [blob_count]Ref = undefined;
+    var refs: [blob_count]Reference = undefined;
 
     // PUT: one blob per write transaction.
     var put_bytes: u64 = 0;
     const put_start = nowNs(io);
     var i: usize = 0;
     while (i < blob_count) : (i += 1) {
-        var w = try db.beginWrite();
-        refs[i] = try blob.put(&w, buf);
+        var w = try database.beginWrite();
+        refs[i] = try blob.put(&w, buffer);
         _ = try w.commit();
         put_bytes += blob_bytes;
     }
@@ -92,7 +92,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     // GET: read every blob back in a single read snapshot.
     var get_bytes: u64 = 0;
     const get_start = nowNs(io);
-    var rd = try db.beginRead();
+    var rd = try database.beginRead();
     i = 0;
     while (i < blob_count) : (i += 1) {
         const out = try blob.getAlloc(&rd, refs[i], alloc);
@@ -101,7 +101,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         // Correctness guard on the last blob: a chunked round-trip that silently
         // dropped or reordered bytes must fail the bench loudly.
         if (i == blob_count - 1) {
-            if (out.len != blob_bytes or out[0] != buf[0] or out[out.len - 1] != buf[buf.len - 1]) {
+            if (out.len != blob_bytes or out[0] != buffer[0] or out[out.len - 1] != buffer[buffer.len - 1]) {
                 return error.BlobRoundTripMismatch;
             }
         }
@@ -109,25 +109,25 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     rd.end();
     const get_ns: u64 = @intCast(nowNs(io) - get_start);
 
-    // Capture the (large) blob-db metrics before closing it.
-    const file_bytes = try db.fileSize();
-    const logical_bytes = db.logicalSize();
-    db.deinit();
+    // Capture the (large) blob-database metrics before closing it.
+    const file_bytes = try database.fileSize();
+    const logical_bytes = database.logicalSize();
+    database.deinit();
 
     // --- Part B: point-in-time read overhead --------------------------------
     const pitr_path = try harness.scratchPath(ctx.*, name ++ "-pitr.airdb");
     defer alloc.free(pitr_path);
     defer harness.removeScratch(ctx.*, pitr_path);
 
-    var pdb = try airdb.Db.create(alloc, pitr_path);
-    defer pdb.deinit();
+    var pitrDatabase = try airdb.Database.create(alloc, pitr_path);
+    defer pitrDatabase.deinit();
 
     // Retain everything so the early version's nodes stay readable.
-    pdb.setRetainVersions(std.math.maxInt(u64));
+    pitrDatabase.setRetainVersions(std.math.maxInt(u64));
 
-    // Two-int type {pk, value}; property 0 is the primary key.
+    // Two-int type {primaryKey, value}; property 0 is the primary key.
     {
-        var w = try pdb.beginWrite();
+        var w = try pitrDatabase.beginWrite();
         const c = try catalog.create(&w, 2);
         w.setRoot(c);
         _ = try w.commit();
@@ -138,71 +138,71 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     var inserted: usize = 0;
     while (inserted < pitr_rows) {
         const this_batch = @min(pitr_batch, pitr_rows - inserted);
-        var w = try pdb.beginWrite();
-        var cat = pdb.active_root;
+        var w = try pitrDatabase.beginWrite();
+        var catalogRef = pitrDatabase.active_root;
         var j: usize = 0;
         while (j < this_batch) : (j += 1) {
-            const pk: u64 = inserted + j;
-            const r = try rows.insert(&w, cat, &.{ pk, pk *% 7 });
-            cat = r.cat;
+            const primaryKey: u64 = inserted + j;
+            const r = try rows.insert(&w, catalogRef, &.{ primaryKey, primaryKey *% 7 });
+            catalogRef = r.catalogRef;
         }
-        w.setRoot(cat);
+        w.setRoot(catalogRef);
         const v = try w.commit();
-        if (inserted == 0) v_old = v; // pks [0, pitr_batch) exist from here on
+        if (inserted == 0) v_old = v; // primaryKeys [0, pitr_batch) exist from here on
         inserted += this_batch;
     }
 
-    // Deterministic xorshift64 over a fixed seed; pk stays in [0, pitr_batch) so
+    // Deterministic xorshift64 over a fixed seed; primaryKey stays in [0, pitr_batch) so
     // every lookup resolves at both the latest and the historical version.
-    const pk_mod: u64 = pitr_batch;
+    const primaryKeyModulus: u64 = pitr_batch;
 
     // Latest-snapshot lookups.
     var lat_latest = harness.Latencies.init();
     defer lat_latest.deinit(alloc);
     {
-        var rl = try pdb.beginRead();
-        const cat = rl.root();
+        var rl = try pitrDatabase.beginRead();
+        const catalogRef = rl.root();
         var x: u64 = 0x9E3779B97F4A7C15;
         var k: usize = 0;
         while (k < pitr_lookups) : (k += 1) {
             x ^= x << 13;
             x ^= x >> 7;
             x ^= x << 17;
-            const pk: u64 = x % pk_mod;
+            const primaryKey: u64 = x % primaryKeyModulus;
             var out: [2]u64 = undefined;
             const t0 = nowNs(io);
-            _ = try rows.getByPk(&rl, cat, pk, &out);
+            _ = try rows.getByPrimaryKey(&rl, catalogRef, primaryKey, &out);
             const dt: u64 = @intCast(nowNs(io) - t0);
             try lat_latest.add(alloc, dt);
         }
         rl.end();
     }
 
-    // Historical-snapshot lookups at v_old (same pk sequence).
+    // Historical-snapshot lookups at v_old (same primaryKey sequence).
     var lat_hist = harness.Latencies.init();
     defer lat_hist.deinit(alloc);
     {
-        var rh = try pdb.beginReadAt(v_old);
-        const cat = rh.root();
+        var rh = try pitrDatabase.beginReadAt(v_old);
+        const catalogRef = rh.root();
         var x: u64 = 0x9E3779B97F4A7C15;
         var k: usize = 0;
         while (k < pitr_lookups) : (k += 1) {
             x ^= x << 13;
             x ^= x >> 7;
             x ^= x << 17;
-            const pk: u64 = x % pk_mod;
+            const primaryKey: u64 = x % primaryKeyModulus;
             var out: [2]u64 = undefined;
             const t0 = nowNs(io);
-            _ = try rows.getByPk(&rh, cat, pk, &out);
+            _ = try rows.getByPrimaryKey(&rh, catalogRef, primaryKey, &out);
             const dt: u64 = @intCast(nowNs(io) - t0);
             try lat_hist.add(alloc, dt);
         }
         rh.end();
     }
 
-    const latest_p50 = lat_latest.pct(50);
-    const hist_p50 = lat_hist.pct(50);
-    const overhead_pct: f64 = if (latest_p50 == 0)
+    const latest_p50 = lat_latest.percentile(50);
+    const hist_p50 = lat_hist.percentile(50);
+    const overheadPercent: f64 = if (latest_p50 == 0)
         0
     else
         (@as(f64, @floatFromInt(hist_p50)) - @as(f64, @floatFromInt(latest_p50))) /
@@ -220,7 +220,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
             mibPerSec(get_bytes, get_ns),
             @as(f64, @floatFromInt(latest_p50)) / 1000.0,
             @as(f64, @floatFromInt(hist_p50)) / 1000.0,
-            overhead_pct,
+            overheadPercent,
         },
     );
 
@@ -229,8 +229,8 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         .ops = blob_count,
         .wall_ns = put_ns + get_ns,
         .p50_ns = latest_p50,
-        .p99_ns = lat_latest.pct(99),
-        .max_ns = lat_latest.pct(100),
+        .p99_ns = lat_latest.percentile(99),
+        .max_ns = lat_latest.percentile(100),
         .file_bytes = file_bytes,
         .logical_bytes = logical_bytes,
         .peak_rss_bytes = airdb.peakResidentBytes(),
