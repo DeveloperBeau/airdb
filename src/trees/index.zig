@@ -1,9 +1,9 @@
-// index.zig -- u64-keyed B+tree: the shared core of bTreeCore.zig
-// instantiated with inline numeric keys. The u64 stored in each key slot IS
-// the key, ordered numerically, so key duplication is identity and key
-// freeing is a no-op. See bTreeCore.zig for the transaction capability the
-// `transaction` parameters must satisfy (WriteTransaction in production; ReadTransaction for the
-// read-only subset).
+//! u64-keyed B+tree: the shared core of bTreeCore.zig
+//! instantiated with inline numeric keys. The u64 stored in each key slot IS
+//! the key, ordered numerically, so key duplication is identity and key
+//! freeing is a no-op. See bTreeCore.zig for the transaction capability the
+//! `transaction` parameters must satisfy (WriteTransaction in production; ReadTransaction for the
+//! read-only subset).
 
 const std = @import("std");
 const Reference = @import("../storage/reference.zig").Reference;
@@ -139,11 +139,12 @@ pub const collapseToRoot = bulkBuild.collapseToRoot;
 /// the tree's right edge; only the rightmost path is rebuilt.
 pub const appendRun = bulkBuild.appendRun;
 
-// Visit every key/value pair whose key lies in [lo, hi] in ascending key
-// order, calling onEntry(ctx, key, value) for each. Same recursive descent as
-// forEachEntry, but routes into the child holding lo via childIndexForKey and
-// starts each leaf at lowerBound(lo), stopping as soon as a key exceeds hi so
-// no leaf outside the range is visited. Read-only: no COW.
+/// Visit every key/value pair whose key lies in [low, high] in ascending key
+/// order, calling onEntry(ctx, key, value) for each. Same recursive descent
+/// as forEachEntry, but routes into the child holding `low` via
+/// childIndexForKey and starts each leaf at lowerBound(low), stopping as soon
+/// as a key exceeds `high` so no leaf outside the range is visited. Read-only
+/// (no COW); O(log n + matches) with I/O.
 pub fn forEachEntryInRange(
     transaction: anytype,
     root: Reference,
@@ -186,7 +187,8 @@ fn forEachEntryInRangeAt(
     }
 }
 
-// Test-only helper: build an inner node from a slice of (ref, low, count) triples.
+/// Test-only helper: build an inner node from a slice of (ref, low, count)
+/// triples and return its ref.
 pub fn makeInnerForTest(transaction: anytype, children: []const struct { ref: u64, low: u64, count: u64 }) !Reference {
     var refs: [fanout]u64 = undefined;
     var lows: [fanout]u64 = undefined;

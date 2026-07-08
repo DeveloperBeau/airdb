@@ -7,9 +7,10 @@ const catalog = @import("../schema/catalog.zig");
 
 const maxPropertyCount: usize = 256;
 
-// Move object `objectKey`'s live row to physical slot `newRow` (which must be a dead
-// slot), updating the key->row index so the key and all links stay valid. Does
-// not shrink columns. Returns the new catalog ref.
+/// Move object `objectKey`'s live row to physical slot `newRow` (which must
+/// be a dead slot), updating the key->row index so the key and all links stay
+/// valid. Does not shrink columns. Returns the new catalog ref. One column
+/// walk per property plus the index update, O(propertyCount x log n).
 pub fn relocateRow(transaction: *WriteTransaction, catalogRef: Reference, objectKey: u64, newRow: u64) !Reference {
     var snapshot = try catalog.CatalogSnapshot.load(transaction, catalogRef);
     const oldRow = (try Index.get(transaction, snapshot.keyrowIndexRef, objectKey)) orelse return catalogRef;

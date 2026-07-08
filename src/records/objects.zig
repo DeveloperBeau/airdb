@@ -1,9 +1,9 @@
-// objects.zig -- typed encode/decode orchestration over the raw row layer.
-//
-// Encodes []Value rows into raw u64 storage (allocating blob and collection
-// structures), decodes them back, and keeps the link graph consistent
-// (backlinks, nullify-on-delete). The raw column/index CRUD it drives lives
-// below this in rows.zig.
+//! Typed encode/decode orchestration over the raw row layer.
+//!
+//! Encodes []Value rows into raw u64 storage (allocating blob and collection
+//! structures), decodes them back, and keeps the link graph consistent
+//! (backlinks, nullify-on-delete). The raw column/index CRUD it drives lives
+//! below this in rows.zig.
 
 const std = @import("std");
 const WriteTransaction = @import("../transactions/writeTransaction.zig").WriteTransaction;
@@ -23,14 +23,20 @@ const maxPropertyCount = catalog.maxPropertyCount;
 
 const loadCatalog = catalog.loadCatalog;
 
-/// Result types shared with the raw layer: the typed update/delete return the
-/// same shapes rows.update/rows.delete produce.
+/// The row's current version, reported when an optimistic write loses the
+/// race (shared with the raw row layer).
 pub const Conflict = rows.Conflict;
+/// Outcome of a typed update -- the same shape rows.update produces.
 pub const UpdateResult = rows.UpdateResult;
+/// Outcome of a typed delete -- the same shape rows.delete produces.
 pub const DeleteResult = rows.DeleteResult;
 
-// insertTyped encodes a []Value row into raw u64 storage, allocating a blob
-// node for each .blob property, then delegates to rows.insert.
+/// Encode a []Value row into raw u64 storage -- allocating a blob node for
+/// each .blob property and building each collection's tree -- then insert it
+/// via rows.insert, maintaining backlinks for any links the row carries.
+/// Returns the new catalog ref and the row's stable object key (the `row`
+/// field). One tree walk per property plus collection builds proportional to
+/// their element counts.
 pub fn insertTyped(transaction: *WriteTransaction, catalogRef: Reference, values: []const Value) !struct { catalogRef: Reference, row: u64 } {
     const view = try loadCatalog(transaction, catalogRef);
     const propertyCount = view.propertyCount;
@@ -90,11 +96,12 @@ pub fn insertTyped(transaction: *WriteTransaction, catalogRef: Reference, values
     return .{ .catalogRef = updatedCatalog, .row = result.row };
 }
 
-// getTyped reads a row by primary key and decodes each property into a Value.
-// A small .blob property decodes to a zero-copy .bytes slice into the mapped
-// storage; a blob larger than the inline cap (stored chunked) decodes to a
-// .blobRef the caller materializes with blob.getAlloc.
-// Returns the row version, or null when the key is not found.
+/// Read a row by primary key and decode each property into `out` as a Value.
+/// A small .blob property decodes to a zero-copy .bytes slice into the mapped
+/// storage (valid until the next mutating call on the transaction); a blob
+/// larger than the inline cap (stored chunked) decodes to a .blobRef the
+/// caller materializes with blob.getAlloc. Returns the row version, or null
+/// when the key is not found. One tree walk per property (O(log n) each).
 pub fn getTyped(transaction: anytype, catalogRef: Reference, primaryKey: u64, out: []Value) !?u64 {
     const view = try loadCatalog(transaction, catalogRef);
     const propertyCount = view.propertyCount;
@@ -123,7 +130,10 @@ pub fn getTyped(transaction: anytype, catalogRef: Reference, primaryKey: u64, ou
     return version;
 }
 
-// getTypedByObjectKey decodes a row addressed by stable object key into Values.
+/// Read a row addressed by its stable object key and decode each property
+/// into `out` as a Value; blob decoding follows the getTyped rules. Returns
+/// the row version, or null when the objectKey is unknown or the row is
+/// tombstoned. One tree walk per property (O(log n) each).
 pub fn getTypedByObjectKey(transaction: anytype, catalogRef: Reference, objectKey: u64, out: []Value) !?u64 {
     const view = try loadCatalog(transaction, catalogRef);
     const propertyCount = view.propertyCount;
@@ -151,8 +161,10 @@ pub fn getTypedByObjectKey(transaction: anytype, catalogRef: Reference, objectKe
     return version;
 }
 
-// Delete an object and keep the graph consistent: nullify inbound links and
-// clean the deleted object's outbound backlink entries.
+/// Delete an object and keep the link graph consistent: nullify inbound links
+/// and clean the deleted object's outbound backlink entries before the
+/// tombstone. Version-guarded like rows.delete. Cost scales with the row's
+/// inbound and outbound link counts.
 pub fn deleteAndNullify(transaction: *WriteTransaction, catalogRef: Reference, primaryKey: u64, expectedVersion: u64) !DeleteResult {
     const view = try loadCatalog(transaction, catalogRef);
     const objectKey = (try Index.get(transaction, view.primaryKeyIndexRef, primaryKey)) orelse return .notFound;
@@ -163,12 +175,17 @@ pub fn deleteAndNullify(transaction: *WriteTransaction, catalogRef: Reference, p
     return try rows.delete(transaction, fixed, primaryKey, expectedVersion);
 }
 
-// updateTyped is MVCC-safe: it does NOT free any blob unless the version check
-// passes. Steps: read current row, check version, then on the apply path free
-// old blobs and allocate new ones before delegating to rows.update.
-// Deliberately one long function: the read/check/free/allocate/update sequence
-// is one irreducible MVCC step -- splitting it would scatter the frees from
-// the version check that alone makes them safe.
+/// Overwrite an object's properties from `values`, guarded by the row's
+/// expected version, and return the update outcome. Collection properties are
+/// carried through unchanged (mutate them via their own APIs); changed to-one
+/// links re-point their backlink entries. One tree walk per property.
+///
+/// MVCC-safe: it does NOT free any blob unless the version check passes.
+/// Steps: read current row, check version, then on the apply path free old
+/// blobs and allocate new ones before delegating to rows.update.
+/// Deliberately one long function: the read/check/free/allocate/update
+/// sequence is one irreducible MVCC step -- splitting it would scatter the
+/// frees from the version check that alone makes them safe.
 pub fn updateTyped(
     transaction: *WriteTransaction,
     catalogRef: Reference,
@@ -237,8 +254,11 @@ pub fn updateTyped(
     }
 }
 
-// deleteTyped is MVCC-safe: blobs are freed only on the apply path, never on
-// conflict or notFound.
+/// Delete an object, fix its link graph (via deleteAndNullify), and reclaim
+/// its blob and collection storage, all guarded by the row's expected
+/// version. MVCC-safe: blobs are freed only on the apply path, never on
+/// conflict or notFound. Cost scales with the row's property, link, and
+/// collection sizes.
 pub fn deleteTyped(
     transaction: *WriteTransaction,
     catalogRef: Reference,

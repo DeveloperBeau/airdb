@@ -1,9 +1,9 @@
-// syncer.zig -- injectable durability-barrier interface and its implementations.
-//
-// The Syncing abstraction lets the storage layer depend on "flush this file to
-// stable storage" without knowing how: production uses the platform barrier
-// (FileSyncer), tests inject a controllable one (FailingSyncer) to simulate a
-// crash at a precise commit step.
+//! Injectable durability-barrier interface and its implementations.
+//!
+//! The Syncing abstraction lets the storage layer depend on "flush this file to
+//! stable storage" without knowing how: production uses the platform barrier
+//! (FileSyncer), tests inject a controllable one (FailingSyncer) to simulate a
+//! crash at a precise commit step.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -14,6 +14,8 @@ pub const Syncing = struct {
     ptr: *anyopaque,
     flushFn: *const fn (ptr: *anyopaque, file: Io.File) anyerror!void,
 
+    /// Flush `file` to stable storage through the injected implementation.
+    /// Issues a durability barrier (fsync or stronger) -- blocking I/O.
     pub fn flush(self: Syncing, file: Io.File) !void {
         return self.flushFn(self.ptr, file);
     }
@@ -47,6 +49,7 @@ pub const FileSyncer = struct {
         try fullSync(file);
     }
 
+    /// The shared FileSyncer as a Syncing capability.
     pub fn any() Syncing {
         return .{
             .ptr = &instance,
@@ -61,6 +64,8 @@ pub const FailingSyncer = struct {
     count: usize = 0,
     failOn: usize,
 
+    /// Vtable target: fails the failOn-th call (1-based) with
+    /// error.SimulatedCrash; every other call performs the real barrier.
     pub fn flushImpl(ptr: *anyopaque, file: Io.File) anyerror!void {
         const self: *FailingSyncer = @ptrCast(@alignCast(ptr));
         self.count += 1;
@@ -68,6 +73,7 @@ pub const FailingSyncer = struct {
         try fullSync(file);
     }
 
+    /// This FailingSyncer as a Syncing capability.
     pub fn any(self: *FailingSyncer) Syncing {
         return .{ .ptr = self, .flushFn = &FailingSyncer.flushImpl };
     }

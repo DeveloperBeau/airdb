@@ -1,20 +1,20 @@
-// bTreeCore.zig -- the comptime-generic B+tree shared by index.zig (inline
-// numeric keys) and byteKeyIndex.zig (blob-ref byte keys). Both trees use the
-// on-disk node layout of indexNode.zig; the only difference between them is
-// how the u64 stored in a key slot relates to the key a caller searches with.
-// That difference is captured by the comptime `Keying` capability, so every
-// operation here is monomorphized per instantiation: no function pointers and
-// no vtables on this hot path.
-//
-// The `transaction` parameter of every operation is `anytype`: a comptime
-// duck-typed transaction capability, monomorphized at compile time.
-// Read-only operations need only
-//   deref(ref, length) ![]const u8
-// and mutating operations additionally require
-//   alloc(size) !Allocation, writableCopy(ref, length) !Allocation,
-//   free(ref, length) !void
-// where Allocation is arena.Allocation. WriteTransaction is the production
-// implementation; ReadTransaction satisfies the read-only subset.
+//! The comptime-generic B+tree shared by index.zig (inline
+//! numeric keys) and byteKeyIndex.zig (blob-ref byte keys). Both trees use the
+//! on-disk node layout of indexNode.zig; the only difference between them is
+//! how the u64 stored in a key slot relates to the key a caller searches with.
+//! That difference is captured by the comptime `Keying` capability, so every
+//! operation here is monomorphized per instantiation: no function pointers and
+//! no vtables on this hot path.
+//!
+//! The `transaction` parameter of every operation is `anytype`: a comptime
+//! duck-typed transaction capability, monomorphized at compile time.
+//! Read-only operations need only
+//!   deref(ref, length) ![]const u8
+//! and mutating operations additionally require
+//!   alloc(size) !Allocation, writableCopy(ref, length) !Allocation,
+//!   free(ref, length) !void
+//! where Allocation is arena.Allocation. WriteTransaction is the production
+//! implementation; ReadTransaction satisfies the read-only subset.
 
 const std = @import("std");
 const Reference = @import("../storage/reference.zig").Reference;

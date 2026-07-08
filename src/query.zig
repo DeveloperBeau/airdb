@@ -1,3 +1,14 @@
+//! Query engine over an object catalog. Operates on the stable object key (objectKey)
+//! space: a scan walks the per-type key->row index, so each entry maps an objectKey to
+//! the physical row that currently holds its data (rows can move via relocation).
+//! Predicates compare the raw u64 stored in a property column, so they apply to
+//! int properties and to link properties (which store target objectKey + 1). Blob and
+//! collection predicates are a later addition.
+//!
+//! Results are object keys (objectKeys); materialize them with
+//! objects.getTypedByObjectKey. The fetch model is stale-snapshot: a query reads one
+//! committed snapshot and returns detached keys, never live cursors.
+
 const std = @import("std");
 const rows = @import("records/rows.zig");
 const catalog = @import("schema/catalog.zig");
@@ -5,21 +16,13 @@ const index = @import("trees/index.zig");
 const Column = @import("trees/column.zig");
 const Reference = @import("storage/reference.zig").Reference;
 
-// Query engine over an object catalog. Operates on the stable object key (objectKey)
-// space: a scan walks the per-type key->row index, so each entry maps an objectKey to
-// the physical row that currently holds its data (rows can move via relocation).
-// Predicates compare the raw u64 stored in a property column, so they apply to
-// int properties and to link properties (which store target objectKey + 1). Blob and
-// collection predicates are a later addition.
-//
-// Results are object keys (objectKeys); materialize them with
-// objects.getTypedByObjectKey. The fetch model is stale-snapshot: a query reads one
-// committed snapshot and returns detached keys, never live cursors.
-
 const MAX_PROPS: usize = 256;
 
+/// Comparison a predicate applies to a property's raw u64 value.
 pub const Operator = enum { eq, ne, lt, le, gt, ge };
 
+/// One filter clause: property `property`'s raw u64 compared against `value`
+/// with `operator`. Clauses in a predicate list AND together.
 pub const Predicate = struct {
     property: usize,
     operator: Operator,
@@ -255,8 +258,11 @@ fn drivingPredicateIndex(transaction: anytype, catalogRef: Reference, predicates
     return pickDriving(&scan, predicates);
 }
 
-// Collect the objectKeys of every live row that satisfies ALL predicates (logical
-// AND). An empty predicate list matches every live row.
+/// Append the objectKeys of every live row that satisfies ALL predicates
+/// (logical AND) to `out`; an empty predicate list matches every live row.
+/// `out` grows with `allocator` and the caller owns it. Drives off an eq
+/// predicate's value index when one exists; otherwise a full scan over the
+/// live set (O(n) tree walks).
 pub fn where(
     transaction: anytype,
     catalogRef: Reference,
@@ -276,8 +282,9 @@ pub fn where(
     try runQuery(transaction, &scan, predicates, allocator, Sink{ .out = out, .allocator = allocator }, Sink.onMatch);
 }
 
-// Number of live rows satisfying all predicates. The full-scan path streams,
-// so this allocates nothing proportional to the table.
+/// Number of live rows satisfying all predicates. The full-scan path streams,
+/// so this allocates nothing proportional to the table; still O(n) over the
+/// live set without a usable value index.
 pub fn countWhere(transaction: anytype, catalogRef: Reference, predicates: []const Predicate, allocator: std.mem.Allocator) !u64 {
     const scan = try openScan(transaction, catalogRef);
     try validateProperties(&scan, predicates);
@@ -292,10 +299,13 @@ pub fn countWhere(transaction: anytype, catalogRef: Reference, predicates: []con
     return rowCount;
 }
 
+/// The result of aggregateInt: matched-row count, wrapping sum, and the
+/// min/max values (null when no row matched).
 pub const Aggregate = struct { count: u64, sum: u64, min: ?u64, max: ?u64 };
 
-// Aggregate an int property over the live rows satisfying all predicates.
-// `sum` wraps on overflow (wrapping add); min/max are null when no row matches.
+/// Aggregate int property `property` over the live rows satisfying all
+/// predicates. `sum` wraps on overflow (wrapping add); min/max are null when
+/// no row matches. O(n) over the live set without a usable value index.
 pub fn aggregateInt(transaction: anytype, catalogRef: Reference, property: usize, predicates: []const Predicate, allocator: std.mem.Allocator) !Aggregate {
     const scan = try openScan(transaction, catalogRef);
     try validateProperties(&scan, predicates);
@@ -318,9 +328,9 @@ pub fn aggregateInt(transaction: anytype, catalogRef: Reference, property: usize
     return agg;
 }
 
-// Convenience: collect objectKeys whose property `property` is in the inclusive range
-// [lo, hi]. Implemented as a scan with two predicates; an index-seek fast path
-// is a later optimization.
+/// Append the objectKeys whose property `property` lies in the inclusive
+/// range [lo, hi] to `out`. Implemented as a scan with two predicates (O(n)
+/// over the live set); an index-seek fast path is a later optimization.
 pub fn rangeInclusive(
     transaction: anytype,
     catalogRef: Reference,
@@ -337,8 +347,10 @@ pub fn rangeInclusive(
     try where(transaction, catalogRef, &predicates, out, allocator);
 }
 
-// Sort a slice of objectKeys in place by an int property, ascending. Reads each
-// row's value once into a temporary pair array, then sorts.
+/// Sort a slice of objectKeys in place by int property `property`, ascending.
+/// Reads each row's value once into a temporary pair array (allocated from
+/// `allocator`, freed before returning), then sorts: O(k log k) plus a tree
+/// walk per key. A key that no longer resolves is error.NotFound.
 pub fn sortByPropertyAscending(
     transaction: anytype,
     catalogRef: Reference,

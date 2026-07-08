@@ -1,7 +1,7 @@
-// writeTransaction.zig -- WriteTransaction and the two-slot atomic durable commit.
-//
-// Slot A byte range in the header page: [64, 64+Slot.size).
-// Slot B byte range in the header page: [128, 128+Slot.size).
+//! WriteTransaction and the two-slot atomic durable commit.
+//!
+//! Slot A byte range in the header page: [64, 64+Slot.size).
+//! Slot B byte range in the header page: [128, 128+Slot.size).
 
 const std = @import("std");
 const testing = std.testing;
@@ -19,6 +19,10 @@ const ringCapacity = @import("../database.zig").ringCapacity;
 const slotAOff: usize = 64;
 const slotBOff: usize = 128;
 
+/// The single in-flight mutation over a Database (one writer at a time,
+/// serialized by the cross-process lock): accumulates a new root and version,
+/// the pending frees, and a transaction-private reuse pool, then concludes
+/// with commit() or deinit() (abort).
 pub const WriteTransaction = struct {
     database: *Database,
     newRoot: Reference,
@@ -48,6 +52,11 @@ pub const WriteTransaction = struct {
     /// bookkeeping lists or double-unlocking the cross-process write lock.
     done: bool = false,
 
+    /// Read `length` bytes at `ref` as a zero-copy slice into mapped storage.
+    /// Sections never move, so the slice stays addressable; its contents are
+    /// stable only until this transaction frees the node (a private free is
+    /// routed to the immediate-reuse pool and may be scribbled by the next
+    /// allocation).
     pub fn deref(self: *WriteTransaction, ref: Reference, length: usize) ![]const u8 {
         return self.database.arena.deref(ref, length);
     }
@@ -73,6 +82,11 @@ pub const WriteTransaction = struct {
         return @min(horizon, self.database.activeVersion -| self.database.retainVersions());
     }
 
+    /// Allocate `size` bytes for a new node: transaction-private reuse first,
+    /// then horizon-gated reuse of committed-free space, then a bump
+    /// allocation that may grow (and remap) the file. Amortized O(1); can
+    /// issue file-growth I/O and, once per transaction, the horizon's
+    /// per-slot liveness syscalls.
     pub fn alloc(self: *WriteTransaction, size: usize) !Allocation {
         // 1. Reuse a transaction-private node first (allocated and freed within this same
         //    uncommitted transaction; no committed version or reader can reference it, so
@@ -85,10 +99,15 @@ pub const WriteTransaction = struct {
         return self.database.bumpGrowing(size);
     }
 
+    /// Record `ref` as the root commit() will publish.
     pub fn setRoot(self: *WriteTransaction, ref: Reference) void {
         self.newRoot = ref;
     }
 
+    /// Mark the node at `ref` reclaimable. A node this transaction allocated
+    /// returns to the private immediate-reuse pool; a committed node's extent
+    /// is deferred to the committed free list, tagged with this version, so
+    /// pinned readers keep their snapshot intact.
     pub fn free(self: *WriteTransaction, ref: Reference, length: usize) !void {
         if (ref >= self.transactionStartTop) {
             // Allocated within this uncommitted transaction: private, immediately reusable.
@@ -105,6 +124,8 @@ pub const WriteTransaction = struct {
         }
     }
 
+    /// Copy-on-write step: allocate a fresh node, copy `length` bytes from
+    /// `ref` into it, free the original, and return the writable copy.
     pub fn writableCopy(self: *WriteTransaction, ref: Reference, length: usize) !Allocation {
         const old = try self.database.arena.deref(ref, length);
         const fresh = try self.alloc(length);
@@ -113,6 +134,10 @@ pub const WriteTransaction = struct {
         return fresh;
     }
 
+    /// Abort the transaction if it has not already concluded: roll the bump
+    /// pointer back, drop the bookkeeping lists, and release the
+    /// cross-process write lock. A no-op after commit(), a commit failure, or
+    /// a prior deinit(), so it is safe to hold in an errdefer across commit().
     pub fn deinit(self: *WriteTransaction) void {
         if (self.done) return; // already committed, commit-failed, or aborted
         self.conclude();

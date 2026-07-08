@@ -22,6 +22,8 @@ const maxPropertyCount = catalog.maxPropertyCount;
 // operations in column.zig and index.zig).
 // ---------------------------------------------------------------------------
 
+/// One value-index entry for bulk building: a property value paired with the
+/// ascending objectKeys of the rows holding it.
 pub const ValueObjectKeys = struct { value: u64, objectKeys: []const u64 };
 
 /// Build a column tree holding `values` at row indices 0..values.len. Returns
@@ -114,26 +116,25 @@ pub fn bulkValueIndex(transaction: *WriteTransaction, entries: []const ValueObje
     return bulkIndex(transaction, values, innerRoots);
 }
 
-// ---------------------------------------------------------------------------
-// Bulk import orchestrator.
-//
-// bulkImport ingests a whole table of rows into an EMPTY type in one shot,
-// building every column and index bottom-up so the result is indistinguishable
-// from inserting the same rows one at a time in primary-key order. The columns,
-// version/live columns, primaryKey index, key->row index, and per-indexed-property value
-// indexes are all built directly from the sorted input.
-//
-// Object-key convention (matched to rows.insert): a fresh insert takes the
-// catalog's current nextKey as the new row's objectKey and assigns physical row =
-// nextRow, then bumps both by one. Inserting the rows in ascending-primaryKey order
-// therefore gives the r-th-smallest primaryKey an objectKey of (startNextKey + r) and a
-// physical row of r. bulkImport reproduces exactly that mapping: it sorts by primaryKey,
-// then assigns objectKeyR = oldNextKey + r and physical row r = r. So a bulk row
-// and its single-insert twin resolve primaryKey -> objectKey -> row identically, and every
-// lookup, scan, and value-index query matches.
-//
-// All rejections happen BEFORE any node is written, so a bad input can never
-// half-commit. Phase 1 excludes link/linkSet properties. The CALLER commits.
+/// Ingest a whole table of rows into an EMPTY type in one shot, returning the
+/// new catalog ref. Builds every column and index bottom-up so the result is
+/// indistinguishable from inserting the same rows one at a time in
+/// primary-key order: the columns, version/live columns, primaryKey index,
+/// key->row index, and per-indexed-property value indexes are all built
+/// directly from the sorted input. O(m log m) to sort, then O(m) node writes
+/// over the row count.
+///
+/// Object-key convention (matched to rows.insert): a fresh insert takes the
+/// catalog's current nextKey as the new row's objectKey and assigns physical row =
+/// nextRow, then bumps both by one. Inserting the rows in ascending-primaryKey order
+/// therefore gives the r-th-smallest primaryKey an objectKey of (startNextKey + r) and a
+/// physical row of r. bulkImport reproduces exactly that mapping: it sorts by primaryKey,
+/// then assigns objectKeyR = oldNextKey + r and physical row r = r. So a bulk row
+/// and its single-insert twin resolve primaryKey -> objectKey -> row identically, and every
+/// lookup, scan, and value-index query matches.
+///
+/// All rejections happen BEFORE any node is written, so a bad input can never
+/// half-commit. Phase 1 excludes link/linkSet properties. The CALLER commits.
 pub fn bulkImport(
     transaction: *WriteTransaction,
     catalogRef: Reference,
@@ -332,27 +333,26 @@ fn buildPropertyValueIndex(
     return bulkValueIndex(transaction, entries.items);
 }
 
-// ---------------------------------------------------------------------------
-// Bulk append orchestrator.
-//
-// bulkAppend fast-paths a batch of rows whose primary keys all land strictly to
-// the RIGHT of the type's current key space onto the right edge of every tree,
-// without touching any left subtree. The result is byte-identical to inserting
-// the same rows one at a time in ascending-primaryKey order: each new row gets the next
-// physical row and object key in batch order, the version stamp matches
-// rows.insert (transaction.newVersion), live = 1, and the primaryKey and key->row indexes
-// grow only along their rightmost path.
-//
-// A batch only qualifies when nothing about it would force a non-right-edge
-// write: no property is indexed and none is a link/linkSet (those maintain
-// secondary structures keyed by value/target, not by row), the batch primaryKeys are
-// strictly ascending and unique, and the smallest batch primaryKey is strictly greater
-// than the type's current max primaryKey. Any other shape returns error.NotAppendable
-// with NOTHING written, so the caller's fallback can replay row-by-row.
-//
-// Crucially, every qualification check is read-only and runs BEFORE the first
-// node is allocated, so a NotAppendable return leaves the catalog and all trees
-// untouched. The CALLER commits.
+/// Fast-path a batch of rows whose primary keys all land strictly to the
+/// RIGHT of the type's current key space onto the right edge of every tree,
+/// without touching any left subtree; returns the new catalog ref. The result
+/// is byte-identical to inserting the same rows one at a time in
+/// ascending-primaryKey order: each new row gets the next physical row and
+/// object key in batch order, the version stamp matches rows.insert
+/// (transaction.newVersion), live = 1, and the primaryKey and key->row
+/// indexes grow only along their rightmost path. O(m) node writes over the
+/// batch plus one right-edge rebuild per tree.
+///
+/// A batch only qualifies when nothing about it would force a non-right-edge
+/// write: no property is indexed and none is a link/linkSet (those maintain
+/// secondary structures keyed by value/target, not by row), the batch primaryKeys are
+/// strictly ascending and unique, and the smallest batch primaryKey is strictly greater
+/// than the type's current max primaryKey. Any other shape returns error.NotAppendable
+/// with NOTHING written, so the caller's fallback can replay row-by-row.
+///
+/// Crucially, every qualification check is read-only and runs BEFORE the first
+/// node is allocated, so a NotAppendable return leaves the catalog and all trees
+/// untouched. The CALLER commits.
 pub fn bulkAppend(transaction: *WriteTransaction, catalogRef: Reference, rows: []const []const u64) !Reference {
     var snapshot = try catalog.CatalogSnapshot.load(transaction, catalogRef);
 
@@ -479,8 +479,10 @@ fn qualifyRightEdgeAppend(
     }
 }
 
-// Try the right-edge fast path; on NotAppendable, fall back to row-by-row
-// rows.insert, which handles any schema and detects duplicate keys per row.
+/// Try the right-edge fast path; on NotAppendable, fall back to row-by-row
+/// rows.insert, which handles any non-link schema and detects duplicate keys
+/// per row. Returns the new catalog ref. O(m) on the fast path, O(m log n)
+/// on the fallback.
 pub fn bulkAppendOrInsert(transaction: *WriteTransaction, catalogRef: Reference, rows: []const []const u64) !Reference {
     return bulkAppend(transaction, catalogRef, rows) catch |err| switch (err) {
         error.NotAppendable => fallbackInsert(transaction, catalogRef, rows),

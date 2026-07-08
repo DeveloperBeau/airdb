@@ -45,44 +45,51 @@ fn blRemove(transaction: *WriteTransaction, blRef: Reference, target: u64, sourc
     return try Index.insert(transaction, blRef, target, newSet);
 }
 
-// Add source->target to link property p's backlink index. Returns new catalog.
+/// Record source->target in link property `propertyIndex`'s backlink index and
+/// return the new catalog ref (copy-on-write). Tree walks, O(log n).
 pub fn addBacklink(transaction: *WriteTransaction, catalogRef: Reference, propertyIndex: usize, target: u64, source: u64) !Reference {
     const view = try catalog.loadCatalog(transaction, catalogRef);
     const newBl = try blAdd(transaction, view.backlinkRef(propertyIndex), target, source);
     return try catalog.setBacklinkRef(transaction, catalogRef, propertyIndex, newBl);
 }
 
-// Remove source from link property p's backlink set for target.
+/// Remove `source` from link property `propertyIndex`'s backlink set for
+/// `target` and return the new catalog ref. No-op if absent; an emptied set
+/// has its outer entry removed and its nodes freed. Tree walks, O(log n).
 pub fn removeBacklink(transaction: *WriteTransaction, catalogRef: Reference, propertyIndex: usize, target: u64, source: u64) !Reference {
     const view = try catalog.loadCatalog(transaction, catalogRef);
     const newBl = try blRemove(transaction, view.backlinkRef(propertyIndex), target, source);
     return try catalog.setBacklinkRef(transaction, catalogRef, propertyIndex, newBl);
 }
 
-// Read the target objectKey of link property `property` for the object with primary key
-// `primaryKey`. Returns null if the link is unset (or the object is absent).
+/// The target objectKey of link property `property` for the object with
+/// primary key `primaryKey`, or null when the link is unset or the object is
+/// absent. Tree walks, O(log n).
 pub fn getLink(transaction: anytype, catalogRef: Reference, primaryKey: u64, property: usize) !?u64 {
     const resolved = (try catalog.resolveProperty(transaction, catalogRef, primaryKey, property)) orelse return null;
     const raw = try Column.get(transaction, resolved.propertyColumn, resolved.row);
     return if (raw == 0) null else raw - 1;
 }
 
-// Number of objects whose link property `property` points at `target` objectKey.
+/// Number of objects whose link property `property` points at `target`
+/// objectKey. One index descent plus a single-node count read (O(log n)).
 pub fn backlinkCount(transaction: anytype, catalogRef: Reference, property: usize, target: u64) !u64 {
     const view = try catalog.loadCatalog(transaction, catalogRef);
     const setRoot = (try Index.get(transaction, view.backlinkRef(property), target)) orelse return 0;
     return try Index.count(transaction, setRoot);
 }
 
-// True when `source` is recorded in link property `property`'s backlink set for
-// `target`.
+/// True when `source` is recorded in link property `property`'s backlink set
+/// for `target`. Tree walks, O(log n).
 pub fn backlinkContains(transaction: anytype, catalogRef: Reference, property: usize, target: u64, source: u64) !bool {
     const view = try catalog.loadCatalog(transaction, catalogRef);
     const setRoot = (try Index.get(transaction, view.backlinkRef(property), target)) orelse return false;
     return (try Index.get(transaction, setRoot, source)) != null;
 }
 
-// Collect the source objectKeys whose link property `property` points at `target`.
+/// Append the source objectKeys whose link property `property` points at
+/// `target` to `out` in ascending order. `out` grows with `allocator` and the
+/// caller owns it. Walks the whole backlink set, O(k) over the source count.
 pub fn backlinkCollect(
     transaction: anytype,
     catalogRef: Reference,
@@ -103,14 +110,17 @@ pub fn backlinkCollect(
     try Index.forEachKey(transaction, setRoot, Sink{ .list = out, .alloc = allocator }, Sink.onKey);
 }
 
-// Set or clear link property `property` of the object with primary key `primaryKey`.
-// Maintains the backlink index and bumps the row version. No-op if unchanged.
-//
-// Backlink SOURCES are object keys, never physical rows: rows move under
-// relocation/compaction while objectKeys are stable, and every backlink consumer
-// (nullifyInboundInCatalog, cleanOutboundInCatalog, rebuildBacklinks) resolves
-// sources through the key->row index. Recording the row here would corrupt the
-// graph the moment a source row is relocated.
+/// Set (target non-null) or clear (target null) link property `property` of
+/// the object with primary key `primaryKey`, returning the new catalog ref.
+/// Maintains the backlink index and bumps the row version. Setting the value
+/// it already has is a no-op that returns `catalogRef` unchanged. Tree walks,
+/// O(log n).
+///
+/// Backlink SOURCES are object keys, never physical rows: rows move under
+/// relocation/compaction while objectKeys are stable, and every backlink consumer
+/// (nullifyInboundInCatalog, cleanOutboundInCatalog, rebuildBacklinks) resolves
+/// sources through the key->row index. Recording the row here would corrupt the
+/// graph the moment a source row is relocated.
 pub fn setLink(transaction: *WriteTransaction, catalogRef: Reference, primaryKey: u64, property: usize, target: ?u64) !Reference {
     const resolvedBefore = (try catalog.resolveProperty(transaction, catalogRef, primaryKey, property)) orelse return catalogRef;
     const objectKey = (try catalog.primaryKeyToObjectKey(transaction, catalogRef, primaryKey)) orelse return catalogRef;
@@ -130,18 +140,27 @@ pub fn setLink(transaction: *WriteTransaction, catalogRef: Reference, primaryKey
 // To-many links (linkSet): a set of target objectKeys with backlink maintenance.
 // ---------------------------------------------------------------------------
 
+/// Number of targets in to-many link property `property`, or null when the
+/// object is absent or tombstoned. Two index descents to resolve the row,
+/// then a single-node count read (O(log n)).
 pub fn linkSetCount(transaction: anytype, catalogRef: Reference, primaryKey: u64, property: usize) !?u64 {
     const resolved = (try catalog.resolveProperty(transaction, catalogRef, primaryKey, property)) orelse return null;
     const setRoot = try Column.get(transaction, resolved.propertyColumn, resolved.row);
     return try Index.count(transaction, setRoot);
 }
 
+/// True when `target` is in to-many link property `property` of the object
+/// with primary key `primaryKey`. Fails with error.NotFound when the object
+/// is absent. Tree walks, O(log n).
 pub fn linkSetContains(transaction: anytype, catalogRef: Reference, primaryKey: u64, property: usize, target: u64) !bool {
     const resolved = (try catalog.resolveProperty(transaction, catalogRef, primaryKey, property)) orelse return error.NotFound;
     const setRoot = try Column.get(transaction, resolved.propertyColumn, resolved.row);
     return (try Index.get(transaction, setRoot, target)) != null;
 }
 
+/// Append every target objectKey in to-many link property `property` to `out`
+/// in ascending order. `out` grows with `allocator` and the caller owns it.
+/// Walks the whole link set, O(k) over the target count.
 pub fn linkSetCollect(
     transaction: anytype,
     catalogRef: Reference,
@@ -162,8 +181,10 @@ pub fn linkSetCollect(
     try Index.forEachKey(transaction, setRoot, Sink{ .list = out, .alloc = allocator }, Sink.onKey);
 }
 
-// Add `target` to the to-many link set of object `primaryKey`; records the backlink.
-// No-op if already a member. The backlink source is the objectKey (see setLink).
+/// Add `target` to the to-many link set of object `primaryKey`, record the
+/// backlink, and return the new catalog ref. Adding an existing member is a
+/// no-op that returns `catalogRef` unchanged. The backlink source is the
+/// objectKey (see setLink). Tree walks, O(log n).
 pub fn linkSetAdd(transaction: *WriteTransaction, catalogRef: Reference, primaryKey: u64, property: usize, target: u64) !Reference {
     const resolved = (try catalog.resolveProperty(transaction, catalogRef, primaryKey, property)) orelse return error.NotFound;
     const objectKey = (try catalog.primaryKeyToObjectKey(transaction, catalogRef, primaryKey)) orelse return error.NotFound;
@@ -176,8 +197,10 @@ pub fn linkSetAdd(transaction: *WriteTransaction, catalogRef: Reference, primary
     return newCatalog;
 }
 
-// Remove `target` from the to-many link set of object `primaryKey`; drops the backlink.
-// No-op if not a member. The backlink source is the objectKey (see setLink).
+/// Remove `target` from the to-many link set of object `primaryKey`, drop the
+/// backlink, and return the new catalog ref. Removing a non-member is a no-op
+/// that returns `catalogRef` unchanged. The backlink source is the objectKey
+/// (see setLink). Tree walks, O(log n).
 pub fn linkSetRemove(transaction: *WriteTransaction, catalogRef: Reference, primaryKey: u64, property: usize, target: u64) !Reference {
     const resolved = (try catalog.resolveProperty(transaction, catalogRef, primaryKey, property)) orelse return error.NotFound;
     const objectKey = (try catalog.primaryKeyToObjectKey(transaction, catalogRef, primaryKey)) orelse return error.NotFound;
@@ -190,10 +213,12 @@ pub fn linkSetRemove(transaction: *WriteTransaction, catalogRef: Reference, prim
     return newCatalog;
 }
 
-// Nullify every inbound link pointing at `objectKey` (and drop those backlink
-// entries) for each link/linkSet property, restricted to properties where
-// `matchAll` is true OR the property's link target type equals `targetType`.
-// Returns the new catalog ref.
+/// Nullify every inbound link pointing at `objectKey` (and drop those
+/// backlink entries) for each link/linkSet property, restricted to properties
+/// where `matchAll` is true OR the property's link target type equals
+/// `targetType`. Returns the new catalog ref. Cost scales with the number of
+/// link properties times the number of inbound sources per property (a tree
+/// walk per source).
 pub fn nullifyInboundInCatalog(transaction: *WriteTransaction, catalogRef: Reference, objectKey: u64, targetType: u16, matchAll: bool) !Reference {
     var currentCatalog = catalogRef;
     const baseView = try catalog.loadCatalog(transaction, catalogRef);
@@ -285,8 +310,10 @@ fn dropBacklinkSet(transaction: *WriteTransaction, catalogRef: Reference, proper
     return catalogRef;
 }
 
-// Remove `objectKey`'s own outbound link entries from its targets' backlink sets for
-// each link/linkSet property. Returns the new catalog ref.
+/// Remove `objectKey`'s own outbound link entries from its targets' backlink
+/// sets for each link/linkSet property. Returns the new catalog ref. Cost
+/// scales with the number of link properties times the deleted row's outbound
+/// target count (a tree walk per target).
 pub fn cleanOutboundInCatalog(transaction: *WriteTransaction, catalogRef: Reference, objectKey: u64) !Reference {
     var currentCatalog = catalogRef;
     const baseView = try catalog.loadCatalog(transaction, catalogRef);
@@ -330,9 +357,11 @@ pub fn cleanOutboundInCatalog(transaction: *WriteTransaction, catalogRef: Refere
     return currentCatalog;
 }
 
-// For each link property: (1) nullify every inbound link pointing at `objectKey`
-// (and drop those backlink entries); (2) remove the deleted row's own outbound
-// link entry from its target's backlink set. Returns the new catalog ref.
+/// For each link property: (1) nullify every inbound link pointing at
+/// `objectKey` (and drop those backlink entries); (2) remove the deleted
+/// row's own outbound link entry from its target's backlink set. Returns the
+/// new catalog ref. Cost scales with the row's inbound and outbound link
+/// counts across all link properties.
 pub fn fixBacklinksForDelete(transaction: *WriteTransaction, catalogRef: Reference, objectKey: u64) !Reference {
     const nullified = try nullifyInboundInCatalog(transaction, catalogRef, objectKey, 0, true);
     return try cleanOutboundInCatalog(transaction, nullified, objectKey);

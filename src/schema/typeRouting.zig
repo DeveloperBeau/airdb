@@ -1,11 +1,10 @@
-// typeRouting.zig -- routing object, link, and delete operations through the
-// type directory.
-//
-// Every function here follows the same pattern: resolve typeId to its catalog
-// ref via the directory (typeDirectory.zig owns the directory node format), forward
-// to the object/link layer, and COW the directory when the catalog changed.
-// The cross-type delete machinery (deleteNullifyX and its worker) also lives
-// here because it routes across every type in the directory.
+//! Routing of object, link, and delete operations through the type directory.
+//!
+//! Every function here follows the same pattern: resolve typeId to its catalog
+//! ref via the directory (typeDirectory.zig owns the directory node format), forward
+//! to the object/link layer, and COW the directory when the catalog changed.
+//! The cross-type delete machinery (deleteNullifyX and its worker) also lives
+//! here because it routes across every type in the directory.
 
 const std = @import("std");
 const WriteTransaction = @import("../database.zig").WriteTransaction;

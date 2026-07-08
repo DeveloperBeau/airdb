@@ -7,14 +7,20 @@ const sectionShift = platform.sectionShift;
 const sectionSize = platform.sectionSize;
 const sectionMask = platform.sectionMask;
 
+/// A fresh or reused arena extent: its stable ref and the writable mapped
+/// bytes behind it.
 pub const Allocation = struct { ref: Reference, bytes: []u8 };
 
+/// Bump allocator over the file's mapped sections, with exact-class reuse
+/// from a FreeList pool, and the single bounds-checked deref chokepoint every
+/// ref read goes through.
 pub const Arena = struct {
     /// Append-only list of fixed-size sections owned by the FileStore. Never moved or
     /// remapped; growth appends new sections, so refs into existing sections stay valid.
     sections: []const platform.Section,
     top: usize, // next free offset (append-only in Phase 1)
 
+    /// An arena over `sections` whose bump pointer starts at `dataStart`.
     pub fn init(sections: []const platform.Section, dataStart: usize) Arena {
         return .{ .sections = sections, .top = dataStart };
     }
@@ -29,6 +35,10 @@ pub const Arena = struct {
         return self.sections[sectionIndex].map[withinSection .. withinSection + length];
     }
 
+    /// Bump-allocate `size` bytes, 8-aligned and never crossing a section
+    /// boundary (a request that would is padded to the next section base).
+    /// error.AllocTooLarge above one section; error.OutOfSpace when no mapped
+    /// section remains -- the caller grows and maps the file, then retries.
     pub fn alloc(self: *Arena, size: usize) error{ OutOfSpace, AllocTooLarge }!Allocation {
         if (size > sectionSize) return error.AllocTooLarge;
         var aligned = std.mem.alignForward(usize, self.top, 8);
@@ -45,10 +55,11 @@ pub const Arena = struct {
         return .{ .ref = ref, .bytes = self.translate(aligned, size) };
     }
 
-    // Reuse an EXACT-size node extent from a pool whose freedVersion <= horizon, else null
-    // (no bump fallback, no carving). Exact-size matching keeps fixed-size node allocation
-    // fragment-free and the pool scan short. For a transaction-private pool (always safe to
-    // reuse) pass horizon = maxInt; for the committed pool pass the reclaim horizon.
+    /// Reuse an EXACT-size node extent from `pool` whose freedVersion <=
+    /// horizon, else null (no bump fallback, no carving). Exact-size matching
+    /// keeps fixed-size node allocation fragment-free and the pool probe
+    /// short. For a transaction-private pool (always safe to reuse) pass
+    /// horizon = maxInt; for the committed pool pass the reclaim horizon.
     pub fn allocFromPool(self: *Arena, pool: *FreeList, size: usize, horizon: u64) ?Allocation {
         if (pool.reuseExact(@intCast(size), horizon)) |offset| {
             const offu: usize = @intCast(offset);
@@ -57,7 +68,9 @@ pub const Arena = struct {
         return null;
     }
 
-    // The single bounds-checked chokepoint. All reads go through here.
+    /// Translate `ref` into a read-only slice of `length` bytes. The single
+    /// bounds-checked chokepoint all reads go through: a null, misaligned,
+    /// unmapped, oversize, or section-crossing ref is error.BadRef.
     pub fn deref(self: *Arena, ref: Reference, length: usize) error{BadRef}![]const u8 {
         const offset: usize = @intCast(ref);
         if (offset == 0) return error.BadRef; // null ref

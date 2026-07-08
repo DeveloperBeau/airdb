@@ -1,8 +1,8 @@
-// verification.zig -- offline integrity audit of a database instance.
-//
-// Checks the header, commit slots, root ref, and free list for structural
-// sanity, then audits every value index and backlink index against the live
-// base rows in both directions. Read-only; nothing inner imports this file.
+//! Offline integrity audit of a database instance.
+//!
+//! Checks the header, commit slots, root ref, and free list for structural
+//! sanity, then audits every value index and backlink index against the live
+//! base rows in both directions. Read-only; nothing inner imports this file.
 
 const std = @import("std");
 const testing = std.testing;

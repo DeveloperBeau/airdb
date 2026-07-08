@@ -1,8 +1,10 @@
-// readTransaction.zig -- ReadTransaction, a pinned read snapshot over a Database.
+//! ReadTransaction, a pinned read snapshot over a Database.
 
 const Reference = @import("../storage/reference.zig").Reference;
 const Database = @import("../database.zig").Database;
 
+/// A pinned read snapshot: captures the root and version current at begin
+/// time and keeps that version's space from being reused until end().
 pub const ReadTransaction = struct {
     database: *Database,
     rootRef: Reference,
@@ -12,14 +14,19 @@ pub const ReadTransaction = struct {
     /// it to premature space reuse.
     ended: bool = false,
 
+    /// The snapshot's root reference (the type directory as of begin time).
     pub fn root(self: ReadTransaction) Reference {
         return self.rootRef;
     }
 
+    /// Read `length` bytes at `ref` as a zero-copy slice into mapped storage;
+    /// valid while this snapshot stays pinned (until end()).
     pub fn deref(self: *ReadTransaction, ref: Reference, length: usize) ![]const u8 {
         return self.database.arena.deref(ref, length);
     }
 
+    /// Release this snapshot's pin and republish the process's minimum pinned
+    /// version. Idempotent: a second end() is a no-op.
     pub fn end(self: *ReadTransaction) void {
         if (self.ended) return;
         self.ended = true;

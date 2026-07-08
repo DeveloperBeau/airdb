@@ -1,8 +1,8 @@
-// database.zig -- Database, ReadTransaction, WriteTransaction, and the two-slot atomic durable commit.
-//
-// Slot A byte range in the header page: [64, 64+Slot.size).
-// Slot B byte range in the header page: [128, 128+Slot.size).
-// Data arena starts at defaultPageSize.
+//! Database, ReadTransaction, WriteTransaction, and the two-slot atomic durable commit.
+//!
+//! Slot A byte range in the header page: [64, 64+Slot.size).
+//! Slot B byte range in the header page: [128, 128+Slot.size).
+//! Data arena starts at defaultPageSize.
 
 const std = @import("std");
 const testing = std.testing;
@@ -30,24 +30,29 @@ pub const slotBOff: usize = 128;
 // Version->root ring log, in the reserved header page (page 0, [0, defaultPageSize)).
 // The arena's data starts at defaultPageSize, so the header page has free room past
 // the FileStore header ([0,32)) and the two commit slots (A: [64,100), B: [128,164)).
-//   ringHeadOff: u64 LE, monotonically increasing count of entries ever written.
-//                  The live head index is ringHead % ringCapacity. u64 so the
-//                  counter cannot overflow within any plausible commit volume (a
-//                  u32 wraps after ~4 billion commits and would panic mid-commit).
-//   ringOff:      ringCapacity entries, each 16 bytes [version u64 LE][rootRef u64 LE].
 // End of ring = ringOff + ringCapacity*16 = 1024 + 128*16 = 3072 < 4096. No overlap.
+
+/// Byte offset of the ring head: a u64 LE monotonically increasing count of
+/// entries ever written. The live head index is ringHead % ringCapacity. u64
+/// so the counter cannot overflow within any plausible commit volume (a u32
+/// wraps after ~4 billion commits and would panic mid-commit).
 pub const ringHeadOff: usize = 1016;
+/// Byte offset of the ring entries: ringCapacity entries of 16 bytes each,
+/// [version u64 LE][rootRef u64 LE].
 pub const ringOff: usize = 1024;
+/// Number of (version, root) entries the ring log retains; older versions'
+/// roots are overwritten and become unreadable for point-in-time reads.
 pub const ringCapacity: u32 = 128;
 
-// Retention window, persisted in the header page so EVERY process honors the
-// same reclaim floor: committed-free space is withheld from reuse until it is
-// older than `activeVersion - retain`. A per-instance in-memory setting would
-// let a default-configured writer in another process reuse space under a
-// point-in-time reader that relies on the window. u64 LE at [192, 200);
-// 8-aligned, clear of slot B ([128, 164)) and the ring head (1016). Zero on a
-// fresh (zero-filled) file, matching the old default. maxInt means "retain
-// everything". Read/written atomically through the shared mapping.
+/// Byte offset of the retention window, persisted in the header page so EVERY
+/// process honors the same reclaim floor: committed-free space is withheld
+/// from reuse until it is older than `activeVersion - retain`. A per-instance
+/// in-memory setting would let a default-configured writer in another process
+/// reuse space under a point-in-time reader that relies on the window. u64 LE
+/// at [192, 200); 8-aligned, clear of slot B ([128, 164)) and the ring head
+/// (1016). Zero on a fresh (zero-filled) file, matching the old default.
+/// maxInt means "retain everything". Read/written atomically through the
+/// shared mapping.
 pub const retainOff: usize = 192;
 
 // ---------------------------------------------------------------------------
@@ -76,6 +81,11 @@ pub const CompactCursor = struct {
     highHi: u64,
 };
 
+/// One process's handle to a database file: the mapped store and arena, the
+/// currently adopted version and root, this instance's reader pins, the
+/// committed free list, and the cross-process coordination state. Create/open
+/// via create()/open(); read via beginRead()/beginReadAt(); mutate via
+/// beginWrite().
 pub const Database = struct {
     store: FileStore,
     arena: Arena,
@@ -252,6 +262,8 @@ pub const Database = struct {
         return database;
     }
 
+    /// Detach from the database: release this instance's participant slot,
+    /// decrement the attach count, and unmap/close the coord and data files.
     pub fn deinit(self: *Database) void {
         if (self.participantSlot) |slotIndex| self.coord.releaseSlot(slotIndex);
         _ = self.coord.detach();
@@ -266,6 +278,10 @@ pub const Database = struct {
         versioning.publishPins(self);
     }
 
+    /// Begin a read snapshot of the latest committed version, refreshing to
+    /// any newer version another process published. Pins the version (and
+    /// publishes the pin to the coord file) so its nodes cannot be reused
+    /// until end().
     pub fn beginRead(self: *Database) !ReadTransaction {
         // Pin-then-validate loop. Between refreshing to the latest published
         // version and this process's pin becoming visible in the coord slot, a
@@ -479,6 +495,9 @@ pub const Database = struct {
         return self.freeList.extents.items.len;
     }
 
+    /// A point-in-time observability snapshot: sizes, versions, free-space
+    /// totals, measurement-only cost counters, and the two recovery flags.
+    /// Produced by metrics(); never affects behavior.
     pub const Metrics = struct {
         mappedLen: u64,
         latestVersion: u64,
@@ -501,6 +520,9 @@ pub const Database = struct {
         poisoned: bool,
     };
 
+    /// Collect the current Metrics snapshot. O(free extents) to total the
+    /// reclaimable bytes, plus the per-slot liveness syscalls of the horizon
+    /// scan.
     pub fn metrics(self: *Database) Metrics {
         var reclaimable: u64 = 0;
         for (self.freeList.extents.items) |extent| reclaimable += extent.len;
@@ -528,7 +550,9 @@ pub const Database = struct {
 // call sites that do @import("database.zig").ReadTransaction / .WriteTransaction keep working).
 // ---------------------------------------------------------------------------
 
+/// A pinned read snapshot (defined in transactions/readTransaction.zig).
 pub const ReadTransaction = @import("transactions/readTransaction.zig").ReadTransaction;
+/// The single in-flight mutation (defined in transactions/writeTransaction.zig).
 pub const WriteTransaction = @import("transactions/writeTransaction.zig").WriteTransaction;
 
 test {

@@ -24,9 +24,13 @@ const maxPropertyCount = catalog.maxPropertyCount;
 // rewrite the catalog transactionally (COW); existing snapshots are unaffected.
 // ---------------------------------------------------------------------------
 
-// Append a new property to the type. The new column is filled with
-// `defaultValue` for every existing row (live or tombstoned). For a link or
-// linkSet property a fresh backlink index is created. Returns the new catalog.
+/// Append a new property to the type and return the new catalog ref. The new
+/// column is backfilled for every existing row: live rows get `defaultValue`
+/// (blob defaults are copied per row; collection kinds get a fresh empty
+/// tree each) and dead rows get 0. A link or linkSet property gets a fresh
+/// backlink index; an indexed property gets its value index backfilled from
+/// the live rows. Indexing a collection kind is error.Unsupported. O(n) over
+/// every existing row, live or tombstoned.
 pub fn addProperty(transaction: *WriteTransaction, catalogRef: Reference, def: PropertyDefinition, defaultValue: u64) !Reference {
     var snapshot = try catalog.CatalogSnapshot.load(transaction, catalogRef);
     const propertyCount = snapshot.propertyCount;
@@ -137,8 +141,9 @@ fn blobDup(transaction: *WriteTransaction, ref: u64) !u64 {
     }
 }
 
-// Remove property `property` (must be >= 1; the primary key at 0 cannot be removed).
-// The dropped column is left for compaction to reclaim. Returns the new catalog.
+/// Remove property `property` (must be >= 1; the primary key at 0 cannot be
+/// removed) and return the new catalog ref. The dropped column's storage is
+/// left for compaction to reclaim. O(propertyCount) catalog rewrite.
 pub fn removeProperty(transaction: *WriteTransaction, catalogRef: Reference, property: usize) !Reference {
     std.debug.assert(property >= 1);
     var snapshot = try catalog.CatalogSnapshot.load(transaction, catalogRef);
