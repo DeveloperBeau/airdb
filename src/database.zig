@@ -38,7 +38,7 @@ pub const slotBOff: usize = 128;
 /// wraps after ~4 billion commits and would panic mid-commit).
 pub const ringHeadOff: usize = 1016;
 /// Byte offset of the ring entries: ringCapacity entries of 16 bytes each,
-/// [version u64 LE][rootRef u64 LE].
+/// [version u64 LE][rootReference u64 LE].
 pub const ringOff: usize = 1024;
 /// Number of (version, root) entries the ring log retains; older versions'
 /// roots are overwritten and become unreadable for point-in-time reads.
@@ -66,15 +66,15 @@ pub const retainOff: usize = 192;
 /// specific catalog shape; holeLo scans upward for dead relocation targets
 /// and highHi scans downward for live rows that must move.
 pub const CompactCursor = struct {
-    /// The TYPE this cursor belongs to plus the catalog ref it was persisted
+    /// The TYPE this cursor belongs to plus the catalog reference it was persisted
     /// against. Both are required for a resume: liveCount/nextRow are a
     /// heuristic two different types can momentarily share, and the catalog
-    /// ref ALONE is recyclable (freed catalog nodes are exact-size-class
-    /// reused, so another type's catalog can land on the same ref). Resuming
+    /// reference ALONE is recyclable (freed catalog nodes are exact-size-class
+    /// reused, so another type's catalog can land on the same reference). Resuming
     /// a foreign cursor would leave rows unexamined ahead of the tail
     /// truncate -- silent live-row loss in release builds.
     typeId: u16,
-    catalogRef: Reference,
+    catalogReference: Reference,
     liveCount: u64,
     nextRow: u64,
     holeLo: u64,
@@ -95,7 +95,7 @@ pub const Database = struct {
     /// Currently-committed free list. Owns its memory; deinit'd in Database.deinit.
     freeList: FreeList,
     /// Offset of the live free-list node on disk (0 if none).
-    freeListNodeRef: Reference,
+    freeListNodeReference: Reference,
     /// Byte length of the live free-list node on disk (0 if none).
     freeListNodeLen: usize,
     /// Coordination file for multi-process attach count and latest-version signal.
@@ -156,8 +156,8 @@ pub const Database = struct {
         // Write version-1 into slot A; mark it active.
         const initial = Slot{
             .version = 1,
-            .rootRef = 0,
-            .freeListRef = 0,
+            .rootReference = 0,
+            .freeListReference = 0,
             .logicalSize = defaultPageSize,
         };
         initial.encode(store.map[slotAOff..][0..Slot.size]);
@@ -193,7 +193,7 @@ pub const Database = struct {
             .activeRoot = 0,
             .pins = std.AutoHashMap(u64, u32).init(allocator),
             .freeList = FreeList.init(allocator),
-            .freeListNodeRef = 0,
+            .freeListNodeReference = 0,
             .freeListNodeLen = 0,
             .coordination = coordination,
             .participantSlot = slot,
@@ -228,7 +228,7 @@ pub const Database = struct {
             .activeRoot = 0,
             .pins = std.AutoHashMap(u64, u32).init(allocator),
             .freeList = FreeList.init(allocator),
-            .freeListNodeRef = 0,
+            .freeListNodeReference = 0,
             .freeListNodeLen = 0,
             .coordination = undefined,
             .participantSlot = null,
@@ -238,9 +238,9 @@ pub const Database = struct {
 
         const active = try versioning.selectActiveSlot(&database);
         database.activeVersion = active.version;
-        database.activeRoot = active.rootRef;
+        database.activeRoot = active.rootReference;
         database.arena.top = @intCast(active.logicalSize);
-        if (active.freeListRef != 0) try freeListRecovery.loadFreeList(&database, active.freeListRef);
+        if (active.freeListReference != 0) try freeListRecovery.loadFreeList(&database, active.freeListReference);
 
         // Coord setup -- done last so the errdefer has no further try-s after it.
         const coordinationPath = try std.fmt.allocPrint(allocator, "{s}.coord", .{path});
@@ -313,10 +313,10 @@ pub const Database = struct {
             const retain = self.retainVersions();
             const floor = if (retain == sentinelMax) 0 else latestVersion -| retain;
             if (activeVersion >= floor) {
-                return ReadTransaction{ .database = self, .rootRef = root, .version = activeVersion };
+                return ReadTransaction{ .database = self, .rootReference = root, .version = activeVersion };
             }
             // The pin landed too late; release it and pin the newer version.
-            var stale = ReadTransaction{ .database = self, .rootRef = root, .version = activeVersion };
+            var stale = ReadTransaction{ .database = self, .rootReference = root, .version = activeVersion };
             stale.end();
         }
     }
@@ -355,12 +355,12 @@ pub const Database = struct {
         if (retain != sentinelMax) {
             const latestVersion = self.coordination.latestVersion();
             if (version < latestVersion -| retain) {
-                var transaction = ReadTransaction{ .database = self, .rootRef = root, .version = version };
+                var transaction = ReadTransaction{ .database = self, .rootReference = root, .version = version };
                 transaction.end(); // unpin
                 return error.VersionUnavailable;
             }
         }
-        return ReadTransaction{ .database = self, .rootRef = root, .version = version };
+        return ReadTransaction{ .database = self, .rootReference = root, .version = version };
     }
 
     /// The minimum version pinned by a live reader in this process, or the
@@ -402,7 +402,7 @@ pub const Database = struct {
         versioning.setRetainVersions(self, count);
     }
 
-    /// Root ref for a committed version, or null if not retained / not yet
+    /// Root reference for a committed version, or null if not retained / not yet
     /// committed. See versioning.versionRoot for the ring-scan rules.
     pub fn versionRoot(self: *Database, version: u64) ?u64 {
         return versioning.versionRoot(self, version);

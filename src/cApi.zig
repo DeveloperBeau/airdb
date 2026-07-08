@@ -1,6 +1,6 @@
 //! C ABI surface for airdb. A thin auto-commit layer over the object store so
 //! language bindings (Swift, Kotlin, TS, Zig) can drive a single int-property
-//! object type without managing transactions or catalog refs directly.
+//! object type without managing transactions or catalog references directly.
 //!
 //! Each call is its own transaction: writes begin, apply, and commit before
 //! returning; reads take a fresh snapshot. Explicit multi-op transactions, blob
@@ -119,11 +119,11 @@ fn createFresh(self: *DatabaseHandle, path: []const u8, propertyCount: u16) ?*Da
         return null;
     };
     var writeTransaction = self.database.beginWrite() catch return abandonHandle(self);
-    const catalogRef = catalog.create(&writeTransaction, propertyCount) catch {
+    const catalogReference = catalog.create(&writeTransaction, propertyCount) catch {
         writeTransaction.deinit();
         return abandonHandle(self);
     };
-    writeTransaction.setRoot(catalogRef);
+    writeTransaction.setRoot(catalogReference);
     _ = writeTransaction.commit() catch return abandonHandle(self);
     self.propertyCount = propertyCount;
     return self;
@@ -152,7 +152,7 @@ export fn airdb_insert(handle: ?*DatabaseHandle, values: [*]const u64, length: u
         writeTransaction.deinit();
         return if (err == error.DuplicateKey) AIRDB_E_DUPLICATE else AIRDB_E_GENERIC;
     };
-    writeTransaction.setRoot(result.catalogRef);
+    writeTransaction.setRoot(result.catalogReference);
     _ = writeTransaction.commit() catch return commitErrCode(self);
     return @intCast(result.objectKey);
 }
@@ -200,7 +200,7 @@ export fn airdb_update(handle: ?*DatabaseHandle, values: [*]const u64, length: u
     };
     switch (result) {
         .ok => |ok| {
-            writeTransaction.setRoot(ok.catalogRef);
+            writeTransaction.setRoot(ok.catalogReference);
             _ = writeTransaction.commit() catch return commitErrCode(self);
             return AIRDB_OK;
         },
@@ -332,7 +332,7 @@ export fn airdb_bulk_append(handle: ?*DatabaseHandle, rowsFlat: [*]const u64, ro
 // ---------------------------------------------------------------------------
 // Explicit multi-operation write transactions.
 //
-// A Transaction holds one open WriteTransaction and threads the catalog ref across operations,
+// A Transaction holds one open WriteTransaction and threads the catalog reference across operations,
 // so a burst of writes commits as a SINGLE durable barrier instead of one
 // commit per call. The auto-commit functions above are unchanged.
 //
@@ -348,7 +348,7 @@ export fn airdb_bulk_append(handle: ?*DatabaseHandle, rowsFlat: [*]const u64, ro
 // BENIGN op results (duplicate, not-found, conflict) are decided before any
 // mutation and leave the transaction fully usable. A STRUCTURAL op failure (generic
 // error mid-mutation) is different: the op may have freed tree nodes that the
-// unadvanced catalog ref still references, so committing afterwards would hand
+// unadvanced catalog reference still references, so committing afterwards would hand
 // live nodes to the free list. Such a failure poisons the transaction -- only
 // airdb_abort is accepted; airdb_commit refuses and aborts instead.
 // ---------------------------------------------------------------------------
@@ -356,7 +356,7 @@ export fn airdb_bulk_append(handle: ?*DatabaseHandle, rowsFlat: [*]const u64, ro
 const Transaction = struct {
     databaseHandle: *DatabaseHandle,
     writeTransaction: WriteTransaction,
-    catalogRef: Reference, // current catalog ref, threaded across operations
+    catalogReference: Reference, // current catalog reference, threaded across operations
     poisoned: bool = false, // structural op failure: commit must not proceed
 };
 
@@ -371,7 +371,7 @@ export fn airdb_begin(handle: ?*DatabaseHandle) ?*Transaction {
         allocator.destroy(created);
         return null;
     };
-    created.catalogRef = created.writeTransaction.newRoot;
+    created.catalogReference = created.writeTransaction.newRoot;
     created.poisoned = false;
     return created;
 }
@@ -386,39 +386,39 @@ export fn airdb_abort(transaction: ?*Transaction) void {
 
 /// Stage an insert in the open transaction (no commit). vals has `length` u64
 /// values (must equal propertyCount; vals[0] is the primary key). Returns the new
-/// object key on success. On error the transaction stays open and the catalog ref is not
+/// object key on success. On error the transaction stays open and the catalog reference is not
 /// advanced, so the batch remains consistent.
 export fn airdb_txn_insert(transaction: ?*Transaction, values: [*]const u64, length: usize) i64 {
     const handle = transaction orelse return AIRDB_E_GENERIC;
     if (handle.poisoned) return AIRDB_E_GENERIC;
     if (length != handle.databaseHandle.propertyCount) return AIRDB_E_BAD_ARGS;
-    const result = rows.insert(&handle.writeTransaction, handle.catalogRef, values[0..length]) catch |err| {
+    const result = rows.insert(&handle.writeTransaction, handle.catalogReference, values[0..length]) catch |err| {
         if (err == error.DuplicateKey) return AIRDB_E_DUPLICATE; // pre-mutation check: transaction stays usable
         handle.poisoned = true; // mid-mutation failure: the batch may reference freed nodes
         return AIRDB_E_GENERIC;
     };
-    handle.catalogRef = result.catalogRef; // thread the new catalog ref; do NOT commit
+    handle.catalogReference = result.catalogReference; // thread the new catalog reference; do NOT commit
     return @intCast(result.objectKey);
 }
 
 /// Stage an update in the open transaction (no commit). Mirrors airdb_update
-/// against the threaded catalog ref. Returns AIRDB_OK or an error code; on error
-/// the transaction stays open and the catalog ref is not advanced.
+/// against the threaded catalog reference. Returns AIRDB_OK or an error code; on error
+/// the transaction stays open and the catalog reference is not advanced.
 export fn airdb_txn_update(transaction: ?*Transaction, values: [*]const u64, length: usize) i64 {
     const handle = transaction orelse return AIRDB_E_GENERIC;
     if (handle.poisoned) return AIRDB_E_GENERIC;
     if (length != handle.databaseHandle.propertyCount) return AIRDB_E_BAD_ARGS;
     const primaryKey = values[0];
     var currentValues: [maxProperties]u64 = undefined;
-    const version = rows.getByPrimaryKey(&handle.writeTransaction, handle.catalogRef, primaryKey, currentValues[0..length]) catch return AIRDB_E_GENERIC;
+    const version = rows.getByPrimaryKey(&handle.writeTransaction, handle.catalogReference, primaryKey, currentValues[0..length]) catch return AIRDB_E_GENERIC;
     if (version == null) return AIRDB_E_NOT_FOUND;
-    const result = rows.update(&handle.writeTransaction, handle.catalogRef, primaryKey, values[0..length], version.?) catch {
+    const result = rows.update(&handle.writeTransaction, handle.catalogReference, primaryKey, values[0..length], version.?) catch {
         handle.poisoned = true; // mid-mutation failure
         return AIRDB_E_GENERIC;
     };
     switch (result) {
         .ok => |ok| {
-            handle.catalogRef = ok.catalogRef;
+            handle.catalogReference = ok.catalogReference;
             return AIRDB_OK;
         },
         .conflict => return AIRDB_E_CONFLICT,
@@ -427,21 +427,21 @@ export fn airdb_txn_update(transaction: ?*Transaction, values: [*]const u64, len
 }
 
 /// Stage a delete in the open transaction (no commit). Mirrors airdb_delete
-/// against the threaded catalog ref. Returns AIRDB_OK or an error code; on error
-/// the transaction stays open and the catalog ref is not advanced.
+/// against the threaded catalog reference. Returns AIRDB_OK or an error code; on error
+/// the transaction stays open and the catalog reference is not advanced.
 export fn airdb_txn_delete(transaction: ?*Transaction, primaryKey: u64) i64 {
     const handle = transaction orelse return AIRDB_E_GENERIC;
     if (handle.poisoned) return AIRDB_E_GENERIC;
     var currentValues: [maxProperties]u64 = undefined;
-    const version = rows.getByPrimaryKey(&handle.writeTransaction, handle.catalogRef, primaryKey, currentValues[0..handle.databaseHandle.propertyCount]) catch return AIRDB_E_GENERIC;
+    const version = rows.getByPrimaryKey(&handle.writeTransaction, handle.catalogReference, primaryKey, currentValues[0..handle.databaseHandle.propertyCount]) catch return AIRDB_E_GENERIC;
     if (version == null) return AIRDB_E_NOT_FOUND;
-    const result = rows.delete(&handle.writeTransaction, handle.catalogRef, primaryKey, version.?) catch {
+    const result = rows.delete(&handle.writeTransaction, handle.catalogReference, primaryKey, version.?) catch {
         handle.poisoned = true; // mid-mutation failure
         return AIRDB_E_GENERIC;
     };
     switch (result) {
         .ok => |newCatalog| {
-            handle.catalogRef = newCatalog;
+            handle.catalogReference = newCatalog;
             return AIRDB_OK;
         },
         .conflict => return AIRDB_E_CONFLICT,
@@ -465,7 +465,7 @@ export fn airdb_commit(transaction: ?*Transaction) i64 {
         allocator.destroy(handle);
         return AIRDB_E_GENERIC;
     }
-    handle.writeTransaction.setRoot(handle.catalogRef);
+    handle.writeTransaction.setRoot(handle.catalogReference);
     _ = handle.writeTransaction.commit() catch {
         // commit already released the lock per WriteTransaction.commit's contract; just
         // free the handle. Do NOT double-unlock.
@@ -894,7 +894,7 @@ test "airdb_bulk_append wrong propertyCount returns AIRDB_E_BAD_ARGS" {
 
 test "ffi transaction: a poisoned transaction refuses commit and releases the lock" {
     // Regression: a structural op failure mid-batch can free tree nodes the
-    // unadvanced catalog ref still references; committing such a transaction handed
+    // unadvanced catalog reference still references; committing such a transaction handed
     // live nodes to the durable free list. Commit must abort instead.
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();

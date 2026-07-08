@@ -1,5 +1,5 @@
 //! The comptime-generic B+tree shared by index.zig (inline
-//! numeric keys) and byteKeyIndex.zig (blob-ref byte keys). Both trees use the
+//! numeric keys) and byteKeyIndex.zig (blob-reference byte keys). Both trees use the
 //! on-disk node layout of indexNode.zig; the only difference between them is
 //! how the u64 stored in a key slot relates to the key a caller searches with.
 //! That difference is captured by the comptime `Keying` capability, so every
@@ -9,10 +9,10 @@
 //! The `transaction` parameter of every operation is `anytype`: a comptime
 //! duck-typed transaction capability, monomorphized at compile time.
 //! Read-only operations need only
-//!   deref(ref, length) ![]const u8
+//!   dereference(reference, length) ![]const u8
 //! and mutating operations additionally require
-//!   alloc(size) !Allocation, writableCopy(ref, length) !Allocation,
-//!   free(ref, length) !void
+//!   alloc(size) !Allocation, writableCopy(reference, length) !Allocation,
+//!   free(reference, length) !void
 //! where Allocation is arena.Allocation. WriteTransaction is the production
 //! implementation; ReadTransaction satisfies the read-only subset.
 
@@ -38,16 +38,16 @@ const InnerView = indexNode.InnerView;
 
 /// Corrupt-cycle guard for every recursive walker: a legal tree over 2^64
 /// keys with fanout 64 is at most ~11 levels deep, so any walk deeper than
-/// this is following a corrupt ref cycle. Walkers carry a depth and fail with
+/// this is following a corrupt reference cycle. Walkers carry a depth and fail with
 /// error.Corrupt instead of overflowing the stack.
 pub const maxDepth: usize = 16;
 
 // A split's right sibling and an insert's resulting node both carry their
 // subtree entry count so the parent can maintain the per-child counts that
 // make count a single-node read.
-const Split = struct { ref: Reference, low: u64, count: u64 };
-const InsertResult = struct { ref: Reference, count: u64, split: ?Split };
-const RemoveResult = struct { ref: Reference, count: u64 };
+const Split = struct { reference: Reference, low: u64, count: u64 };
+const InsertResult = struct { reference: Reference, count: u64, split: ?Split };
+const RemoveResult = struct { reference: Reference, count: u64 };
 
 /// Shared B+tree operations over the indexNode.zig layout, specialized by a
 /// comptime `Keying` capability that decides how the u64 stored in each key
@@ -62,7 +62,7 @@ const RemoveResult = struct { ref: Reference, count: u64 };
 ///   freeKey(transaction, storedKey) !void
 ///     release of any key material a slot owns.
 /// For inline keys, order is numeric, duplicateKey is identity, and freeKey
-/// is a no-op; for out-of-node keys (blob refs) they dereference, copy, and
+/// is a no-op; for out-of-node keys (blob references) they dereference, copy, and
 /// release the referenced bytes.
 pub fn BTreeCore(comptime Keying: type) type {
     return struct {
@@ -70,15 +70,15 @@ pub fn BTreeCore(comptime Keying: type) type {
         pub fn create(transaction: anytype) !Reference {
             const allocation = try transaction.alloc(leafNodeSize);
             _ = encodeLeaf(allocation.bytes, &.{}, &.{});
-            return allocation.ref;
+            return allocation.reference;
         }
 
-        /// Deref a node, sizing the read by its kind byte (leaf vs inner).
-        pub fn derefNode(transaction: anytype, ref: Reference) ![]const u8 {
-            const kindBytes = try transaction.deref(ref, 1);
+        /// Dereference a node, sizing the read by its kind byte (leaf vs inner).
+        pub fn dereferenceNode(transaction: anytype, reference: Reference) ![]const u8 {
+            const kindBytes = try transaction.dereference(reference, 1);
             return switch (kindBytes[0]) {
-                kindLeaf => transaction.deref(ref, leafNodeSize),
-                kindInner => transaction.deref(ref, innerNodeSize),
+                kindLeaf => transaction.dereference(reference, leafNodeSize),
+                kindInner => transaction.dereference(reference, innerNodeSize),
                 else => error.Corrupt,
             };
         }
@@ -123,7 +123,7 @@ pub fn BTreeCore(comptime Keying: type) type {
 
         fn getAt(transaction: anytype, root: Reference, probeKey: Keying.ProbeKey, depth: usize) !?u64 {
             if (depth >= maxDepth) return error.Corrupt;
-            const bytes = try derefNode(transaction, root);
+            const bytes = try dereferenceNode(transaction, root);
             if (bytes[0] == kindLeaf) {
                 const leaf = try parseLeaf(bytes);
                 const slot = try leafLowerBound(transaction, leaf, probeKey);
@@ -135,39 +135,39 @@ pub fn BTreeCore(comptime Keying: type) type {
             // Inner node: descend into the child whose range holds probeKey.
             const inner = try parseInner(bytes);
             const childIndex = try childIndexForKey(transaction, inner, probeKey);
-            return getAt(transaction, inner.childRef(childIndex), probeKey, depth + 1);
+            return getAt(transaction, inner.childReference(childIndex), probeKey, depth + 1);
         }
 
         /// Descend the leftmost spine to the leftmost leaf and return its
         /// first (smallest) stored key. O(height) with I/O.
-        fn minKey(transaction: anytype, ref: Reference) !u64 {
-            var current: Reference = ref;
+        fn minKey(transaction: anytype, reference: Reference) !u64 {
+            var current: Reference = reference;
             var depth: usize = 0;
             while (depth < maxDepth) : (depth += 1) {
-                const bytes = try derefNode(transaction, current);
+                const bytes = try dereferenceNode(transaction, current);
                 if (bytes[0] == kindLeaf) {
                     const leaf = try parseLeaf(bytes);
                     return leaf.key(0);
                 }
                 const inner = try parseInner(bytes);
-                current = inner.childRef(0);
+                current = inner.childReference(0);
             }
             return error.Corrupt;
         }
 
-        /// Recursive insert. Returns the (possibly new) node ref and an
+        /// Recursive insert. Returns the (possibly new) node reference and an
         /// optional right sibling produced by a midpoint split. Deliberately
         /// one long function: it is a single-pass B+tree insert whose
         /// leaf/inner upsert, shift, and midpoint-split cases all share the
         /// split-propagation state -- one irreducible algorithm rather than
         /// separable steps.
-        fn insertInto(transaction: anytype, nodeRef: Reference, probeKey: Keying.ProbeKey, storedKey: u64, value: u64, depth: usize) !InsertResult {
+        fn insertInto(transaction: anytype, nodeReference: Reference, probeKey: Keying.ProbeKey, storedKey: u64, value: u64, depth: usize) !InsertResult {
             if (depth >= maxDepth) return error.Corrupt;
-            const kind = (try transaction.deref(nodeRef, 1))[0];
+            const kind = (try transaction.dereference(nodeReference, 1))[0];
 
             // ---- LEAF -----------------------------------------------------
             if (kind == kindLeaf) {
-                const leafBytes = try transaction.deref(nodeRef, leafNodeSize);
+                const leafBytes = try transaction.dereference(nodeReference, leafNodeSize);
                 const leaf = try parseLeaf(leafBytes);
                 const slot = try leafLowerBound(transaction, leaf, probeKey);
 
@@ -175,15 +175,15 @@ pub fn BTreeCore(comptime Keying: type) type {
                 // stored key, so the caller's storedKey is redundant and any
                 // key material it owns is released.
                 if (slot < leaf.count and (try Keying.order(transaction, leaf.key(slot), probeKey)) == .eq) {
-                    const updated = try transaction.writableCopy(nodeRef, leafNodeSize);
+                    const updated = try transaction.writableCopy(nodeReference, leafNodeSize);
                     std.mem.writeInt(u64, updated.bytes[headerSize + slot * 16 + 8 ..][0..8], value, .little);
                     try Keying.freeKey(transaction, storedKey);
-                    return InsertResult{ .ref = updated.ref, .count = leaf.count, .split = null };
+                    return InsertResult{ .reference = updated.reference, .count = leaf.count, .split = null };
                 }
 
                 // Not full: shift the tail right and insert at slot.
                 if (leaf.count < leafCapacity) {
-                    const updated = try transaction.writableCopy(nodeRef, leafNodeSize);
+                    const updated = try transaction.writableCopy(nodeReference, leafNodeSize);
                     var moveSlot: usize = leaf.count;
                     while (moveSlot > slot) : (moveSlot -= 1) {
                         const source = headerSize + (moveSlot - 1) * 16;
@@ -193,7 +193,7 @@ pub fn BTreeCore(comptime Keying: type) type {
                     std.mem.writeInt(u64, updated.bytes[headerSize + slot * 16 ..][0..8], storedKey, .little);
                     std.mem.writeInt(u64, updated.bytes[headerSize + slot * 16 + 8 ..][0..8], value, .little);
                     std.mem.writeInt(u16, updated.bytes[1..3], leaf.count + 1, .little);
-                    return InsertResult{ .ref = updated.ref, .count = @as(u64, leaf.count) + 1, .split = null };
+                    return InsertResult{ .reference = updated.reference, .count = @as(u64, leaf.count) + 1, .split = null };
                 }
 
                 // Full: build leafCapacity+1 sorted pairs, split at the
@@ -215,7 +215,7 @@ pub fn BTreeCore(comptime Keying: type) type {
                     valueSlots[copySlot + 1] = leaf.value(copySlot);
                 }
                 const midpoint: usize = totalPairs / 2;
-                const left = try transaction.writableCopy(nodeRef, leafNodeSize);
+                const left = try transaction.writableCopy(nodeReference, leafNodeSize);
                 std.mem.writeInt(u16, left.bytes[1..3], @intCast(midpoint), .little);
                 copySlot = 0;
                 while (copySlot < midpoint) : (copySlot += 1) {
@@ -231,26 +231,26 @@ pub fn BTreeCore(comptime Keying: type) type {
                 // free. Keying decides -- identity for inline keys.
                 const boundaryLow = try Keying.duplicateKey(transaction, keySlots[midpoint]);
                 return InsertResult{
-                    .ref = left.ref,
+                    .reference = left.reference,
                     .count = midpoint,
-                    .split = Split{ .ref = right.ref, .low = boundaryLow, .count = totalPairs - midpoint },
+                    .split = Split{ .reference = right.reference, .low = boundaryLow, .count = totalPairs - midpoint },
                 };
             }
 
             // ---- INNER ----------------------------------------------------
-            const innerBytes = try transaction.deref(nodeRef, innerNodeSize);
+            const innerBytes = try transaction.dereference(nodeReference, innerNodeSize);
             const inner = try parseInner(innerBytes);
             const childIndex = try childIndexForKey(transaction, inner, probeKey);
             const oldTotal = inner.totalCount();
             const oldChildCount = inner.subtreeCount(childIndex);
-            const childResult = try insertInto(transaction, inner.childRef(childIndex), probeKey, storedKey, value, depth + 1);
+            const childResult = try insertInto(transaction, inner.childReference(childIndex), probeKey, storedKey, value, depth + 1);
 
-            // No split in the child: update the child's ref and subtree count.
+            // No split in the child: update the child's reference and subtree count.
             if (childResult.split == null) {
-                const updated = try transaction.writableCopy(nodeRef, innerNodeSize);
-                std.mem.writeInt(u64, updated.bytes[headerSize + childIndex * innerStride ..][0..8], childResult.ref, .little);
+                const updated = try transaction.writableCopy(nodeReference, innerNodeSize);
+                std.mem.writeInt(u64, updated.bytes[headerSize + childIndex * innerStride ..][0..8], childResult.reference, .little);
                 std.mem.writeInt(u64, updated.bytes[headerSize + childIndex * innerStride + 16 ..][0..8], childResult.count, .little);
-                return InsertResult{ .ref = updated.ref, .count = oldTotal - oldChildCount + childResult.count, .split = null };
+                return InsertResult{ .reference = updated.reference, .count = oldTotal - oldChildCount + childResult.count, .split = null };
             }
 
             const childSplit = childResult.split.?;
@@ -259,10 +259,10 @@ pub fn BTreeCore(comptime Keying: type) type {
             // Child split but this inner node is not full: shift and insert
             // the new right sibling at childIndex+1.
             if (inner.childCount < fanout) {
-                const updated = try transaction.writableCopy(nodeRef, innerNodeSize);
-                // Update the split child's ref+count (its low key is
+                const updated = try transaction.writableCopy(nodeReference, innerNodeSize);
+                // Update the split child's reference+count (its low key is
                 // unchanged: the left half keeps the same minimum).
-                std.mem.writeInt(u64, updated.bytes[headerSize + childIndex * innerStride ..][0..8], childResult.ref, .little);
+                std.mem.writeInt(u64, updated.bytes[headerSize + childIndex * innerStride ..][0..8], childResult.reference, .little);
                 std.mem.writeInt(u64, updated.bytes[headerSize + childIndex * innerStride + 16 ..][0..8], childResult.count, .little);
                 // Shift slots [childIndex+1, childCount) right by one.
                 var moveSlot: usize = inner.childCount;
@@ -271,47 +271,47 @@ pub fn BTreeCore(comptime Keying: type) type {
                     const destination = headerSize + moveSlot * innerStride;
                     @memcpy(updated.bytes[destination..][0..innerStride], updated.bytes[source..][0..innerStride]);
                 }
-                std.mem.writeInt(u64, updated.bytes[headerSize + (childIndex + 1) * innerStride ..][0..8], childSplit.ref, .little);
+                std.mem.writeInt(u64, updated.bytes[headerSize + (childIndex + 1) * innerStride ..][0..8], childSplit.reference, .little);
                 std.mem.writeInt(u64, updated.bytes[headerSize + (childIndex + 1) * innerStride + 8 ..][0..8], childSplit.low, .little);
                 std.mem.writeInt(u64, updated.bytes[headerSize + (childIndex + 1) * innerStride + 16 ..][0..8], childSplit.count, .little);
                 std.mem.writeInt(u16, updated.bytes[1..3], inner.childCount + 1, .little);
-                return InsertResult{ .ref = updated.ref, .count = newTotal, .split = null };
+                return InsertResult{ .reference = updated.reference, .count = newTotal, .split = null };
             }
 
             // Child split AND this inner node is full: build fanout+1
             // entries, split at the midpoint. All entries are read from
             // `inner` before writableCopy.
             const totalChildren: usize = @as(usize, fanout) + 1;
-            var childRefs: [fanout + 1]u64 = undefined;
+            var childReferences: [fanout + 1]u64 = undefined;
             var lowKeys: [fanout + 1]u64 = undefined;
             var subtreeCounts: [fanout + 1]u64 = undefined;
             var copySlot: usize = 0;
             while (copySlot < inner.childCount) : (copySlot += 1) {
-                childRefs[copySlot] = inner.childRef(copySlot);
+                childReferences[copySlot] = inner.childReference(copySlot);
                 lowKeys[copySlot] = inner.lowKey(copySlot);
                 subtreeCounts[copySlot] = inner.subtreeCount(copySlot);
             }
-            // Update the split child's ref/count to the left half.
-            childRefs[childIndex] = childResult.ref;
+            // Update the split child's reference/count to the left half.
+            childReferences[childIndex] = childResult.reference;
             subtreeCounts[childIndex] = childResult.count;
             // Insert the new right sibling immediately after childIndex.
             copySlot = inner.childCount; // = fanout
             while (copySlot > childIndex + 1) : (copySlot -= 1) {
-                childRefs[copySlot] = childRefs[copySlot - 1];
+                childReferences[copySlot] = childReferences[copySlot - 1];
                 lowKeys[copySlot] = lowKeys[copySlot - 1];
                 subtreeCounts[copySlot] = subtreeCounts[copySlot - 1];
             }
-            childRefs[childIndex + 1] = childSplit.ref;
+            childReferences[childIndex + 1] = childSplit.reference;
             lowKeys[childIndex + 1] = childSplit.low;
             subtreeCounts[childIndex + 1] = childSplit.count;
 
             const midpoint: usize = totalChildren / 2;
-            const left = try transaction.writableCopy(nodeRef, innerNodeSize);
+            const left = try transaction.writableCopy(nodeReference, innerNodeSize);
             std.mem.writeInt(u16, left.bytes[1..3], @intCast(midpoint), .little);
             var leftCount: u64 = 0;
             copySlot = 0;
             while (copySlot < midpoint) : (copySlot += 1) {
-                std.mem.writeInt(u64, left.bytes[headerSize + copySlot * innerStride ..][0..8], childRefs[copySlot], .little);
+                std.mem.writeInt(u64, left.bytes[headerSize + copySlot * innerStride ..][0..8], childReferences[copySlot], .little);
                 std.mem.writeInt(u64, left.bytes[headerSize + copySlot * innerStride + 8 ..][0..8], lowKeys[copySlot], .little);
                 std.mem.writeInt(u64, left.bytes[headerSize + copySlot * innerStride + 16 ..][0..8], subtreeCounts[copySlot], .little);
                 leftCount += subtreeCounts[copySlot];
@@ -320,7 +320,7 @@ pub fn BTreeCore(comptime Keying: type) type {
             copySlot = midpoint;
             while (copySlot < totalChildren) : (copySlot += 1) rightCount += subtreeCounts[copySlot];
             const right = try transaction.alloc(innerNodeSize);
-            _ = encodeInner(right.bytes, childRefs[midpoint..totalChildren], lowKeys[midpoint..totalChildren], subtreeCounts[midpoint..totalChildren]);
+            _ = encodeInner(right.bytes, childReferences[midpoint..totalChildren], lowKeys[midpoint..totalChildren], subtreeCounts[midpoint..totalChildren]);
             // Duplicate the promoted low for the parent: the right inner node
             // keeps lowKeys[midpoint] as its own slot-0 low, and freeTree
             // releases every node's owned key material exactly once --
@@ -328,9 +328,9 @@ pub fn BTreeCore(comptime Keying: type) type {
             // for inline keys.
             const promotedLow = try Keying.duplicateKey(transaction, lowKeys[midpoint]);
             return InsertResult{
-                .ref = left.ref,
+                .reference = left.reference,
                 .count = leftCount,
-                .split = Split{ .ref = right.ref, .low = promotedLow, .count = rightCount },
+                .split = Split{ .reference = right.reference, .low = promotedLow, .count = rightCount },
             };
         }
 
@@ -341,46 +341,46 @@ pub fn BTreeCore(comptime Keying: type) type {
         /// released via Keying.freeKey.
         pub fn insert(transaction: anytype, root: Reference, probeKey: Keying.ProbeKey, storedKey: u64, value: u64) !Reference {
             const result = try insertInto(transaction, root, probeKey, storedKey, value, 0);
-            if (result.split == null) return result.ref;
+            if (result.split == null) return result.reference;
             // Root was split: build a new two-child inner root. The left low
             // is duplicated for the same ownership reason as split
             // separators: minKey returns the leftmost LEAF's slot-0 stored
             // key, which removeInto may free.
-            const leftLow = try Keying.duplicateKey(transaction, try minKey(transaction, result.ref));
+            const leftLow = try Keying.duplicateKey(transaction, try minKey(transaction, result.reference));
             const newRoot = try transaction.alloc(innerNodeSize);
-            const rootRefs = [_]u64{ result.ref, result.split.?.ref };
+            const rootReferences = [_]u64{ result.reference, result.split.?.reference };
             const rootLows = [_]u64{ leftLow, result.split.?.low };
             const rootCounts = [_]u64{ result.count, result.split.?.count };
-            _ = encodeInner(newRoot.bytes, &rootRefs, &rootLows, &rootCounts);
-            return newRoot.ref;
+            _ = encodeInner(newRoot.bytes, &rootReferences, &rootLows, &rootCounts);
+            return newRoot.reference;
         }
 
         /// Remove probeKey from the tree rooted at root, releasing the
         /// matched slot's key material via Keying.freeKey. Returns the
         /// (possibly new) root Reference; unchanged if the key is absent.
         pub fn remove(transaction: anytype, root: Reference, probeKey: Keying.ProbeKey) !Reference {
-            return (try removeInto(transaction, root, probeKey, 0)).ref;
+            return (try removeInto(transaction, root, probeKey, 0)).reference;
         }
 
-        /// Recursive remove. Returns the (possibly new) node ref and its
-        /// subtree count. Returns nodeRef unchanged when the key is absent
+        /// Recursive remove. Returns the (possibly new) node reference and its
+        /// subtree count. Returns nodeReference unchanged when the key is absent
         /// (no COW on the path).
-        fn removeInto(transaction: anytype, nodeRef: Reference, probeKey: Keying.ProbeKey, depth: usize) !RemoveResult {
+        fn removeInto(transaction: anytype, nodeReference: Reference, probeKey: Keying.ProbeKey, depth: usize) !RemoveResult {
             if (depth >= maxDepth) return error.Corrupt;
-            const kind = (try transaction.deref(nodeRef, 1))[0];
+            const kind = (try transaction.dereference(nodeReference, 1))[0];
 
             // ---- LEAF -----------------------------------------------------
             if (kind == kindLeaf) {
-                const leafBytes = try transaction.deref(nodeRef, leafNodeSize);
+                const leafBytes = try transaction.dereference(nodeReference, leafNodeSize);
                 const leaf = try parseLeaf(leafBytes);
                 const slot = try leafLowerBound(transaction, leaf, probeKey);
                 if (slot >= leaf.count or (try Keying.order(transaction, leaf.key(slot), probeKey)) != .eq) {
-                    return .{ .ref = nodeRef, .count = leaf.count }; // no-op
+                    return .{ .reference = nodeReference, .count = leaf.count }; // no-op
                 }
                 // Capture the stored key before COW so its key material can
                 // be freed afterward.
                 const removedKey = leaf.key(slot);
-                const updated = try transaction.writableCopy(nodeRef, leafNodeSize);
+                const updated = try transaction.writableCopy(nodeReference, leafNodeSize);
                 // Shift slots (slot+1 .. count) left by one, overwriting slot.
                 var moveSlot: usize = slot;
                 while (moveSlot + 1 < leaf.count) : (moveSlot += 1) {
@@ -390,62 +390,62 @@ pub fn BTreeCore(comptime Keying: type) type {
                 }
                 std.mem.writeInt(u16, updated.bytes[1..3], leaf.count - 1, .little);
                 try Keying.freeKey(transaction, removedKey);
-                return .{ .ref = updated.ref, .count = @as(u64, leaf.count) - 1 };
+                return .{ .reference = updated.reference, .count = @as(u64, leaf.count) - 1 };
             }
 
             // ---- INNER ----------------------------------------------------
-            const innerBytes = try transaction.deref(nodeRef, innerNodeSize);
+            const innerBytes = try transaction.dereference(nodeReference, innerNodeSize);
             const inner = try parseInner(innerBytes);
             const childIndex = try childIndexForKey(transaction, inner, probeKey);
-            const oldChildRef: Reference = inner.childRef(childIndex);
-            // Capture BEFORE writableCopy: it frees nodeRef into the reuse
+            const oldChildReference: Reference = inner.childReference(childIndex);
+            // Capture BEFORE writableCopy: it frees nodeReference into the reuse
             // pool, so inner's bytes must not be read after it (the node can
             // be reallocated).
             const oldTotal = inner.totalCount();
             const oldChildCount = inner.subtreeCount(childIndex);
-            const childResult = try removeInto(transaction, oldChildRef, probeKey, depth + 1);
+            const childResult = try removeInto(transaction, oldChildReference, probeKey, depth + 1);
             // No change in the subtree: skip COW on this inner node too.
-            if (childResult.ref == oldChildRef) return .{ .ref = nodeRef, .count = oldTotal };
-            const updated = try transaction.writableCopy(nodeRef, innerNodeSize);
-            std.mem.writeInt(u64, updated.bytes[headerSize + childIndex * innerStride ..][0..8], childResult.ref, .little);
+            if (childResult.reference == oldChildReference) return .{ .reference = nodeReference, .count = oldTotal };
+            const updated = try transaction.writableCopy(nodeReference, innerNodeSize);
+            std.mem.writeInt(u64, updated.bytes[headerSize + childIndex * innerStride ..][0..8], childResult.reference, .little);
             std.mem.writeInt(u64, updated.bytes[headerSize + childIndex * innerStride + 16 ..][0..8], childResult.count, .little);
-            return .{ .ref = updated.ref, .count = oldTotal - oldChildCount + childResult.count };
+            return .{ .reference = updated.reference, .count = oldTotal - oldChildCount + childResult.count };
         }
 
         /// Recursively free every node of the tree rooted at root so the
         /// space becomes reclaimable, releasing each slot's owned key
         /// material (leaf stored keys and inner low keys) via Keying.freeKey
         /// -- a no-op for inline keys. Values are NOT freed; for trees whose
-        /// leaf values are refs to other structures the caller owns those
+        /// leaf values are references to other structures the caller owns those
         /// separately. O(nodes) with I/O.
         pub fn freeTree(transaction: anytype, root: Reference) !void {
             return freeTreeAt(transaction, root, 0);
         }
 
-        fn freeTreeAt(transaction: anytype, nodeRef: Reference, depth: usize) !void {
+        fn freeTreeAt(transaction: anytype, nodeReference: Reference, depth: usize) !void {
             if (depth >= maxDepth) return error.Corrupt;
-            const bytes = try derefNode(transaction, nodeRef);
+            const bytes = try dereferenceNode(transaction, nodeReference);
             if (bytes[0] == kindLeaf) {
                 const leaf = try parseLeaf(bytes);
                 var slot: usize = 0;
                 while (slot < leaf.count) : (slot += 1) try Keying.freeKey(transaction, leaf.key(slot));
-                try transaction.free(nodeRef, leafNodeSize);
+                try transaction.free(nodeReference, leafNodeSize);
                 return;
             }
             const inner = try parseInner(bytes);
             var childIndex: usize = 0;
             while (childIndex < inner.childCount) : (childIndex += 1) {
-                try freeTreeAt(transaction, inner.childRef(childIndex), depth + 1);
+                try freeTreeAt(transaction, inner.childReference(childIndex), depth + 1);
                 try Keying.freeKey(transaction, inner.lowKey(childIndex));
             }
-            try transaction.free(nodeRef, innerNodeSize);
+            try transaction.free(nodeReference, innerNodeSize);
         }
 
         /// Return the number of keys in the tree rooted at root. A
         /// single-node read: leaves know their own count and inner nodes
         /// store per-child subtree counts.
         pub fn count(transaction: anytype, root: Reference) !u64 {
-            const bytes = try derefNode(transaction, root);
+            const bytes = try dereferenceNode(transaction, root);
             if (bytes[0] == kindLeaf) {
                 const leaf = try parseLeaf(bytes);
                 return leaf.count;
@@ -474,7 +474,7 @@ pub fn BTreeCore(comptime Keying: type) type {
             depth: usize,
         ) !void {
             if (depth >= maxDepth) return error.Corrupt;
-            const bytes = try derefNode(transaction, root);
+            const bytes = try dereferenceNode(transaction, root);
             if (bytes[0] == kindLeaf) {
                 const leaf = try parseLeaf(bytes);
                 var slot: usize = 0;
@@ -484,7 +484,7 @@ pub fn BTreeCore(comptime Keying: type) type {
             const inner = try parseInner(bytes);
             var childIndex: usize = 0;
             while (childIndex < inner.childCount) : (childIndex += 1) {
-                try forEachKeyAt(transaction, inner.childRef(childIndex), context, onKey, depth + 1);
+                try forEachKeyAt(transaction, inner.childReference(childIndex), context, onKey, depth + 1);
             }
         }
 
@@ -509,7 +509,7 @@ pub fn BTreeCore(comptime Keying: type) type {
             depth: usize,
         ) !void {
             if (depth >= maxDepth) return error.Corrupt;
-            const bytes = try derefNode(transaction, root);
+            const bytes = try dereferenceNode(transaction, root);
             if (bytes[0] == kindLeaf) {
                 const leaf = try parseLeaf(bytes);
                 var slot: usize = 0;
@@ -519,7 +519,7 @@ pub fn BTreeCore(comptime Keying: type) type {
             const inner = try parseInner(bytes);
             var childIndex: usize = 0;
             while (childIndex < inner.childCount) : (childIndex += 1) {
-                try forEachEntryAt(transaction, inner.childRef(childIndex), context, onEntry, depth + 1);
+                try forEachEntryAt(transaction, inner.childReference(childIndex), context, onEntry, depth + 1);
             }
         }
     };

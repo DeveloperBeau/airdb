@@ -44,8 +44,8 @@ fn nowNs(io: Io) i96 {
 // already-populated base. Returns nothing; the committed catalog is the root.
 fn seedBase(database: *airdb.Database, baseRows: []const []const u64) !void {
     var writeTransaction = try database.beginWrite();
-    const catalogRef = try catalog.create(&writeTransaction, 2);
-    const seeded = try bulk.bulkImport(&writeTransaction, catalogRef, baseRows, .{ .presorted = true });
+    const catalogReference = try catalog.create(&writeTransaction, 2);
+    const seeded = try bulk.bulkImport(&writeTransaction, catalogReference, baseRows, .{ .presorted = true });
     writeTransaction.setRoot(seeded);
     _ = try writeTransaction.commit();
 }
@@ -123,14 +123,14 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     while (inserted < metrics) {
         const thisBatch = @min(batchSize, metrics - inserted);
         var writeTransaction = try databaseB.beginWrite();
-        var catalogRef: Reference = databaseB.activeRoot; // reload the committed catalog ref
+        var catalogReference: Reference = databaseB.activeRoot; // reload the committed catalog reference
         var innerIndex: usize = 0;
         while (innerIndex < thisBatch) : (innerIndex += 1) {
             const primaryKey: u64 = base + inserted + innerIndex;
-            const result = try rows.insert(&writeTransaction, catalogRef, &.{ primaryKey, primaryKey });
-            catalogRef = result.catalogRef;
+            const result = try rows.insert(&writeTransaction, catalogReference, &.{ primaryKey, primaryKey });
+            catalogReference = result.catalogReference;
         }
-        writeTransaction.setRoot(catalogRef);
+        writeTransaction.setRoot(catalogReference);
         _ = try writeTransaction.commit();
         inserted += thisBatch;
     }

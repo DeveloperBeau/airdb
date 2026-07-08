@@ -28,7 +28,7 @@ const FileSyncer = @import("syncer.zig").FileSyncer;
 
 /// File magic doubling as the format version ("airdb" + _NNNN).
 /// _0002: the free list is persisted as a chain of bounded chunks
-/// ([count u32][nextRef u64][extents...]), not a single unbounded node.
+/// ([count u32][nextReference u64][extents...]), not a single unbounded node.
 pub const airdbMagic: u64 = 0x6169726462_0002;
 /// Size of the header page; the header and both commit slots live in it.
 pub const defaultPageSize: u32 = 4096;
@@ -163,7 +163,7 @@ pub const FileStore = struct {
         // Map all sections covering the existing file. ensureMapped rounds the file up to
         // a whole-section multiple first (an old file whose length is not a section
         // multiple is extended via setLength before mapping), so every section is fully
-        // backed before any deref.
+        // backed before any dereference.
         try store.ensureMapped(@intCast(openedLength));
         try store.readHeader();
         return store;
@@ -289,7 +289,7 @@ pub const FileStore = struct {
         return self.file.length(sysIo());
     }
 
-    /// The live section table, for the arena's ref translation.
+    /// The live section table, for the arena's reference translation.
     pub fn sectionsView(self: *FileStore) []const platform.Section {
         return self.sections.items;
     }

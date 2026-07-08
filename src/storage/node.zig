@@ -1,7 +1,7 @@
 const std = @import("std");
 
-/// Kind byte of a generic storage node: leaf values, inner refs, or raw bytes.
-pub const NodeKind = enum(u8) { leafValues, innerRefs, rawBytes };
+/// Kind byte of a generic storage node: leaf values, inner references, or raw bytes.
+pub const NodeKind = enum(u8) { leafValues, innerReferences, rawBytes };
 
 /// The header every generic storage node starts with: a kind byte plus a
 /// little-endian element count.
@@ -55,7 +55,7 @@ const testing = std.testing;
 test "encode then decode node header round-trips for every kind" {
     const cases = [_]struct { kind: NodeKind, count: u32 }{
         .{ .kind = .leafValues, .count = 0 },
-        .{ .kind = .innerRefs, .count = 300 },
+        .{ .kind = .innerReferences, .count = 300 },
         .{ .kind = .rawBytes, .count = 4294967295 },
     };
     for (cases) |testCase| {

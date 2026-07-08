@@ -45,26 +45,26 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     errdefer database.deinit();
 
     // Simple two-int type: {primaryKey, value}. The first value is the primary key.
-    var catalogRef: Reference = blk: {
+    var catalogReference: Reference = blk: {
         var writeTransaction = try database.beginWrite();
-        const catalogRef = try catalog.create(&writeTransaction, 2);
-        writeTransaction.setRoot(catalogRef);
+        const catalogReference = try catalog.create(&writeTransaction, 2);
+        writeTransaction.setRoot(catalogReference);
         _ = try writeTransaction.commit();
-        break :blk catalogRef;
+        break :blk catalogReference;
     };
 
     var inserted: usize = 0;
     while (inserted < ctx.rowCount) {
         const thisBatch = @min(batchSize, ctx.rowCount - inserted);
         var writeTransaction = try database.beginWrite();
-        catalogRef = database.activeRoot; // reload the committed catalog ref
+        catalogReference = database.activeRoot; // reload the committed catalog reference
         var innerIndex: usize = 0;
         while (innerIndex < thisBatch) : (innerIndex += 1) {
             const primaryKey: u64 = inserted + innerIndex;
-            const result = try rows.insert(&writeTransaction, catalogRef, &.{ primaryKey, primaryKey });
-            catalogRef = result.catalogRef;
+            const result = try rows.insert(&writeTransaction, catalogReference, &.{ primaryKey, primaryKey });
+            catalogReference = result.catalogReference;
         }
-        writeTransaction.setRoot(catalogRef);
+        writeTransaction.setRoot(catalogReference);
         _ = try writeTransaction.commit();
         inserted += thisBatch;
     }
@@ -89,9 +89,9 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     // forcing the freshly reopened mapping live. Time a single lookup with it.
     const readStart = nowNs(io);
     var readTransaction = try reopened.beginRead();
-    catalogRef = readTransaction.root();
+    catalogReference = readTransaction.root();
     var out: [2]u64 = undefined;
-    _ = try rows.getByPrimaryKey(&readTransaction, catalogRef, 0, &out);
+    _ = try rows.getByPrimaryKey(&readTransaction, catalogReference, 0, &out);
     const firstReadNs: u64 = @intCast(nowNs(io) - readStart);
     readTransaction.end();
 

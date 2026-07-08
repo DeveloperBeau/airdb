@@ -34,16 +34,16 @@ test "commit then reopen sees the committed root" {
         var writeTransaction = try database.beginWrite();
         const allocation = try writeTransaction.alloc(8);
         @memcpy(allocation.bytes, "HELLOAID");
-        writeTransaction.setRoot(allocation.ref);
+        writeTransaction.setRoot(allocation.reference);
         _ = try writeTransaction.commit();
     }
     {
         var database = try Database.open(testing.allocator, path);
         defer database.deinit();
         var readTransaction = try database.beginRead();
-        const rootRef = readTransaction.root();
-        try testing.expect(rootRef != 0);
-        const bytes = try readTransaction.deref(rootRef, 8);
+        const rootReference = readTransaction.root();
+        try testing.expect(rootReference != 0);
+        const bytes = try readTransaction.dereference(rootReference, 8);
         try testing.expectEqualStrings("HELLOAID", bytes);
     }
 }
@@ -59,7 +59,7 @@ test "ending a read transaction twice does not release another reader's pin" {
         var writeTransaction = try database.beginWrite();
         const allocation = try writeTransaction.alloc(8);
         @memcpy(allocation.bytes, "PINDATA_");
-        writeTransaction.setRoot(allocation.ref);
+        writeTransaction.setRoot(allocation.reference);
         _ = try writeTransaction.commit();
     }
     var readTransaction1 = try database.beginRead();
@@ -89,7 +89,7 @@ test "version horizon tracks the oldest live reader" {
         var writeTransaction = try database.beginWrite();
         const allocation = try writeTransaction.alloc(8);
         @memcpy(allocation.bytes, "NEWDATA_");
-        writeTransaction.setRoot(allocation.ref);
+        writeTransaction.setRoot(allocation.reference);
         _ = try writeTransaction.commit();
     }
     try testing.expectEqual(version, database.horizon()); // r1 still pinned at v
@@ -108,8 +108,8 @@ test "free list persists across commit and reopen" {
         var writeTransaction = try database.beginWrite();
         const allocation = try writeTransaction.alloc(8);
         @memcpy(allocation.bytes, "FIRSTVAL");
-        const allocationB = try writeTransaction.writableCopy(allocation.ref, 8); // frees the old node at this version
-        writeTransaction.setRoot(allocationB.ref);
+        const allocationB = try writeTransaction.writableCopy(allocation.reference, 8); // frees the old node at this version
+        writeTransaction.setRoot(allocationB.reference);
         _ = try writeTransaction.commit();
     }
     {
@@ -129,7 +129,7 @@ test "verifyIntegrity passes on a freshly committed database" {
     var writeTransaction = try database.beginWrite();
     const allocation = try writeTransaction.alloc(8);
     @memcpy(allocation.bytes, "INTEGER_");
-    writeTransaction.setRoot(allocation.ref);
+    writeTransaction.setRoot(allocation.reference);
     _ = try writeTransaction.commit();
     try verification.verifyIntegrity(&database); // void on clean database
 }
@@ -144,10 +144,10 @@ test "verifyIntegrity detects a root reference out of bounds" {
     var writeTransaction = try database.beginWrite();
     const allocation = try writeTransaction.alloc(8);
     @memcpy(allocation.bytes, "INTEGER_");
-    writeTransaction.setRoot(allocation.ref);
+    writeTransaction.setRoot(allocation.reference);
     _ = try writeTransaction.commit();
     database.activeRoot = database.store.map.len + 8; // point past the mapped region
-    try testing.expectError(error.RootRefOutOfBounds, verification.verifyIntegrity(&database));
+    try testing.expectError(error.RootReferenceOutOfBounds, verification.verifyIntegrity(&database));
 }
 
 test "verifyIntegrity detects a corrupt header" {
@@ -160,7 +160,7 @@ test "verifyIntegrity detects a corrupt header" {
     var writeTransaction = try database.beginWrite();
     const allocation = try writeTransaction.alloc(8);
     @memcpy(allocation.bytes, "INTEGER_");
-    writeTransaction.setRoot(allocation.ref);
+    writeTransaction.setRoot(allocation.reference);
     _ = try writeTransaction.commit();
     database.store.headerChecksumOk = false; // simulate an unreadable header
     try testing.expectError(error.HeaderCorrupt, verification.verifyIntegrity(&database));
@@ -176,9 +176,9 @@ test "verifyIntegrity detects a free-list node reference out of bounds" {
     var writeTransaction = try database.beginWrite();
     const allocation = try writeTransaction.alloc(8);
     @memcpy(allocation.bytes, "INTEGER_");
-    writeTransaction.setRoot(allocation.ref);
+    writeTransaction.setRoot(allocation.reference);
     _ = try writeTransaction.commit();
-    database.freeListNodeRef = @intCast(database.store.map.len + 8); // past the mapped region (8-aligned)
+    database.freeListNodeReference = @intCast(database.store.map.len + 8); // past the mapped region (8-aligned)
     database.freeListNodeLen = 16;
     try testing.expectError(error.FreeListCorrupt, verification.verifyIntegrity(&database));
 }
@@ -193,7 +193,7 @@ test "verifyIntegrity detects a free extent out of bounds" {
     var writeTransaction = try database.beginWrite();
     const allocation = try writeTransaction.alloc(8);
     @memcpy(allocation.bytes, "INTEGER_");
-    writeTransaction.setRoot(allocation.ref);
+    writeTransaction.setRoot(allocation.reference);
     _ = try writeTransaction.commit();
     // Inject an extent whose offset is past the mapped region.
     try database.freeList.extents.append(database.store.allocator, .{ .offset = @intCast(database.store.map.len + 8), .len = 8, .freedVersion = 1 });
@@ -287,15 +287,15 @@ test "verifyIntegrity detects a corrupted value index" {
     {
         var writeTransaction = try database.beginWrite();
         const directoryReference = database.activeRoot;
-        const catalogRef = try typeDirectory.catalogRef(&writeTransaction, directoryReference, tid);
-        const view = try catalog.loadCatalog(&writeTransaction, catalogRef);
-        const objectKey = (try catalog.primaryKeyToObjectKey(&writeTransaction, catalogRef, 0)).?; // row primaryKey 0 has value 0
+        const catalogReference = try typeDirectory.catalogReference(&writeTransaction, directoryReference, tid);
+        const view = try catalog.loadCatalog(&writeTransaction, catalogReference);
+        const objectKey = (try catalog.primaryKeyToObjectKey(&writeTransaction, catalogReference, 0)).?; // row primaryKey 0 has value 0
         const bogusValue: u64 = 999_999; // no row carries this value
         var setRoot = try Index.create(&writeTransaction);
         setRoot = try Index.insert(&writeTransaction, setRoot, objectKey, 1);
-        const newVi = try Index.insert(&writeTransaction, view.valueIndexRef(propertyIndex), bogusValue, setRoot);
-        const newCatalog = try catalog.setValueIndexRef(&writeTransaction, catalogRef, propertyIndex, newVi);
-        const newDirectoryReference = try typeDirectory.setCatalogRef(&writeTransaction, directoryReference, tid, newCatalog);
+        const newVi = try Index.insert(&writeTransaction, view.valueIndexReference(propertyIndex), bogusValue, setRoot);
+        const newCatalog = try catalog.setValueIndexReference(&writeTransaction, catalogReference, propertyIndex, newVi);
+        const newDirectoryReference = try typeDirectory.setCatalogReference(&writeTransaction, directoryReference, tid, newCatalog);
         writeTransaction.setRoot(newDirectoryReference);
         _ = try writeTransaction.commit();
     }
@@ -326,9 +326,9 @@ test "verifyIntegrity passes on a clean link graph after churn" {
         directoryReference = (try typeRouting.insert(&writeTransaction, directoryReference, 1, &.{ .{ .int = 2 }, .{ .link = insertedB.objectKey }, .{ .linkSet = &.{} } })).directoryReference;
         // Churn: move source 1's to-one link, drop one set member.
         directoryReference = try typeRouting.setLink(&writeTransaction, directoryReference, 1, 1, 1, insertedB.objectKey);
-        const sourceCatalog = try typeDirectory.catalogRef(&writeTransaction, directoryReference, 1);
+        const sourceCatalog = try typeDirectory.catalogReference(&writeTransaction, directoryReference, 1);
         const newCatalog = try links.linkSetRemove(&writeTransaction, sourceCatalog, 1, 2, insertedA.objectKey);
-        directoryReference = try typeDirectory.setCatalogRef(&writeTransaction, directoryReference, 1, newCatalog);
+        directoryReference = try typeDirectory.setCatalogReference(&writeTransaction, directoryReference, 1, newCatalog);
         writeTransaction.setRoot(directoryReference);
         _ = try writeTransaction.commit();
     }
@@ -363,11 +363,11 @@ test "verifyIntegrity detects a corrupted backlink index" {
     {
         var writeTransaction = try database.beginWrite();
         const directoryReference = database.activeRoot;
-        const catalogRef = try typeDirectory.catalogRef(&writeTransaction, directoryReference, 0);
-        const view = try catalog.loadCatalog(&writeTransaction, catalogRef);
-        const newBl = try Index.remove(&writeTransaction, view.backlinkRef(1), targetObjectKey);
-        const newCatalog = try catalog.setBacklinkRef(&writeTransaction, catalogRef, 1, newBl);
-        const newDirectoryReference = try typeDirectory.setCatalogRef(&writeTransaction, directoryReference, 0, newCatalog);
+        const catalogReference = try typeDirectory.catalogReference(&writeTransaction, directoryReference, 0);
+        const view = try catalog.loadCatalog(&writeTransaction, catalogReference);
+        const newBl = try Index.remove(&writeTransaction, view.backlinkReference(1), targetObjectKey);
+        const newCatalog = try catalog.setBacklinkReference(&writeTransaction, catalogReference, 1, newBl);
+        const newDirectoryReference = try typeDirectory.setCatalogReference(&writeTransaction, directoryReference, 0, newCatalog);
         writeTransaction.setRoot(newDirectoryReference);
         _ = try writeTransaction.commit();
     }
@@ -445,11 +445,11 @@ test "a second Database instance sees a commit made by the first after refresh-o
         var writeTransaction = try databaseA.beginWrite();
         const allocation = try writeTransaction.alloc(8);
         @memcpy(allocation.bytes, "SHARED!!");
-        writeTransaction.setRoot(allocation.ref);
+        writeTransaction.setRoot(allocation.reference);
         _ = try writeTransaction.commit();
     }
     var readTransaction = try databaseB.beginRead();
-    try testing.expectEqualStrings("SHARED!!", try readTransaction.deref(readTransaction.root(), 8));
+    try testing.expectEqualStrings("SHARED!!", try readTransaction.dereference(readTransaction.root(), 8));
     readTransaction.end();
 }
 
@@ -466,7 +466,7 @@ test "a second writer is excluded while the first holds the write lock" {
     try testing.expectError(error.WouldBlock, databaseB.beginWriteTry());
     const allocation = try writeTransactionA.alloc(8);
     @memcpy(allocation.bytes, "FIRST!!!");
-    writeTransactionA.setRoot(allocation.ref);
+    writeTransactionA.setRoot(allocation.reference);
     _ = try writeTransactionA.commit();
     var writeTransactionB = try databaseB.beginWriteTry();
     writeTransactionB.deinit();
@@ -483,7 +483,7 @@ test "Database publishes its minimum pinned version to its participant slot" {
         var writeTransaction = try database.beginWrite();
         const allocation = try writeTransaction.alloc(8);
         @memcpy(allocation.bytes, "VERSION2");
-        writeTransaction.setRoot(allocation.ref);
+        writeTransaction.setRoot(allocation.reference);
         _ = try writeTransaction.commit();
     }
     // No readers: this process publishes the sentinel (imposes no horizon constraint).
@@ -499,7 +499,7 @@ test "allocations beyond the initial mapping grow the file and data survives reo
     defer tmp.cleanup();
     const path = try tmpFilePath(testing.allocator, &tmp, "biggrow.airdb");
     defer testing.allocator.free(path);
-    var lastRef: Reference = 0;
+    var lastReference: Reference = 0;
     {
         var database = try Database.create(testing.allocator, path);
         defer database.deinit();
@@ -508,9 +508,9 @@ test "allocations beyond the initial mapping grow the file and data survives reo
         while (index < 400) : (index += 1) {
             const allocation = try writeTransaction.alloc(4096);
             allocation.bytes[0] = @intCast(index & 0xff);
-            lastRef = allocation.ref;
+            lastReference = allocation.reference;
         }
-        writeTransaction.setRoot(lastRef);
+        writeTransaction.setRoot(lastReference);
         _ = try writeTransaction.commit();
         try testing.expect(database.store.map.len > 4096 * 256);
     }
@@ -518,7 +518,7 @@ test "allocations beyond the initial mapping grow the file and data survives reo
         var database = try Database.open(testing.allocator, path);
         defer database.deinit();
         var readTransaction = try database.beginRead();
-        const got = try readTransaction.deref(readTransaction.root(), 4096);
+        const got = try readTransaction.dereference(readTransaction.root(), 4096);
         try testing.expectEqual(@as(u8, @intCast(399 & 0xff)), got[0]);
         readTransaction.end();
     }
@@ -537,7 +537,7 @@ test "observability: pinned version and storage size" {
         var writeTransaction = try database.beginWrite();
         const allocation = try writeTransaction.alloc(8);
         @memcpy(allocation.bytes, "FIRST!!!");
-        writeTransaction.setRoot(allocation.ref);
+        writeTransaction.setRoot(allocation.reference);
         _ = try writeTransaction.commit();
     }
     // No open reader: the oldest pinned version is the active version.
@@ -549,7 +549,7 @@ test "observability: pinned version and storage size" {
         var writeTransaction = try database.beginWrite();
         const allocation = try writeTransaction.alloc(8);
         @memcpy(allocation.bytes, "SECOND!!");
-        writeTransaction.setRoot(allocation.ref);
+        writeTransaction.setRoot(allocation.reference);
         _ = try writeTransaction.commit();
     }
     // The held reader pins the older version, below the new active version.
@@ -574,7 +574,7 @@ test "metrics report mapped length, versions, and reclaimable bytes" {
         var writeTransaction = try database.beginWrite();
         const allocation = try writeTransaction.alloc(8);
         @memcpy(allocation.bytes, "AAAAAAAA");
-        writeTransaction.setRoot(allocation.ref);
+        writeTransaction.setRoot(allocation.reference);
         _ = try writeTransaction.commit();
     }
     const oldRoot = database.activeRoot;
@@ -583,7 +583,7 @@ test "metrics report mapped length, versions, and reclaimable bytes" {
         const allocation = try writeTransaction.alloc(8);
         @memcpy(allocation.bytes, "BBBBBBBB");
         try writeTransaction.free(oldRoot, 8);
-        writeTransaction.setRoot(allocation.ref);
+        writeTransaction.setRoot(allocation.reference);
         _ = try writeTransaction.commit();
     }
 
@@ -614,15 +614,15 @@ test "version->root ring records committed versions" {
             var writeTransaction = try database.beginWrite();
             const allocation = try writeTransaction.alloc(8);
             @memcpy(allocation.bytes, "RINGDATA");
-            writeTransaction.setRoot(allocation.ref);
+            writeTransaction.setRoot(allocation.reference);
             _ = try writeTransaction.commit();
         }
 
         // Each committed version (2..activeVersion) maps to a non-zero root.
         var version: u64 = 2;
         while (version <= database.activeVersion) : (version += 1) {
-            const rootRef = database.versionRoot(version) orelse return error.TestUnexpectedNull;
-            try testing.expect(rootRef != 0);
+            const rootReference = database.versionRoot(version) orelse return error.TestUnexpectedNull;
+            try testing.expect(rootReference != 0);
         }
         // A version that was never committed yet is null.
         try testing.expectEqual(@as(?u64, null), database.versionRoot(database.activeVersion + 1));
@@ -635,8 +635,8 @@ test "version->root ring records committed versions" {
         try testing.expectEqual(@as(u64, 1 + key), database.activeVersion);
         var version: u64 = 2;
         while (version <= database.activeVersion) : (version += 1) {
-            const rootRef = database.versionRoot(version) orelse return error.TestUnexpectedNull;
-            try testing.expect(rootRef != 0);
+            const rootReference = database.versionRoot(version) orelse return error.TestUnexpectedNull;
+            try testing.expect(rootReference != 0);
         }
     }
 }
@@ -657,7 +657,7 @@ test "ring wraps after capacity" {
         var writeTransaction = try database.beginWrite();
         const allocation = try writeTransaction.alloc(8);
         @memcpy(allocation.bytes, "WRAPDATA");
-        writeTransaction.setRoot(allocation.ref);
+        writeTransaction.setRoot(allocation.reference);
         _ = try writeTransaction.commit();
     }
 
@@ -668,8 +668,8 @@ test "ring wraps after capacity" {
     try testing.expectEqual(oldestLive, database.oldestRetainedVersion());
     var version: u64 = oldestLive;
     while (version <= newest) : (version += 1) {
-        const rootRef = database.versionRoot(version) orelse return error.TestUnexpectedNull;
-        try testing.expect(rootRef != 0);
+        const rootReference = database.versionRoot(version) orelse return error.TestUnexpectedNull;
+        try testing.expect(rootReference != 0);
     }
 
     // Versions older than the live window were evicted.
@@ -693,7 +693,7 @@ test "a failed refresh leaves version and free list untouched" {
         var writeTransaction = try databaseA.beginWrite();
         const allocation = try writeTransaction.alloc(8);
         @memcpy(allocation.bytes, "VERSION2");
-        writeTransaction.setRoot(allocation.ref);
+        writeTransaction.setRoot(allocation.reference);
         _ = try writeTransaction.commit();
     }
 
@@ -710,15 +710,15 @@ test "a failed refresh leaves version and free list untouched" {
         const allocation = try writeTransaction.alloc(8);
         @memcpy(allocation.bytes, "VERSION3");
         try writeTransaction.free(oldRoot, 8);
-        writeTransaction.setRoot(allocation.ref);
+        writeTransaction.setRoot(allocation.reference);
         _ = try writeTransaction.commit();
     }
-    try testing.expect(databaseA.freeListNodeRef != 0);
-    const nodeOff: usize = @intCast(databaseA.freeListNodeRef);
+    try testing.expect(databaseA.freeListNodeReference != 0);
+    const nodeOff: usize = @intCast(databaseA.freeListNodeReference);
     // An absurd extent count makes the node length exceed the mapping.
     std.mem.writeInt(u32, databaseA.store.map[nodeOff..][0..4], 0xFFFF_FFFF, .little);
 
-    try testing.expectError(error.BadRef, databaseB.beginRead());
+    try testing.expectError(error.BadReference, databaseB.beginRead());
     try testing.expectEqual(bVersion, databaseB.activeVersion);
     try testing.expectEqual(bFlLen, databaseB.freeListLengthForTest());
 }
@@ -745,7 +745,7 @@ test "a retried commit's ring entry wins over the aborted duplicate" {
         var writeTransaction = try database.beginWrite();
         const allocation = try writeTransaction.alloc(8);
         @memcpy(allocation.bytes, "BASELINE");
-        writeTransaction.setRoot(allocation.ref);
+        writeTransaction.setRoot(allocation.reference);
         _ = try writeTransaction.commit();
     }
     const vTarget = database.activeVersion + 1;
@@ -755,7 +755,7 @@ test "a retried commit's ring entry wins over the aborted duplicate" {
         var writeTransaction = try database.beginWrite();
         const allocation = try writeTransaction.alloc(8);
         @memcpy(allocation.bytes, "ABORTED!");
-        writeTransaction.setRoot(allocation.ref);
+        writeTransaction.setRoot(allocation.reference);
         try testing.expectError(error.Durability, writeTransaction.commit());
     }
 
@@ -764,14 +764,14 @@ test "a retried commit's ring entry wins over the aborted duplicate" {
         var writeTransaction = try database.beginWrite();
         const allocation = try writeTransaction.alloc(8);
         @memcpy(allocation.bytes, "REALDATA");
-        writeTransaction.setRoot(allocation.ref);
+        writeTransaction.setRoot(allocation.reference);
         try testing.expectEqual(vTarget, try writeTransaction.commit());
     }
 
     // The past-version read must resolve to the committed root.
     var readTransaction = try database.beginReadAt(vTarget);
     defer readTransaction.end();
-    try testing.expectEqualStrings("REALDATA", try readTransaction.deref(readTransaction.root(), 8));
+    try testing.expectEqualStrings("REALDATA", try readTransaction.dereference(readTransaction.root(), 8));
 }
 
 test "beginReadAt opens a past version within the retention window" {
@@ -790,21 +790,21 @@ test "beginReadAt opens a past version within the retention window" {
     var versionC: u64 = undefined;
     {
         var writeTransaction = try database.beginWrite();
-        var catalogRef = try catalog.create(&writeTransaction, 2);
-        catalogRef = (try rows.insert(&writeTransaction, catalogRef, &.{ 1, 100 })).catalogRef;
-        writeTransaction.setRoot(catalogRef);
+        var catalogReference = try catalog.create(&writeTransaction, 2);
+        catalogReference = (try rows.insert(&writeTransaction, catalogReference, &.{ 1, 100 })).catalogReference;
+        writeTransaction.setRoot(catalogReference);
         versionA = try writeTransaction.commit();
     }
     {
         var writeTransaction = try database.beginWrite();
-        const catalogRef = (try rows.insert(&writeTransaction, writeTransaction.newRoot, &.{ 2, 200 })).catalogRef;
-        writeTransaction.setRoot(catalogRef);
+        const catalogReference = (try rows.insert(&writeTransaction, writeTransaction.newRoot, &.{ 2, 200 })).catalogReference;
+        writeTransaction.setRoot(catalogReference);
         versionB = try writeTransaction.commit();
     }
     {
         var writeTransaction = try database.beginWrite();
-        const catalogRef = (try rows.insert(&writeTransaction, writeTransaction.newRoot, &.{ 3, 300 })).catalogRef;
-        writeTransaction.setRoot(catalogRef);
+        const catalogReference = (try rows.insert(&writeTransaction, writeTransaction.newRoot, &.{ 3, 300 })).catalogReference;
+        writeTransaction.setRoot(catalogReference);
         versionC = try writeTransaction.commit();
     }
 
@@ -850,7 +850,7 @@ test "the retention window is shared across instances and survives reopen" {
         var writeTransaction = try databaseA.beginWrite();
         const allocation = try writeTransaction.alloc(8);
         @memcpy(allocation.bytes, "RETAINED");
-        writeTransaction.setRoot(allocation.ref);
+        writeTransaction.setRoot(allocation.reference);
         _ = try writeTransaction.commit();
     }
     {
@@ -879,7 +879,7 @@ test "a writer honors a retention floor raised by another instance" {
         var writeTransaction = try databaseB.beginWrite();
         const allocation = try writeTransaction.alloc(8);
         @memcpy(allocation.bytes, "AAAAAAAA");
-        writeTransaction.setRoot(allocation.ref);
+        writeTransaction.setRoot(allocation.reference);
         _ = try writeTransaction.commit();
     }
     const oldRoot = databaseB.activeRoot;
@@ -888,14 +888,14 @@ test "a writer honors a retention floor raised by another instance" {
         const allocation = try writeTransaction.alloc(8);
         @memcpy(allocation.bytes, "BBBBBBBB");
         try writeTransaction.free(oldRoot, 8);
-        writeTransaction.setRoot(allocation.ref);
+        writeTransaction.setRoot(allocation.reference);
         _ = try writeTransaction.commit();
     }
     {
         var writeTransaction = try databaseB.beginWrite();
         const allocation = try writeTransaction.alloc(8);
         // Without the shared window this allocation reused oldRoot.
-        try testing.expect(allocation.ref != oldRoot);
+        try testing.expect(allocation.reference != oldRoot);
         writeTransaction.deinit();
     }
 }
@@ -912,15 +912,15 @@ test "beginReadAt rejects a version aged out of the retention window" {
     var versionA: u64 = undefined;
     {
         var writeTransaction = try database.beginWrite();
-        var catalogRef = try catalog.create(&writeTransaction, 2);
-        catalogRef = (try rows.insert(&writeTransaction, catalogRef, &.{ 1, 100 })).catalogRef;
-        writeTransaction.setRoot(catalogRef);
+        var catalogReference = try catalog.create(&writeTransaction, 2);
+        catalogReference = (try rows.insert(&writeTransaction, catalogReference, &.{ 1, 100 })).catalogReference;
+        writeTransaction.setRoot(catalogReference);
         versionA = try writeTransaction.commit();
     }
     {
         var writeTransaction = try database.beginWrite();
-        const catalogRef = (try rows.insert(&writeTransaction, writeTransaction.newRoot, &.{ 2, 200 })).catalogRef;
-        writeTransaction.setRoot(catalogRef);
+        const catalogReference = (try rows.insert(&writeTransaction, writeTransaction.newRoot, &.{ 2, 200 })).catalogReference;
+        writeTransaction.setRoot(catalogReference);
         _ = try writeTransaction.commit();
     }
     // vA is older than active - retainVersions(0) -> aged out.
@@ -997,10 +997,10 @@ fn churnNetZero(path: []const u8, live: u64, iters: u64, auto: bool) !struct { n
 
     var readTransaction = try database.beginRead();
     defer readTransaction.end();
-    const catalogRef = try typeDirectory.catalogRef(&readTransaction, readTransaction.root(), tid);
+    const catalogReference = try typeDirectory.catalogReference(&readTransaction, readTransaction.root(), tid);
     return .{
-        .nextRow = (try catalog.loadCatalog(&readTransaction, catalogRef)).nextRow,
-        .live = try compaction.liveCount(&readTransaction, catalogRef),
+        .nextRow = (try catalog.loadCatalog(&readTransaction, catalogReference)).nextRow,
+        .live = try compaction.liveCount(&readTransaction, catalogReference),
     };
 }
 
@@ -1025,7 +1025,7 @@ test "a failed commit-point flush poisons the instance until reopen" {
             errdefer writeTransaction.deinit();
             const allocation = try writeTransaction.alloc(8);
             @memcpy(allocation.bytes, "POISON!!");
-            writeTransaction.setRoot(allocation.ref);
+            writeTransaction.setRoot(allocation.reference);
             try testing.expectError(error.Durability, writeTransaction.commit());
         }
         try testing.expectError(error.CommitIndeterminate, database.beginWrite());
@@ -1037,7 +1037,7 @@ test "a failed commit-point flush poisons the instance until reopen" {
     var writeTransaction = try database.beginWrite();
     const allocation = try writeTransaction.alloc(8);
     @memcpy(allocation.bytes, "RESOLVED");
-    writeTransaction.setRoot(allocation.ref);
+    writeTransaction.setRoot(allocation.reference);
     _ = try writeTransaction.commit();
 }
 
@@ -1098,7 +1098,7 @@ test "the compaction cursor never resumes across types" {
     // Regression: the cursor was keyed only on (liveCount, nextRow), which
     // two different types can share. Resuming type A's high-water cursor while
     // stepping type B left B's tail unexamined and the final truncate would
-    // have dropped live rows. The cursor now also pins the exact catalog ref.
+    // have dropped live rows. The cursor now also pins the exact catalog reference.
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try tmpFilePath(testing.allocator, &tmp, "cursor_types.airdb");
@@ -1160,8 +1160,8 @@ test "the compaction cursor never resumes across types" {
         while (primaryKey < 12) : (primaryKey += 1) {
             try testing.expect((try typeRouting.get(&readTransaction, readTransaction.root(), typeId, primaryKey, &out)) != null);
         }
-        const catalogRef = try typeDirectory.catalogRef(&readTransaction, readTransaction.root(), typeId);
-        try testing.expectEqual(@as(u64, 4), (try catalog.loadCatalog(&readTransaction, catalogRef)).nextRow);
+        const catalogReference = try typeDirectory.catalogReference(&readTransaction, readTransaction.root(), typeId);
+        try testing.expectEqual(@as(u64, 4), (try catalog.loadCatalog(&readTransaction, catalogReference)).nextRow);
     }
 }
 
@@ -1170,7 +1170,7 @@ test "a corrupt persisted free-list extent fails open instead of poisoning reuse
     defer tmp.cleanup();
     const path = try tmpFilePath(testing.allocator, &tmp, "flcorrupt.airdb");
     defer testing.allocator.free(path);
-    var nodeRef: Reference = 0;
+    var nodeReference: Reference = 0;
     {
         var database = try Database.create(testing.allocator, path);
         defer database.deinit();
@@ -1178,7 +1178,7 @@ test "a corrupt persisted free-list extent fails open instead of poisoning reuse
             var writeTransaction = try database.beginWrite();
             const allocation = try writeTransaction.alloc(8);
             @memcpy(allocation.bytes, "AAAAAAAA");
-            writeTransaction.setRoot(allocation.ref);
+            writeTransaction.setRoot(allocation.reference);
             _ = try writeTransaction.commit();
         }
         const oldRoot = database.activeRoot;
@@ -1187,13 +1187,13 @@ test "a corrupt persisted free-list extent fails open instead of poisoning reuse
             const allocation = try writeTransaction.alloc(8);
             @memcpy(allocation.bytes, "BBBBBBBB");
             try writeTransaction.free(oldRoot, 8);
-            writeTransaction.setRoot(allocation.ref);
+            writeTransaction.setRoot(allocation.reference);
             _ = try writeTransaction.commit();
         }
-        nodeRef = database.freeListNodeRef;
-        try testing.expect(nodeRef != 0);
+        nodeReference = database.freeListNodeReference;
+        try testing.expect(nodeReference != 0);
         // Corrupt the first extent's offset into something misaligned.
-        const off: usize = @intCast(nodeRef);
+        const off: usize = @intCast(nodeReference);
         std.mem.writeInt(u64, database.store.map[off + 12 ..][0..8], 12345, .little); // % 8 != 0
         try database.store.syncer.flush(database.store.file);
     }
@@ -1247,9 +1247,9 @@ test "maybeCompactStep is a no-op when nothing to compact" {
     // The type is untouched: all three rows remain live and packed.
     var readTransaction = try database.beginRead();
     defer readTransaction.end();
-    const catalogRef = try typeDirectory.catalogRef(&readTransaction, readTransaction.root(), tid);
-    try testing.expectEqual(@as(u64, 3), try compaction.liveCount(&readTransaction, catalogRef));
-    try testing.expectEqual(@as(u64, 3), (try catalog.loadCatalog(&readTransaction, catalogRef)).nextRow);
+    const catalogReference = try typeDirectory.catalogReference(&readTransaction, readTransaction.root(), tid);
+    try testing.expectEqual(@as(u64, 3), try compaction.liveCount(&readTransaction, catalogReference));
+    try testing.expectEqual(@as(u64, 3), (try catalog.loadCatalog(&readTransaction, catalogReference)).nextRow);
 }
 
 test "a free list spanning multiple chunks survives commit and reopen" {
@@ -1267,22 +1267,22 @@ test "a free list spanning multiple chunks survives commit and reopen" {
     errdefer database.deinit();
 
     const nExtents = FreeList.chunkExtentCap + 500;
-    const refs = try testing.allocator.alloc(u64, nExtents);
-    defer testing.allocator.free(refs);
+    const references = try testing.allocator.alloc(u64, nExtents);
+    defer testing.allocator.free(references);
     {
         var writeTransaction = try database.beginWrite();
-        for (refs) |*ref| ref.* = (try writeTransaction.alloc(8)).ref;
+        for (references) |*reference| reference.* = (try writeTransaction.alloc(8)).reference;
         const root = try writeTransaction.alloc(8);
         @memcpy(root.bytes, "CHUNKED!");
-        writeTransaction.setRoot(root.ref);
+        writeTransaction.setRoot(root.reference);
         _ = try writeTransaction.commit();
     }
     {
         var writeTransaction = try database.beginWrite();
-        for (refs) |ref| try writeTransaction.free(ref, 8);
+        for (references) |reference| try writeTransaction.free(reference, 8);
         const root = try writeTransaction.alloc(8);
         @memcpy(root.bytes, "CHUNKED2");
-        writeTransaction.setRoot(root.ref);
+        writeTransaction.setRoot(root.reference);
         _ = try writeTransaction.commit();
     }
     try testing.expect(database.freeListLengthForTest() >= nExtents);
@@ -1294,17 +1294,17 @@ test "a free list spanning multiple chunks survives commit and reopen" {
     try verification.verifyIntegrity(&database2);
 }
 
-test "a free-list chain whose next ref points up-chain is rejected as corrupt" {
-    // Regression: a forged or bit-rotted nextRef forming a cycle re-decoded
+test "a free-list chain whose next reference points up-chain is rejected as corrupt" {
+    // Regression: a forged or bit-rotted nextReference forming a cycle re-decoded
     // the same chunk's extents on every hop -- an out-of-memory death, not an
     // error, long before the hop guard tripped. Legitimate chains have
-    // strictly decreasing refs (chunks are written back-to-front), so a
+    // strictly decreasing references (chunks are written back-to-front), so a
     // self-referencing head must fail the open cheaply with error.Corrupt.
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try tmpFilePath(testing.allocator, &tmp, "flcycle.airdb");
     defer testing.allocator.free(path);
-    var nodeRef: u64 = 0;
+    var nodeReference: u64 = 0;
     {
         var database = try Database.create(testing.allocator, path);
         defer database.deinit();
@@ -1312,7 +1312,7 @@ test "a free-list chain whose next ref points up-chain is rejected as corrupt" {
             var writeTransaction = try database.beginWrite();
             const allocation = try writeTransaction.alloc(8);
             @memcpy(allocation.bytes, "CYCLBASE");
-            writeTransaction.setRoot(allocation.ref);
+            writeTransaction.setRoot(allocation.reference);
             _ = try writeTransaction.commit();
         }
         const oldRoot = database.activeRoot;
@@ -1321,14 +1321,14 @@ test "a free-list chain whose next ref points up-chain is rejected as corrupt" {
             const allocation = try writeTransaction.alloc(8);
             @memcpy(allocation.bytes, "CYCLNEXT");
             try writeTransaction.free(oldRoot, 8);
-            writeTransaction.setRoot(allocation.ref);
+            writeTransaction.setRoot(allocation.reference);
             _ = try writeTransaction.commit();
         }
-        nodeRef = database.freeListNodeRef;
-        try testing.expect(nodeRef != 0);
-        // Point the head chunk's nextRef at itself.
-        const off: usize = @intCast(nodeRef);
-        std.mem.writeInt(u64, database.store.map[off + 4 ..][0..8], nodeRef, .little);
+        nodeReference = database.freeListNodeReference;
+        try testing.expect(nodeReference != 0);
+        // Point the head chunk's nextReference at itself.
+        const off: usize = @intCast(nodeReference);
+        std.mem.writeInt(u64, database.store.map[off + 4 ..][0..8], nodeReference, .little);
         try database.store.syncer.flush(database.store.file);
     }
     try testing.expectError(error.Corrupt, Database.open(testing.allocator, path));

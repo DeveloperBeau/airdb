@@ -24,7 +24,7 @@ fn bidxTmpPath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const
     return std.fs.path.join(allocator, &.{ pathBuffer[0..dlen], name });
 }
 
-test "a byteKeyIndex ref cycle fails with error.Corrupt" {
+test "a byteKeyIndex reference cycle fails with error.Corrupt" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try bidxTmpPath(testing.allocator, &tmp, "bidx_cycle.airdb");
@@ -36,21 +36,21 @@ test "a byteKeyIndex ref cycle fails with error.Corrupt" {
 
     // Inner node whose only child is itself; its low key is a real blob so the
     // ordering compare succeeds and the walk descends into the cycle.
-    const keyRef = try blob.put(&writeTransaction, "k");
+    const keyReference = try blob.put(&writeTransaction, "k");
     const allocation = try writeTransaction.alloc(innerNodeSize);
-    _ = encodeInner(allocation.bytes, &.{allocation.ref}, &.{keyRef}, &.{1});
-    try testing.expectError(error.Corrupt, get(&writeTransaction, allocation.ref, "k"));
-    try testing.expectError(error.Corrupt, insert(&writeTransaction, allocation.ref, "x", 1));
-    try testing.expectError(error.Corrupt, remove(&writeTransaction, allocation.ref, "k"));
+    _ = encodeInner(allocation.bytes, &.{allocation.reference}, &.{keyReference}, &.{1});
+    try testing.expectError(error.Corrupt, get(&writeTransaction, allocation.reference, "k"));
+    try testing.expectError(error.Corrupt, insert(&writeTransaction, allocation.reference, "x", 1));
+    try testing.expectError(error.Corrupt, remove(&writeTransaction, allocation.reference, "k"));
     const NopSink = struct {
         fn onEntry(_: @This(), _: []const u8, _: u64) !void {}
     };
-    try testing.expectError(error.Corrupt, forEachEntry(&writeTransaction, allocation.ref, NopSink{}, NopSink.onEntry));
+    try testing.expectError(error.Corrupt, forEachEntry(&writeTransaction, allocation.reference, NopSink{}, NopSink.onEntry));
 }
 
 test "freeTree over a three-level tree frees every blob exactly once" {
     // Regression: an inner split promoted its boundary low to the parent while
-    // the right inner node kept the SAME blob ref as its slot-0 low; freeTree
+    // the right inner node kept the SAME blob reference as its slot-0 low; freeTree
     // then freed that blob twice, planting a duplicate extent in the pool
     // (two later allocations handed the same bytes). The promoted low is now
     // duplicated. Detector: after freeing the whole tree, no freed offset may

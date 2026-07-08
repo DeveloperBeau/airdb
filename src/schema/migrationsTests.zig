@@ -38,14 +38,14 @@ test "addProperty backfills the default for existing rows" {
     defer database.deinit();
     var writeTransaction = try database.beginWrite();
     // start with primaryKey + one value
-    var catalogRef = try create(&writeTransaction, 2);
-    catalogRef = (try insert(&writeTransaction, catalogRef, &.{ 1, 10 })).catalogRef;
-    catalogRef = (try insert(&writeTransaction, catalogRef, &.{ 2, 20 })).catalogRef;
+    var catalogReference = try create(&writeTransaction, 2);
+    catalogReference = (try insert(&writeTransaction, catalogReference, &.{ 1, 10 })).catalogReference;
+    catalogReference = (try insert(&writeTransaction, catalogReference, &.{ 2, 20 })).catalogReference;
     // add a third int property defaulting to 7
-    catalogRef = try addProperty(&writeTransaction, catalogRef, .{ .kind = .int }, 7);
-    try testing.expectEqual(@as(PropertyCount, 3), try loadPropertyCount(&writeTransaction, catalogRef));
+    catalogReference = try addProperty(&writeTransaction, catalogReference, .{ .kind = .int }, 7);
+    try testing.expectEqual(@as(PropertyCount, 3), try loadPropertyCount(&writeTransaction, catalogReference));
     var out: [3]u64 = undefined;
-    _ = (try getByPrimaryKey(&writeTransaction, catalogRef, 1, &out)).?;
+    _ = (try getByPrimaryKey(&writeTransaction, catalogReference, 1, &out)).?;
     try testing.expectEqual(@as(u64, 10), out[1]);
     try testing.expectEqual(@as(u64, 7), out[2]); // backfilled
     writeTransaction.deinit();
@@ -59,14 +59,14 @@ test "addProperty: new inserts supply the added property" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var writeTransaction = try database.beginWrite();
-    var catalogRef = try create(&writeTransaction, 2);
-    catalogRef = (try insert(&writeTransaction, catalogRef, &.{ 1, 10 })).catalogRef;
-    catalogRef = (try insert(&writeTransaction, catalogRef, &.{ 2, 20 })).catalogRef;
-    catalogRef = try addProperty(&writeTransaction, catalogRef, .{ .kind = .int }, 7);
+    var catalogReference = try create(&writeTransaction, 2);
+    catalogReference = (try insert(&writeTransaction, catalogReference, &.{ 1, 10 })).catalogReference;
+    catalogReference = (try insert(&writeTransaction, catalogReference, &.{ 2, 20 })).catalogReference;
+    catalogReference = try addProperty(&writeTransaction, catalogReference, .{ .kind = .int }, 7);
     // new inserts provide all three
-    catalogRef = (try insert(&writeTransaction, catalogRef, &.{ 3, 30, 99 })).catalogRef;
+    catalogReference = (try insert(&writeTransaction, catalogReference, &.{ 3, 30, 99 })).catalogReference;
     var out: [3]u64 = undefined;
-    _ = (try getByPrimaryKey(&writeTransaction, catalogRef, 3, &out)).?;
+    _ = (try getByPrimaryKey(&writeTransaction, catalogReference, 3, &out)).?;
     try testing.expectEqual(@as(u64, 99), out[2]);
     writeTransaction.deinit();
 }
@@ -79,15 +79,15 @@ test "removeProperty drops a property and shifts the rest" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var writeTransaction = try database.beginWrite();
-    var catalogRef = try create(&writeTransaction, 2);
-    catalogRef = (try insert(&writeTransaction, catalogRef, &.{ 1, 10 })).catalogRef;
-    catalogRef = try addProperty(&writeTransaction, catalogRef, .{ .kind = .int }, 7);
-    catalogRef = (try insert(&writeTransaction, catalogRef, &.{ 3, 30, 99 })).catalogRef;
+    var catalogReference = try create(&writeTransaction, 2);
+    catalogReference = (try insert(&writeTransaction, catalogReference, &.{ 1, 10 })).catalogReference;
+    catalogReference = try addProperty(&writeTransaction, catalogReference, .{ .kind = .int }, 7);
+    catalogReference = (try insert(&writeTransaction, catalogReference, &.{ 3, 30, 99 })).catalogReference;
     // remove the middle property (index 1); now primaryKey + the added property
-    catalogRef = try removeProperty(&writeTransaction, catalogRef, 1);
-    try testing.expectEqual(@as(PropertyCount, 2), try loadPropertyCount(&writeTransaction, catalogRef));
+    catalogReference = try removeProperty(&writeTransaction, catalogReference, 1);
+    try testing.expectEqual(@as(PropertyCount, 2), try loadPropertyCount(&writeTransaction, catalogReference));
     var out2: [2]u64 = undefined;
-    _ = (try getByPrimaryKey(&writeTransaction, catalogRef, 3, &out2)).?;
+    _ = (try getByPrimaryKey(&writeTransaction, catalogReference, 3, &out2)).?;
     try testing.expectEqual(@as(u64, 3), out2[0]); // primaryKey preserved
     try testing.expectEqual(@as(u64, 99), out2[1]); // the formerly-third property shifted to index 1
     writeTransaction.deinit();
@@ -105,13 +105,13 @@ test "addProperty(indexed) backfills the value index for existing rows" {
     defer database.deinit();
     {
         var writeTransaction = try database.beginWrite();
-        var catalogRef = try create(&writeTransaction, 2);
-        catalogRef = (try insert(&writeTransaction, catalogRef, &.{ 1, 10 })).catalogRef;
-        catalogRef = (try insert(&writeTransaction, catalogRef, &.{ 2, 20 })).catalogRef;
-        catalogRef = try addProperty(&writeTransaction, catalogRef, .{ .kind = .int, .indexed = true }, 7);
+        var catalogReference = try create(&writeTransaction, 2);
+        catalogReference = (try insert(&writeTransaction, catalogReference, &.{ 1, 10 })).catalogReference;
+        catalogReference = (try insert(&writeTransaction, catalogReference, &.{ 2, 20 })).catalogReference;
+        catalogReference = try addProperty(&writeTransaction, catalogReference, .{ .kind = .int, .indexed = true }, 7);
         // A post-migration insert supplies its own value.
-        catalogRef = (try insert(&writeTransaction, catalogRef, &.{ 3, 30, 9 })).catalogRef;
-        writeTransaction.setRoot(catalogRef);
+        catalogReference = (try insert(&writeTransaction, catalogReference, &.{ 3, 30, 9 })).catalogReference;
+        writeTransaction.setRoot(catalogReference);
         _ = try writeTransaction.commit();
     }
     try verification.verifyIntegrity(&database);
@@ -130,7 +130,7 @@ test "addProperty(linkSet) leaves pre-migration rows deletable" {
     // Regression: collection kinds were backfilled with a raw 0 root, which
     // broke every collection accessor on migrated rows and made them
     // undeletable through the graph-safe delete (its outbound cleanup walks
-    // linkSet roots and hit error.BadRef).
+    // linkSet roots and hit error.BadReference).
     const typeDirectory = @import("typeDirectory.zig");
     const typeRouting = @import("typeRouting.zig");
     var tmp = testing.tmpDir(.{});
@@ -144,9 +144,9 @@ test "addProperty(linkSet) leaves pre-migration rows deletable" {
         var directoryReference = try typeDirectory.createTypes(&writeTransaction, &.{&.{.{ .kind = .int }}}, &.{false});
         directoryReference = (try typeRouting.insert(&writeTransaction, directoryReference, 0, &.{.{ .int = 1 }})).directoryReference;
         // Migrate: add a linkSet property targeting the same type.
-        const catalogRef = try typeDirectory.catalogRef(&writeTransaction, directoryReference, 0);
-        const newCatalog = try addProperty(&writeTransaction, catalogRef, .{ .kind = .linkSet, .linkTarget = 0 }, 0);
-        directoryReference = try typeDirectory.setCatalogRef(&writeTransaction, directoryReference, 0, newCatalog);
+        const catalogReference = try typeDirectory.catalogReference(&writeTransaction, directoryReference, 0);
+        const newCatalog = try addProperty(&writeTransaction, catalogReference, .{ .kind = .linkSet, .linkTarget = 0 }, 0);
+        directoryReference = try typeDirectory.setCatalogReference(&writeTransaction, directoryReference, 0, newCatalog);
         writeTransaction.setRoot(directoryReference);
         _ = try writeTransaction.commit();
     }
@@ -156,7 +156,7 @@ test "addProperty(linkSet) leaves pre-migration rows deletable" {
         var out: [2]catalog.Value = undefined;
         const version = (try typeRouting.get(&writeTransaction, writeTransaction.newRoot, 0, 1, &out)).?;
         const res = try typeRouting.deleteNullifyCrossType(&writeTransaction, writeTransaction.newRoot, 0, 1, version);
-        try testing.expect(res == .ok); // previously error.BadRef
+        try testing.expect(res == .ok); // previously error.BadReference
         writeTransaction.setRoot(res.ok);
         _ = try writeTransaction.commit();
     }
@@ -171,8 +171,8 @@ test "addProperty rejects an indexed collection" {
     defer database.deinit();
     var writeTransaction = try database.beginWrite();
     defer writeTransaction.deinit();
-    const catalogRef = try create(&writeTransaction, 1);
-    try testing.expectError(error.Unsupported, addProperty(&writeTransaction, catalogRef, .{ .kind = .list, .indexed = true }, 0));
+    const catalogReference = try create(&writeTransaction, 1);
+    try testing.expectError(error.Unsupported, addProperty(&writeTransaction, catalogReference, .{ .kind = .list, .indexed = true }, 0));
 }
 
 test "addProperty link type gets a backlink index" {
@@ -183,19 +183,19 @@ test "addProperty link type gets a backlink index" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var writeTransaction = try database.beginWrite();
-    var catalogRef = try create(&writeTransaction, 1); // just a primaryKey
-    catalogRef = (try insert(&writeTransaction, catalogRef, &.{1})).catalogRef;
-    catalogRef = try addProperty(&writeTransaction, catalogRef, .{ .kind = .link }, 0); // 0 == null link
-    const view = try catalog.loadCatalog(&writeTransaction, catalogRef);
+    var catalogReference = try create(&writeTransaction, 1); // just a primaryKey
+    catalogReference = (try insert(&writeTransaction, catalogReference, &.{1})).catalogReference;
+    catalogReference = try addProperty(&writeTransaction, catalogReference, .{ .kind = .link }, 0); // 0 == null link
+    const view = try catalog.loadCatalog(&writeTransaction, catalogReference);
     try testing.expectEqual(PropertyKind.link, view.kind(1));
-    try testing.expect(view.backlinkRef(1) != 0);
+    try testing.expect(view.backlinkReference(1) != 0);
     // a row created before the migration reads as a null link
-    try testing.expectEqual(@as(?u64, null), try getLink(&writeTransaction, catalogRef, 1, 1));
+    try testing.expectEqual(@as(?u64, null), try getLink(&writeTransaction, catalogReference, 1, 1));
     writeTransaction.deinit();
 }
 
 test "addProperty copies a blob default per row instead of sharing one node" {
-    // Regression: the backfill wrote the caller's single blob ref into every
+    // Regression: the backfill wrote the caller's single blob reference into every
     // existing row. The first row's delete freed the node underneath all the
     // others, and a second delete freed it again -- a duplicate extent in the
     // free list, handing the same bytes to two future allocations.
@@ -208,12 +208,12 @@ test "addProperty copies a blob default per row instead of sharing one node" {
 
     {
         var writeTransaction = try database.beginWrite();
-        var catalogRef = try catalog.createTyped(&writeTransaction, &.{ .int, .int });
-        catalogRef = (try insert(&writeTransaction, catalogRef, &.{ 1, 10 })).catalogRef;
-        catalogRef = (try insert(&writeTransaction, catalogRef, &.{ 2, 20 })).catalogRef;
+        var catalogReference = try catalog.createTyped(&writeTransaction, &.{ .int, .int });
+        catalogReference = (try insert(&writeTransaction, catalogReference, &.{ 1, 10 })).catalogReference;
+        catalogReference = (try insert(&writeTransaction, catalogReference, &.{ 2, 20 })).catalogReference;
         const dflt = try blob.put(&writeTransaction, "default-bytes");
-        catalogRef = try addProperty(&writeTransaction, catalogRef, .{ .kind = .blob }, dflt);
-        writeTransaction.setRoot(catalogRef);
+        catalogReference = try addProperty(&writeTransaction, catalogReference, .{ .kind = .blob }, dflt);
+        writeTransaction.setRoot(catalogReference);
         _ = try writeTransaction.commit();
     }
     var writeTransaction = try database.beginWrite();
@@ -227,13 +227,13 @@ test "addProperty copies a blob default per row instead of sharing one node" {
     try testing.expectEqualStrings("default-bytes", try blob.get(&writeTransaction, raw2[2]));
     try testing.expect(raw1[2] != raw2[2]);
     // Deleting both rows must not free any extent twice.
-    var catalogRef = writeTransaction.newRoot;
-    switch (try objects.deleteTyped(&writeTransaction, catalogRef, 1, version)) {
-        .ok => |newCatalog| catalogRef = newCatalog,
+    var catalogReference = writeTransaction.newRoot;
+    switch (try objects.deleteTyped(&writeTransaction, catalogReference, 1, version)) {
+        .ok => |newCatalog| catalogReference = newCatalog,
         else => return error.TestUnexpectedResult,
     }
-    switch (try objects.deleteTyped(&writeTransaction, catalogRef, 2, version2)) {
-        .ok => |newCatalog| catalogRef = newCatalog,
+    switch (try objects.deleteTyped(&writeTransaction, catalogReference, 2, version2)) {
+        .ok => |newCatalog| catalogReference = newCatalog,
         else => return error.TestUnexpectedResult,
     }
     var seen = std.AutoHashMap(u64, void).init(testing.allocator);

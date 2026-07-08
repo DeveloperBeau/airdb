@@ -1,8 +1,8 @@
 //! Byte-keyed ordered B+tree: the shared core of bTreeCore.zig
-//! instantiated with blob-ref keys. Same on-disk node layout as index.zig
+//! instantiated with blob-reference keys. Same on-disk node layout as index.zig
 //! (see indexNode.zig). The ONLY difference from index.zig: the u64 stored in
-//! a leaf key slot is a blob ref to the key bytes (not the key itself), and
-//! the "lowKey" of an inner pair is a blob ref to the smallest key in that
+//! a leaf key slot is a blob reference to the key bytes (not the key itself), and
+//! the "lowKey" of an inner pair is a blob reference to the smallest key in that
 //! subtree. All ordering compares the dereferenced bytes with std.mem.order;
 //! keys live in the blob heap. See bTreeCore.zig for the transaction
 //! capability the `transaction` parameters must satisfy (WriteTransaction in production;
@@ -13,7 +13,7 @@ const Reference = @import("../storage/reference.zig").Reference;
 const blob = @import("../records/blob.zig");
 const bTreeCore = @import("bTreeCore.zig");
 
-/// Keying for blob-ref keys: the stored u64 refs the key bytes in the blob
+/// Keying for blob-reference keys: the stored u64 references the key bytes in the blob
 /// heap, and ordering dereferences and byte-compares them.
 const BlobKeying = struct {
     /// Callers search with the key bytes.
@@ -22,8 +22,8 @@ const BlobKeying = struct {
     /// Byte order of the stored key's blob against the probe bytes. Pure
     /// byte ordering via std.mem.order -- this is index ordering, not a
     /// secret comparison, so constant-time is neither required nor wanted.
-    pub fn order(transaction: anytype, storedKeyRef: u64, probeKey: []const u8) !std.math.Order {
-        const storedBytes = try blob.get(transaction, storedKeyRef);
+    pub fn order(transaction: anytype, storedKeyReference: u64, probeKey: []const u8) !std.math.Order {
+        const storedBytes = try blob.get(transaction, storedKeyReference);
         return std.mem.order(u8, storedBytes, probeKey);
     }
 
@@ -34,14 +34,14 @@ const BlobKeying = struct {
     /// across sibling inner nodes would double-free in freeTree. Like classic
     /// B+tree separators, duplicated separator blobs are never freed by
     /// remove -- one small blob per split, released only by freeTree.
-    pub fn duplicateKey(transaction: anytype, storedKeyRef: u64) !u64 {
-        const keyBytes = try blob.get(transaction, storedKeyRef);
+    pub fn duplicateKey(transaction: anytype, storedKeyReference: u64) !u64 {
+        const keyBytes = try blob.get(transaction, storedKeyReference);
         return blob.put(transaction, keyBytes);
     }
 
     /// Release the key blob a slot owns.
-    pub fn freeKey(transaction: anytype, storedKeyRef: u64) !void {
-        return blob.free(transaction, storedKeyRef);
+    pub fn freeKey(transaction: anytype, storedKeyReference: u64) !void {
+        return blob.free(transaction, storedKeyReference);
     }
 };
 
@@ -59,8 +59,8 @@ pub const get = Tree.get;
 /// added; otherwise the key bytes are stored in the blob heap and a new entry
 /// is inserted in byte-sorted order. Returns the (possibly new) root.
 pub fn insert(transaction: anytype, root: Reference, key: []const u8, value: u64) !Reference {
-    const keyRef = try blob.put(transaction, key);
-    return Tree.insert(transaction, root, key, keyRef, value);
+    const keyReference = try blob.put(transaction, key);
+    return Tree.insert(transaction, root, key, keyReference, value);
 }
 
 /// Remove `key` from the tree rooted at `root`. Frees the key's blob node when
@@ -88,12 +88,12 @@ pub fn forEachEntry(
     comptime onEntry: fn (@TypeOf(ctx), key: []const u8, value: u64) anyerror!void,
 ) !void {
     // Adapt the core's raw (storedKey, value) walker: each stored key is a
-    // blob ref, dereferenced here before reaching the caller's callback.
+    // blob reference, dereferenced here before reaching the caller's callback.
     const KeyDereferencing = struct {
         transaction: @TypeOf(transaction),
         context: @TypeOf(ctx),
-        fn visit(self: @This(), storedKeyRef: u64, value: u64) anyerror!void {
-            const keyBytes = try blob.get(self.transaction, storedKeyRef);
+        fn visit(self: @This(), storedKeyReference: u64, value: u64) anyerror!void {
+            const keyBytes = try blob.get(self.transaction, storedKeyReference);
             return onEntry(self.context, keyBytes, value);
         }
     };

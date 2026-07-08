@@ -37,7 +37,7 @@ pub const bulk = @import("records/bulk.zig");
 // Schema: catalogs, the type directory, and routing.
 /// The per-type catalog: property definitions, columns, and indexes.
 pub const catalog = @import("schema/catalog.zig");
-/// The type directory mapping type ids to catalog refs.
+/// The type directory mapping type ids to catalog references.
 pub const typeDirectory = @import("schema/typeDirectory.zig");
 /// Object/link/delete routing through the type directory.
 pub const typeRouting = @import("schema/typeRouting.zig");
@@ -53,13 +53,13 @@ pub const columnNode = @import("trees/columnNode.zig");
 pub const index = @import("trees/index.zig");
 /// The key->value B+tree's on-disk node formats.
 pub const indexNode = @import("trees/indexNode.zig");
-/// Byte-keyed B+tree (blob-ref keys).
+/// Byte-keyed B+tree (blob-reference keys).
 pub const byteKeyIndex = @import("trees/byteKeyIndex.zig");
 
 // Storage primitives.
 /// A node's stable identity: an absolute byte offset into the mapped file.
 pub const Reference = @import("storage/reference.zig").Reference;
-/// Bump allocation, pooled reuse, and the bounds-checked deref chokepoint.
+/// Bump allocation, pooled reuse, and the bounds-checked dereference chokepoint.
 pub const arena = @import("storage/arena.zig");
 /// The reclaimable-extent pool and its persisted chunk-chain format.
 pub const freeList = @import("storage/freeList.zig");

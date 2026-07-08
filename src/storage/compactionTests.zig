@@ -40,31 +40,31 @@ test "compactType packs live rows and drops dead ones" {
     var writeTransaction = try database.beginWrite();
     defer writeTransaction.deinit();
 
-    var catalogRef = try catalog.create(&writeTransaction, 2);
+    var catalogReference = try catalog.create(&writeTransaction, 2);
     var primaryKey: u64 = 0;
     while (primaryKey < 10) : (primaryKey += 1) {
-        const inserted = try rows.insert(&writeTransaction, catalogRef, &.{ primaryKey, primaryKey * 10 });
-        catalogRef = inserted.catalogRef;
+        const inserted = try rows.insert(&writeTransaction, catalogReference, &.{ primaryKey, primaryKey * 10 });
+        catalogReference = inserted.catalogReference;
     }
 
     for ([_]u64{ 2, 5, 8 }) |deletedPrimaryKey| {
         var out: [2]u64 = undefined;
-        const version = (try rows.getByPrimaryKey(&writeTransaction, catalogRef, deletedPrimaryKey, &out)).?;
-        catalogRef = switch (try rows.delete(&writeTransaction, catalogRef, deletedPrimaryKey, version)) {
+        const version = (try rows.getByPrimaryKey(&writeTransaction, catalogReference, deletedPrimaryKey, &out)).?;
+        catalogReference = switch (try rows.delete(&writeTransaction, catalogReference, deletedPrimaryKey, version)) {
             .ok => |newCatalog| newCatalog,
             else => unreachable,
         };
     }
 
-    catalogRef = try compactType(&writeTransaction, catalogRef);
+    catalogReference = try compactType(&writeTransaction, catalogReference);
 
-    try testing.expectEqual(@as(u64, 7), (try catalog.loadCatalog(&writeTransaction, catalogRef)).nextRow);
-    try testing.expectEqual(@as(u64, 7), try liveCount(&writeTransaction, catalogRef));
+    try testing.expectEqual(@as(u64, 7), (try catalog.loadCatalog(&writeTransaction, catalogReference)).nextRow);
+    try testing.expectEqual(@as(u64, 7), try liveCount(&writeTransaction, catalogReference));
 
     primaryKey = 0;
     while (primaryKey < 10) : (primaryKey += 1) {
         var out: [2]u64 = undefined;
-        const got = try rows.getByPrimaryKey(&writeTransaction, catalogRef, primaryKey, &out);
+        const got = try rows.getByPrimaryKey(&writeTransaction, catalogReference, primaryKey, &out);
         if (primaryKey == 2 or primaryKey == 5 or primaryKey == 8) {
             try testing.expect(got == null);
         } else {
@@ -85,16 +85,16 @@ test "compactType frees the replaced column set" {
     // Commit a type with rows and holes so compaction has real work.
     {
         var writeTransaction = try database.beginWrite();
-        var catalogRef = try catalog.create(&writeTransaction, 2);
+        var catalogReference = try catalog.create(&writeTransaction, 2);
         var primaryKey: u64 = 0;
-        while (primaryKey < 100) : (primaryKey += 1) catalogRef = (try rows.insert(&writeTransaction, catalogRef, &.{ primaryKey, primaryKey * 10 })).catalogRef;
+        while (primaryKey < 100) : (primaryKey += 1) catalogReference = (try rows.insert(&writeTransaction, catalogReference, &.{ primaryKey, primaryKey * 10 })).catalogReference;
         primaryKey = 0;
         while (primaryKey < 100) : (primaryKey += 5) {
             var out: [2]u64 = undefined;
-            const version = (try rows.getByPrimaryKey(&writeTransaction, catalogRef, primaryKey, &out)).?;
-            catalogRef = (try rows.delete(&writeTransaction, catalogRef, primaryKey, version)).ok;
+            const version = (try rows.getByPrimaryKey(&writeTransaction, catalogReference, primaryKey, &out)).?;
+            catalogReference = (try rows.delete(&writeTransaction, catalogReference, primaryKey, version)).ok;
         }
-        writeTransaction.setRoot(catalogRef);
+        writeTransaction.setRoot(catalogReference);
         _ = try writeTransaction.commit();
     }
 
@@ -116,34 +116,34 @@ test "object keys and links survive compaction" {
     var writeTransaction = try database.beginWrite();
     defer writeTransaction.deinit();
 
-    var catalogRef = try catalog.createFromDefinitions(&writeTransaction, &.{ .{ .kind = .int }, .{ .kind = .link } });
+    var catalogReference = try catalog.createFromDefinitions(&writeTransaction, &.{ .{ .kind = .int }, .{ .kind = .link } });
 
-    const insertedA = try objects.insertTyped(&writeTransaction, catalogRef, &.{ .{ .int = 1 }, .{ .link = null } });
-    catalogRef = insertedA.catalogRef;
+    const insertedA = try objects.insertTyped(&writeTransaction, catalogReference, &.{ .{ .int = 1 }, .{ .link = null } });
+    catalogReference = insertedA.catalogReference;
     const objectKeyA = insertedA.objectKey;
-    const insertedB = try objects.insertTyped(&writeTransaction, catalogRef, &.{ .{ .int = 2 }, .{ .link = null } });
-    catalogRef = insertedB.catalogRef;
-    const insertedC = try objects.insertTyped(&writeTransaction, catalogRef, &.{ .{ .int = 3 }, .{ .link = objectKeyA } });
-    catalogRef = insertedC.catalogRef;
+    const insertedB = try objects.insertTyped(&writeTransaction, catalogReference, &.{ .{ .int = 2 }, .{ .link = null } });
+    catalogReference = insertedB.catalogReference;
+    const insertedC = try objects.insertTyped(&writeTransaction, catalogReference, &.{ .{ .int = 3 }, .{ .link = objectKeyA } });
+    catalogReference = insertedC.catalogReference;
 
     // delete B (primaryKey 2) -- creates a hole
     var out: [2]u64 = undefined;
-    const version = (try rows.getByPrimaryKey(&writeTransaction, catalogRef, 2, &out)).?;
-    catalogRef = switch (try rows.delete(&writeTransaction, catalogRef, 2, version)) {
+    const version = (try rows.getByPrimaryKey(&writeTransaction, catalogReference, 2, &out)).?;
+    catalogReference = switch (try rows.delete(&writeTransaction, catalogReference, 2, version)) {
         .ok => |newCatalog| newCatalog,
         else => unreachable,
     };
 
-    catalogRef = try compactType(&writeTransaction, catalogRef);
+    catalogReference = try compactType(&writeTransaction, catalogReference);
 
     // C still links to A by object key
-    try testing.expectEqual(objectKeyA, (try links.getLink(&writeTransaction, catalogRef, 3, 1)).?);
+    try testing.expectEqual(objectKeyA, (try links.getLink(&writeTransaction, catalogReference, 3, 1)).?);
     // A is still resolvable by its object key
     var valuesA: [2]u64 = undefined;
-    try testing.expect((try rows.getByObjectKey(&writeTransaction, catalogRef, objectKeyA, &valuesA)) != null);
+    try testing.expect((try rows.getByObjectKey(&writeTransaction, catalogReference, objectKeyA, &valuesA)) != null);
     try testing.expectEqual(@as(u64, 1), valuesA[0]);
     // backlink from C -> A survived
-    try testing.expectEqual(@as(u64, 1), try links.backlinkCount(&writeTransaction, catalogRef, 1, objectKeyA));
+    try testing.expectEqual(@as(u64, 1), try links.backlinkCount(&writeTransaction, catalogReference, 1, objectKeyA));
 }
 
 test "shouldCompact reflects dead ratio" {
@@ -156,24 +156,24 @@ test "shouldCompact reflects dead ratio" {
     var writeTransaction = try database.beginWrite();
     defer writeTransaction.deinit();
 
-    var catalogRef = try catalog.create(&writeTransaction, 1);
+    var catalogReference = try catalog.create(&writeTransaction, 1);
     var primaryKey: u64 = 0;
     while (primaryKey < 10) : (primaryKey += 1) {
-        const inserted = try rows.insert(&writeTransaction, catalogRef, &.{primaryKey});
-        catalogRef = inserted.catalogRef;
+        const inserted = try rows.insert(&writeTransaction, catalogReference, &.{primaryKey});
+        catalogReference = inserted.catalogReference;
     }
-    try testing.expect(!(try shouldCompact(&writeTransaction, catalogRef)));
+    try testing.expect(!(try shouldCompact(&writeTransaction, catalogReference)));
 
     primaryKey = 0;
     while (primaryKey < 6) : (primaryKey += 1) {
         var out: [1]u64 = undefined;
-        const version = (try rows.getByPrimaryKey(&writeTransaction, catalogRef, primaryKey, &out)).?;
-        catalogRef = switch (try rows.delete(&writeTransaction, catalogRef, primaryKey, version)) {
+        const version = (try rows.getByPrimaryKey(&writeTransaction, catalogReference, primaryKey, &out)).?;
+        catalogReference = switch (try rows.delete(&writeTransaction, catalogReference, primaryKey, version)) {
             .ok => |newCatalog| newCatalog,
             else => unreachable,
         };
     }
-    try testing.expect(try shouldCompact(&writeTransaction, catalogRef));
+    try testing.expect(try shouldCompact(&writeTransaction, catalogReference));
 }
 
 test "compaction reclaims under churn (scale)" {
@@ -187,35 +187,35 @@ test "compaction reclaims under churn (scale)" {
     defer writeTransaction.deinit();
 
     const count: u64 = 200_000;
-    var catalogRef = try catalog.create(&writeTransaction, 2);
+    var catalogReference = try catalog.create(&writeTransaction, 2);
     var index: u64 = 0;
     while (index < count) : (index += 1) {
-        const inserted = try rows.insert(&writeTransaction, catalogRef, &.{ index, index });
-        catalogRef = inserted.catalogRef;
+        const inserted = try rows.insert(&writeTransaction, catalogReference, &.{ index, index });
+        catalogReference = inserted.catalogReference;
     }
 
     // delete every even primaryKey; all rows carry version == w.newVersion this transaction
     index = 0;
     while (index < count) : (index += 2) {
-        catalogRef = switch (try rows.delete(&writeTransaction, catalogRef, index, writeTransaction.newVersion)) {
+        catalogReference = switch (try rows.delete(&writeTransaction, catalogReference, index, writeTransaction.newVersion)) {
             .ok => |newCatalog| newCatalog,
             else => unreachable,
         };
     }
 
-    catalogRef = try compactType(&writeTransaction, catalogRef);
+    catalogReference = try compactType(&writeTransaction, catalogReference);
 
-    try testing.expectEqual(@as(u64, 100_000), (try catalog.loadCatalog(&writeTransaction, catalogRef)).nextRow);
-    try testing.expectEqual(@as(u64, 100_000), try liveCount(&writeTransaction, catalogRef));
+    try testing.expectEqual(@as(u64, 100_000), (try catalog.loadCatalog(&writeTransaction, catalogReference)).nextRow);
+    try testing.expectEqual(@as(u64, 100_000), try liveCount(&writeTransaction, catalogReference));
 
     var out: [2]u64 = undefined;
-    try testing.expect((try rows.getByPrimaryKey(&writeTransaction, catalogRef, 1, &out)) != null);
+    try testing.expect((try rows.getByPrimaryKey(&writeTransaction, catalogReference, 1, &out)) != null);
     try testing.expectEqual(@as(u64, 1), out[1]);
-    try testing.expect((try rows.getByPrimaryKey(&writeTransaction, catalogRef, 99_999, &out)) != null);
+    try testing.expect((try rows.getByPrimaryKey(&writeTransaction, catalogReference, 99_999, &out)) != null);
     try testing.expectEqual(@as(u64, 99_999), out[1]);
-    try testing.expect((try rows.getByPrimaryKey(&writeTransaction, catalogRef, 100_001, &out)) != null);
+    try testing.expect((try rows.getByPrimaryKey(&writeTransaction, catalogReference, 100_001, &out)) != null);
     try testing.expectEqual(@as(u64, 100_001), out[1]);
-    try testing.expect((try rows.getByPrimaryKey(&writeTransaction, catalogRef, 2, &out)) == null);
+    try testing.expect((try rows.getByPrimaryKey(&writeTransaction, catalogReference, 2, &out)) == null);
 }
 
 test "all value kinds deep-copy across databases preserving keys" {
@@ -237,34 +237,34 @@ test "all value kinds deep-copy across databases preserving keys" {
     // Build the source database: 3 rows across every value kind, then delete one.
     {
         var writeTransaction = try sourceDatabase.beginWrite();
-        var catalogRef = try catalog.createFromDefinitions(&writeTransaction, &.{
+        var catalogReference = try catalog.createFromDefinitions(&writeTransaction, &.{
             .{ .kind = .int },
             .{ .kind = .blob },
             .{ .kind = .list, .element = .int },
             .{ .kind = .set, .element = .int },
             .{ .kind = .link, .linkTarget = 0 },
         });
-        const inserted1 = try objects.insertTyped(&writeTransaction, catalogRef, &.{
+        const inserted1 = try objects.insertTyped(&writeTransaction, catalogReference, &.{
             .{ .int = 1 }, .{ .bytes = "a" }, .{ .listInt = &.{ 10, 20 } }, .{ .setInt = &.{ 5, 6 } }, .{ .link = null },
         });
-        catalogRef = inserted1.catalogRef;
+        catalogReference = inserted1.catalogReference;
         primaryKey1ObjectKey = inserted1.objectKey;
-        const inserted2 = try objects.insertTyped(&writeTransaction, catalogRef, &.{
+        const inserted2 = try objects.insertTyped(&writeTransaction, catalogReference, &.{
             .{ .int = 2 }, .{ .bytes = "bb" }, .{ .listInt = &.{} }, .{ .setInt = &.{7} }, .{ .link = primaryKey1ObjectKey },
         });
-        catalogRef = inserted2.catalogRef;
-        const inserted3 = try objects.insertTyped(&writeTransaction, catalogRef, &.{
+        catalogReference = inserted2.catalogReference;
+        const inserted3 = try objects.insertTyped(&writeTransaction, catalogReference, &.{
             .{ .int = 3 }, .{ .bytes = "ccc" }, .{ .listInt = &.{ 1, 2, 3 } }, .{ .setInt = &.{} }, .{ .link = null },
         });
-        catalogRef = inserted3.catalogRef;
+        catalogReference = inserted3.catalogReference;
 
         // Delete primaryKey 3 -- leaves a gap in the source.
         var dout: [5]catalog.Value = undefined;
-        const version = (try objects.getTyped(&writeTransaction, catalogRef, 3, &dout)).?;
-        catalogRef = (try objects.deleteTyped(&writeTransaction, catalogRef, 3, version)).ok;
+        const version = (try objects.getTyped(&writeTransaction, catalogReference, 3, &dout)).?;
+        catalogReference = (try objects.deleteTyped(&writeTransaction, catalogReference, 3, version)).ok;
 
-        srcNextKey = (try catalog.loadCatalog(&writeTransaction, catalogRef)).nextKey;
-        writeTransaction.setRoot(catalogRef);
+        srcNextKey = (try catalog.loadCatalog(&writeTransaction, catalogReference)).nextKey;
+        writeTransaction.setRoot(catalogReference);
         _ = try writeTransaction.commit();
     }
 
@@ -286,44 +286,44 @@ test "all value kinds deep-copy across databases preserving keys" {
         defer reopenedDestination.deinit();
         var readTransaction = try reopenedDestination.beginRead();
         defer readTransaction.end();
-        const catalogRef = readTransaction.root();
+        const catalogReference = readTransaction.root();
 
         // primaryKey 1 and primaryKey 2 readable with identical int + blob.
         var values1: [5]catalog.Value = undefined;
-        try testing.expect((try objects.getTyped(&readTransaction, catalogRef, 1, &values1)) != null);
+        try testing.expect((try objects.getTyped(&readTransaction, catalogReference, 1, &values1)) != null);
         try testing.expectEqual(@as(u64, 1), values1[0].int);
         try testing.expectEqualStrings("a", values1[1].bytes);
         var values2: [5]catalog.Value = undefined;
-        try testing.expect((try objects.getTyped(&readTransaction, catalogRef, 2, &values2)) != null);
+        try testing.expect((try objects.getTyped(&readTransaction, catalogReference, 2, &values2)) != null);
         try testing.expectEqual(@as(u64, 2), values2[0].int);
         try testing.expectEqualStrings("bb", values2[1].bytes);
 
         // list/set contents match.
-        try testing.expectEqual(@as(?u64, 2), try collections.listLength(&readTransaction, catalogRef, 1, 2));
-        try testing.expectEqual(@as(u64, 10), try collections.listGetInt(&readTransaction, catalogRef, 1, 2, 0));
-        try testing.expectEqual(@as(u64, 20), try collections.listGetInt(&readTransaction, catalogRef, 1, 2, 1));
-        try testing.expectEqual(@as(?u64, 2), try collections.setCountInt(&readTransaction, catalogRef, 1, 3));
-        try testing.expect(try collections.setContainsInt(&readTransaction, catalogRef, 1, 3, 5));
-        try testing.expect(try collections.setContainsInt(&readTransaction, catalogRef, 1, 3, 6));
-        try testing.expectEqual(@as(?u64, 0), try collections.listLength(&readTransaction, catalogRef, 2, 2));
-        try testing.expectEqual(@as(?u64, 1), try collections.setCountInt(&readTransaction, catalogRef, 2, 3));
-        try testing.expect(try collections.setContainsInt(&readTransaction, catalogRef, 2, 3, 7));
+        try testing.expectEqual(@as(?u64, 2), try collections.listLength(&readTransaction, catalogReference, 1, 2));
+        try testing.expectEqual(@as(u64, 10), try collections.listGetInt(&readTransaction, catalogReference, 1, 2, 0));
+        try testing.expectEqual(@as(u64, 20), try collections.listGetInt(&readTransaction, catalogReference, 1, 2, 1));
+        try testing.expectEqual(@as(?u64, 2), try collections.setCountInt(&readTransaction, catalogReference, 1, 3));
+        try testing.expect(try collections.setContainsInt(&readTransaction, catalogReference, 1, 3, 5));
+        try testing.expect(try collections.setContainsInt(&readTransaction, catalogReference, 1, 3, 6));
+        try testing.expectEqual(@as(?u64, 0), try collections.listLength(&readTransaction, catalogReference, 2, 2));
+        try testing.expectEqual(@as(?u64, 1), try collections.setCountInt(&readTransaction, catalogReference, 2, 3));
+        try testing.expect(try collections.setContainsInt(&readTransaction, catalogReference, 2, 3, 7));
 
         // The link on primaryKey 2 still equals primaryKey 1's original object key and resolves to primaryKey 1.
-        try testing.expectEqual(@as(?u64, primaryKey1ObjectKey), try links.getLink(&readTransaction, catalogRef, 2, 4));
+        try testing.expectEqual(@as(?u64, primaryKey1ObjectKey), try links.getLink(&readTransaction, catalogReference, 2, 4));
         var rawB: [5]u64 = undefined;
-        try testing.expect((try rows.getByObjectKey(&readTransaction, catalogRef, primaryKey1ObjectKey, &rawB)) != null);
+        try testing.expect((try rows.getByObjectKey(&readTransaction, catalogReference, primaryKey1ObjectKey, &rawB)) != null);
         try testing.expectEqual(@as(u64, 1), rawB[0]);
 
         // Backlink rebuilt from the copied forward link.
-        try testing.expectEqual(@as(u64, 1), try links.backlinkCount(&readTransaction, catalogRef, 4, primaryKey1ObjectKey));
+        try testing.expectEqual(@as(u64, 1), try links.backlinkCount(&readTransaction, catalogReference, 4, primaryKey1ObjectKey));
 
         // primaryKey 3 was dead in the source and must be absent.
         var values3: [5]catalog.Value = undefined;
-        try testing.expect((try objects.getTyped(&readTransaction, catalogRef, 3, &values3)) == null);
+        try testing.expect((try objects.getTyped(&readTransaction, catalogReference, 3, &values3)) == null);
 
         // nextKey preserved across the copy.
-        try testing.expectEqual(srcNextKey, (try catalog.loadCatalog(&readTransaction, catalogRef)).nextKey);
+        try testing.expectEqual(srcNextKey, (try catalog.loadCatalog(&readTransaction, catalogReference)).nextKey);
     }
 }
 
@@ -477,21 +477,21 @@ test "compaction preserves dict and set-of-blob" {
         var readTransaction = try reopenedDestination.beginRead();
         defer readTransaction.end();
         const directoryReference = readTransaction.root();
-        const catalogRef = try typeDirectory.catalogRef(&readTransaction, directoryReference, 0);
+        const catalogReference = try typeDirectory.catalogReference(&readTransaction, directoryReference, 0);
 
         try testing.expectEqual(@as(u64, 1), try typeRouting.liveCount(&readTransaction, directoryReference, 0));
 
         // Surviving row primaryKey 1: dict entries preserved.
-        try testing.expectEqual(@as(?u64, 2), try collections.dictCount(&readTransaction, catalogRef, 1, 1));
-        try testing.expectEqual(@as(?u64, 1), try collections.dictGet(&readTransaction, catalogRef, 1, 1, "a"));
-        try testing.expectEqual(@as(?u64, 2), try collections.dictGet(&readTransaction, catalogRef, 1, 1, "b"));
-        try testing.expectEqual(@as(?u64, null), try collections.dictGet(&readTransaction, catalogRef, 1, 1, "c"));
+        try testing.expectEqual(@as(?u64, 2), try collections.dictCount(&readTransaction, catalogReference, 1, 1));
+        try testing.expectEqual(@as(?u64, 1), try collections.dictGet(&readTransaction, catalogReference, 1, 1, "a"));
+        try testing.expectEqual(@as(?u64, 2), try collections.dictGet(&readTransaction, catalogReference, 1, 1, "b"));
+        try testing.expectEqual(@as(?u64, null), try collections.dictGet(&readTransaction, catalogReference, 1, 1, "c"));
 
         // Surviving row primaryKey 1: blob-set members preserved.
-        try testing.expectEqual(@as(?u64, 2), try collections.setCountBlob(&readTransaction, catalogRef, 1, 2));
-        try testing.expect(try collections.setContainsBlob(&readTransaction, catalogRef, 1, 2, "x"));
-        try testing.expect(try collections.setContainsBlob(&readTransaction, catalogRef, 1, 2, "yy"));
-        try testing.expect(!(try collections.setContainsBlob(&readTransaction, catalogRef, 1, 2, "zzz")));
+        try testing.expectEqual(@as(?u64, 2), try collections.setCountBlob(&readTransaction, catalogReference, 1, 2));
+        try testing.expect(try collections.setContainsBlob(&readTransaction, catalogReference, 1, 2, "x"));
+        try testing.expect(try collections.setContainsBlob(&readTransaction, catalogReference, 1, 2, "yy"));
+        try testing.expect(!(try collections.setContainsBlob(&readTransaction, catalogReference, 1, 2, "zzz")));
 
         // Deleted row primaryKey 2 is absent.
         var values2: [3]catalog.Value = undefined;
@@ -541,11 +541,11 @@ test "compaction preserves a large (chunked) blob" {
         defer readTransaction.end();
         const directoryReference = readTransaction.root();
 
-        // The large blob materializes byte-identical via its ref.
+        // The large blob materializes byte-identical via its reference.
         var values1: [2]catalog.Value = undefined;
         try testing.expect((try typeRouting.get(&readTransaction, directoryReference, 0, 1, &values1)) != null);
-        try testing.expect(values1[1] == .blobRef);
-        const got = try blob.getAlloc(&readTransaction, values1[1].blobRef, testing.allocator);
+        try testing.expect(values1[1] == .blobReference);
+        const got = try blob.getAlloc(&readTransaction, values1[1].blobReference, testing.allocator);
         defer testing.allocator.free(got);
         try testing.expectEqualSlices(u8, big, got);
 
@@ -567,20 +567,20 @@ test "compactStep packs a delete-heavy type across several small steps" {
     var writeTransaction = try database.beginWrite();
     defer writeTransaction.deinit();
 
-    var catalogRef = try catalog.create(&writeTransaction, 2);
+    var catalogReference = try catalog.create(&writeTransaction, 2);
     var objectKeys: [12]u64 = undefined;
     var primaryKey: u64 = 0;
     while (primaryKey < 12) : (primaryKey += 1) {
-        const inserted = try rows.insert(&writeTransaction, catalogRef, &.{ primaryKey, primaryKey * 100 });
-        catalogRef = inserted.catalogRef;
+        const inserted = try rows.insert(&writeTransaction, catalogReference, &.{ primaryKey, primaryKey * 100 });
+        catalogReference = inserted.catalogReference;
         objectKeys[@intCast(primaryKey)] = inserted.objectKey;
     }
 
     const dels = [_]u64{ 0, 2, 3, 5, 7, 8, 11 };
     for (dels) |deletedPrimaryKey| {
         var out: [2]u64 = undefined;
-        const version = (try rows.getByPrimaryKey(&writeTransaction, catalogRef, deletedPrimaryKey, &out)).?;
-        catalogRef = switch (try rows.delete(&writeTransaction, catalogRef, deletedPrimaryKey, version)) {
+        const version = (try rows.getByPrimaryKey(&writeTransaction, catalogReference, deletedPrimaryKey, &out)).?;
+        catalogReference = switch (try rows.delete(&writeTransaction, catalogReference, deletedPrimaryKey, version)) {
             .ok => |newCatalog| newCatalog,
             else => unreachable,
         };
@@ -589,8 +589,8 @@ test "compactStep packs a delete-heavy type across several small steps" {
     // Pack in small budgeted steps until done.
     var guard: usize = 0;
     while (true) {
-        const res = try compactStep(&writeTransaction, catalogRef, 0, 2);
-        catalogRef = res.catalogRef;
+        const res = try compactStep(&writeTransaction, catalogReference, 0, 2);
+        catalogReference = res.catalogReference;
         try testing.expect(res.moved <= 2);
         if (res.done) break;
         guard += 1;
@@ -598,7 +598,7 @@ test "compactStep packs a delete-heavy type across several small steps" {
     }
 
     // Fully packed: nextRow == live count.
-    try testing.expectEqual(try liveCount(&writeTransaction, catalogRef), (try catalog.loadCatalog(&writeTransaction, catalogRef)).nextRow);
+    try testing.expectEqual(try liveCount(&writeTransaction, catalogReference), (try catalog.loadCatalog(&writeTransaction, catalogReference)).nextRow);
 
     // Every survivor reads back its exact values; deleted keys are gone.
     primaryKey = 0;
@@ -608,7 +608,7 @@ test "compactStep packs a delete-heavy type across several small steps" {
             break :blk false;
         };
         var out: [2]catalog.Value = undefined;
-        const got = try objects.getTypedByObjectKey(&writeTransaction, catalogRef, objectKeys[@intCast(primaryKey)], &out);
+        const got = try objects.getTypedByObjectKey(&writeTransaction, catalogReference, objectKeys[@intCast(primaryKey)], &out);
         if (isDel) {
             try testing.expect(got == null);
         } else {
@@ -629,17 +629,17 @@ test "compactStep on an all-dead type truncates to zero" {
     var writeTransaction = try database.beginWrite();
     defer writeTransaction.deinit();
 
-    var catalogRef = try catalog.create(&writeTransaction, 2);
+    var catalogReference = try catalog.create(&writeTransaction, 2);
     var primaryKey: u64 = 0;
     while (primaryKey < 6) : (primaryKey += 1) {
-        const inserted = try rows.insert(&writeTransaction, catalogRef, &.{ primaryKey, primaryKey });
-        catalogRef = inserted.catalogRef;
+        const inserted = try rows.insert(&writeTransaction, catalogReference, &.{ primaryKey, primaryKey });
+        catalogReference = inserted.catalogReference;
     }
     primaryKey = 0;
     while (primaryKey < 6) : (primaryKey += 1) {
         var out: [2]u64 = undefined;
-        const version = (try rows.getByPrimaryKey(&writeTransaction, catalogRef, primaryKey, &out)).?;
-        catalogRef = switch (try rows.delete(&writeTransaction, catalogRef, primaryKey, version)) {
+        const version = (try rows.getByPrimaryKey(&writeTransaction, catalogReference, primaryKey, &out)).?;
+        catalogReference = switch (try rows.delete(&writeTransaction, catalogReference, primaryKey, version)) {
             .ok => |newCatalog| newCatalog,
             else => unreachable,
         };
@@ -647,15 +647,15 @@ test "compactStep on an all-dead type truncates to zero" {
 
     var guard: usize = 0;
     while (true) {
-        const res = try compactStep(&writeTransaction, catalogRef, 0, 2);
-        catalogRef = res.catalogRef;
+        const res = try compactStep(&writeTransaction, catalogReference, 0, 2);
+        catalogReference = res.catalogReference;
         if (res.done) break;
         guard += 1;
         try testing.expect(guard < 100);
     }
 
-    try testing.expectEqual(@as(u64, 0), (try catalog.loadCatalog(&writeTransaction, catalogRef)).nextRow);
-    try testing.expectEqual(@as(u64, 0), try liveCount(&writeTransaction, catalogRef));
+    try testing.expectEqual(@as(u64, 0), (try catalog.loadCatalog(&writeTransaction, catalogReference)).nextRow);
+    try testing.expectEqual(@as(u64, 0), try liveCount(&writeTransaction, catalogReference));
 }
 
 test "compactStep is a no-op on an already-packed type" {
@@ -668,24 +668,24 @@ test "compactStep is a no-op on an already-packed type" {
     var writeTransaction = try database.beginWrite();
     defer writeTransaction.deinit();
 
-    var catalogRef = try catalog.create(&writeTransaction, 2);
+    var catalogReference = try catalog.create(&writeTransaction, 2);
     var objectKeys: [5]u64 = undefined;
     var primaryKey: u64 = 0;
     while (primaryKey < 5) : (primaryKey += 1) {
-        const inserted = try rows.insert(&writeTransaction, catalogRef, &.{ primaryKey, primaryKey * 7 });
-        catalogRef = inserted.catalogRef;
+        const inserted = try rows.insert(&writeTransaction, catalogReference, &.{ primaryKey, primaryKey * 7 });
+        catalogReference = inserted.catalogReference;
         objectKeys[@intCast(primaryKey)] = inserted.objectKey;
     }
 
-    const res = try compactStep(&writeTransaction, catalogRef, 0, 4);
-    catalogRef = res.catalogRef;
+    const res = try compactStep(&writeTransaction, catalogReference, 0, 4);
+    catalogReference = res.catalogReference;
     try testing.expect(res.done);
     try testing.expectEqual(@as(usize, 0), res.moved);
 
     primaryKey = 0;
     while (primaryKey < 5) : (primaryKey += 1) {
         var out: [2]catalog.Value = undefined;
-        const got = try objects.getTypedByObjectKey(&writeTransaction, catalogRef, objectKeys[@intCast(primaryKey)], &out);
+        const got = try objects.getTypedByObjectKey(&writeTransaction, catalogReference, objectKeys[@intCast(primaryKey)], &out);
         try testing.expect(got != null);
         try testing.expectEqual(primaryKey, out[0].int);
         try testing.expectEqual(primaryKey * 7, out[1].int);
@@ -727,10 +727,10 @@ test "compactStep cursor path packs identically to the scan path" {
     var primaryKey: u64 = 0;
     while (primaryKey < 20) : (primaryKey += 1) {
         const insertedStep = try rows.insert(&stepW, stepCatalog, &.{ primaryKey, primaryKey * 100 });
-        stepCatalog = insertedStep.catalogRef;
+        stepCatalog = insertedStep.catalogReference;
         stepObjectKeys[@intCast(primaryKey)] = insertedStep.objectKey;
         const insertedControl = try rows.insert(&ctrlW, controlCatalog, &.{ primaryKey, primaryKey * 100 });
-        controlCatalog = insertedControl.catalogRef;
+        controlCatalog = insertedControl.catalogReference;
     }
     for (dels) |deletedPrimaryKey| {
         var out: [2]u64 = undefined;
@@ -747,7 +747,7 @@ test "compactStep cursor path packs identically to the scan path" {
     var guard: usize = 0;
     while (true) {
         const res = try compactStep(&stepW, stepCatalog, 0, 3);
-        stepCatalog = res.catalogRef;
+        stepCatalog = res.catalogReference;
         try testing.expect(res.moved <= 3);
         if (res.done) break;
         guard += 1;
@@ -797,39 +797,39 @@ test "compactStep truncation never drops a live row at the top" {
     // Insert 10 rows at physical 0..9, then delete the LOW primaryKeys (0..4). The five
     // survivors (primaryKeys 5..9) all sit at physical rows >= liveCount (=5): every
     // live row is a "high" row that must be relocated downward before truncation.
-    var catalogRef = try catalog.create(&writeTransaction, 2);
+    var catalogReference = try catalog.create(&writeTransaction, 2);
     var objectKeys: [10]u64 = undefined;
     var primaryKey: u64 = 0;
     while (primaryKey < 10) : (primaryKey += 1) {
-        const inserted = try rows.insert(&writeTransaction, catalogRef, &.{ primaryKey, primaryKey * 1000 });
-        catalogRef = inserted.catalogRef;
+        const inserted = try rows.insert(&writeTransaction, catalogReference, &.{ primaryKey, primaryKey * 1000 });
+        catalogReference = inserted.catalogReference;
         objectKeys[@intCast(primaryKey)] = inserted.objectKey;
     }
     primaryKey = 0;
     while (primaryKey < 5) : (primaryKey += 1) {
         var out: [2]u64 = undefined;
-        const version = (try rows.getByPrimaryKey(&writeTransaction, catalogRef, primaryKey, &out)).?;
-        catalogRef = (try rows.delete(&writeTransaction, catalogRef, primaryKey, version)).ok;
+        const version = (try rows.getByPrimaryKey(&writeTransaction, catalogReference, primaryKey, &out)).?;
+        catalogReference = (try rows.delete(&writeTransaction, catalogReference, primaryKey, version)).ok;
     }
-    try testing.expectEqual(@as(u64, 5), try liveCount(&writeTransaction, catalogRef));
+    try testing.expectEqual(@as(u64, 5), try liveCount(&writeTransaction, catalogReference));
 
     // Pack in tiny steps; the downward cursor must examine the entire top range.
     var guard: usize = 0;
     while (true) {
-        const res = try compactStep(&writeTransaction, catalogRef, 0, 2);
-        catalogRef = res.catalogRef;
+        const res = try compactStep(&writeTransaction, catalogReference, 0, 2);
+        catalogReference = res.catalogReference;
         try testing.expect(res.moved <= 2);
         if (res.done) break;
         guard += 1;
         try testing.expect(guard < 100);
     }
 
-    try testing.expectEqual(@as(u64, 5), (try catalog.loadCatalog(&writeTransaction, catalogRef)).nextRow);
+    try testing.expectEqual(@as(u64, 5), (try catalog.loadCatalog(&writeTransaction, catalogReference)).nextRow);
     // Every top-stranded survivor is intact with its exact values.
     primaryKey = 5;
     while (primaryKey < 10) : (primaryKey += 1) {
         var out: [2]catalog.Value = undefined;
-        const got = try objects.getTypedByObjectKey(&writeTransaction, catalogRef, objectKeys[@intCast(primaryKey)], &out);
+        const got = try objects.getTypedByObjectKey(&writeTransaction, catalogReference, objectKeys[@intCast(primaryKey)], &out);
         try testing.expect(got != null);
         try testing.expectEqual(primaryKey, out[0].int);
         try testing.expectEqual(primaryKey * 1000, out[1].int);
@@ -848,16 +848,16 @@ test "compactStep moves at most budget rows per call" {
 
     // A large set with heavy churn so many high rows need relocating.
     const count: u64 = 400;
-    var catalogRef = try catalog.create(&writeTransaction, 2);
+    var catalogReference = try catalog.create(&writeTransaction, 2);
     var primaryKey: u64 = 0;
     while (primaryKey < count) : (primaryKey += 1) {
-        const inserted = try rows.insert(&writeTransaction, catalogRef, &.{ primaryKey, primaryKey });
-        catalogRef = inserted.catalogRef;
+        const inserted = try rows.insert(&writeTransaction, catalogReference, &.{ primaryKey, primaryKey });
+        catalogReference = inserted.catalogReference;
     }
     // Delete every even primaryKey -> ~200 holes scattered through the low half.
     primaryKey = 0;
     while (primaryKey < count) : (primaryKey += 2) {
-        catalogRef = switch (try rows.delete(&writeTransaction, catalogRef, primaryKey, writeTransaction.newVersion)) {
+        catalogReference = switch (try rows.delete(&writeTransaction, catalogReference, primaryKey, writeTransaction.newVersion)) {
             .ok => |newCatalog| newCatalog,
             else => unreachable,
         };
@@ -867,8 +867,8 @@ test "compactStep moves at most budget rows per call" {
     var guard: usize = 0;
     var sawFullBudget = false;
     while (true) {
-        const res = try compactStep(&writeTransaction, catalogRef, 0, budget);
-        catalogRef = res.catalogRef;
+        const res = try compactStep(&writeTransaction, catalogReference, 0, budget);
+        catalogReference = res.catalogReference;
         try testing.expect(res.moved <= budget);
         if (res.moved == budget) sawFullBudget = true;
         if (res.done) break;
@@ -877,7 +877,7 @@ test "compactStep moves at most budget rows per call" {
     }
     // The set is large enough that at least one step hit the cap.
     try testing.expect(sawFullBudget);
-    try testing.expectEqual(try liveCount(&writeTransaction, catalogRef), (try catalog.loadCatalog(&writeTransaction, catalogRef)).nextRow);
+    try testing.expectEqual(try liveCount(&writeTransaction, catalogReference), (try catalog.loadCatalog(&writeTransaction, catalogReference)).nextRow);
 }
 
 test "compactInPlace preserves value indexes and passes verifyIntegrity" {
@@ -912,10 +912,10 @@ test "compactInPlace preserves value indexes and passes verifyIntegrity" {
     try verification.verifyIntegrity(&database); // the audit must agree the indexes are intact
     var readTransaction = try database.beginRead();
     defer readTransaction.end();
-    const catalogRef = try typeDirectory.catalogRef(&readTransaction, readTransaction.root(), 0);
+    const catalogReference = try typeDirectory.catalogReference(&readTransaction, readTransaction.root(), 0);
     var hits = std.ArrayList(u64).empty;
     defer hits.deinit(testing.allocator);
-    try query.where(&readTransaction, catalogRef, &.{.{ .property = 1, .operator = .eq, .value = 3 }}, &hits, testing.allocator);
+    try query.where(&readTransaction, catalogReference, &.{.{ .property = 1, .operator = .eq, .value = 3 }}, &hits, testing.allocator);
     try testing.expectEqual(@as(usize, 10), hits.items.len);
 }
 

@@ -14,8 +14,8 @@ const createTypes = typeDirectory.createTypes;
 const createWithDefinitions = typeDirectory.createWithDefinitions;
 const create = typeDirectory.create;
 const typeCount = typeDirectory.typeCount;
-const catalogRef = typeDirectory.catalogRef;
-const setCatalogRef = typeDirectory.setCatalogRef;
+const catalogReference = typeDirectory.catalogReference;
+const setCatalogReference = typeDirectory.setCatalogReference;
 const addTypeDefinitions = typeDirectory.addTypeDefinitions;
 const addType = typeDirectory.addType;
 const isEmbedded = typeDirectory.isEmbedded;
@@ -56,15 +56,15 @@ test "create builds a directory with one catalog per type" {
     };
     const directoryReference = try create(&writeTransaction, &schema);
     try testing.expectEqual(@as(u16, 2), try typeCount(&writeTransaction, directoryReference));
-    const catalog0 = try catalogRef(&writeTransaction, directoryReference, 0);
-    const catalog1 = try catalogRef(&writeTransaction, directoryReference, 1);
+    const catalog0 = try catalogReference(&writeTransaction, directoryReference, 0);
+    const catalog1 = try catalogReference(&writeTransaction, directoryReference, 1);
     try testing.expect(catalog0 != 0 and catalog1 != 0 and catalog0 != catalog1);
     try testing.expectEqual(@as(catalog.PropertyCount, 2), (try catalog.loadCatalog(&writeTransaction, catalog0)).propertyCount);
     try testing.expectEqual(@as(catalog.PropertyCount, 3), (try catalog.loadCatalog(&writeTransaction, catalog1)).propertyCount);
     writeTransaction.deinit();
 }
 
-test "catalogRef rejects an out-of-range type id" {
+test "catalogReference rejects an out-of-range type id" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try tdTmpPath(testing.allocator, &tmp, "td1b.airdb");
@@ -74,7 +74,7 @@ test "catalogRef rejects an out-of-range type id" {
     var writeTransaction = try database.beginWrite();
     const schema = [_][]const catalog.PropertyKind{&.{ .int, .int }};
     const directoryReference = try create(&writeTransaction, &schema);
-    try testing.expectError(error.NoSuchType, catalogRef(&writeTransaction, directoryReference, 5));
+    try testing.expectError(error.NoSuchType, catalogReference(&writeTransaction, directoryReference, 5));
     writeTransaction.deinit();
 }
 
@@ -227,10 +227,10 @@ test "multi-type directory carries links and collections via createWithDefs" {
     try testing.expectEqual(@as(u16, 2), try typeCount(&writeTransaction, directoryReference));
 
     // insert two type-1 rows; row a links to nothing, b's set links to a.
-    const insertedA = try Objects.insertTyped(&writeTransaction, try catalogRef(&writeTransaction, directoryReference, 1), &.{ .{ .int = 10 }, .{ .link = null }, .{ .linkSet = &.{} } });
-    directoryReference = try setCatalogRef(&writeTransaction, directoryReference, 1, insertedA.catalogRef);
-    const insertedB = try Objects.insertTyped(&writeTransaction, try catalogRef(&writeTransaction, directoryReference, 1), &.{ .{ .int = 20 }, .{ .link = insertedA.objectKey }, .{ .linkSet = &.{insertedA.objectKey} } });
-    directoryReference = try setCatalogRef(&writeTransaction, directoryReference, 1, insertedB.catalogRef);
+    const insertedA = try Objects.insertTyped(&writeTransaction, try catalogReference(&writeTransaction, directoryReference, 1), &.{ .{ .int = 10 }, .{ .link = null }, .{ .linkSet = &.{} } });
+    directoryReference = try setCatalogReference(&writeTransaction, directoryReference, 1, insertedA.catalogReference);
+    const insertedB = try Objects.insertTyped(&writeTransaction, try catalogReference(&writeTransaction, directoryReference, 1), &.{ .{ .int = 20 }, .{ .link = insertedA.objectKey }, .{ .linkSet = &.{insertedA.objectKey} } });
+    directoryReference = try setCatalogReference(&writeTransaction, directoryReference, 1, insertedB.catalogReference);
 
     // route a to-many add through the directory
     directoryReference = try linkSetAdd(&writeTransaction, directoryReference, 1, 20, 2, insertedA.objectKey); // already member -> no-op
@@ -244,7 +244,7 @@ test "multi-type directory carries links and collections via createWithDefs" {
     directoryReference = added.directoryReference;
     try testing.expectEqual(@as(u16, 2), added.typeId);
     directoryReference = (try insert(&writeTransaction, directoryReference, 2, &.{ .{ .int = 1 }, .{ .listInt = &.{ 7, 8, 9 } } })).directoryReference;
-    try testing.expectEqual(@as(?u64, 3), try collections.listLength(&writeTransaction, try catalogRef(&writeTransaction, directoryReference, 2), 1, 1));
+    try testing.expectEqual(@as(?u64, 3), try collections.listLength(&writeTransaction, try catalogReference(&writeTransaction, directoryReference, 2), 1, 1));
     writeTransaction.deinit();
 }
 
@@ -441,7 +441,7 @@ test "directory records per-type embedded flags" {
     try testing.expectEqual(false, try isEmbedded(&writeTransaction, directoryReference, 0));
     try testing.expectEqual(true, try isEmbedded(&writeTransaction, directoryReference, 1));
 
-    // A setCatalogRef (via insert) rebuilds the node; flags must survive.
+    // A setCatalogReference (via insert) rebuilds the node; flags must survive.
     directoryReference = (try insert(&writeTransaction, directoryReference, 0, &.{ .{ .int = 1 }, .{ .bytes = "x" } })).directoryReference;
     try testing.expectEqual(false, try isEmbedded(&writeTransaction, directoryReference, 0));
     try testing.expectEqual(true, try isEmbedded(&writeTransaction, directoryReference, 1));
@@ -564,14 +564,14 @@ test "directory delete works after relocating the target" {
     try testing.expectEqual(@as(?u64, authorObjectKey), try getLink(&writeTransaction, directoryReference, 1, 1, 1));
 
     // Free the throwaway's physical slot, then relocate the author into it.
-    const authorCatalog = try catalogRef(&writeTransaction, directoryReference, 0);
+    const authorCatalog = try catalogReference(&writeTransaction, directoryReference, 0);
     const deadRow = (try catalog.objectKeyToRow(&writeTransaction, authorCatalog, throwawayObjectKey)).?;
     var vbuf: [2]Value = undefined;
     const throwawayVersion = (try get(&writeTransaction, directoryReference, 0, 99, &vbuf)).?;
     const throwawayDelete = try delete(&writeTransaction, directoryReference, 0, 99, throwawayVersion);
     directoryReference = throwawayDelete.ok;
-    const relocated = try relocation.relocateRow(&writeTransaction, try catalogRef(&writeTransaction, directoryReference, 0), authorObjectKey, deadRow);
-    directoryReference = try setCatalogRef(&writeTransaction, directoryReference, 0, relocated);
+    const relocated = try relocation.relocateRow(&writeTransaction, try catalogReference(&writeTransaction, directoryReference, 0), authorObjectKey, deadRow);
+    directoryReference = try setCatalogReference(&writeTransaction, directoryReference, 0, relocated);
 
     // Deleting the author must nullify the book's link, proving the delete used
     // the object key rather than a stale physical row.
@@ -718,7 +718,7 @@ test "a directory delete frees the row's collection storage" {
     var writeTransaction = try database.beginWrite();
     defer writeTransaction.deinit();
     var raw: [3]u64 = undefined;
-    _ = (try rows.getByPrimaryKey(&writeTransaction, try catalogRef(&writeTransaction, writeTransaction.newRoot, 0), 1, &raw)).?;
+    _ = (try rows.getByPrimaryKey(&writeTransaction, try catalogReference(&writeTransaction, writeTransaction.newRoot, 0), 1, &raw)).?;
     var out: [3]Value = undefined;
     const version = (try get(&writeTransaction, writeTransaction.newRoot, 0, 1, &out)).?;
     const res = try deleteNullifyCrossType(&writeTransaction, writeTransaction.newRoot, 0, 1, version);
@@ -762,7 +762,7 @@ test "a cascade delete frees the child's collection storage" {
     var writeTransaction = try database.beginWrite();
     defer writeTransaction.deinit();
     var raw: [2]u64 = undefined;
-    _ = (try rows.getByPrimaryKey(&writeTransaction, try catalogRef(&writeTransaction, writeTransaction.newRoot, 1), 100, &raw)).?;
+    _ = (try rows.getByPrimaryKey(&writeTransaction, try catalogReference(&writeTransaction, writeTransaction.newRoot, 1), 100, &raw)).?;
     var out: [2]Value = undefined;
     const version = (try get(&writeTransaction, writeTransaction.newRoot, 0, 1, &out)).?;
     const res = try deleteNullifyCrossType(&writeTransaction, writeTransaction.newRoot, 0, 1, version);

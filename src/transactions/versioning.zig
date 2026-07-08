@@ -119,16 +119,16 @@ pub fn refreshToLatest(database: *Database) !void {
     var newFl = FreeList.init(database.store.allocator);
     errdefer newFl.deinit();
     var nodeLen: usize = 0;
-    if (published.freeListRef != 0) {
-        nodeLen = try freeListRecovery.decodeFreeListNode(database, published.freeListRef, &newFl);
+    if (published.freeListReference != 0) {
+        nodeLen = try freeListRecovery.decodeFreeListNode(database, published.freeListReference, &newFl);
     }
     // All decoding succeeded: install everything together.
     database.activeVersion = published.version;
-    database.activeRoot = published.rootRef;
+    database.activeRoot = published.rootReference;
     database.arena.top = @intCast(published.logicalSize);
     database.freeList.deinit();
     database.freeList = newFl;
-    database.freeListNodeRef = published.freeListRef;
+    database.freeListNodeReference = published.freeListReference;
     database.freeListNodeLen = nodeLen;
 }
 
@@ -180,7 +180,7 @@ pub fn setRetainVersions(database: *Database, count: u64) void {
     @atomicStore(u64, retainPtr(database), count, .release);
 }
 
-/// Root ref for a committed version, or null if not retained / not yet committed.
+/// Root reference for a committed version, or null if not retained / not yet committed.
 /// The `version > activeVersion` guard rejects a ring entry written during a
 /// commit that crashed/aborted before publishing (the slot flip never happened),
 /// so a recorded-but-unpublished pair is never trusted.
@@ -251,13 +251,13 @@ test "refresh does not advance to a durable-but-unpublished (aborted) slot" {
         var writeTransaction = try database.beginWrite();
         const allocation = try writeTransaction.alloc(8);
         @memcpy(allocation.bytes, "PUBLISH_");
-        writeTransaction.setRoot(allocation.ref);
+        writeTransaction.setRoot(allocation.reference);
         _ = try writeTransaction.commit(); // publishes; coordination.latestVersion advances to this version
     }
     const publishedVersion = database.activeVersion;
     // Forge a VALID slot with a much higher version into the inactive slot bytes,
     // WITHOUT advancing coordination.latestVersion (simulates an aborted-but-durable commit).
-    const forged = Slot{ .version = publishedVersion + 50, .rootRef = 0, .freeListRef = 0, .logicalSize = defaultPageSize };
+    const forged = Slot{ .version = publishedVersion + 50, .rootReference = 0, .freeListReference = 0, .logicalSize = defaultPageSize };
     var buffer: [Slot.size]u8 = undefined;
     forged.encode(&buffer);
     // Write it into whichever slot is currently inactive. The active slot is header.activeSlot.
@@ -286,7 +286,7 @@ test "recovery follows header activeSlot pointer, not max version" {
         var database = try Database.create(testing.allocator, path);
         defer database.deinit();
         // Inject a plausible-but-aborted slot into slot B without touching the header.
-        const aborted = Slot{ .version = 50, .rootRef = 0, .freeListRef = 0, .logicalSize = defaultPageSize };
+        const aborted = Slot{ .version = 50, .rootReference = 0, .freeListReference = 0, .logicalSize = defaultPageSize };
         aborted.encode(database.store.map[slotBOff..][0..Slot.size]);
         try database.store.syncer.flush(database.store.file);
         // header.activeSlot remains 0 (slot A, version 1).
@@ -312,7 +312,7 @@ test "falling back past a corrupt primary slot is surfaced in metrics" {
         var writeTransaction = try database.beginWrite();
         const allocation = try writeTransaction.alloc(8);
         @memcpy(allocation.bytes, "VERSION2");
-        writeTransaction.setRoot(allocation.ref);
+        writeTransaction.setRoot(allocation.reference);
         _ = try writeTransaction.commit();
         try testing.expect(!database.metrics().recoveredFallback); // clean session
         // Corrupt the PRIMARY (active) slot's checksum region on disk.

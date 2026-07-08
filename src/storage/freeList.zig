@@ -101,14 +101,14 @@ pub const FreeList = struct {
         try self.bucketAdd(rounded.len, self.extents.items.len - 1);
     }
 
-    /// Byte size of a persisted chunk's [count u32 LE][nextRef u64 LE] header.
+    /// Byte size of a persisted chunk's [count u32 LE][nextReference u64 LE] header.
     ///
     /// The persisted free list is a CHAIN of bounded chunks, not one node: a
     /// single node's size grows with the extent count, and once heavy churn
     /// pushed the list past the 16 MiB section cap the commit-path allocation
     /// died with error.AllocTooLarge -- an unrecoverable commit failure.
     ///
-    /// Chunk layout: [count u32 LE][nextRef u64 LE] then
+    /// Chunk layout: [count u32 LE][nextReference u64 LE] then
     /// count * ([offset u64][length u64][freedVersion u64]) LE.
     pub const chunkHeaderBytes: usize = 12;
     /// Extents per chunk: 12 + 65_536 * 24 bytes keeps every chunk allocation
@@ -122,12 +122,12 @@ pub const FreeList = struct {
         return chunkHeaderBytes + count * extentBytes;
     }
 
-    /// Encode `extents` plus the next chunk's ref into `buffer` as one chunk;
+    /// Encode `extents` plus the next chunk's reference into `buffer` as one chunk;
     /// returns the encoded byte length. O(extents).
-    pub fn encodeChunk(extents: []const FreeExtent, nextRef: u64, buffer: []u8) usize {
+    pub fn encodeChunk(extents: []const FreeExtent, nextReference: u64, buffer: []u8) usize {
         std.debug.assert(buffer.len >= chunkByteLength(extents.len));
         std.mem.writeInt(u32, buffer[0..4], @intCast(extents.len), .little);
-        std.mem.writeInt(u64, buffer[4..12], nextRef, .little);
+        std.mem.writeInt(u64, buffer[4..12], nextReference, .little);
         var offset: usize = chunkHeaderBytes;
         for (extents) |extent| {
             std.mem.writeInt(u64, buffer[offset..][0..8], extent.offset, .little);
@@ -146,7 +146,7 @@ pub const FreeList = struct {
     }
 
     /// Append one decoded chunk's extents to this list; returns the chunk's
-    /// nextRef (0 for the last chunk in the chain).
+    /// nextReference (0 for the last chunk in the chain).
     pub fn decodeChunkAppend(self: *FreeList, buffer: []const u8) !u64 {
         if (buffer.len < chunkHeaderBytes) return error.Corrupt;
         const count = std.mem.readInt(u32, buffer[0..4], .little);
@@ -198,7 +198,7 @@ test "extent chunks encode and decode round-trip, preserving the chain link" {
     try list.add(.{ .offset = 8192, .len = 128, .freedVersion = 3 });
     try list.add(.{ .offset = 16384, .len = 8, .freedVersion = 4 });
     var buffer: [4096]u8 = undefined;
-    // Split across two chunks; the first names the second's ref.
+    // Split across two chunks; the first names the second's reference.
     const firstChunkLength = FreeList.encodeChunk(list.extents.items[0..2], 0xDEAD_BEE8, buffer[0..]);
     const secondChunkLength = FreeList.encodeChunk(list.extents.items[2..], 0, buffer[firstChunkLength..]);
     var list2 = FreeList.init(allocator);

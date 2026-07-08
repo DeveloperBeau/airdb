@@ -20,7 +20,7 @@ pub const leafNodeSize: usize = 1 + 2 + @as(usize, leafCap) * 8;
 pub const leafHeader: usize = 3;
 
 /// Fixed inner allocation size.
-/// Inner layout: [kind u8][childCount u16 LE][childCount * (childRef u64 LE, subtreeCount u64 LE)].
+/// Inner layout: [kind u8][childCount u16 LE][childCount * (childReference u64 LE, subtreeCount u64 LE)].
 pub const innerNodeSize: usize = 1 + 2 + @as(usize, fanout) * 16;
 /// Byte offset of an inner node's first child entry (past kind and count).
 pub const innerHeader: usize = 3;
@@ -60,16 +60,16 @@ pub fn parseLeaf(bytes: []const u8) error{Corrupt}!LeafView {
     return .{ .bytes = bytes, .count = count };
 }
 
-/// Encode the parallel (childRefs, childCounts) entries into `buffer` as an
+/// Encode the parallel (childReferences, childCounts) entries into `buffer` as an
 /// inner node; returns the encoded byte length.
-pub fn encodeInner(buffer: []u8, childRefs: []const u64, childCounts: []const u64) usize {
-    std.debug.assert(childRefs.len == childCounts.len);
-    std.debug.assert(childRefs.len <= fanout);
+pub fn encodeInner(buffer: []u8, childReferences: []const u64, childCounts: []const u64) usize {
+    std.debug.assert(childReferences.len == childCounts.len);
+    std.debug.assert(childReferences.len <= fanout);
     buffer[0] = kindInner;
-    std.mem.writeInt(u16, buffer[1..3], @intCast(childRefs.len), .little);
+    std.mem.writeInt(u16, buffer[1..3], @intCast(childReferences.len), .little);
     var offset: usize = innerHeader;
-    for (childRefs, childCounts) |ref, count| {
-        std.mem.writeInt(u64, buffer[offset..][0..8], ref, .little);
+    for (childReferences, childCounts) |reference, count| {
+        std.mem.writeInt(u64, buffer[offset..][0..8], reference, .little);
         offset += 8;
         std.mem.writeInt(u64, buffer[offset..][0..8], count, .little);
         offset += 8;
@@ -81,8 +81,8 @@ pub fn encodeInner(buffer: []u8, childRefs: []const u64, childCounts: []const u6
 pub const InnerView = struct {
     bytes: []const u8,
     childCount: u16,
-    /// The ref of child `entryIndex`.
-    pub fn childRef(self: InnerView, entryIndex: usize) u64 {
+    /// The reference of child `entryIndex`.
+    pub fn childReference(self: InnerView, entryIndex: usize) u64 {
         return std.mem.readInt(u64, self.bytes[innerHeader + entryIndex * 16 ..][0..8], .little);
     }
     /// The number of values stored under child `entryIndex`.

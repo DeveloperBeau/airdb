@@ -1,6 +1,6 @@
-//! Type directory node mapping type ids to catalog refs.
+//! Type directory node mapping type ids to catalog references.
 //!
-//! Node layout: [typeCount u16 LE @0][typeCount * (catalogRef u64 LE) @2]
+//! Node layout: [typeCount u16 LE @0][typeCount * (catalogReference u64 LE) @2]
 //!              [typeCount * (isEmbedded u8) @ 2 + tc*8]
 //! directorySize(tc) = 2 + tc * 8 + tc
 
@@ -25,29 +25,29 @@ fn directorySize(typeCountTotal: u16) usize {
     return 2 + @as(usize, typeCountTotal) * 8 + typeCountTotal;
 }
 
-// Pack `tc` catalog refs + per-type embedded flags into a fresh directory node.
-fn writeDirectory(transaction: *WriteTransaction, catalogRefs: []const Reference, embedded: []const bool) !Reference {
-    std.debug.assert(embedded.len == catalogRefs.len);
-    const typeCountTotal: u16 = @intCast(catalogRefs.len);
+// Pack `tc` catalog references + per-type embedded flags into a fresh directory node.
+fn writeDirectory(transaction: *WriteTransaction, catalogReferences: []const Reference, embedded: []const bool) !Reference {
+    std.debug.assert(embedded.len == catalogReferences.len);
+    const typeCountTotal: u16 = @intCast(catalogReferences.len);
     const allocation = try transaction.alloc(directorySize(typeCountTotal));
     std.mem.writeInt(u16, allocation.bytes[0..2], typeCountTotal, .little);
-    for (catalogRefs, 0..) |cref, typeIndex| {
-        std.mem.writeInt(u64, allocation.bytes[2 + typeIndex * 8 ..][0..8], cref, .little);
+    for (catalogReferences, 0..) |typeCatalogReference, typeIndex| {
+        std.mem.writeInt(u64, allocation.bytes[2 + typeIndex * 8 ..][0..8], typeCatalogReference, .little);
     }
-    for (embedded, 0..) |flag, typeIndex| allocation.bytes[2 + catalogRefs.len * 8 + typeIndex] = if (flag) 1 else 0;
-    return allocation.ref;
+    for (embedded, 0..) |flag, typeIndex| allocation.bytes[2 + catalogReferences.len * 8 + typeIndex] = if (flag) 1 else 0;
+    return allocation.reference;
 }
 
 /// Create a directory from a full PropertyDefinition schema (supports
 /// links/collections) with the given per-type embedded flags, creating one
-/// catalog per type. Returns the directory ref. One catalog build per type.
+/// catalog per type. Returns the directory reference. One catalog build per type.
 pub fn createTypes(transaction: *WriteTransaction, schema: DefinitionSchema, embedded: []const bool) !Reference {
     std.debug.assert(schema.len <= 256);
     std.debug.assert(embedded.len == schema.len);
-    var catalogRefs: [256]Reference = undefined;
+    var catalogReferences: [256]Reference = undefined;
     var typeIndex: usize = 0;
-    while (typeIndex < schema.len) : (typeIndex += 1) catalogRefs[typeIndex] = try catalog.createFromDefinitions(transaction, schema[typeIndex]);
-    return writeDirectory(transaction, catalogRefs[0..schema.len], embedded);
+    while (typeIndex < schema.len) : (typeIndex += 1) catalogReferences[typeIndex] = try catalog.createFromDefinitions(transaction, schema[typeIndex]);
+    return writeDirectory(transaction, catalogReferences[0..schema.len], embedded);
 }
 
 /// Create a directory from a full PropertyDefinition schema (supports
@@ -62,20 +62,20 @@ pub fn createWithDefinitions(transaction: *WriteTransaction, schema: DefinitionS
 /// element = int and no type is marked embedded.
 pub fn create(transaction: *WriteTransaction, schema: Schema) !Reference {
     std.debug.assert(schema.len <= 256);
-    var catalogRefs: [256]Reference = undefined;
+    var catalogReferences: [256]Reference = undefined;
     var typeIndex: usize = 0;
     while (typeIndex < schema.len) : (typeIndex += 1) {
-        catalogRefs[typeIndex] = try catalog.createTyped(transaction, schema[typeIndex]);
+        catalogReferences[typeIndex] = try catalog.createTyped(transaction, schema[typeIndex]);
     }
     var flags: [256]bool = undefined;
     @memset(flags[0..schema.len], false);
-    return writeDirectory(transaction, catalogRefs[0..schema.len], flags[0..schema.len]);
+    return writeDirectory(transaction, catalogReferences[0..schema.len], flags[0..schema.len]);
 }
 
 fn loadDirectory(transaction: anytype, directoryReference: Reference) !struct { typeCount: u16, bytes: []const u8 } {
-    const tcBytes = try transaction.deref(directoryReference, 2);
+    const tcBytes = try transaction.dereference(directoryReference, 2);
     const storedTypeCount = std.mem.readInt(u16, tcBytes[0..2], .little);
-    const bytes = try transaction.deref(directoryReference, directorySize(storedTypeCount));
+    const bytes = try transaction.dereference(directoryReference, directorySize(storedTypeCount));
     return .{ .typeCount = storedTypeCount, .bytes = bytes };
 }
 
@@ -85,42 +85,42 @@ pub fn typeCount(transaction: anytype, directoryReference: Reference) !u16 {
     return directory.typeCount;
 }
 
-/// The catalog ref of `typeId`, or error.NoSuchType past the directory's end.
-pub fn catalogRef(transaction: anytype, directoryReference: Reference, typeId: u16) !Reference {
+/// The catalog reference of `typeId`, or error.NoSuchType past the directory's end.
+pub fn catalogReference(transaction: anytype, directoryReference: Reference, typeId: u16) !Reference {
     const directory = try loadDirectory(transaction, directoryReference);
     if (typeId >= directory.typeCount) return error.NoSuchType;
     return std.mem.readInt(u64, directory.bytes[2 + @as(usize, typeId) * 8 ..][0..8], .little);
 }
 
-/// Point `typeId` at `newCatalog` and return the new directory ref
+/// Point `typeId` at `newCatalog` and return the new directory reference
 /// (copy-on-write; the caller must adopt it).
-pub fn setCatalogRef(transaction: *WriteTransaction, directoryReference: Reference, typeId: u16, newCatalog: Reference) !Reference {
+pub fn setCatalogReference(transaction: *WriteTransaction, directoryReference: Reference, typeId: u16, newCatalog: Reference) !Reference {
     const directory = try loadDirectory(transaction, directoryReference);
     if (typeId >= directory.typeCount) return error.NoSuchType;
     const allocation = try transaction.writableCopy(directoryReference, directorySize(directory.typeCount));
     std.mem.writeInt(u64, allocation.bytes[2 + @as(usize, typeId) * 8 ..][0..8], newCatalog, .little);
-    return allocation.ref;
+    return allocation.reference;
 }
 
 // Append an already-created catalog to the directory; returns grown directory + id.
 // Carries the existing per-type embedded flags and appends the new type's flag.
-fn appendCatalog(transaction: *WriteTransaction, oldRefs: []const Reference, oldEmbedded: []const bool, newCatalog: Reference, newEmbedded: bool) !Reference {
-    std.debug.assert(oldRefs.len == oldEmbedded.len);
-    const oldTc = oldRefs.len;
-    var refs: [256]Reference = undefined;
+fn appendCatalog(transaction: *WriteTransaction, oldReferences: []const Reference, oldEmbedded: []const bool, newCatalog: Reference, newEmbedded: bool) !Reference {
+    std.debug.assert(oldReferences.len == oldEmbedded.len);
+    const oldTc = oldReferences.len;
+    var references: [256]Reference = undefined;
     var flags: [256]bool = undefined;
     var typeIndex: usize = 0;
     while (typeIndex < oldTc) : (typeIndex += 1) {
-        refs[typeIndex] = oldRefs[typeIndex];
+        references[typeIndex] = oldReferences[typeIndex];
         flags[typeIndex] = oldEmbedded[typeIndex];
     }
-    refs[oldTc] = newCatalog;
+    references[oldTc] = newCatalog;
     flags[oldTc] = newEmbedded;
-    return writeDirectory(transaction, refs[0 .. oldTc + 1], flags[0 .. oldTc + 1]);
+    return writeDirectory(transaction, references[0 .. oldTc + 1], flags[0 .. oldTc + 1]);
 }
 
-// Snapshot existing catalog refs (before any file-growing create call).
-fn snapshotRefs(transaction: anytype, directoryReference: Reference, out: *[256]Reference) !u16 {
+// Snapshot existing catalog references (before any file-growing create call).
+fn snapshotReferences(transaction: anytype, directoryReference: Reference, out: *[256]Reference) !u16 {
     const directory = try loadDirectory(transaction, directoryReference);
     var typeIndex: usize = 0;
     while (typeIndex < directory.typeCount) : (typeIndex += 1) {
@@ -139,11 +139,11 @@ fn snapshotFlags(transaction: anytype, directoryReference: Reference, out: *[256
     return directory.typeCount;
 }
 
-/// Outcome of adding a type: the grown directory ref and the new type's id.
+/// Outcome of adding a type: the grown directory reference and the new type's id.
 pub const AddTypeResult = struct { directoryReference: Reference, typeId: u16 };
 
 /// Append a new type from a full PropertyDefinition schema (supports
-/// links/collections) and return the grown directory ref plus the new type id.
+/// links/collections) and return the grown directory reference plus the new type id.
 pub fn addTypeDefinitions(transaction: *WriteTransaction, directoryReference: Reference, definitions: []const PropertyDefinition) !AddTypeResult {
     return addTypeDefinitionsEmbedded(transaction, directoryReference, definitions, false);
 }
@@ -151,29 +151,29 @@ pub fn addTypeDefinitions(transaction: *WriteTransaction, directoryReference: Re
 /// Like addTypeDefinitions but marks the new type embedded (single-owner)
 /// when `embedded` is set.
 pub fn addTypeDefinitionsEmbedded(transaction: *WriteTransaction, directoryReference: Reference, definitions: []const PropertyDefinition, embedded: bool) !AddTypeResult {
-    var oldRefs: [256]Reference = undefined;
+    var oldReferences: [256]Reference = undefined;
     var oldFlags: [256]bool = undefined;
-    const oldTc = try snapshotRefs(transaction, directoryReference, &oldRefs);
+    const oldTc = try snapshotReferences(transaction, directoryReference, &oldReferences);
     _ = try snapshotFlags(transaction, directoryReference, &oldFlags);
     std.debug.assert(oldTc < 256);
     const newCatalog = try catalog.createFromDefinitions(transaction, definitions);
-    const newDirectoryReference = try appendCatalog(transaction, oldRefs[0..oldTc], oldFlags[0..oldTc], newCatalog, embedded);
+    const newDirectoryReference = try appendCatalog(transaction, oldReferences[0..oldTc], oldFlags[0..oldTc], newCatalog, embedded);
     return .{ .directoryReference = newDirectoryReference, .typeId = oldTc };
 }
 
 /// Append a new object type to the directory and return the grown directory
-/// ref plus the new type id. The new type's catalog is created from the
+/// reference plus the new type id. The new type's catalog is created from the
 /// scalar `typeSchema` (element = int, no links).
 pub fn addType(transaction: *WriteTransaction, directoryReference: Reference, typeSchema: []const PropertyKind) !AddTypeResult {
-    // Capture existing catalog refs and embedded flags before createTyped, which
-    // can grow the file and invalidate the directory deref slice.
-    var oldRefs: [256]Reference = undefined;
+    // Capture existing catalog references and embedded flags before createTyped, which
+    // can grow the file and invalidate the directory dereference slice.
+    var oldReferences: [256]Reference = undefined;
     var oldFlags: [256]bool = undefined;
-    const oldTc = try snapshotRefs(transaction, directoryReference, &oldRefs);
+    const oldTc = try snapshotReferences(transaction, directoryReference, &oldReferences);
     _ = try snapshotFlags(transaction, directoryReference, &oldFlags);
     std.debug.assert(oldTc < 256);
     const newCatalog = try catalog.createTyped(transaction, typeSchema);
-    const newDirectoryReference = try appendCatalog(transaction, oldRefs[0..oldTc], oldFlags[0..oldTc], newCatalog, false);
+    const newDirectoryReference = try appendCatalog(transaction, oldReferences[0..oldTc], oldFlags[0..oldTc], newCatalog, false);
     return .{ .directoryReference = newDirectoryReference, .typeId = oldTc };
 }
 
@@ -192,7 +192,7 @@ pub fn validate(transaction: anytype, directoryReference: Reference, expected: S
     if (typeCountTotal != expected.len) return error.SchemaMismatch;
     var typeIndex: u16 = 0;
     while (typeIndex < typeCountTotal) : (typeIndex += 1) {
-        const view = try catalog.loadCatalog(transaction, try catalogRef(transaction, directoryReference, typeIndex));
+        const view = try catalog.loadCatalog(transaction, try catalogReference(transaction, directoryReference, typeIndex));
         if (view.propertyCount != expected[typeIndex].len) return error.SchemaMismatch;
         var propertyIndex: usize = 0;
         while (propertyIndex < view.propertyCount) : (propertyIndex += 1) {
@@ -211,13 +211,13 @@ const typeRouting = @import("typeRouting.zig");
 // ---------------------------------------------------------------------------
 
 /// Create an embedded child for the owner's to-one link `property` and link
-/// it in, returning the new directory ref. If the owner already has a child
+/// it in, returning the new directory reference. If the owner already has a child
 /// via `property`, the old child is deleted first (replace semantics); a
 /// delete refused by a block-rule link surfaces as error.Blocked rather than
 /// leaking an ownerless object.
 pub fn insertEmbedded(transaction: *WriteTransaction, directoryReference: Reference, ownerType: u16, ownerPrimaryKey: u64, property: usize, childValues: []const Value) !Reference {
     var currentDirectoryReference = directoryReference;
-    const childType = (try catalog.loadCatalog(transaction, try catalogRef(transaction, currentDirectoryReference, ownerType))).linkTarget(property);
+    const childType = (try catalog.loadCatalog(transaction, try catalogReference(transaction, currentDirectoryReference, ownerType))).linkTarget(property);
 
     // Replace: delete any existing owned child first. A refused delete must
     // SURFACE, not be swallowed: silently linking the new child while the old
@@ -225,7 +225,7 @@ pub fn insertEmbedded(transaction: *WriteTransaction, directoryReference: Refere
     // object. (.blocked is reachable when another type block-links the child;
     // conflict/notFound are impossible for a version read in this transaction.)
     if (try typeRouting.getLink(transaction, currentDirectoryReference, ownerType, ownerPrimaryKey, property)) |oldObjectKey| {
-        const childCatalog = try catalogRef(transaction, currentDirectoryReference, childType);
+        const childCatalog = try catalogReference(transaction, currentDirectoryReference, childType);
         const propertyCount = (try catalog.loadCatalog(transaction, childCatalog)).propertyCount;
         var buffer: [256]u64 = undefined;
         if (try rows.getByObjectKey(transaction, childCatalog, oldObjectKey, buffer[0..propertyCount])) |oldVersion| {
@@ -244,13 +244,13 @@ pub fn insertEmbedded(transaction: *WriteTransaction, directoryReference: Refere
 }
 
 /// Delete the embedded child owned via to-one link `property`, returning the
-/// new directory ref (unchanged if there is no child). Deleting the child
+/// new directory reference (unchanged if there is no child). Deleting the child
 /// cross-type-nullifies the owner's inbound link automatically; a delete
 /// refused by a block-rule link surfaces as error.Blocked.
 pub fn clearEmbedded(transaction: *WriteTransaction, directoryReference: Reference, ownerType: u16, ownerPrimaryKey: u64, property: usize) !Reference {
     const childObjectKey = (try typeRouting.getLink(transaction, directoryReference, ownerType, ownerPrimaryKey, property)) orelse return directoryReference;
-    const childType = (try catalog.loadCatalog(transaction, try catalogRef(transaction, directoryReference, ownerType))).linkTarget(property);
-    const childCatalog = try catalogRef(transaction, directoryReference, childType);
+    const childType = (try catalog.loadCatalog(transaction, try catalogReference(transaction, directoryReference, ownerType))).linkTarget(property);
+    const childCatalog = try catalogReference(transaction, directoryReference, childType);
     const propertyCount = (try catalog.loadCatalog(transaction, childCatalog)).propertyCount;
     var buffer: [256]u64 = undefined;
     const childVersion = (try rows.getByObjectKey(transaction, childCatalog, childObjectKey, buffer[0..propertyCount])) orelse return directoryReference;

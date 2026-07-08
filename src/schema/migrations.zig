@@ -24,15 +24,15 @@ const maxPropertyCount = catalog.maxPropertyCount;
 // rewrite the catalog transactionally (COW); existing snapshots are unaffected.
 // ---------------------------------------------------------------------------
 
-/// Append a new property to the type and return the new catalog ref. The new
+/// Append a new property to the type and return the new catalog reference. The new
 /// column is backfilled for every existing row: live rows get `defaultValue`
 /// (blob defaults are copied per row; collection kinds get a fresh empty
 /// tree each) and dead rows get 0. A link or linkSet property gets a fresh
 /// backlink index; an indexed property gets its value index backfilled from
 /// the live rows. Indexing a collection kind is error.Unsupported. O(n) over
 /// every existing row, live or tombstoned.
-pub fn addProperty(transaction: *WriteTransaction, catalogRef: Reference, def: PropertyDefinition, defaultValue: u64) !Reference {
-    var snapshot = try catalog.CatalogSnapshot.load(transaction, catalogRef);
+pub fn addProperty(transaction: *WriteTransaction, catalogReference: Reference, def: PropertyDefinition, defaultValue: u64) !Reference {
+    var snapshot = try catalog.CatalogSnapshot.load(transaction, catalogReference);
     const propertyCount = snapshot.propertyCount;
     std.debug.assert(propertyCount + 1 <= maxPropertyCount);
 
@@ -40,12 +40,12 @@ pub fn addProperty(transaction: *WriteTransaction, catalogRef: Reference, def: P
         .list, .set, .dict, .linkSet => true,
         .int, .blob, .link => false,
     };
-    // Indexing a collection property would index its per-row root refs --
+    // Indexing a collection property would index its per-row root references --
     // meaningless as values and impossible to backfill coherently.
     if (def.indexed and isCollection) return error.Unsupported;
 
     const newColumn = try buildBackfilledColumn(transaction, &snapshot, def, defaultValue, isCollection);
-    const valueIndexRef: Reference = if (def.indexed) try backfillValueIndex(transaction, snapshot.keyrowIndexRef, newColumn) else 0;
+    const valueIndexReference: Reference = if (def.indexed) try backfillValueIndex(transaction, snapshot.keyToRowIndexReference, newColumn) else 0;
 
     snapshot.properties[propertyCount] = .{
         .column = newColumn,
@@ -54,7 +54,7 @@ pub fn addProperty(transaction: *WriteTransaction, catalogRef: Reference, def: P
         .backlink = if (def.kind == .link or def.kind == .linkSet) try Index.create(transaction) else 0,
         .target = def.linkTarget,
         .rule = def.deletionRule,
-        .valueIndex = valueIndexRef,
+        .valueIndex = valueIndexReference,
         .indexed = def.indexed,
     };
     snapshot.propertyCount = propertyCount + 1;
@@ -67,10 +67,10 @@ pub fn addProperty(transaction: *WriteTransaction, catalogRef: Reference, def: P
 // pre-migration rows undeletable through the graph-safe delete (its outbound
 // cleanup walks linkSet roots), while a SHARED root would be freed by the
 // first row's delete underneath every other row. Blobs have the same aliasing
-// hazard: writing the caller's single default ref into every row meant the
+// hazard: writing the caller's single default reference into every row meant the
 // first row's delete freed the node under all the others, planting a
 // duplicate extent in the free list -- so each live row gets its own copy of
-// the default bytes (the caller keeps ownership of the passed-in ref). Dead
+// the default bytes (the caller keeps ownership of the passed-in reference). Dead
 // rows get 0 for both; nothing ever dereferences a tombstoned row's columns.
 fn buildBackfilledColumn(
     transaction: *WriteTransaction,
@@ -82,7 +82,7 @@ fn buildBackfilledColumn(
     var newColumn = try Column.create(transaction);
     var row: u64 = 0;
     while (row < snapshot.nextRow) : (row += 1) {
-        const live = (try Column.get(transaction, snapshot.liveColumnRef, row)) != 0;
+        const live = (try Column.get(transaction, snapshot.liveColumnReference, row)) != 0;
         const fill: u64 = if (def.kind == .blob)
             (if (live and defaultValue != 0) try blobDup(transaction, defaultValue) else if (live) defaultValue else 0)
         else if (!isCollection)
@@ -108,32 +108,32 @@ fn buildBackfilledColumn(
 // planner trusts the indexed flag, so an empty index would silently drop
 // every pre-migration row from indexed queries (and fail the integrity
 // audit). Each row is indexed under its OWN raw column value (mirroring the
-// insert path) -- blob backfills give every row a distinct ref, so a single
+// insert path) -- blob backfills give every row a distinct reference, so a single
 // shared key would diverge from what reads and audits expect.
-fn backfillValueIndex(transaction: *WriteTransaction, keyrowRef: Reference, newColumn: Reference) !Reference {
-    var valueIndexRef = try Index.create(transaction);
+fn backfillValueIndex(transaction: *WriteTransaction, keyToRowIndexReference: Reference, newColumn: Reference) !Reference {
+    var valueIndexReference = try Index.create(transaction);
     const Sink = struct {
         transaction: *WriteTransaction,
-        valueIndexRef: *Reference,
+        valueIndexReference: *Reference,
         column: Reference,
         fn onEntry(self: @This(), objectKey: u64, row: u64) anyerror!void {
             const raw = try Column.get(self.transaction, self.column, row);
-            self.valueIndexRef.* = try rows.valueIndexAdd(self.transaction, self.valueIndexRef.*, raw, objectKey);
+            self.valueIndexReference.* = try rows.valueIndexAdd(self.transaction, self.valueIndexReference.*, raw, objectKey);
         }
     };
-    try Index.forEachEntry(transaction, keyrowRef, Sink{ .transaction = transaction, .valueIndexRef = &valueIndexRef, .column = newColumn }, Sink.onEntry);
-    return valueIndexRef;
+    try Index.forEachEntry(transaction, keyToRowIndexReference, Sink{ .transaction = transaction, .valueIndexReference = &valueIndexReference, .column = newColumn }, Sink.onEntry);
+    return valueIndexReference;
 }
 
-// Copy a blob's bytes into a fresh node, returning the new ref. Used by the
+// Copy a blob's bytes into a fresh node, returning the new reference. Used by the
 // blob-default backfill so no two rows share one node.
-fn blobDup(transaction: *WriteTransaction, ref: u64) !u64 {
-    if (blob.get(transaction, ref)) |bytes| {
+fn blobDup(transaction: *WriteTransaction, reference: u64) !u64 {
+    if (blob.get(transaction, reference)) |bytes| {
         return blob.put(transaction, bytes);
     } else |err| switch (err) {
         error.BlobChunked => {
             const scratchAllocator = transaction.database.store.allocator;
-            const bytes = try blob.getAlloc(transaction, ref, scratchAllocator);
+            const bytes = try blob.getAlloc(transaction, reference, scratchAllocator);
             defer scratchAllocator.free(bytes);
             return blob.put(transaction, bytes);
         },
@@ -142,11 +142,11 @@ fn blobDup(transaction: *WriteTransaction, ref: u64) !u64 {
 }
 
 /// Remove property `property` (must be >= 1; the primary key at 0 cannot be
-/// removed) and return the new catalog ref. The dropped column's storage is
+/// removed) and return the new catalog reference. The dropped column's storage is
 /// left for compaction to reclaim. O(propertyCount) catalog rewrite.
-pub fn removeProperty(transaction: *WriteTransaction, catalogRef: Reference, property: usize) !Reference {
+pub fn removeProperty(transaction: *WriteTransaction, catalogReference: Reference, property: usize) !Reference {
     std.debug.assert(property >= 1);
-    var snapshot = try catalog.CatalogSnapshot.load(transaction, catalogRef);
+    var snapshot = try catalog.CatalogSnapshot.load(transaction, catalogReference);
     std.debug.assert(property < snapshot.propertyCount);
     var propertyIndex: usize = property;
     while (propertyIndex + 1 < snapshot.propertyCount) : (propertyIndex += 1) snapshot.properties[propertyIndex] = snapshot.properties[propertyIndex + 1];

@@ -47,25 +47,25 @@ test "bulk append is refused when the batch does not clear the true max primaryK
     var writeTransaction = try database.beginWrite();
     defer writeTransaction.deinit();
 
-    var catalogRef = try catalog.create(&writeTransaction, 2);
+    var catalogReference = try catalog.create(&writeTransaction, 2);
     var primaryKey: u64 = 0;
-    while (primaryKey <= 64) : (primaryKey += 1) catalogRef = (try rawRows.insert(&writeTransaction, catalogRef, &.{ primaryKey, primaryKey })).catalogRef; // primaryKey index splits
+    while (primaryKey <= 64) : (primaryKey += 1) catalogReference = (try rawRows.insert(&writeTransaction, catalogReference, &.{ primaryKey, primaryKey })).catalogReference; // primaryKey index splits
     var out: [2]u64 = undefined;
     primaryKey = 32;
     while (primaryKey <= 64) : (primaryKey += 1) {
-        const version = (try rawRows.getByPrimaryKey(&writeTransaction, catalogRef, primaryKey, &out)).?;
-        catalogRef = (try rawRows.delete(&writeTransaction, catalogRef, primaryKey, version)).ok;
+        const version = (try rawRows.getByPrimaryKey(&writeTransaction, catalogReference, primaryKey, &out)).?;
+        catalogReference = (try rawRows.delete(&writeTransaction, catalogReference, primaryKey, version)).ok;
     }
     // primaryKeys 0..31 survive; a batch starting at 10 must NOT take the fast path.
     const rows = [_][]const u64{ &.{ 10, 1 }, &.{ 11, 2 } };
-    try testing.expectError(error.NotAppendable, bulkAppend(&writeTransaction, catalogRef, &rows));
+    try testing.expectError(error.NotAppendable, bulkAppend(&writeTransaction, catalogReference, &rows));
     // The orchestrator falls back to row-by-row, which detects the duplicate.
-    try testing.expectError(error.DuplicateKey, bulkAppendOrInsert(&writeTransaction, catalogRef, &rows));
+    try testing.expectError(error.DuplicateKey, bulkAppendOrInsert(&writeTransaction, catalogReference, &rows));
     // A batch that truly clears the surviving max qualifies.
     const okRows = [_][]const u64{ &.{ 100, 1 }, &.{ 101, 2 } };
-    catalogRef = try bulkAppend(&writeTransaction, catalogRef, &okRows);
-    try testing.expect((try rawRows.getByPrimaryKey(&writeTransaction, catalogRef, 100, &out)) != null);
-    try testing.expect((try rawRows.getByPrimaryKey(&writeTransaction, catalogRef, 31, &out)) != null);
+    catalogReference = try bulkAppend(&writeTransaction, catalogReference, &okRows);
+    try testing.expect((try rawRows.getByPrimaryKey(&writeTransaction, catalogReference, 100, &out)) != null);
+    try testing.expect((try rawRows.getByPrimaryKey(&writeTransaction, catalogReference, 31, &out)) != null);
 }
 
 test "bulk append into a primaryKey-history gap takes the fallback" {
@@ -84,29 +84,29 @@ test "bulk append into a primaryKey-history gap takes the fallback" {
     var writeTransaction = try database.beginWrite();
     defer writeTransaction.deinit();
 
-    var catalogRef = try catalog.create(&writeTransaction, 2);
+    var catalogReference = try catalog.create(&writeTransaction, 2);
     var primaryKey: u64 = 0;
-    while (primaryKey <= 31) : (primaryKey += 1) catalogRef = (try rawRows.insert(&writeTransaction, catalogRef, &.{ primaryKey, primaryKey })).catalogRef;
+    while (primaryKey <= 31) : (primaryKey += 1) catalogReference = (try rawRows.insert(&writeTransaction, catalogReference, &.{ primaryKey, primaryKey })).catalogReference;
     primaryKey = 40;
-    while (primaryKey <= 104) : (primaryKey += 1) catalogRef = (try rawRows.insert(&writeTransaction, catalogRef, &.{ primaryKey, primaryKey })).catalogRef;
+    while (primaryKey <= 104) : (primaryKey += 1) catalogReference = (try rawRows.insert(&writeTransaction, catalogReference, &.{ primaryKey, primaryKey })).catalogReference;
     var out: [2]u64 = undefined;
     primaryKey = 40;
     while (primaryKey <= 104) : (primaryKey += 1) {
-        const version = (try rawRows.getByPrimaryKey(&writeTransaction, catalogRef, primaryKey, &out)).?;
-        catalogRef = (try rawRows.delete(&writeTransaction, catalogRef, primaryKey, version)).ok;
+        const version = (try rawRows.getByPrimaryKey(&writeTransaction, catalogReference, primaryKey, &out)).?;
+        catalogReference = (try rawRows.delete(&writeTransaction, catalogReference, primaryKey, version)).ok;
     }
 
     // Below the stale low: NotAppendable; the orchestrator's fallback must
     // leave every row reachable.
     const gapRows = [_][]const u64{ &.{ 33, 1 }, &.{ 34, 2 } };
-    try testing.expectError(error.NotAppendable, bulkAppend(&writeTransaction, catalogRef, &gapRows));
-    catalogRef = try bulkAppendOrInsert(&writeTransaction, catalogRef, &gapRows);
-    try testing.expect((try rawRows.getByPrimaryKey(&writeTransaction, catalogRef, 33, &out)) != null);
-    try testing.expect((try rawRows.getByPrimaryKey(&writeTransaction, catalogRef, 34, &out)) != null);
+    try testing.expectError(error.NotAppendable, bulkAppend(&writeTransaction, catalogReference, &gapRows));
+    catalogReference = try bulkAppendOrInsert(&writeTransaction, catalogReference, &gapRows);
+    try testing.expect((try rawRows.getByPrimaryKey(&writeTransaction, catalogReference, 33, &out)) != null);
+    try testing.expect((try rawRows.getByPrimaryKey(&writeTransaction, catalogReference, 34, &out)) != null);
 
     // Every surviving primaryKey still resolves (routing lows intact).
     primaryKey = 0;
-    while (primaryKey <= 31) : (primaryKey += 1) try testing.expect((try rawRows.getByPrimaryKey(&writeTransaction, catalogRef, primaryKey, &out)) != null);
+    while (primaryKey <= 31) : (primaryKey += 1) try testing.expect((try rawRows.getByPrimaryKey(&writeTransaction, catalogReference, primaryKey, &out)) != null);
 }
 
 test "bulk append fallback refuses link-bearing schemas" {
@@ -121,9 +121,9 @@ test "bulk append fallback refuses link-bearing schemas" {
     defer database.deinit();
     var writeTransaction = try database.beginWrite();
     defer writeTransaction.deinit();
-    const catalogRef = try catalog.createFromDefinitions(&writeTransaction, &.{ .{ .kind = .int }, .{ .kind = .link } });
+    const catalogReference = try catalog.createFromDefinitions(&writeTransaction, &.{ .{ .kind = .int }, .{ .kind = .link } });
     const rows = [_][]const u64{&.{ 1, 0 }};
-    try testing.expectError(error.UnsupportedForBulk, bulkAppendOrInsert(&writeTransaction, catalogRef, &rows));
+    try testing.expectError(error.UnsupportedForBulk, bulkAppendOrInsert(&writeTransaction, catalogReference, &rows));
 }
 
 test "bulk append frees the replaced right-edge nodes" {
@@ -137,10 +137,10 @@ test "bulk append frees the replaced right-edge nodes" {
     // Commit a populated type so the old right edge is committed nodes.
     {
         var writeTransaction = try database.beginWrite();
-        var catalogRef = try catalog.create(&writeTransaction, 2);
+        var catalogReference = try catalog.create(&writeTransaction, 2);
         var primaryKey: u64 = 0;
-        while (primaryKey < 200) : (primaryKey += 1) catalogRef = (try rawRows.insert(&writeTransaction, catalogRef, &.{ primaryKey, primaryKey })).catalogRef;
-        writeTransaction.setRoot(catalogRef);
+        while (primaryKey < 200) : (primaryKey += 1) catalogReference = (try rawRows.insert(&writeTransaction, catalogReference, &.{ primaryKey, primaryKey })).catalogReference;
+        writeTransaction.setRoot(catalogReference);
         _ = try writeTransaction.commit();
     }
 
@@ -379,9 +379,9 @@ test "bulkImport equals row-by-row for a scalar indexed type" {
         defer database.deinit();
         var writeTransaction = try database.beginWrite();
         const directoryReference = try typeDirectory.createTypes(&writeTransaction, &.{&importDefinitions}, &.{false});
-        const catalog0 = try typeDirectory.catalogRef(&writeTransaction, directoryReference, 0);
+        const catalog0 = try typeDirectory.catalogReference(&writeTransaction, directoryReference, 0);
         const newCatalog = try bulkImport(&writeTransaction, catalog0, rowSlices, .{});
-        const newDirectoryReference = try typeDirectory.setCatalogRef(&writeTransaction, directoryReference, 0, newCatalog);
+        const newDirectoryReference = try typeDirectory.setCatalogReference(&writeTransaction, directoryReference, 0, newCatalog);
         writeTransaction.setRoot(newDirectoryReference);
         _ = try writeTransaction.commit();
         try verification.verifyIntegrity(&database); // both value-index directions, in memory
@@ -392,10 +392,10 @@ test "bulkImport equals row-by-row for a scalar indexed type" {
         var database = try Database.create(testing.allocator, pathB);
         defer database.deinit();
         var writeTransaction = try database.beginWrite();
-        var catalogRef = try catalog.createFromDefinitions(&writeTransaction, &importDefinitions);
+        var catalogReference = try catalog.createFromDefinitions(&writeTransaction, &importDefinitions);
         var primaryKey: u64 = 0;
-        while (primaryKey < N) : (primaryKey += 1) catalogRef = (try rawRows.insert(&writeTransaction, catalogRef, &.{ primaryKey, primaryKey * 3, primaryKey % 50 })).catalogRef;
-        writeTransaction.setRoot(catalogRef);
+        while (primaryKey < N) : (primaryKey += 1) catalogReference = (try rawRows.insert(&writeTransaction, catalogReference, &.{ primaryKey, primaryKey * 3, primaryKey % 50 })).catalogReference;
+        writeTransaction.setRoot(catalogReference);
         _ = try writeTransaction.commit();
     }
 
@@ -411,7 +411,7 @@ test "bulkImport equals row-by-row for a scalar indexed type" {
     var readTransactionB = try databaseB.beginRead();
     defer readTransactionB.end();
 
-    const catalogA = try typeDirectory.catalogRef(&readTransactionA, readTransactionA.root(), 0);
+    const catalogA = try typeDirectory.catalogReference(&readTransactionA, readTransactionA.root(), 0);
     const catalogB = readTransactionB.root();
 
     // Counts equal.
@@ -463,16 +463,16 @@ test "bulkImport rejects a non-empty type" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var writeTransaction = try database.beginWrite();
-    var catalogRef = try catalog.createFromDefinitions(&writeTransaction, &importDefinitions);
-    catalogRef = (try rawRows.insert(&writeTransaction, catalogRef, &.{ 1, 3, 1 })).catalogRef;
+    var catalogReference = try catalog.createFromDefinitions(&writeTransaction, &importDefinitions);
+    catalogReference = (try rawRows.insert(&writeTransaction, catalogReference, &.{ 1, 3, 1 })).catalogReference;
 
     const more = [_][]const u64{ &.{ 10, 30, 5 }, &.{ 11, 33, 6 } };
-    try testing.expectError(error.TypeNotEmpty, bulkImport(&writeTransaction, catalogRef, &more, .{}));
+    try testing.expectError(error.TypeNotEmpty, bulkImport(&writeTransaction, catalogReference, &more, .{}));
 
     // The type is unchanged: still one live row, intact.
-    try testing.expectEqual(@as(u64, 1), try catalog.liveCount(&writeTransaction, catalogRef));
+    try testing.expectEqual(@as(u64, 1), try catalog.liveCount(&writeTransaction, catalogReference));
     var out: [3]u64 = undefined;
-    try testing.expect((try rawRows.getByPrimaryKey(&writeTransaction, catalogRef, 1, &out)) != null);
+    try testing.expect((try rawRows.getByPrimaryKey(&writeTransaction, catalogReference, 1, &out)) != null);
     try testing.expectEqual(@as(u64, 1), out[0]);
     try testing.expectEqual(@as(u64, 3), out[1]);
     try testing.expectEqual(@as(u64, 1), out[2]);
@@ -487,14 +487,14 @@ test "bulkImport rejects duplicate primaryKey before committing" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var writeTransaction = try database.beginWrite();
-    const catalogRef = try catalog.createFromDefinitions(&writeTransaction, &importDefinitions);
+    const catalogReference = try catalog.createFromDefinitions(&writeTransaction, &importDefinitions);
 
     const dup = [_][]const u64{ &.{ 5, 1, 0 }, &.{ 6, 2, 0 }, &.{ 5, 3, 0 } };
-    try testing.expectError(error.DuplicateKey, bulkImport(&writeTransaction, catalogRef, &dup, .{}));
+    try testing.expectError(error.DuplicateKey, bulkImport(&writeTransaction, catalogReference, &dup, .{}));
 
     // Nothing was written: the type is still empty.
-    try testing.expectEqual(@as(u64, 0), try catalog.liveCount(&writeTransaction, catalogRef));
-    const view = try catalog.loadCatalog(&writeTransaction, catalogRef);
+    try testing.expectEqual(@as(u64, 0), try catalog.liveCount(&writeTransaction, catalogReference));
+    const view = try catalog.loadCatalog(&writeTransaction, catalogReference);
     try testing.expectEqual(@as(u64, 0), view.nextRow);
     try testing.expectEqual(@as(u64, 0), view.nextKey);
     writeTransaction.deinit();
@@ -509,10 +509,10 @@ test "bulkImport rejects a link-bearing type" {
     defer database.deinit();
     var writeTransaction = try database.beginWrite();
     const linkDefinitions = [_]catalog.PropertyDefinition{ .{ .kind = .int }, .{ .kind = .link, .linkTarget = 0 } };
-    const catalogRef = try catalog.createFromDefinitions(&writeTransaction, &linkDefinitions);
+    const catalogReference = try catalog.createFromDefinitions(&writeTransaction, &linkDefinitions);
 
     const rws = [_][]const u64{&.{ 1, 0 }};
-    try testing.expectError(error.UnsupportedForBulk, bulkImport(&writeTransaction, catalogRef, &rws, .{}));
+    try testing.expectError(error.UnsupportedForBulk, bulkImport(&writeTransaction, catalogReference, &rws, .{}));
     writeTransaction.deinit();
 }
 
@@ -541,9 +541,9 @@ test "bulkImport edge sizes: empty, single, leafCap" {
         {
             var writeTransaction = try database.beginWrite();
             const directoryReference = try typeDirectory.createTypes(&writeTransaction, &.{&importDefinitions}, &.{false});
-            const catalog0 = try typeDirectory.catalogRef(&writeTransaction, directoryReference, 0);
+            const catalog0 = try typeDirectory.catalogReference(&writeTransaction, directoryReference, 0);
             const newCatalog = try bulkImport(&writeTransaction, catalog0, rowSlices, .{ .presorted = true });
-            const newDirectoryReference = try typeDirectory.setCatalogRef(&writeTransaction, directoryReference, 0, newCatalog);
+            const newDirectoryReference = try typeDirectory.setCatalogReference(&writeTransaction, directoryReference, 0, newCatalog);
             writeTransaction.setRoot(newDirectoryReference);
             _ = try writeTransaction.commit();
         }
@@ -551,15 +551,15 @@ test "bulkImport edge sizes: empty, single, leafCap" {
 
         var readTransaction = try database.beginRead();
         defer readTransaction.end();
-        const catalogRef = try typeDirectory.catalogRef(&readTransaction, readTransaction.root(), 0);
-        try testing.expectEqual(count, try catalog.liveCount(&readTransaction, catalogRef));
-        const view = try catalog.loadCatalog(&readTransaction, catalogRef);
+        const catalogReference = try typeDirectory.catalogReference(&readTransaction, readTransaction.root(), 0);
+        try testing.expectEqual(count, try catalog.liveCount(&readTransaction, catalogReference));
+        const view = try catalog.loadCatalog(&readTransaction, catalogReference);
         try testing.expectEqual(count, view.nextRow);
         try testing.expectEqual(count, view.nextKey);
         if (count > 0) {
             var out: [3]u64 = undefined;
             const last = count - 1;
-            try testing.expect((try rawRows.getByPrimaryKey(&readTransaction, catalogRef, last, &out)) != null);
+            try testing.expect((try rawRows.getByPrimaryKey(&readTransaction, catalogReference, last, &out)) != null);
             try testing.expectEqual(last, out[0]);
             try testing.expectEqual(last * 3, out[1]);
             try testing.expectEqual(last % 7, out[2]);
@@ -603,11 +603,11 @@ test "bulkAppend equals row-by-row for a contiguous monotonic batch" {
         defer database.deinit();
         var writeTransaction = try database.beginWrite();
         const directoryReference = try typeDirectory.createTypes(&writeTransaction, &.{&appendDefinitions}, &.{false});
-        var catalogRef = try typeDirectory.catalogRef(&writeTransaction, directoryReference, 0);
+        var catalogReference = try typeDirectory.catalogReference(&writeTransaction, directoryReference, 0);
         var primaryKey: u64 = 0;
-        while (primaryKey < BASE) : (primaryKey += 1) catalogRef = (try rawRows.insert(&writeTransaction, catalogRef, &.{ primaryKey, primaryKey * 3 })).catalogRef;
-        const newCatalog = try bulkAppend(&writeTransaction, catalogRef, batch);
-        const newDirectoryReference = try typeDirectory.setCatalogRef(&writeTransaction, directoryReference, 0, newCatalog);
+        while (primaryKey < BASE) : (primaryKey += 1) catalogReference = (try rawRows.insert(&writeTransaction, catalogReference, &.{ primaryKey, primaryKey * 3 })).catalogReference;
+        const newCatalog = try bulkAppend(&writeTransaction, catalogReference, batch);
+        const newDirectoryReference = try typeDirectory.setCatalogReference(&writeTransaction, directoryReference, 0, newCatalog);
         writeTransaction.setRoot(newDirectoryReference);
         _ = try writeTransaction.commit();
         try verification.verifyIntegrity(&database);
@@ -618,10 +618,10 @@ test "bulkAppend equals row-by-row for a contiguous monotonic batch" {
         var database = try Database.create(testing.allocator, pathB);
         defer database.deinit();
         var writeTransaction = try database.beginWrite();
-        var catalogRef = try catalog.createFromDefinitions(&writeTransaction, &appendDefinitions);
+        var catalogReference = try catalog.createFromDefinitions(&writeTransaction, &appendDefinitions);
         var primaryKey: u64 = 0;
-        while (primaryKey < TOTAL) : (primaryKey += 1) catalogRef = (try rawRows.insert(&writeTransaction, catalogRef, &.{ primaryKey, primaryKey * 3 })).catalogRef;
-        writeTransaction.setRoot(catalogRef);
+        while (primaryKey < TOTAL) : (primaryKey += 1) catalogReference = (try rawRows.insert(&writeTransaction, catalogReference, &.{ primaryKey, primaryKey * 3 })).catalogReference;
+        writeTransaction.setRoot(catalogReference);
         _ = try writeTransaction.commit();
     }
 
@@ -637,7 +637,7 @@ test "bulkAppend equals row-by-row for a contiguous monotonic batch" {
     var readTransactionB = try databaseB.beginRead();
     defer readTransactionB.end();
 
-    const catalogA = try typeDirectory.catalogRef(&readTransactionA, readTransactionA.root(), 0);
+    const catalogA = try typeDirectory.catalogReference(&readTransactionA, readTransactionA.root(), 0);
     const catalogB = readTransactionB.root();
 
     // Counts equal.
@@ -675,22 +675,22 @@ test "bulkAppend returns NotAppendable for a scattered batch" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var writeTransaction = try database.beginWrite();
-    var catalogRef = try catalog.createFromDefinitions(&writeTransaction, &appendDefinitions);
+    var catalogReference = try catalog.createFromDefinitions(&writeTransaction, &appendDefinitions);
     var primaryKey: u64 = 0;
-    while (primaryKey < 100) : (primaryKey += 1) catalogRef = (try rawRows.insert(&writeTransaction, catalogRef, &.{ primaryKey, primaryKey * 3 })).catalogRef;
+    while (primaryKey < 100) : (primaryKey += 1) catalogReference = (try rawRows.insert(&writeTransaction, catalogReference, &.{ primaryKey, primaryKey * 3 })).catalogReference;
 
-    const before = try catalog.liveCount(&writeTransaction, catalogRef);
+    const before = try catalog.liveCount(&writeTransaction, catalogReference);
     var beforeRow: [2]u64 = undefined;
-    try testing.expect((try rawRows.getByPrimaryKey(&writeTransaction, catalogRef, 50, &beforeRow)) != null);
+    try testing.expect((try rawRows.getByPrimaryKey(&writeTransaction, catalogReference, 50, &beforeRow)) != null);
 
     // First batch primaryKey (50) is <= the current max (99): not a right-edge append.
     const batch = [_][]const u64{ &.{ 50, 150 }, &.{ 200, 600 }, &.{ 201, 603 } };
-    try testing.expectError(error.NotAppendable, bulkAppend(&writeTransaction, catalogRef, &batch));
+    try testing.expectError(error.NotAppendable, bulkAppend(&writeTransaction, catalogReference, &batch));
 
     // The type is byte-unchanged: same count, and the sampled row is intact.
-    try testing.expectEqual(before, try catalog.liveCount(&writeTransaction, catalogRef));
+    try testing.expectEqual(before, try catalog.liveCount(&writeTransaction, catalogReference));
     var afterRow: [2]u64 = undefined;
-    try testing.expect((try rawRows.getByPrimaryKey(&writeTransaction, catalogRef, 50, &afterRow)) != null);
+    try testing.expect((try rawRows.getByPrimaryKey(&writeTransaction, catalogReference, 50, &afterRow)) != null);
     try testing.expectEqualSlices(u64, &beforeRow, &afterRow);
     writeTransaction.deinit();
 }
@@ -703,13 +703,13 @@ test "bulkAppend returns NotAppendable for an indexed type" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var writeTransaction = try database.beginWrite();
-    var catalogRef = try catalog.createFromDefinitions(&writeTransaction, &.{ .{ .kind = .int }, .{ .kind = .int, .indexed = true } });
-    catalogRef = (try rawRows.insert(&writeTransaction, catalogRef, &.{ 1, 10 })).catalogRef;
+    var catalogReference = try catalog.createFromDefinitions(&writeTransaction, &.{ .{ .kind = .int }, .{ .kind = .int, .indexed = true } });
+    catalogReference = (try rawRows.insert(&writeTransaction, catalogReference, &.{ 1, 10 })).catalogReference;
 
     // Even an ascending batch above the max is rejected: a pure right-edge append
     // cannot maintain the value index.
     const batch = [_][]const u64{ &.{ 100, 5 }, &.{ 101, 6 } };
-    try testing.expectError(error.NotAppendable, bulkAppend(&writeTransaction, catalogRef, &batch));
+    try testing.expectError(error.NotAppendable, bulkAppend(&writeTransaction, catalogReference, &batch));
     writeTransaction.deinit();
 }
 
@@ -721,11 +721,11 @@ test "bulkAppend returns NotAppendable for a link-bearing type" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var writeTransaction = try database.beginWrite();
-    var catalogRef = try catalog.createFromDefinitions(&writeTransaction, &.{ .{ .kind = .int }, .{ .kind = .link, .linkTarget = 0 } });
-    catalogRef = (try rawRows.insert(&writeTransaction, catalogRef, &.{ 1, 0 })).catalogRef;
+    var catalogReference = try catalog.createFromDefinitions(&writeTransaction, &.{ .{ .kind = .int }, .{ .kind = .link, .linkTarget = 0 } });
+    catalogReference = (try rawRows.insert(&writeTransaction, catalogReference, &.{ 1, 0 })).catalogReference;
 
     const batch = [_][]const u64{ &.{ 100, 0 }, &.{ 101, 0 } };
-    try testing.expectError(error.NotAppendable, bulkAppend(&writeTransaction, catalogRef, &batch));
+    try testing.expectError(error.NotAppendable, bulkAppend(&writeTransaction, catalogReference, &batch));
     writeTransaction.deinit();
 }
 
@@ -737,16 +737,16 @@ test "bulkAppend returns NotAppendable for a non-ascending or duplicate batch" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var writeTransaction = try database.beginWrite();
-    var catalogRef = try catalog.createFromDefinitions(&writeTransaction, &appendDefinitions);
-    catalogRef = (try rawRows.insert(&writeTransaction, catalogRef, &.{ 1, 3 })).catalogRef;
+    var catalogReference = try catalog.createFromDefinitions(&writeTransaction, &appendDefinitions);
+    catalogReference = (try rawRows.insert(&writeTransaction, catalogReference, &.{ 1, 3 })).catalogReference;
 
     // Non-ascending batch (both primaryKeys above the max, but out of order).
     const desc = [_][]const u64{ &.{ 200, 600 }, &.{ 150, 450 } };
-    try testing.expectError(error.NotAppendable, bulkAppend(&writeTransaction, catalogRef, &desc));
+    try testing.expectError(error.NotAppendable, bulkAppend(&writeTransaction, catalogReference, &desc));
 
     // In-batch duplicate primaryKey.
     const dup = [_][]const u64{ &.{ 300, 900 }, &.{ 300, 901 } };
-    try testing.expectError(error.NotAppendable, bulkAppend(&writeTransaction, catalogRef, &dup));
+    try testing.expectError(error.NotAppendable, bulkAppend(&writeTransaction, catalogReference, &dup));
     writeTransaction.deinit();
 }
 
@@ -778,11 +778,11 @@ test "bulkAppendOrInsert falls back and equals row-by-row for a scattered batch"
         defer database.deinit();
         var writeTransaction = try database.beginWrite();
         const directoryReference = try typeDirectory.createTypes(&writeTransaction, &.{&appendDefinitions}, &.{false});
-        var catalogRef = try typeDirectory.catalogRef(&writeTransaction, directoryReference, 0);
+        var catalogReference = try typeDirectory.catalogReference(&writeTransaction, directoryReference, 0);
         var primaryKey: u64 = 0;
-        while (primaryKey < BASE) : (primaryKey += 1) catalogRef = (try rawRows.insert(&writeTransaction, catalogRef, &.{ primaryKey, primaryKey * 3 })).catalogRef;
-        const newCatalog = try bulkAppendOrInsert(&writeTransaction, catalogRef, &batch);
-        const newDirectoryReference = try typeDirectory.setCatalogRef(&writeTransaction, directoryReference, 0, newCatalog);
+        while (primaryKey < BASE) : (primaryKey += 1) catalogReference = (try rawRows.insert(&writeTransaction, catalogReference, &.{ primaryKey, primaryKey * 3 })).catalogReference;
+        const newCatalog = try bulkAppendOrInsert(&writeTransaction, catalogReference, &batch);
+        const newDirectoryReference = try typeDirectory.setCatalogReference(&writeTransaction, directoryReference, 0, newCatalog);
         writeTransaction.setRoot(newDirectoryReference);
         _ = try writeTransaction.commit();
         try verification.verifyIntegrity(&database);
@@ -794,11 +794,11 @@ test "bulkAppendOrInsert falls back and equals row-by-row for a scattered batch"
         var database = try Database.create(testing.allocator, pathB);
         defer database.deinit();
         var writeTransaction = try database.beginWrite();
-        var catalogRef = try catalog.createFromDefinitions(&writeTransaction, &appendDefinitions);
+        var catalogReference = try catalog.createFromDefinitions(&writeTransaction, &appendDefinitions);
         var primaryKey: u64 = 0;
-        while (primaryKey < BASE) : (primaryKey += 1) catalogRef = (try rawRows.insert(&writeTransaction, catalogRef, &.{ primaryKey, primaryKey * 3 })).catalogRef;
-        for (scatteredPrimaryKeys) |scatteredPrimaryKey| catalogRef = (try rawRows.insert(&writeTransaction, catalogRef, &.{ scatteredPrimaryKey, scatteredPrimaryKey * 3 })).catalogRef;
-        writeTransaction.setRoot(catalogRef);
+        while (primaryKey < BASE) : (primaryKey += 1) catalogReference = (try rawRows.insert(&writeTransaction, catalogReference, &.{ primaryKey, primaryKey * 3 })).catalogReference;
+        for (scatteredPrimaryKeys) |scatteredPrimaryKey| catalogReference = (try rawRows.insert(&writeTransaction, catalogReference, &.{ scatteredPrimaryKey, scatteredPrimaryKey * 3 })).catalogReference;
+        writeTransaction.setRoot(catalogReference);
         _ = try writeTransaction.commit();
     }
 
@@ -813,7 +813,7 @@ test "bulkAppendOrInsert falls back and equals row-by-row for a scattered batch"
     var readTransactionB = try databaseB.beginRead();
     defer readTransactionB.end();
 
-    const catalogA = try typeDirectory.catalogRef(&readTransactionA, readTransactionA.root(), 0);
+    const catalogA = try typeDirectory.catalogReference(&readTransactionA, readTransactionA.root(), 0);
     const catalogB = readTransactionB.root();
 
     try testing.expectEqual(@as(u64, TOTAL), try catalog.liveCount(&readTransactionA, catalogA));
@@ -850,12 +850,12 @@ test "bulkAppendOrInsert empty batch is a no-op" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var writeTransaction = try database.beginWrite();
-    var catalogRef = try catalog.createFromDefinitions(&writeTransaction, &appendDefinitions);
-    catalogRef = (try rawRows.insert(&writeTransaction, catalogRef, &.{ 1, 3 })).catalogRef;
+    var catalogReference = try catalog.createFromDefinitions(&writeTransaction, &appendDefinitions);
+    catalogReference = (try rawRows.insert(&writeTransaction, catalogReference, &.{ 1, 3 })).catalogReference;
 
-    const before = try catalog.liveCount(&writeTransaction, catalogRef);
-    const after = try bulkAppendOrInsert(&writeTransaction, catalogRef, &.{});
-    try testing.expectEqual(catalogRef, after); // same ref, untouched
+    const before = try catalog.liveCount(&writeTransaction, catalogReference);
+    const after = try bulkAppendOrInsert(&writeTransaction, catalogReference, &.{});
+    try testing.expectEqual(catalogReference, after); // same reference, untouched
     try testing.expectEqual(before, try catalog.liveCount(&writeTransaction, after));
     writeTransaction.deinit();
 }

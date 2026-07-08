@@ -27,17 +27,17 @@ fn seedPlannerCatalog(writeTransaction: *@import("database.zig").WriteTransactio
         .{ .kind = .int, .indexed = indexed },
         .{ .kind = .int },
     };
-    var catalogRef = try catalog.createFromDefinitions(writeTransaction, &definitions);
+    var catalogReference = try catalog.createFromDefinitions(writeTransaction, &definitions);
     var row: u64 = 0;
-    while (row < rowCount) : (row += 1) catalogRef = (try rows.insert(writeTransaction, catalogRef, &.{ row, row % 100, row })).catalogRef;
-    return catalogRef;
+    while (row < rowCount) : (row += 1) catalogReference = (try rows.insert(writeTransaction, catalogReference, &.{ row, row % 100, row })).catalogReference;
+    return catalogReference;
 }
 
 // Build a type with primaryKey(int) + age(int) and insert (primaryKey, age) rows.
 fn seed(writeTransaction: anytype, pairs: []const [2]u64) !Reference {
-    var catalogRef = try catalog.create(writeTransaction, 2);
-    for (pairs) |pair| catalogRef = (try rows.insert(writeTransaction, catalogRef, &.{ pair[0], pair[1] })).catalogRef;
-    return catalogRef;
+    var catalogReference = try catalog.create(writeTransaction, 2);
+    for (pairs) |pair| catalogReference = (try rows.insert(writeTransaction, catalogReference, &.{ pair[0], pair[1] })).catalogReference;
+    return catalogReference;
 }
 
 test "where filters live rows by ANDed predicates" {
@@ -48,27 +48,27 @@ test "where filters live rows by ANDed predicates" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var writeTransaction = try database.beginWrite();
-    var catalogRef = try seed(&writeTransaction, &.{ .{ 1, 20 }, .{ 2, 30 }, .{ 3, 40 }, .{ 4, 30 } });
+    var catalogReference = try seed(&writeTransaction, &.{ .{ 1, 20 }, .{ 2, 30 }, .{ 3, 40 }, .{ 4, 30 } });
     // age == 30
     var hits1 = std.ArrayList(u64).empty;
     defer hits1.deinit(testing.allocator);
-    try where(&writeTransaction, catalogRef, &.{.{ .property = 1, .operator = .eq, .value = 30 }}, &hits1, testing.allocator);
+    try where(&writeTransaction, catalogReference, &.{.{ .property = 1, .operator = .eq, .value = 30 }}, &hits1, testing.allocator);
     try testing.expectEqual(@as(usize, 2), hits1.items.len);
     // age > 25 AND primaryKey < 4  -> primaryKey 2 (age30), primaryKey3 (age40) ; primaryKey4 excluded by primaryKey<4
     var hits2 = std.ArrayList(u64).empty;
     defer hits2.deinit(testing.allocator);
-    try where(&writeTransaction, catalogRef, &.{
+    try where(&writeTransaction, catalogReference, &.{
         .{ .property = 1, .operator = .gt, .value = 25 },
         .{ .property = 0, .operator = .lt, .value = 4 },
     }, &hits2, testing.allocator);
     try testing.expectEqual(@as(usize, 2), hits2.items.len);
     // delete primaryKey 2, re-query age==30 -> only primaryKey4
     var out: [2]u64 = undefined;
-    const version2 = (try rows.getByPrimaryKey(&writeTransaction, catalogRef, 2, &out)).?;
-    catalogRef = (try rows.delete(&writeTransaction, catalogRef, 2, version2)).ok;
+    const version2 = (try rows.getByPrimaryKey(&writeTransaction, catalogReference, 2, &out)).?;
+    catalogReference = (try rows.delete(&writeTransaction, catalogReference, 2, version2)).ok;
     var hits3 = std.ArrayList(u64).empty;
     defer hits3.deinit(testing.allocator);
-    try where(&writeTransaction, catalogRef, &.{.{ .property = 1, .operator = .eq, .value = 30 }}, &hits3, testing.allocator);
+    try where(&writeTransaction, catalogReference, &.{.{ .property = 1, .operator = .eq, .value = 30 }}, &hits3, testing.allocator);
     try testing.expectEqual(@as(usize, 1), hits3.items.len);
     writeTransaction.deinit();
 }
@@ -82,15 +82,15 @@ test "out-of-range property indices are rejected up front" {
     defer database.deinit();
     var writeTransaction = try database.beginWrite();
     defer writeTransaction.deinit();
-    const catalogRef = try seed(&writeTransaction, &.{.{ 1, 20 }});
+    const catalogReference = try seed(&writeTransaction, &.{.{ 1, 20 }});
     var hits = std.ArrayList(u64).empty;
     defer hits.deinit(testing.allocator);
     const bad = [_]Predicate{.{ .property = 2, .operator = .eq, .value = 1 }};
-    try testing.expectError(error.BadProperty, where(&writeTransaction, catalogRef, &bad, &hits, testing.allocator));
-    try testing.expectError(error.BadProperty, countWhere(&writeTransaction, catalogRef, &bad, testing.allocator));
-    try testing.expectError(error.BadProperty, aggregateInt(&writeTransaction, catalogRef, 9, &.{}, testing.allocator));
+    try testing.expectError(error.BadProperty, where(&writeTransaction, catalogReference, &bad, &hits, testing.allocator));
+    try testing.expectError(error.BadProperty, countWhere(&writeTransaction, catalogReference, &bad, testing.allocator));
+    try testing.expectError(error.BadProperty, aggregateInt(&writeTransaction, catalogReference, 9, &.{}, testing.allocator));
     var objectKeys = [_]u64{};
-    try testing.expectError(error.BadProperty, sortByPropertyAscending(&writeTransaction, catalogRef, &objectKeys, 5, testing.allocator));
+    try testing.expectError(error.BadProperty, sortByPropertyAscending(&writeTransaction, catalogReference, &objectKeys, 5, testing.allocator));
 }
 
 test "streamed full scan agrees with where on count and aggregate" {
@@ -102,19 +102,19 @@ test "streamed full scan agrees with where on count and aggregate" {
     defer database.deinit();
     var writeTransaction = try database.beginWrite();
     defer writeTransaction.deinit();
-    var catalogRef = try seed(&writeTransaction, &.{ .{ 1, 20 }, .{ 2, 30 }, .{ 3, 40 }, .{ 4, 30 }, .{ 5, 25 } });
+    var catalogReference = try seed(&writeTransaction, &.{ .{ 1, 20 }, .{ 2, 30 }, .{ 3, 40 }, .{ 4, 30 }, .{ 5, 25 } });
     // Tombstone one matching row so the live filter is exercised mid-stream.
     var out: [2]u64 = undefined;
-    const version = (try rows.getByPrimaryKey(&writeTransaction, catalogRef, 4, &out)).?;
-    catalogRef = (try rows.delete(&writeTransaction, catalogRef, 4, version)).ok;
+    const version = (try rows.getByPrimaryKey(&writeTransaction, catalogReference, 4, &out)).?;
+    catalogReference = (try rows.delete(&writeTransaction, catalogReference, 4, version)).ok;
 
     const preds = [_]Predicate{.{ .property = 1, .operator = .ge, .value = 25 }};
     var objectKeys = std.ArrayList(u64).empty;
     defer objectKeys.deinit(testing.allocator);
-    try where(&writeTransaction, catalogRef, &preds, &objectKeys, testing.allocator);
+    try where(&writeTransaction, catalogReference, &preds, &objectKeys, testing.allocator);
     try testing.expectEqual(@as(usize, 3), objectKeys.items.len); // primaryKeys 2, 3, 5
-    try testing.expectEqual(@as(u64, objectKeys.items.len), try countWhere(&writeTransaction, catalogRef, &preds, testing.allocator));
-    const agg = try aggregateInt(&writeTransaction, catalogRef, 1, &preds, testing.allocator);
+    try testing.expectEqual(@as(u64, objectKeys.items.len), try countWhere(&writeTransaction, catalogReference, &preds, testing.allocator));
+    const agg = try aggregateInt(&writeTransaction, catalogReference, 1, &preds, testing.allocator);
     try testing.expectEqual(@as(u64, 3), agg.count);
     try testing.expectEqual(@as(u64, 30 + 40 + 25), agg.sum);
     try testing.expectEqual(@as(?u64, 25), agg.min);
@@ -129,15 +129,15 @@ test "countWhere and aggregateInt" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var writeTransaction = try database.beginWrite();
-    const catalogRef = try seed(&writeTransaction, &.{ .{ 1, 10 }, .{ 2, 20 }, .{ 3, 30 }, .{ 4, 40 } });
-    try testing.expectEqual(@as(u64, 4), try countWhere(&writeTransaction, catalogRef, &.{}, testing.allocator));
-    try testing.expectEqual(@as(u64, 2), try countWhere(&writeTransaction, catalogRef, &.{.{ .property = 1, .operator = .ge, .value = 30 }}, testing.allocator));
-    const agg = try aggregateInt(&writeTransaction, catalogRef, 1, &.{}, testing.allocator);
+    const catalogReference = try seed(&writeTransaction, &.{ .{ 1, 10 }, .{ 2, 20 }, .{ 3, 30 }, .{ 4, 40 } });
+    try testing.expectEqual(@as(u64, 4), try countWhere(&writeTransaction, catalogReference, &.{}, testing.allocator));
+    try testing.expectEqual(@as(u64, 2), try countWhere(&writeTransaction, catalogReference, &.{.{ .property = 1, .operator = .ge, .value = 30 }}, testing.allocator));
+    const agg = try aggregateInt(&writeTransaction, catalogReference, 1, &.{}, testing.allocator);
     try testing.expectEqual(@as(u64, 4), agg.count);
     try testing.expectEqual(@as(u64, 100), agg.sum);
     try testing.expectEqual(@as(?u64, 10), agg.min);
     try testing.expectEqual(@as(?u64, 40), agg.max);
-    const empty = try aggregateInt(&writeTransaction, catalogRef, 1, &.{.{ .property = 1, .operator = .gt, .value = 1000 }}, testing.allocator);
+    const empty = try aggregateInt(&writeTransaction, catalogReference, 1, &.{.{ .property = 1, .operator = .gt, .value = 1000 }}, testing.allocator);
     try testing.expectEqual(@as(u64, 0), empty.count);
     try testing.expectEqual(@as(?u64, null), empty.min);
     writeTransaction.deinit();
@@ -151,20 +151,20 @@ test "rangeInclusive and sortByPropertyAscending" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var writeTransaction = try database.beginWrite();
-    const catalogRef = try seed(&writeTransaction, &.{ .{ 5, 1 }, .{ 1, 1 }, .{ 9, 1 }, .{ 3, 1 }, .{ 7, 1 } });
+    const catalogReference = try seed(&writeTransaction, &.{ .{ 5, 1 }, .{ 1, 1 }, .{ 9, 1 }, .{ 3, 1 }, .{ 7, 1 } });
     var rng = std.ArrayList(u64).empty;
     defer rng.deinit(testing.allocator);
     // primaryKey in [3,7]
-    try rangeInclusive(&writeTransaction, catalogRef, 0, 3, 7, &rng, testing.allocator);
+    try rangeInclusive(&writeTransaction, catalogReference, 0, 3, 7, &rng, testing.allocator);
     try testing.expectEqual(@as(usize, 3), rng.items.len); // primaryKeys 5,3,7
     // sort the matching objectKeys by primaryKey ascending, then verify the primaryKey order is 3,5,7
-    try sortByPropertyAscending(&writeTransaction, catalogRef, rng.items, 0, testing.allocator);
+    try sortByPropertyAscending(&writeTransaction, catalogReference, rng.items, 0, testing.allocator);
     var out: [2]u64 = undefined;
-    _ = try rows.getByObjectKey(&writeTransaction, catalogRef, rng.items[0], &out);
+    _ = try rows.getByObjectKey(&writeTransaction, catalogReference, rng.items[0], &out);
     try testing.expectEqual(@as(u64, 3), out[0]);
-    _ = try rows.getByObjectKey(&writeTransaction, catalogRef, rng.items[1], &out);
+    _ = try rows.getByObjectKey(&writeTransaction, catalogReference, rng.items[1], &out);
     try testing.expectEqual(@as(u64, 5), out[0]);
-    _ = try rows.getByObjectKey(&writeTransaction, catalogRef, rng.items[2], &out);
+    _ = try rows.getByObjectKey(&writeTransaction, catalogReference, rng.items[2], &out);
     try testing.expectEqual(@as(u64, 7), out[0]);
     writeTransaction.deinit();
 }
@@ -177,11 +177,11 @@ test "scan over 100k rows finds the matching slice" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var writeTransaction = try database.beginWrite();
-    var catalogRef = try catalog.create(&writeTransaction, 2);
+    var catalogReference = try catalog.create(&writeTransaction, 2);
     var row: u64 = 0;
-    while (row < 100_000) : (row += 1) catalogRef = (try rows.insert(&writeTransaction, catalogRef, &.{ row, row % 100 })).catalogRef;
+    while (row < 100_000) : (row += 1) catalogReference = (try rows.insert(&writeTransaction, catalogReference, &.{ row, row % 100 })).catalogReference;
     // 1000 rows have (i % 100 == 7)
-    try testing.expectEqual(@as(u64, 1000), try countWhere(&writeTransaction, catalogRef, &.{.{ .property = 1, .operator = .eq, .value = 7 }}, testing.allocator));
+    try testing.expectEqual(@as(u64, 1000), try countWhere(&writeTransaction, catalogReference, &.{.{ .property = 1, .operator = .eq, .value = 7 }}, testing.allocator));
     writeTransaction.deinit();
 }
 
@@ -195,32 +195,32 @@ test "query returns stable object keys after relocation" {
     var writeTransaction = try database.beginWrite();
 
     // primaryKey + age. Insert a throwaway first to open up a dead slot, then the target.
-    var catalogRef = try catalog.create(&writeTransaction, 2);
-    const throwaway = try rows.insert(&writeTransaction, catalogRef, &.{ 1, 99 });
-    catalogRef = throwaway.catalogRef;
-    const target = try rows.insert(&writeTransaction, catalogRef, &.{ 2, 30 });
-    catalogRef = target.catalogRef;
+    var catalogReference = try catalog.create(&writeTransaction, 2);
+    const throwaway = try rows.insert(&writeTransaction, catalogReference, &.{ 1, 99 });
+    catalogReference = throwaway.catalogReference;
+    const target = try rows.insert(&writeTransaction, catalogReference, &.{ 2, 30 });
+    catalogReference = target.catalogReference;
     const targetObjectKey = target.objectKey;
 
     // Free the throwaway's physical slot.
-    const deadRow = (try catalog.objectKeyToRow(&writeTransaction, catalogRef, throwaway.objectKey)).?;
+    const deadRow = (try catalog.objectKeyToRow(&writeTransaction, catalogReference, throwaway.objectKey)).?;
     var vbuf: [2]u64 = undefined;
-    const rowVersion1 = (try rows.getByPrimaryKey(&writeTransaction, catalogRef, 1, &vbuf)).?;
-    catalogRef = (try rows.delete(&writeTransaction, catalogRef, 1, rowVersion1)).ok;
+    const rowVersion1 = (try rows.getByPrimaryKey(&writeTransaction, catalogReference, 1, &vbuf)).?;
+    catalogReference = (try rows.delete(&writeTransaction, catalogReference, 1, rowVersion1)).ok;
 
     // Relocate the target into the freed slot; its objectKey is unchanged.
-    catalogRef = try relocation.relocateRow(&writeTransaction, catalogRef, targetObjectKey, deadRow);
+    catalogReference = try relocation.relocateRow(&writeTransaction, catalogReference, targetObjectKey, deadRow);
 
     // A query that matches the relocated row must return its stable objectKey, and
     // that objectKey must resolve to the right values.
     var hits = std.ArrayList(u64).empty;
     defer hits.deinit(testing.allocator);
-    try where(&writeTransaction, catalogRef, &.{.{ .property = 1, .operator = .eq, .value = 30 }}, &hits, testing.allocator);
+    try where(&writeTransaction, catalogReference, &.{.{ .property = 1, .operator = .eq, .value = 30 }}, &hits, testing.allocator);
     try testing.expectEqual(@as(usize, 1), hits.items.len);
     try testing.expectEqual(targetObjectKey, hits.items[0]);
 
     var out: [2]u64 = undefined;
-    try testing.expect((try rows.getByObjectKey(&writeTransaction, catalogRef, hits.items[0], &out)) != null);
+    try testing.expect((try rows.getByObjectKey(&writeTransaction, catalogReference, hits.items[0], &out)) != null);
     try testing.expectEqual(@as(u64, 2), out[0]); // primaryKey
     try testing.expectEqual(@as(u64, 30), out[1]); // age
     writeTransaction.deinit();
@@ -228,8 +228,8 @@ test "query returns stable object keys after relocation" {
 
 const relocation = @import("storage/relocation.zig");
 
-fn whereSorted(transaction: anytype, catalogRef: Reference, preds: []const Predicate, out: *std.ArrayList(u64)) !void {
-    try where(transaction, catalogRef, preds, out, testing.allocator);
+fn whereSorted(transaction: anytype, catalogReference: Reference, preds: []const Predicate, out: *std.ArrayList(u64)) !void {
+    try where(transaction, catalogReference, preds, out, testing.allocator);
     std.mem.sort(u64, out.items, {}, std.sort.asc(u64));
 }
 

@@ -40,45 +40,45 @@ fn matches(operator: Operator, lhs: u64, rhs: u64) bool {
     };
 }
 
-// Snapshot of the column refs a scan needs: all property columns, the live
-// column, and the key->row index. Captured into locals so no catalog deref slice
+// Snapshot of the column references a scan needs: all property columns, the live
+// column, and the key->row index. Captured into locals so no catalog dereference slice
 // is held across reads.
 const Scan = struct {
-    propertyRefs: [MAX_PROPS]Reference,
-    // Per-property: whether the property has a value index, and the ref of that
+    propertyReferences: [MAX_PROPS]Reference,
+    // Per-property: whether the property has a value index, and the reference of that
     // index. Captured so the planner can drive a query off the index without a
-    // second catalog deref.
+    // second catalog dereference.
     indexed: [MAX_PROPS]bool,
-    valueIndexRefs: [MAX_PROPS]Reference,
+    valueIndexReferences: [MAX_PROPS]Reference,
     propertyCount: usize,
-    liveRef: Reference,
-    keyrowIndexRef: Reference,
+    liveColumnReference: Reference,
+    keyToRowIndexReference: Reference,
     nextRow: u64,
 };
 
-fn openScan(transaction: anytype, catalogRef: Reference) !Scan {
-    const view = try catalog.loadCatalog(transaction, catalogRef);
+fn openScan(transaction: anytype, catalogReference: Reference) !Scan {
+    const view = try catalog.loadCatalog(transaction, catalogReference);
     var scan: Scan = undefined;
     scan.propertyCount = view.propertyCount;
-    scan.liveRef = view.liveColumnRef;
-    scan.keyrowIndexRef = view.keyrowIndexRef;
+    scan.liveColumnReference = view.liveColumnReference;
+    scan.keyToRowIndexReference = view.keyToRowIndexReference;
     scan.nextRow = view.nextRow;
     var propertyIndex: usize = 0;
     while (propertyIndex < view.propertyCount) : (propertyIndex += 1) {
-        scan.propertyRefs[propertyIndex] = view.propertyColumnRef(propertyIndex);
+        scan.propertyReferences[propertyIndex] = view.propertyColumnReference(propertyIndex);
         scan.indexed[propertyIndex] = view.indexed(propertyIndex);
-        scan.valueIndexRefs[propertyIndex] = view.valueIndexRef(propertyIndex);
+        scan.valueIndexReferences[propertyIndex] = view.valueIndexReference(propertyIndex);
     }
     return scan;
 }
 
-// A keyrow entry is live unless its row is tombstoned. `delete` removes the
+// A key-to-row index entry is live unless its row is tombstoned. `delete` removes the
 // object key from the key->row index, so the current snapshot's index never
 // holds a stale key that could alias a relocated row; the live check is the
 // only filter needed.
 fn rowMatches(transaction: anytype, scan: *const Scan, row: u64, predicates: []const Predicate) !bool {
     for (predicates) |predicate| {
-        const raw = try Column.get(transaction, scan.propertyRefs[predicate.property], row);
+        const raw = try Column.get(transaction, scan.propertyReferences[predicate.property], row);
         if (!matches(predicate.operator, raw, predicate.value)) return false;
     }
     return true;
@@ -86,12 +86,12 @@ fn rowMatches(transaction: anytype, scan: *const Scan, row: u64, predicates: []c
 
 // Full row evaluation: live check plus every predicate (logical AND).
 fn evalRow(transaction: anytype, scan: *const Scan, row: u64, predicates: []const Predicate) !bool {
-    if ((try Column.get(transaction, scan.liveRef, row)) == 0) return false;
+    if ((try Column.get(transaction, scan.liveColumnReference, row)) == 0) return false;
     return rowMatches(transaction, scan, row, predicates);
 }
 
 // Reject out-of-range property indices up front: the evaluators index
-// fixed-size ref arrays, so an unchecked property is an undefined ref below 256
+// fixed-size reference arrays, so an unchecked property is an undefined reference below 256
 // and an out-of-bounds read past it. Query inputs will eventually cross the
 // C ABI, which must not trust its arguments.
 fn validateProperties(scan: *const Scan, predicates: []const Predicate) !void {
@@ -109,13 +109,13 @@ const Pair = struct { objectKey: u64, row: u64 };
 // The planner chooses an optional DRIVING predicate: a predicate whose property
 // is indexed and whose operator is index-friendly (eq, lt, le, gt, ge). When one
 // exists, the candidate objectKeys are gathered from that property's value index
-// rather than from a full keyrow scan; the remaining predicates are then applied
+// rather than from a full key-to-row index scan; the remaining predicates are then applied
 // to each candidate by the same rowLive/rowMatches logic the scan uses.
 //
 // Correctness: the value index is an exact mirror of the indexed property (kept
 // in sync on every mutation), so its inner sets contain exactly the objectKeys whose
 // value satisfies the driving predicate. Resolving each candidate objectKey through
-// the keyrow index and re-applying ALL predicates (including the driving one,
+// the key-to-row index and re-applying ALL predicates (including the driving one,
 // which always passes) plus the live check reproduces, on the same committed
 // snapshot, the exact objectKey set the full scan would emit. Candidate pairs are
 // sorted by objectKey so the emitted order matches the ascending-objectKey scan order too.
@@ -165,7 +165,7 @@ const ObjectKeyCollector = struct {
     }
 };
 
-// Appends each outer entry's value (an inner-set root ref) to a list; used to
+// Appends each outer entry's value (an inner-set root reference) to a list; used to
 // gather the inner sets a range scan of the value index touches.
 const InnerRootCollector = struct {
     list: *std.ArrayList(u64),
@@ -176,7 +176,7 @@ const InnerRootCollector = struct {
 };
 
 // Gather candidate (objectKey, row) pairs for a driving predicate from its value
-// index, resolving each objectKey to its current physical row via the keyrow index
+// index, resolving each objectKey to its current physical row via the key-to-row index
 // (skipping any objectKey with no mapping). Pairs are returned sorted by objectKey.
 fn collectCandidatePairs(
     transaction: anytype,
@@ -185,12 +185,12 @@ fn collectCandidatePairs(
     pairs: *std.ArrayList(Pair),
     allocator: std.mem.Allocator,
 ) !void {
-    const valueIndexRef = scan.valueIndexRefs[driver.property];
+    const valueIndexReference = scan.valueIndexReferences[driver.property];
     var objectKeys = std.ArrayList(u64).empty;
     defer objectKeys.deinit(allocator);
 
     if (driver.operator == .eq) {
-        if (try index.get(transaction, valueIndexRef, driver.value)) |innerRoot| {
+        if (try index.get(transaction, valueIndexReference, driver.value)) |innerRoot| {
             if (innerRoot != 0) {
                 try index.forEachKey(transaction, innerRoot, ObjectKeyCollector{ .list = &objectKeys, .allocator = allocator }, ObjectKeyCollector.onKey);
             }
@@ -199,7 +199,7 @@ fn collectCandidatePairs(
         const bounds = rangeBounds(driver.operator, driver.value) orelse return; // empty range
         var innerRoots = std.ArrayList(u64).empty;
         defer innerRoots.deinit(allocator);
-        try index.forEachEntryInRange(transaction, valueIndexRef, bounds.lo, bounds.hi, InnerRootCollector{ .list = &innerRoots, .allocator = allocator }, InnerRootCollector.onEntry);
+        try index.forEachEntryInRange(transaction, valueIndexReference, bounds.lo, bounds.hi, InnerRootCollector{ .list = &innerRoots, .allocator = allocator }, InnerRootCollector.onEntry);
         for (innerRoots.items) |innerRoot| {
             if (innerRoot == 0) continue;
             try index.forEachKey(transaction, innerRoot, ObjectKeyCollector{ .list = &objectKeys, .allocator = allocator }, ObjectKeyCollector.onKey);
@@ -207,7 +207,7 @@ fn collectCandidatePairs(
     }
 
     for (objectKeys.items) |objectKey| {
-        const row = (try index.get(transaction, scan.keyrowIndexRef, objectKey)) orelse continue;
+        const row = (try index.get(transaction, scan.keyToRowIndexReference, objectKey)) orelse continue;
         try pairs.append(allocator, .{ .objectKey = objectKey, .row = row });
     }
     std.mem.sort(Pair, pairs.items, {}, struct {
@@ -248,13 +248,13 @@ fn runQuery(
             if (try evalRow(self.transaction, self.scan, row, self.predicates)) try onMatch(self.inner, objectKey, row);
         }
     };
-    try index.forEachEntry(transaction, scan.keyrowIndexRef, Stream{ .transaction = transaction, .scan = scan, .predicates = predicates, .inner = ctx }, Stream.onEntry);
+    try index.forEachEntry(transaction, scan.keyToRowIndexReference, Stream{ .transaction = transaction, .scan = scan, .predicates = predicates, .inner = ctx }, Stream.onEntry);
 }
 
 // Test-only: expose the driving-predicate choice so equivalence tests can assert
 // which path the planner takes.
-fn drivingPredicateIndex(transaction: anytype, catalogRef: Reference, predicates: []const Predicate) !?usize {
-    const scan = try openScan(transaction, catalogRef);
+fn drivingPredicateIndex(transaction: anytype, catalogReference: Reference, predicates: []const Predicate) !?usize {
+    const scan = try openScan(transaction, catalogReference);
     return pickDriving(&scan, predicates);
 }
 
@@ -265,12 +265,12 @@ fn drivingPredicateIndex(transaction: anytype, catalogRef: Reference, predicates
 /// live set (O(n) tree walks).
 pub fn where(
     transaction: anytype,
-    catalogRef: Reference,
+    catalogReference: Reference,
     predicates: []const Predicate,
     out: *std.ArrayList(u64),
     allocator: std.mem.Allocator,
 ) !void {
-    const scan = try openScan(transaction, catalogRef);
+    const scan = try openScan(transaction, catalogReference);
     try validateProperties(&scan, predicates);
     const Sink = struct {
         out: *std.ArrayList(u64),
@@ -285,8 +285,8 @@ pub fn where(
 /// Number of live rows satisfying all predicates. The full-scan path streams,
 /// so this allocates nothing proportional to the table; still O(n) over the
 /// live set without a usable value index.
-pub fn countWhere(transaction: anytype, catalogRef: Reference, predicates: []const Predicate, allocator: std.mem.Allocator) !u64 {
-    const scan = try openScan(transaction, catalogRef);
+pub fn countWhere(transaction: anytype, catalogReference: Reference, predicates: []const Predicate, allocator: std.mem.Allocator) !u64 {
+    const scan = try openScan(transaction, catalogReference);
     try validateProperties(&scan, predicates);
     var rowCount: u64 = 0;
     const Sink = struct {
@@ -306,8 +306,8 @@ pub const Aggregate = struct { count: u64, sum: u64, min: ?u64, max: ?u64 };
 /// Aggregate int property `property` over the live rows satisfying all
 /// predicates. `sum` wraps on overflow (wrapping add); min/max are null when
 /// no row matches. O(n) over the live set without a usable value index.
-pub fn aggregateInt(transaction: anytype, catalogRef: Reference, property: usize, predicates: []const Predicate, allocator: std.mem.Allocator) !Aggregate {
-    const scan = try openScan(transaction, catalogRef);
+pub fn aggregateInt(transaction: anytype, catalogReference: Reference, property: usize, predicates: []const Predicate, allocator: std.mem.Allocator) !Aggregate {
+    const scan = try openScan(transaction, catalogReference);
     try validateProperties(&scan, predicates);
     if (property >= scan.propertyCount) return error.BadProperty;
     var agg = Aggregate{ .count = 0, .sum = 0, .min = null, .max = null };
@@ -317,7 +317,7 @@ pub fn aggregateInt(transaction: anytype, catalogRef: Reference, property: usize
         property: usize,
         agg: *Aggregate,
         fn onMatch(self: @This(), _: u64, row: u64) anyerror!void {
-            const value = try Column.get(self.transaction, self.scan.propertyRefs[self.property], row);
+            const value = try Column.get(self.transaction, self.scan.propertyReferences[self.property], row);
             self.agg.count += 1;
             self.agg.sum +%= value;
             if (self.agg.min == null or value < self.agg.min.?) self.agg.min = value;
@@ -333,7 +333,7 @@ pub fn aggregateInt(transaction: anytype, catalogRef: Reference, property: usize
 /// over the live set); an index-seek fast path is a later optimization.
 pub fn rangeInclusive(
     transaction: anytype,
-    catalogRef: Reference,
+    catalogReference: Reference,
     property: usize,
     lo: u64,
     hi: u64,
@@ -344,7 +344,7 @@ pub fn rangeInclusive(
         .{ .property = property, .operator = .ge, .value = lo },
         .{ .property = property, .operator = .le, .value = hi },
     };
-    try where(transaction, catalogRef, &predicates, out, allocator);
+    try where(transaction, catalogReference, &predicates, out, allocator);
 }
 
 /// Sort a slice of objectKeys in place by int property `property`, ascending.
@@ -353,21 +353,21 @@ pub fn rangeInclusive(
 /// walk per key. A key that no longer resolves is error.NotFound.
 pub fn sortByPropertyAscending(
     transaction: anytype,
-    catalogRef: Reference,
+    catalogReference: Reference,
     objectKeys: []u64,
     property: usize,
     allocator: std.mem.Allocator,
 ) !void {
-    const view = try catalog.loadCatalog(transaction, catalogRef);
+    const view = try catalog.loadCatalog(transaction, catalogReference);
     if (property >= view.propertyCount) return error.BadProperty;
-    const column = view.propertyColumnRef(property);
+    const column = view.propertyColumnReference(property);
     const SortPair = struct { value: u64, key: u64 };
     const pairs = try allocator.alloc(SortPair, objectKeys.len);
     defer allocator.free(pairs);
     for (objectKeys, 0..) |key, rowIndex| {
         // A caller-supplied objectKey that no longer resolves (stale or deleted) is
         // an input error, not a crash.
-        const row = (try catalog.objectKeyToRow(transaction, catalogRef, key)) orelse return error.NotFound;
+        const row = (try catalog.objectKeyToRow(transaction, catalogReference, key)) orelse return error.NotFound;
         pairs[rowIndex] = .{ .value = try Column.get(transaction, column, row), .key = key };
     }
     std.mem.sort(SortPair, pairs, {}, struct {
@@ -408,10 +408,10 @@ fn seedPlannerCatalog(writeTransaction: *@import("database.zig").WriteTransactio
         .{ .kind = .int, .indexed = indexed },
         .{ .kind = .int },
     };
-    var catalogRef = try catalog.createFromDefinitions(writeTransaction, &definitions);
+    var catalogReference = try catalog.createFromDefinitions(writeTransaction, &definitions);
     var rowIndex: u64 = 0;
-    while (rowIndex < rowCount) : (rowIndex += 1) catalogRef = (try rows.insert(writeTransaction, catalogRef, &.{ rowIndex, rowIndex % 100, rowIndex })).catalogRef;
-    return catalogRef;
+    while (rowIndex < rowCount) : (rowIndex += 1) catalogReference = (try rows.insert(writeTransaction, catalogReference, &.{ rowIndex, rowIndex % 100, rowIndex })).catalogReference;
+    return catalogReference;
 }
 
 test "planner picks an indexed eq predicate as the driver, prefers eq over range, ignores ne and non-indexed" {
@@ -422,28 +422,28 @@ test "planner picks an indexed eq predicate as the driver, prefers eq over range
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var writeTransaction = try database.beginWrite();
-    const catalogRef = try seedPlannerCatalog(&writeTransaction, true, 10);
+    const catalogReference = try seedPlannerCatalog(&writeTransaction, true, 10);
 
     // property 1 is indexed; property 0 and property 2 are not.
     // eq on the indexed property drives.
-    try testing.expectEqual(@as(?usize, 0), try drivingPredicateIndex(&writeTransaction, catalogRef, &.{
+    try testing.expectEqual(@as(?usize, 0), try drivingPredicateIndex(&writeTransaction, catalogReference, &.{
         .{ .property = 1, .operator = .eq, .value = 5 },
     }));
     // Prefer the eq over a range, even when the range appears first.
-    try testing.expectEqual(@as(?usize, 1), try drivingPredicateIndex(&writeTransaction, catalogRef, &.{
+    try testing.expectEqual(@as(?usize, 1), try drivingPredicateIndex(&writeTransaction, catalogReference, &.{
         .{ .property = 1, .operator = .ge, .value = 5 },
         .{ .property = 1, .operator = .eq, .value = 5 },
     }));
     // A range on the indexed property drives when there is no eq.
-    try testing.expectEqual(@as(?usize, 0), try drivingPredicateIndex(&writeTransaction, catalogRef, &.{
+    try testing.expectEqual(@as(?usize, 0), try drivingPredicateIndex(&writeTransaction, catalogReference, &.{
         .{ .property = 1, .operator = .lt, .value = 5 },
     }));
     // ne is not index-friendly: stays on the scan.
-    try testing.expectEqual(@as(?usize, null), try drivingPredicateIndex(&writeTransaction, catalogRef, &.{
+    try testing.expectEqual(@as(?usize, null), try drivingPredicateIndex(&writeTransaction, catalogReference, &.{
         .{ .property = 1, .operator = .ne, .value = 5 },
     }));
     // eq on a non-indexed property: no driver.
-    try testing.expectEqual(@as(?usize, null), try drivingPredicateIndex(&writeTransaction, catalogRef, &.{
+    try testing.expectEqual(@as(?usize, null), try drivingPredicateIndex(&writeTransaction, catalogReference, &.{
         .{ .property = 0, .operator = .eq, .value = 5 },
         .{ .property = 2, .operator = .ge, .value = 5 },
     }));

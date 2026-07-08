@@ -50,8 +50,8 @@ const Tree = bTreeCore.BTreeCore(NumericKeying);
 /// Corrupt-cycle guard shared by every recursive walker (see bTreeCore.zig).
 pub const maxDepth = bTreeCore.maxDepth;
 
-/// Deref a node, sizing the read by its kind byte (leaf vs inner).
-pub const derefNode = Tree.derefNode;
+/// Dereference a node, sizing the read by its kind byte (leaf vs inner).
+pub const dereferenceNode = Tree.dereferenceNode;
 
 /// Create a new empty leaf node and return its Reference.
 pub const create = Tree.create;
@@ -69,9 +69,9 @@ pub fn insert(transaction: anytype, root: Reference, key: u64, value: u64) !Refe
 /// Returns the (possibly new) root Reference. No-op if key is absent.
 pub const remove = Tree.remove;
 
-/// Recursively free every node of the tree rooted at nodeRef so the space
+/// Recursively free every node of the tree rooted at nodeReference so the space
 /// becomes reclaimable. Only the NODES are freed; for trees whose leaf values
-/// are refs to other structures (e.g. value-index inner sets) the caller owns
+/// are references to other structures (e.g. value-index inner sets) the caller owns
 /// those separately.
 pub const freeTree = Tree.freeTree;
 
@@ -96,10 +96,10 @@ pub const forEachEntry = Tree.forEachEntry;
 /// admit a batch whose keys do not clear the true maximum, corrupting the primaryKey
 /// index with duplicates and broken ordering.
 pub fn maxKey(transaction: anytype, root: Reference) !?u64 {
-    var currentRef: Reference = root;
+    var currentReference: Reference = root;
     var depth: usize = 0;
     while (depth < maxDepth) : (depth += 1) {
-        const bytes = try derefNode(transaction, currentRef);
+        const bytes = try dereferenceNode(transaction, currentReference);
         if (bytes[0] == kindLeaf) {
             const view = try parseLeaf(bytes);
             if (view.count == 0) return null; // only the empty root reaches here
@@ -107,10 +107,10 @@ pub fn maxKey(transaction: anytype, root: Reference) !?u64 {
         }
         const view = try parseInner(bytes);
         var childIndex: usize = view.childCount;
-        currentRef = blk: {
+        currentReference = blk: {
             while (childIndex > 0) {
                 childIndex -= 1;
-                if (view.subtreeCount(childIndex) > 0) break :blk view.childRef(childIndex);
+                if (view.subtreeCount(childIndex) > 0) break :blk view.childReference(childIndex);
             }
             return null; // every subtree is empty
         };
@@ -167,7 +167,7 @@ fn forEachEntryInRangeAt(
 ) !void {
     if (root == 0 or low > high) return;
     if (depth >= maxDepth) return error.Corrupt;
-    const bytes = try derefNode(transaction, root);
+    const bytes = try dereferenceNode(transaction, root);
     if (bytes[0] == kindLeaf) {
         const leaf = try parseLeaf(bytes);
         var childIndex: usize = leaf.lowerBound(low);
@@ -182,25 +182,25 @@ fn forEachEntryInRangeAt(
     var childIndex: usize = try Tree.childIndexForKey(transaction, inner, low);
     while (childIndex < inner.childCount) : (childIndex += 1) {
         if (inner.lowKey(childIndex) > high) return;
-        const childRef: Reference = inner.childRef(childIndex);
-        try forEachEntryInRangeAt(transaction, childRef, low, high, ctx, onEntry, depth + 1);
+        const childReference: Reference = inner.childReference(childIndex);
+        try forEachEntryInRangeAt(transaction, childReference, low, high, ctx, onEntry, depth + 1);
     }
 }
 
-/// Test-only helper: build an inner node from a slice of (ref, low, count)
-/// triples and return its ref.
-pub fn makeInnerForTest(transaction: anytype, children: []const struct { ref: u64, low: u64, count: u64 }) !Reference {
-    var refs: [fanout]u64 = undefined;
+/// Test-only helper: build an inner node from a slice of (reference, low, count)
+/// triples and return its reference.
+pub fn makeInnerForTest(transaction: anytype, children: []const struct { reference: u64, low: u64, count: u64 }) !Reference {
+    var references: [fanout]u64 = undefined;
     var lows: [fanout]u64 = undefined;
     var counts: [fanout]u64 = undefined;
     for (children, 0..) |child, childIndex| {
-        refs[childIndex] = child.ref;
+        references[childIndex] = child.reference;
         lows[childIndex] = child.low;
         counts[childIndex] = child.count;
     }
     const allocation = try transaction.alloc(innerNodeSize);
-    _ = encodeInner(allocation.bytes, refs[0..children.len], lows[0..children.len], counts[0..children.len]);
-    return allocation.ref;
+    _ = encodeInner(allocation.bytes, references[0..children.len], lows[0..children.len], counts[0..children.len]);
+    return allocation.reference;
 }
 
 test "leaf encode/decode round-trips sorted pairs" {

@@ -14,8 +14,8 @@ Code pointers use `module.function` names under `src/`.
 - `Database.verifyIntegrity`: header/slot/root/free-list validation plus
   bidirectional audits of every value index and backlink index.
 - Corrupt input is an error, never a crash: parsers validate counts and enum
-  bytes, tree walks are depth-capped against ref cycles, and every read passes
-  a bounds-checked deref.
+  bytes, tree walks are depth-capped against reference cycles, and every read passes
+  a bounds-checked dereference.
 
 ## Transactions
 

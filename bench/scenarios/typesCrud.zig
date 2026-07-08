@@ -93,7 +93,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     // One type carrying a property of each exercised kind.
     {
         var writeTransaction = try database.beginWrite();
-        const catalogRef = try catalog.createFromDefinitions(&writeTransaction, &.{
+        const catalogReference = try catalog.createFromDefinitions(&writeTransaction, &.{
             .{ .kind = .int }, // 0 primaryKey
             .{ .kind = .int }, // 1 int
             .{ .kind = .int }, // 2 bool (0/1)
@@ -103,7 +103,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
             .{ .kind = .set, .element = .int }, // 6 set of int
             .{ .kind = .set, .element = .blob }, // 7 set of blob
         });
-        writeTransaction.setRoot(catalogRef);
+        writeTransaction.setRoot(catalogReference);
         _ = try writeTransaction.commit();
     }
 
@@ -127,7 +127,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         while (inserted < rows) {
             const thisBatch = @min(batchSize, rows - inserted);
             var writeTransaction = try database.beginWrite();
-            var catalogRef = writeTransaction.newRoot;
+            var catalogReference = writeTransaction.newRoot;
             var innerIndex: usize = 0;
             while (innerIndex < thisBatch) : (innerIndex += 1) {
                 const primaryKey: u64 = inserted + innerIndex;
@@ -158,13 +158,13 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
                 };
 
                 const startNs = nowNs(io);
-                const result = try objects.insertTyped(&writeTransaction, catalogRef, &row);
+                const result = try objects.insertTyped(&writeTransaction, catalogReference, &row);
                 const elapsedNs: u64 = @intCast(nowNs(io) - startNs);
-                catalogRef = result.catalogRef;
+                catalogReference = result.catalogReference;
                 try createLat.add(alloc, elapsedNs);
                 try combined.add(alloc, elapsedNs);
             }
-            writeTransaction.setRoot(catalogRef);
+            writeTransaction.setRoot(catalogReference);
             _ = try writeTransaction.commit();
             inserted += thisBatch;
         }
@@ -183,18 +183,18 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     {
         const phaseStart = nowNs(io);
         var readTransaction = try database.beginRead();
-        const catalogRef = readTransaction.root();
+        const catalogReference = readTransaction.root();
         var out: [propertyCount]Value = undefined;
         var key: usize = 0;
         while (key < readN) : (key += 1) {
             const primaryKey: u64 = (key * readStride) % rows;
             const startNs = nowNs(io);
-            _ = try objects.getTyped(&readTransaction, catalogRef, primaryKey, &out); // int/bool/blob/link
-            _ = try collections.dictCount(&readTransaction, catalogRef, primaryKey, pDict);
-            _ = try collections.dictGet(&readTransaction, catalogRef, primaryKey, pDict, "alpha");
-            _ = try collections.setCountInt(&readTransaction, catalogRef, primaryKey, pSetInt);
-            _ = try collections.setCountBlob(&readTransaction, catalogRef, primaryKey, pSetBlob);
-            _ = try collections.setContainsBlob(&readTransaction, catalogRef, primaryKey, pSetBlob, "m1");
+            _ = try objects.getTyped(&readTransaction, catalogReference, primaryKey, &out); // int/bool/blob/link
+            _ = try collections.dictCount(&readTransaction, catalogReference, primaryKey, pDict);
+            _ = try collections.dictGet(&readTransaction, catalogReference, primaryKey, pDict, "alpha");
+            _ = try collections.setCountInt(&readTransaction, catalogReference, primaryKey, pSetInt);
+            _ = try collections.setCountBlob(&readTransaction, catalogReference, primaryKey, pSetBlob);
+            _ = try collections.setContainsBlob(&readTransaction, catalogReference, primaryKey, pSetBlob, "m1");
             const elapsedNs: u64 = @intCast(nowNs(io) - startNs);
             try readLat.add(alloc, elapsedNs);
             try combined.add(alloc, elapsedNs);
@@ -210,20 +210,20 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         while (done < updateN) {
             const thisBatch = @min(batchSize, updateN - done);
             var writeTransaction = try database.beginWrite();
-            var catalogRef = writeTransaction.newRoot;
+            var catalogReference = writeTransaction.newRoot;
             var innerIndex: usize = 0;
             while (innerIndex < thisBatch) : (innerIndex += 1) {
                 const primaryKey: u64 = ((done + innerIndex) * updateStride) % rows;
                 const target: u64 = (primaryKey + 7) % rows;
                 const startNs = nowNs(io);
-                catalogRef = try collections.setAddInt(&writeTransaction, catalogRef, primaryKey, pSetInt, 1_000_000 + primaryKey);
-                catalogRef = try collections.dictPut(&writeTransaction, catalogRef, primaryKey, pDict, "delta", primaryKey);
-                catalogRef = try links.setLink(&writeTransaction, catalogRef, primaryKey, pLink, target);
+                catalogReference = try collections.setAddInt(&writeTransaction, catalogReference, primaryKey, pSetInt, 1_000_000 + primaryKey);
+                catalogReference = try collections.dictPut(&writeTransaction, catalogReference, primaryKey, pDict, "delta", primaryKey);
+                catalogReference = try links.setLink(&writeTransaction, catalogReference, primaryKey, pLink, target);
                 const elapsedNs: u64 = @intCast(nowNs(io) - startNs);
                 try updateLat.add(alloc, elapsedNs);
                 try combined.add(alloc, elapsedNs);
             }
-            writeTransaction.setRoot(catalogRef);
+            writeTransaction.setRoot(catalogReference);
             _ = try writeTransaction.commit();
             done += thisBatch;
         }
@@ -238,18 +238,18 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         while (done < deleteN) {
             const thisBatch = @min(batchSize, deleteN - done);
             var writeTransaction = try database.beginWrite();
-            var catalogRef = writeTransaction.newRoot;
+            var catalogReference = writeTransaction.newRoot;
             var raw: [propertyCount]u64 = undefined;
             var innerIndex: usize = 0;
             while (innerIndex < thisBatch) : (innerIndex += 1) {
                 const primaryKey: u64 = ((done + innerIndex) * deleteStride) % rows;
-                const version = (try rawRows.getByPrimaryKey(&writeTransaction, catalogRef, primaryKey, &raw)) orelse continue;
+                const version = (try rawRows.getByPrimaryKey(&writeTransaction, catalogReference, primaryKey, &raw)) orelse continue;
                 const startNs = nowNs(io);
-                const dres = try objects.deleteTyped(&writeTransaction, catalogRef, primaryKey, version);
+                const dres = try objects.deleteTyped(&writeTransaction, catalogReference, primaryKey, version);
                 const elapsedNs: u64 = @intCast(nowNs(io) - startNs);
                 switch (dres) {
                     .ok => |newCatalog| {
-                        catalogRef = newCatalog;
+                        catalogReference = newCatalog;
                         deleted += 1;
                         try deleteLat.add(alloc, elapsedNs);
                         try combined.add(alloc, elapsedNs);
@@ -257,7 +257,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
                     else => {},
                 }
             }
-            writeTransaction.setRoot(catalogRef);
+            writeTransaction.setRoot(catalogReference);
             _ = try writeTransaction.commit();
             done += thisBatch;
         }

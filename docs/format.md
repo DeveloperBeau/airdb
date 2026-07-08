@@ -19,9 +19,9 @@ mapped individually and never moved. A `Reference` is an absolute byte offset,
 | `[128, 164)` | commit slot B |
 | `[192, 200)` | retention window u64 (shared reclaim floor; 0 = none, maxInt = retain everything) |
 | `[1016, 1024)` | version-ring head counter u64 (monotonic; live index = head % 128) |
-| `[1024, 3072)` | version ring: 128 × (version u64, root_ref u64) |
+| `[1024, 3072)` | version ring: 128 × (version u64, root_reference u64) |
 
-A commit slot is `version u64, root_ref u64, free_list_ref u64,
+A commit slot is `version u64, root_reference u64, free_list_reference u64,
 logical_size u64, CRC32 of the preceding 32 bytes` (36 bytes).
 
 ### Free-list node
@@ -40,17 +40,17 @@ capacity are both 64.
 indexes, sets of objectKeys, and value-index outer/inner trees:
 
 - leaf (1027 B): count × (key u64, value u64), sorted by key
-- inner (1539 B): count × (child_ref u64, low_key u64, subtree_count u64) —
+- inner (1539 B): count × (child_reference u64, low_key u64, subtree_count u64) —
   the subtree counts make `count()` a single-node read
 
 **Column (row → u64)** — `trees/columnNode.zig`, one per property plus version and
 liveness columns:
 
 - leaf (515 B): count × value u64, addressed by position
-- inner (1027 B): count × (child_ref u64, subtree_count u64)
+- inner (1027 B): count × (child_reference u64, subtree_count u64)
 
 **Bindex (bytes → u64)** — `trees/byteKeyIndex.zig`, byte-keyed dictionary/set: identical
-layout to the index, except each key slot holds a blob ref to the key bytes
+layout to the index, except each key slot holds a blob reference to the key bytes
 and ordering compares the dereferenced bytes.
 
 ## Blobs
@@ -58,21 +58,21 @@ and ordering compares the dereferenced bytes.
 Tagged by the first byte:
 
 - inline (`0`): `[tag][len u32][bytes]`, up to just under one section
-- chunked (`1`): `[tag][total_len u64][chunk_count u32][chunk_ref u64 × n]`
+- chunked (`1`): `[tag][total_len u64][chunk_count u32][chunk_reference u64 × n]`
   with raw chunk nodes of up to ~16 MiB each
 
-The empty blob is the null ref; no node is written.
+The empty blob is the null reference; no node is written.
 
 ## Catalog node
 
-Per type: `propertyCount u16, next_row u64, primaryKeyIndexRef u64,
-version_col_ref u64, live_col_ref u64, keyrow_index_ref u64, next_key u64`,
-then per-property parallel arrays in this order: column refs (u64), kinds
-(u8), element kinds (u8), backlink refs (u64), link targets (u16), delete
-rules (u8), value-index refs (u64), indexed flags (u8). New arrays append at
+Per type: `propertyCount u16, next_row u64, primaryKeyIndexReference u64,
+version_column_reference u64, live_column_reference u64, key_to_row_index_reference u64, next_key u64`,
+then per-property parallel arrays in this order: column references (u64), kinds
+(u8), element kinds (u8), backlink references (u64), link targets (u16), delete
+rules (u8), value-index references (u64), indexed flags (u8). New arrays append at
 the end so earlier offsets never move.
 
-The type directory node is `type_count u16`, `type_count × catalog_ref u64`,
+The type directory node is `type_count u16`, `type_count × catalog_reference u64`,
 `type_count × embedded_flag u8`.
 
 ## Coordination sidecar (`<path>.coord`)

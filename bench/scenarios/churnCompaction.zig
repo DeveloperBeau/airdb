@@ -72,24 +72,24 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     defer database.deinit();
 
     // Two-int type: {primaryKey, value}. Property 0 is the primary key.
-    var catalogRef: Reference = blk: {
+    var catalogReference: Reference = blk: {
         var writeTransaction = try database.beginWrite();
-        const catalogRef = try catalog.create(&writeTransaction, 2);
-        writeTransaction.setRoot(catalogRef);
+        const catalogReference = try catalog.create(&writeTransaction, 2);
+        writeTransaction.setRoot(catalogReference);
         _ = try writeTransaction.commit();
-        break :blk catalogRef;
+        break :blk catalogReference;
     };
 
     // --- Seed the live working set (setup only, not timed) -------------------
     {
         var writeTransaction = try database.beginWrite();
-        catalogRef = database.activeRoot;
+        catalogReference = database.activeRoot;
         var primaryKey: u64 = 0;
         while (primaryKey < workingSet) : (primaryKey += 1) {
-            const inserted = try rows.insert(&writeTransaction, catalogRef, &.{ primaryKey, primaryKey });
-            catalogRef = inserted.catalogRef;
+            const inserted = try rows.insert(&writeTransaction, catalogReference, &.{ primaryKey, primaryKey });
+            catalogReference = inserted.catalogReference;
         }
-        writeTransaction.setRoot(catalogRef);
+        writeTransaction.setRoot(catalogReference);
         _ = try writeTransaction.commit();
     }
 
@@ -111,27 +111,27 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         // Churn: insert k fresh rows and delete the k oldest live primaryKeys in one transaction.
         {
             var writeTransaction = try database.beginWrite();
-            catalogRef = database.activeRoot;
+            catalogReference = database.activeRoot;
 
             var innerIndex: usize = 0;
             while (innerIndex < key) : (innerIndex += 1) {
                 const primaryKey = nextPrimaryKey + innerIndex;
-                const inserted = try rows.insert(&writeTransaction, catalogRef, &.{ primaryKey, primaryKey });
-                catalogRef = inserted.catalogRef;
+                const inserted = try rows.insert(&writeTransaction, catalogReference, &.{ primaryKey, primaryKey });
+                catalogReference = inserted.catalogReference;
             }
 
             innerIndex = 0;
             while (innerIndex < key) : (innerIndex += 1) {
                 const primaryKey = oldestPrimaryKey + innerIndex;
                 var out: [2]u64 = undefined;
-                const version = (try rows.getByPrimaryKey(&writeTransaction, catalogRef, primaryKey, &out)) orelse unreachable;
-                catalogRef = switch (try rows.delete(&writeTransaction, catalogRef, primaryKey, version)) {
+                const version = (try rows.getByPrimaryKey(&writeTransaction, catalogReference, primaryKey, &out)) orelse unreachable;
+                catalogReference = switch (try rows.delete(&writeTransaction, catalogReference, primaryKey, version)) {
                     .ok => |newCatalog| newCatalog,
                     else => unreachable,
                 };
             }
 
-            writeTransaction.setRoot(catalogRef);
+            writeTransaction.setRoot(catalogReference);
             _ = try writeTransaction.commit();
 
             nextPrimaryKey += key;
@@ -141,12 +141,12 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         // Compaction: repack the type until fully packed, one step per write transaction.
         while (true) {
             var writeTransaction = try database.beginWrite();
-            catalogRef = database.activeRoot;
+            catalogReference = database.activeRoot;
             const startNs = nowNs(io);
-            const res = try compaction.compactStep(&writeTransaction, catalogRef, 0, compactBudget);
+            const res = try compaction.compactStep(&writeTransaction, catalogReference, 0, compactBudget);
             const elapsedNs: u64 = @intCast(nowNs(io) - startNs);
-            catalogRef = res.catalogRef;
-            writeTransaction.setRoot(catalogRef);
+            catalogReference = res.catalogReference;
+            writeTransaction.setRoot(catalogReference);
             _ = try writeTransaction.commit();
 
             try stepLat.add(alloc, elapsedNs);
@@ -163,9 +163,9 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     {
         var readTransaction = try database.beginRead();
         defer readTransaction.end();
-        catalogRef = readTransaction.root();
-        live = try compaction.liveCount(&readTransaction, catalogRef);
-        nextRow = (try catalog.loadCatalog(&readTransaction, catalogRef)).nextRow;
+        catalogReference = readTransaction.root();
+        live = try compaction.liveCount(&readTransaction, catalogReference);
+        nextRow = (try catalog.loadCatalog(&readTransaction, catalogReference)).nextRow;
     }
     const deadRatio: f64 = if (nextRow == 0)
         0

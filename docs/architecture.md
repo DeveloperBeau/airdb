@@ -23,7 +23,7 @@ maintenance (compaction) is driven explicitly by the caller.
 The file is mapped in fixed 16 MiB sections. Growth only appends new
 sections; an existing section is never remapped or moved, so every live
 pointer into the mapping stays valid for the life of the process. A `Reference` is
-an absolute byte offset; `arena.deref` is the single bounds-checked chokepoint
+an absolute byte offset; `arena.dereference` is the single bounds-checked chokepoint
 every read goes through (null, alignment, section bounds, no cross-section
 spans). No allocation may cross a section boundary, which caps a single
 allocation at the section size.
@@ -31,7 +31,7 @@ allocation at the section size.
 ## The commit protocol
 
 The header page holds two commit slots (A and B), each a CRC32-checksummed
-`(version, root_ref, free_list_ref, logical_size)` record, plus a header whose
+`(version, root_reference, free_list_reference, logical_size)` record, plus a header whose
 `active_slot` byte is the commit pointer.
 
 1. Build the new persistent free list and write it into the arena.
@@ -112,7 +112,7 @@ without breaking anything.
 
 Catalog rewrites go through `CatalogSnapshot`: load every field into an owned
 value, mutate, write. Mutations are whole-catalog copy-on-write, so a
-transaction threads catalog refs exactly like tree roots.
+transaction threads catalog references exactly like tree roots.
 
 Secondary structures are maintained transactionally with the row:
 

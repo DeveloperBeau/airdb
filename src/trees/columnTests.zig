@@ -43,7 +43,7 @@ test "parseLeaf rejects a buffer too small for its declared count" {
     try testing.expectError(error.Corrupt, parseLeaf(buffer[0..16]));
 }
 
-test "a column ref cycle fails with error.Corrupt" {
+test "a column reference cycle fails with error.Corrupt" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try colTmpPath(testing.allocator, &tmp, "col_cycle.airdb");
@@ -56,10 +56,10 @@ test "a column ref cycle fails with error.Corrupt" {
     // Inner node whose only child is itself with a nonzero claimed count:
     // get/set/append must hit the depth cap, not overflow the stack.
     const allocation = try writeTransaction.alloc(innerNodeSize);
-    _ = encodeInner(allocation.bytes, &.{allocation.ref}, &.{10});
-    try testing.expectError(error.Corrupt, get(&writeTransaction, allocation.ref, 0));
-    try testing.expectError(error.Corrupt, set(&writeTransaction, allocation.ref, 0, 1));
-    try testing.expectError(error.Corrupt, append(&writeTransaction, allocation.ref, 1));
+    _ = encodeInner(allocation.bytes, &.{allocation.reference}, &.{10});
+    try testing.expectError(error.Corrupt, get(&writeTransaction, allocation.reference, 0));
+    try testing.expectError(error.Corrupt, set(&writeTransaction, allocation.reference, 0, 1));
+    try testing.expectError(error.Corrupt, append(&writeTransaction, allocation.reference, 1));
 }
 
 test "single-leaf column: create, append, get, length, set" {
@@ -119,7 +119,7 @@ test "get and length traverse an inner node over two leaves" {
     var column1 = try create(&writeTransaction);
     column1 = try append(&writeTransaction, column1, 2);
     column1 = try append(&writeTransaction, column1, 3);
-    const inner = try makeInnerForTest(&writeTransaction, &.{ .{ .ref = column0, .count = 2 }, .{ .ref = column1, .count = 2 } });
+    const inner = try makeInnerForTest(&writeTransaction, &.{ .{ .reference = column0, .count = 2 }, .{ .reference = column1, .count = 2 } });
     try testing.expectEqual(@as(u64, 4), try length(&writeTransaction, inner));
     try testing.expectEqual(@as(u64, 0), try get(&writeTransaction, inner, 0));
     try testing.expectEqual(@as(u64, 2), try get(&writeTransaction, inner, 2));
@@ -388,7 +388,7 @@ test "appendRun empty run is a no-op" {
     while (key < 100) : (key += 1) baseRoot = try append(&writeTransaction, baseRoot, appendColVal(key));
     const before = try length(&writeTransaction, baseRoot);
     const appended = try appendRun(&writeTransaction, baseRoot, &.{}, testing.allocator);
-    try testing.expectEqual(baseRoot, appended); // same ref, unchanged
+    try testing.expectEqual(baseRoot, appended); // same reference, unchanged
     try testing.expectEqual(before, try length(&writeTransaction, appended));
     writeTransaction.deinit();
 }
