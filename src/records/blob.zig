@@ -18,7 +18,7 @@
 
 const std = @import("std");
 const Reference = @import("../storage/reference.zig").Reference;
-const WriteTransaction = @import("../database.zig").WriteTransaction;
+const WriteTransaction = @import("../transactions/writeTransaction.zig").WriteTransaction;
 const sectionSize = @import("../platform.zig").sectionSize;
 
 /// Largest blob stored as a single inline node. The +5 node header (tag + length)
