@@ -38,27 +38,27 @@ const Value = catalog.Value;
 pub const name = "nested_embedded";
 
 // Deepest nesting the engine supports for this scenario; measured up to here.
-const max_depth: usize = 3;
+const maxDepth: usize = 3;
 
 // Embedded chains are heavy (one object + link per level), so cap the dataset
 // to keep the three depth passes well under a minute at 1m scale.
-const max_rows: usize = 50_000;
+const maxRows: usize = 50_000;
 
 // Root rows committed per write transaction.
-const batch_size: usize = 5_000;
+const batchSize: usize = 5_000;
 
-// Disjoint primaryKey band per depth; larger than max_rows so depth passes never alias.
-const depth_stride: u64 = 1_000_000;
+// Disjoint primaryKey band per depth; larger than maxRows so depth passes never alias.
+const depthStride: u64 = 1_000_000;
 
 // A 4-type chain: types 0..2 carry a cascade to-one link to the next type;
 // type 3 is the leaf. Type 0 is the non-embedded root, types 1..3 are embedded.
-const chain_schema = [_][]const catalog.PropertyDefinition{
-    &.{ .{ .kind = .int }, .{ .kind = .link, .link_target = 1, .del_rule = .cascade } },
-    &.{ .{ .kind = .int }, .{ .kind = .link, .link_target = 2, .del_rule = .cascade } },
-    &.{ .{ .kind = .int }, .{ .kind = .link, .link_target = 3, .del_rule = .cascade } },
+const chainSchema = [_][]const catalog.PropertyDefinition{
+    &.{ .{ .kind = .int }, .{ .kind = .link, .linkTarget = 1, .delRule = .cascade } },
+    &.{ .{ .kind = .int }, .{ .kind = .link, .linkTarget = 2, .delRule = .cascade } },
+    &.{ .{ .kind = .int }, .{ .kind = .link, .linkTarget = 3, .delRule = .cascade } },
     &.{ .{ .kind = .int }, .{ .kind = .int } },
 };
-const chain_embedded = [_]bool{ false, true, true, true };
+const chainEmbedded = [_]bool{ false, true, true, true };
 
 // The to-one link property is index 1 on every chain type.
 const linkProperty: usize = 1;
@@ -75,7 +75,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     const alloc = ctx.alloc;
     const io = sysIo();
 
-    const rows = @min(ctx.n, max_rows);
+    const rows = @min(ctx.n, maxRows);
 
     const path = try harness.scratchPath(ctx.*, name ++ ".airdb");
     defer alloc.free(path);
@@ -86,7 +86,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
 
     {
         var w = try database.beginWrite();
-        const dir = try typedir.createTypes(&w, &chain_schema, &chain_embedded);
+        const dir = try typedir.createTypes(&w, &chainSchema, &chainEmbedded);
         w.setRoot(dir);
         _ = try w.commit();
     }
@@ -95,107 +95,107 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     defer combined.deinit(alloc);
 
     // Per-depth create/read p50s, in microseconds, indexed by depth-1.
-    var create_p50_us = [_]f64{0} ** max_depth;
-    var read_p50_us = [_]f64{0} ** max_depth;
+    var createP50Us = [_]f64{0} ** maxDepth;
+    var readP50Us = [_]f64{0} ** maxDepth;
 
-    var total_ns: u64 = 0;
-    var total_built: u64 = 0;
+    var totalNs: u64 = 0;
+    var totalBuilt: u64 = 0;
 
     var d: usize = 1;
-    while (d <= max_depth) : (d += 1) {
-        const key_base: u64 = @as(u64, @intCast(d)) * depth_stride;
+    while (d <= maxDepth) : (d += 1) {
+        const keyBase: u64 = @as(u64, @intCast(d)) * depthStride;
 
-        var create_lat = harness.Latencies.init();
-        defer create_lat.deinit(alloc);
-        var read_lat = harness.Latencies.init();
-        defer read_lat.deinit(alloc);
+        var createLat = harness.Latencies.init();
+        defer createLat.deinit(alloc);
+        var readLat = harness.Latencies.init();
+        defer readLat.deinit(alloc);
 
         // --- CREATE: root + d embedded levels, one nested structure per row ----
         {
-            const phase_start = nowNs(io);
+            const phaseStart = nowNs(io);
             var inserted: usize = 0;
             while (inserted < rows) {
-                const this_batch = @min(batch_size, rows - inserted);
+                const thisBatch = @min(batchSize, rows - inserted);
                 var w = try database.beginWrite();
-                var dir = w.new_root;
+                var dir = w.newRoot;
                 var j: usize = 0;
-                while (j < this_batch) : (j += 1) {
-                    const key: u64 = key_base + inserted + j;
+                while (j < thisBatch) : (j += 1) {
+                    const key: u64 = keyBase + inserted + j;
                     const t0 = nowNs(io);
                     // Root row of type 0.
                     dir = (try typeRouting.insert(&w, dir, 0, &.{ .{ .int = key }, .{ .link = null } })).dir;
                     // Embedded levels 1..d. Each shares `key` in its own primaryKey space.
                     var level: u16 = 0;
                     while (level < d) : (level += 1) {
-                        const leaf = level + 1 == max_depth;
-                        const child_vals: [2]Value = if (leaf)
+                        const leaf = level + 1 == maxDepth;
+                        const childVals: [2]Value = if (leaf)
                             .{ .{ .int = key }, .{ .int = key *% 2654435761 } }
                         else
                             .{ .{ .int = key }, .{ .link = null } };
-                        dir = try typedir.insertEmbedded(&w, dir, level, key, linkProperty, &child_vals);
+                        dir = try typedir.insertEmbedded(&w, dir, level, key, linkProperty, &childVals);
                     }
                     const dt: u64 = @intCast(nowNs(io) - t0);
-                    try create_lat.add(alloc, dt);
+                    try createLat.add(alloc, dt);
                     try combined.add(alloc, dt);
                 }
                 w.setRoot(dir);
                 _ = try w.commit();
-                inserted += this_batch;
+                inserted += thisBatch;
             }
-            total_ns += @intCast(nowNs(io) - phase_start);
+            totalNs += @intCast(nowNs(io) - phaseStart);
         }
 
         // --- READ: full descent through all d levels via getLinked ------------
         {
-            const phase_start = nowNs(io);
+            const phaseStart = nowNs(io);
             var r = try database.beginRead();
             const dir = r.root();
             var out: [2]Value = undefined;
             var i: usize = 0;
             while (i < rows) : (i += 1) {
-                const key: u64 = key_base + i;
+                const key: u64 = keyBase + i;
                 const t0 = nowNs(io);
                 var level: u16 = 0;
                 while (level < d) : (level += 1) {
                     _ = try typeRouting.getLinked(&r, dir, level, key, linkProperty, &out);
                 }
                 const dt: u64 = @intCast(nowNs(io) - t0);
-                try read_lat.add(alloc, dt);
+                try readLat.add(alloc, dt);
                 try combined.add(alloc, dt);
             }
             r.end();
-            total_ns += @intCast(nowNs(io) - phase_start);
+            totalNs += @intCast(nowNs(io) - phaseStart);
         }
 
-        create_p50_us[d - 1] = @as(f64, @floatFromInt(create_lat.percentile(50))) / 1000.0;
-        read_p50_us[d - 1] = @as(f64, @floatFromInt(read_lat.percentile(50))) / 1000.0;
-        total_built += rows;
+        createP50Us[d - 1] = @as(f64, @floatFromInt(createLat.percentile(50))) / 1000.0;
+        readP50Us[d - 1] = @as(f64, @floatFromInt(readLat.percentile(50))) / 1000.0;
+        totalBuilt += rows;
     }
 
-    const file_bytes = try database.fileSize();
-    const logical_bytes = database.logicalSize();
+    const fileBytes = try database.fileSize();
+    const logicalBytes = database.logicalSize();
 
     const note = try std.fmt.allocPrint(
         alloc,
         "d1_create_us={d:.1} d1_read_us={d:.1} d2_create_us={d:.1} d2_read_us={d:.1} d3_create_us={d:.1} d3_read_us={d:.1} rows={d} max_depth={d}",
         .{
-            create_p50_us[0], read_p50_us[0],
-            create_p50_us[1], read_p50_us[1],
-            create_p50_us[2], read_p50_us[2],
-            rows,             max_depth,
+            createP50Us[0], readP50Us[0],
+            createP50Us[1], readP50Us[1],
+            createP50Us[2], readP50Us[2],
+            rows,           maxDepth,
         },
     );
 
     const result = harness.Result{
         .name = name,
-        .ops = total_built,
-        .wall_ns = total_ns,
-        .p50_ns = combined.percentile(50),
-        .p99_ns = combined.percentile(99),
-        .max_ns = combined.percentile(100),
-        .file_bytes = file_bytes,
-        .logical_bytes = logical_bytes,
-        .peak_rss_bytes = airdb.peakResidentBytes(),
+        .ops = totalBuilt,
+        .wallNs = totalNs,
+        .p50Ns = combined.percentile(50),
+        .p99Ns = combined.percentile(99),
+        .maxNs = combined.percentile(100),
+        .fileBytes = fileBytes,
+        .logicalBytes = logicalBytes,
+        .peakRssBytes = airdb.peakResidentBytes(),
         .note = note,
     };
 

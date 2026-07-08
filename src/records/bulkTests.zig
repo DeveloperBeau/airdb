@@ -62,8 +62,8 @@ test "bulk append is refused when the batch does not clear the true max primaryK
     // The orchestrator falls back to row-by-row, which detects the duplicate.
     try testing.expectError(error.DuplicateKey, bulkAppendOrInsert(&w, catalogRef, &rows));
     // A batch that truly clears the surviving max qualifies.
-    const ok_rows = [_][]const u64{ &.{ 100, 1 }, &.{ 101, 2 } };
-    catalogRef = try bulkAppend(&w, catalogRef, &ok_rows);
+    const okRows = [_][]const u64{ &.{ 100, 1 }, &.{ 101, 2 } };
+    catalogRef = try bulkAppend(&w, catalogRef, &okRows);
     try testing.expect((try rawRows.getByPrimaryKey(&w, catalogRef, 100, &out)) != null);
     try testing.expect((try rawRows.getByPrimaryKey(&w, catalogRef, 31, &out)) != null);
 }
@@ -98,9 +98,9 @@ test "bulk append into a primaryKey-history gap takes the fallback" {
 
     // Below the stale low: NotAppendable; the orchestrator's fallback must
     // leave every row reachable.
-    const gap_rows = [_][]const u64{ &.{ 33, 1 }, &.{ 34, 2 } };
-    try testing.expectError(error.NotAppendable, bulkAppend(&w, catalogRef, &gap_rows));
-    catalogRef = try bulkAppendOrInsert(&w, catalogRef, &gap_rows);
+    const gapRows = [_][]const u64{ &.{ 33, 1 }, &.{ 34, 2 } };
+    try testing.expectError(error.NotAppendable, bulkAppend(&w, catalogRef, &gapRows));
+    catalogRef = try bulkAppendOrInsert(&w, catalogRef, &gapRows);
     try testing.expect((try rawRows.getByPrimaryKey(&w, catalogRef, 33, &out)) != null);
     try testing.expect((try rawRows.getByPrimaryKey(&w, catalogRef, 34, &out)) != null);
 
@@ -111,7 +111,7 @@ test "bulk append into a primaryKey-history gap takes the fallback" {
 
 test "bulk append fallback refuses link-bearing schemas" {
     // objects.insert writes raw columns without backlink maintenance, so the
-    // row-by-row fallback must reject link/link_set types like bulkImport does
+    // row-by-row fallback must reject link/linkSet types like bulkImport does
     // instead of silently corrupting the graph.
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -149,8 +149,8 @@ test "bulk append frees the replaced right-edge nodes" {
     var w = try database.beginWrite();
     defer w.deinit();
     const rows = [_][]const u64{ &.{ 1000, 1 }, &.{ 1001, 2 } };
-    _ = try bulkAppend(&w, w.new_root, &rows);
-    try testing.expect(w.in_flight_frees.items.len > 0);
+    _ = try bulkAppend(&w, w.newRoot, &rows);
+    try testing.expect(w.inFlightFrees.items.len > 0);
 }
 
 fn checkColumnSize(w: *WriteTransaction, n: usize) !void {
@@ -276,9 +276,9 @@ const SetCollector = struct {
     }
 };
 
-fn collectSet(w: *WriteTransaction, set_root: Reference, out: *std.ArrayList(u64)) !void {
+fn collectSet(w: *WriteTransaction, setRoot: Reference, out: *std.ArrayList(u64)) !void {
     out.clearRetainingCapacity();
-    try Index.forEachKey(w, set_root, SetCollector{ .keys = out }, SetCollector.onKey);
+    try Index.forEachKey(w, setRoot, SetCollector{ .keys = out }, SetCollector.onKey);
 }
 
 test "bulkValueIndex equals sequential maintenance" {
@@ -291,7 +291,7 @@ test "bulkValueIndex equals sequential maintenance" {
     var w = try database.beginWrite();
 
     const N: u64 = 1000;
-    const num_values: u64 = 100;
+    const numValues: u64 = 100;
 
     // Build the grouped entries: value v=i%100 maps to objectKeys {i : i%100==v}, ascending.
     var entries = std.ArrayList(ValueObjectKeys).empty;
@@ -300,10 +300,10 @@ test "bulkValueIndex equals sequential maintenance" {
         entries.deinit(testing.allocator);
     }
     var v: u64 = 0;
-    while (v < num_values) : (v += 1) {
+    while (v < numValues) : (v += 1) {
         var objectKeys = std.ArrayList(u64).empty;
         var i: u64 = v; // first objectKey with i%100==v
-        while (i < N) : (i += num_values) try objectKeys.append(testing.allocator, i);
+        while (i < N) : (i += numValues) try objectKeys.append(testing.allocator, i);
         try entries.append(testing.allocator, .{ .value = v, .objectKeys = try objectKeys.toOwnedSlice(testing.allocator) });
     }
 
@@ -314,26 +314,26 @@ test "bulkValueIndex equals sequential maintenance" {
     var seq = try Index.create(&w);
     var i: u64 = 0;
     while (i < N) : (i += 1) {
-        const value = i % num_values;
+        const value = i % numValues;
         const existing = try Index.get(&w, seq, value);
-        var set_root = existing orelse try Index.create(&w);
-        set_root = try Index.insert(&w, set_root, i, 1);
-        seq = try Index.insert(&w, seq, value, set_root);
+        var setRoot = existing orelse try Index.create(&w);
+        setRoot = try Index.insert(&w, setRoot, i, 1);
+        seq = try Index.insert(&w, seq, value, setRoot);
     }
 
     // Compare the inner objectKey set for every value.
-    var built_set = std.ArrayList(u64).empty;
-    defer built_set.deinit(testing.allocator);
-    var seq_set = std.ArrayList(u64).empty;
-    defer seq_set.deinit(testing.allocator);
+    var builtSet = std.ArrayList(u64).empty;
+    defer builtSet.deinit(testing.allocator);
+    var seqSet = std.ArrayList(u64).empty;
+    defer seqSet.deinit(testing.allocator);
 
     v = 0;
-    while (v < num_values) : (v += 1) {
-        const b_inner = (try Index.get(&w, built, v)) orelse return error.MissingValue;
-        const s_inner = (try Index.get(&w, seq, v)) orelse return error.MissingValue;
-        try collectSet(&w, b_inner, &built_set);
-        try collectSet(&w, s_inner, &seq_set);
-        try testing.expectEqualSlices(u64, seq_set.items, built_set.items);
+    while (v < numValues) : (v += 1) {
+        const bInner = (try Index.get(&w, built, v)) orelse return error.MissingValue;
+        const sInner = (try Index.get(&w, seq, v)) orelse return error.MissingValue;
+        try collectSet(&w, bInner, &builtSet);
+        try collectSet(&w, sInner, &seqSet);
+        try testing.expectEqualSlices(u64, seqSet.items, builtSet.items);
     }
     w.deinit();
 }
@@ -348,10 +348,10 @@ const importDefinitions = [_]catalog.PropertyDefinition{
 test "bulkImport equals row-by-row for a scalar indexed type" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const path_a = try bulkTmpPath(testing.allocator, &tmp, "import_a.airdb");
-    defer testing.allocator.free(path_a);
-    const path_b = try bulkTmpPath(testing.allocator, &tmp, "import_b.airdb");
-    defer testing.allocator.free(path_b);
+    const pathA = try bulkTmpPath(testing.allocator, &tmp, "import_a.airdb");
+    defer testing.allocator.free(pathA);
+    const pathB = try bulkTmpPath(testing.allocator, &tmp, "import_b.airdb");
+    defer testing.allocator.free(pathB);
 
     const N: u64 = 5000;
 
@@ -366,30 +366,30 @@ test "bulkImport equals row-by-row for a scalar indexed type" {
 
     const storage = try testing.allocator.alloc([3]u64, N);
     defer testing.allocator.free(storage);
-    const row_slices = try testing.allocator.alloc([]const u64, N);
-    defer testing.allocator.free(row_slices);
+    const rowSlices = try testing.allocator.alloc([]const u64, N);
+    defer testing.allocator.free(rowSlices);
     for (order, 0..) |primaryKey, k| {
         storage[k] = .{ primaryKey, primaryKey * 3, primaryKey % 50 };
-        row_slices[k] = &storage[k];
+        rowSlices[k] = &storage[k];
     }
 
     // database A: bulk import inside a one-type directory so verifyIntegrity audits it.
     {
-        var database = try Database.create(testing.allocator, path_a);
+        var database = try Database.create(testing.allocator, pathA);
         defer database.deinit();
         var w = try database.beginWrite();
         const dir = try typedir.createTypes(&w, &.{&importDefinitions}, &.{false});
         const catalog0 = try typedir.catalogRef(&w, dir, 0);
-        const newCatalog = try bulkImport(&w, catalog0, row_slices, .{});
-        const new_dir = try typedir.setCatalogRef(&w, dir, 0, newCatalog);
-        w.setRoot(new_dir);
+        const newCatalog = try bulkImport(&w, catalog0, rowSlices, .{});
+        const newDir = try typedir.setCatalogRef(&w, dir, 0, newCatalog);
+        w.setRoot(newDir);
         _ = try w.commit();
         try verification.verifyIntegrity(&database); // both value-index directions, in memory
     }
 
     // database B: the same rows inserted one at a time, in ascending-primaryKey order.
     {
-        var database = try Database.create(testing.allocator, path_b);
+        var database = try Database.create(testing.allocator, pathB);
         defer database.deinit();
         var w = try database.beginWrite();
         var catalogRef = try catalog.createFromDefinitions(&w, &importDefinitions);
@@ -400,10 +400,10 @@ test "bulkImport equals row-by-row for a scalar indexed type" {
     }
 
     // Reopen A from disk (durability) and compare against B.
-    var da = try Database.open(testing.allocator, path_a);
+    var da = try Database.open(testing.allocator, pathA);
     defer da.deinit();
     try verification.verifyIntegrity(&da); // audit again after reopen
-    var databaseB = try Database.open(testing.allocator, path_b);
+    var databaseB = try Database.open(testing.allocator, pathB);
     defer databaseB.deinit();
 
     var ra = try da.beginRead();
@@ -495,8 +495,8 @@ test "bulkImport rejects duplicate primaryKey before committing" {
     // Nothing was written: the type is still empty.
     try testing.expectEqual(@as(u64, 0), try catalog.liveCount(&w, catalogRef));
     const cv = try catalog.loadCatalog(&w, catalogRef);
-    try testing.expectEqual(@as(u64, 0), cv.next_row);
-    try testing.expectEqual(@as(u64, 0), cv.next_key);
+    try testing.expectEqual(@as(u64, 0), cv.nextRow);
+    try testing.expectEqual(@as(u64, 0), cv.nextKey);
     w.deinit();
 }
 
@@ -508,7 +508,7 @@ test "bulkImport rejects a link-bearing type" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    const linkDefinitions = [_]catalog.PropertyDefinition{ .{ .kind = .int }, .{ .kind = .link, .link_target = 0 } };
+    const linkDefinitions = [_]catalog.PropertyDefinition{ .{ .kind = .int }, .{ .kind = .link, .linkTarget = 0 } };
     const catalogRef = try catalog.createFromDefinitions(&w, &linkDefinitions);
 
     const rws = [_][]const u64{&.{ 1, 0 }};
@@ -528,12 +528,12 @@ test "bulkImport edge sizes: empty, single, leafCap" {
 
         const storage = try testing.allocator.alloc([3]u64, n);
         defer testing.allocator.free(storage);
-        const row_slices = try testing.allocator.alloc([]const u64, n);
-        defer testing.allocator.free(row_slices);
+        const rowSlices = try testing.allocator.alloc([]const u64, n);
+        defer testing.allocator.free(rowSlices);
         var i: u64 = 0;
         while (i < n) : (i += 1) {
             storage[i] = .{ i, i * 3, i % 7 };
-            row_slices[i] = &storage[i];
+            rowSlices[i] = &storage[i];
         }
 
         var database = try Database.create(testing.allocator, path);
@@ -542,9 +542,9 @@ test "bulkImport edge sizes: empty, single, leafCap" {
             var w = try database.beginWrite();
             const dir = try typedir.createTypes(&w, &.{&importDefinitions}, &.{false});
             const catalog0 = try typedir.catalogRef(&w, dir, 0);
-            const newCatalog = try bulkImport(&w, catalog0, row_slices, .{ .presorted = true });
-            const new_dir = try typedir.setCatalogRef(&w, dir, 0, newCatalog);
-            w.setRoot(new_dir);
+            const newCatalog = try bulkImport(&w, catalog0, rowSlices, .{ .presorted = true });
+            const newDir = try typedir.setCatalogRef(&w, dir, 0, newCatalog);
+            w.setRoot(newDir);
             _ = try w.commit();
         }
         try verification.verifyIntegrity(&database);
@@ -554,8 +554,8 @@ test "bulkImport edge sizes: empty, single, leafCap" {
         const catalogRef = try typedir.catalogRef(&r, r.root(), 0);
         try testing.expectEqual(n, try catalog.liveCount(&r, catalogRef));
         const cv = try catalog.loadCatalog(&r, catalogRef);
-        try testing.expectEqual(n, cv.next_row);
-        try testing.expectEqual(n, cv.next_key);
+        try testing.expectEqual(n, cv.nextRow);
+        try testing.expectEqual(n, cv.nextKey);
         if (n > 0) {
             var out: [3]u64 = undefined;
             const last = n - 1;
@@ -573,10 +573,10 @@ const appendDefinitions = [_]catalog.PropertyDefinition{ .{ .kind = .int }, .{ .
 test "bulkAppend equals row-by-row for a contiguous monotonic batch" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const path_a = try bulkTmpPath(testing.allocator, &tmp, "append_eq_a.airdb");
-    defer testing.allocator.free(path_a);
-    const path_b = try bulkTmpPath(testing.allocator, &tmp, "append_eq_b.airdb");
-    defer testing.allocator.free(path_b);
+    const pathA = try bulkTmpPath(testing.allocator, &tmp, "append_eq_a.airdb");
+    defer testing.allocator.free(pathA);
+    const pathB = try bulkTmpPath(testing.allocator, &tmp, "append_eq_b.airdb");
+    defer testing.allocator.free(pathB);
 
     const BASE: u64 = 1000;
     const APPEND: u64 = 500;
@@ -599,7 +599,7 @@ test "bulkAppend equals row-by-row for a contiguous monotonic batch" {
     // database A: base via row-by-row insert, then the batch via bulkAppend, inside a
     // one-type directory so verifyIntegrity audits it.
     {
-        var database = try Database.create(testing.allocator, path_a);
+        var database = try Database.create(testing.allocator, pathA);
         defer database.deinit();
         var w = try database.beginWrite();
         const dir = try typedir.createTypes(&w, &.{&appendDefinitions}, &.{false});
@@ -607,15 +607,15 @@ test "bulkAppend equals row-by-row for a contiguous monotonic batch" {
         var primaryKey: u64 = 0;
         while (primaryKey < BASE) : (primaryKey += 1) catalogRef = (try rawRows.insert(&w, catalogRef, &.{ primaryKey, primaryKey * 3 })).catalogRef;
         const newCatalog = try bulkAppend(&w, catalogRef, batch);
-        const new_dir = try typedir.setCatalogRef(&w, dir, 0, newCatalog);
-        w.setRoot(new_dir);
+        const newDir = try typedir.setCatalogRef(&w, dir, 0, newCatalog);
+        w.setRoot(newDir);
         _ = try w.commit();
         try verification.verifyIntegrity(&database);
     }
 
     // database B: every row inserted one at a time, in ascending-primaryKey order.
     {
-        var database = try Database.create(testing.allocator, path_b);
+        var database = try Database.create(testing.allocator, pathB);
         defer database.deinit();
         var w = try database.beginWrite();
         var catalogRef = try catalog.createFromDefinitions(&w, &appendDefinitions);
@@ -626,10 +626,10 @@ test "bulkAppend equals row-by-row for a contiguous monotonic batch" {
     }
 
     // Reopen A from disk (durability) and compare against B.
-    var da = try Database.open(testing.allocator, path_a);
+    var da = try Database.open(testing.allocator, pathA);
     defer da.deinit();
     try verification.verifyIntegrity(&da); // audit again after reopen
-    var databaseB = try Database.open(testing.allocator, path_b);
+    var databaseB = try Database.open(testing.allocator, pathB);
     defer databaseB.deinit();
 
     var ra = try da.beginRead();
@@ -680,8 +680,8 @@ test "bulkAppend returns NotAppendable for a scattered batch" {
     while (primaryKey < 100) : (primaryKey += 1) catalogRef = (try rawRows.insert(&w, catalogRef, &.{ primaryKey, primaryKey * 3 })).catalogRef;
 
     const before = try catalog.liveCount(&w, catalogRef);
-    var before_row: [2]u64 = undefined;
-    try testing.expect((try rawRows.getByPrimaryKey(&w, catalogRef, 50, &before_row)) != null);
+    var beforeRow: [2]u64 = undefined;
+    try testing.expect((try rawRows.getByPrimaryKey(&w, catalogRef, 50, &beforeRow)) != null);
 
     // First batch primaryKey (50) is <= the current max (99): not a right-edge append.
     const batch = [_][]const u64{ &.{ 50, 150 }, &.{ 200, 600 }, &.{ 201, 603 } };
@@ -689,9 +689,9 @@ test "bulkAppend returns NotAppendable for a scattered batch" {
 
     // The type is byte-unchanged: same count, and the sampled row is intact.
     try testing.expectEqual(before, try catalog.liveCount(&w, catalogRef));
-    var after_row: [2]u64 = undefined;
-    try testing.expect((try rawRows.getByPrimaryKey(&w, catalogRef, 50, &after_row)) != null);
-    try testing.expectEqualSlices(u64, &before_row, &after_row);
+    var afterRow: [2]u64 = undefined;
+    try testing.expect((try rawRows.getByPrimaryKey(&w, catalogRef, 50, &afterRow)) != null);
+    try testing.expectEqualSlices(u64, &beforeRow, &afterRow);
     w.deinit();
 }
 
@@ -721,7 +721,7 @@ test "bulkAppend returns NotAppendable for a link-bearing type" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
     var w = try database.beginWrite();
-    var catalogRef = try catalog.createFromDefinitions(&w, &.{ .{ .kind = .int }, .{ .kind = .link, .link_target = 0 } });
+    var catalogRef = try catalog.createFromDefinitions(&w, &.{ .{ .kind = .int }, .{ .kind = .link, .linkTarget = 0 } });
     catalogRef = (try rawRows.insert(&w, catalogRef, &.{ 1, 0 })).catalogRef;
 
     const batch = [_][]const u64{ &.{ 100, 0 }, &.{ 101, 0 } };
@@ -753,10 +753,10 @@ test "bulkAppend returns NotAppendable for a non-ascending or duplicate batch" {
 test "bulkAppendOrInsert falls back and equals row-by-row for a scattered batch" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const path_a = try bulkTmpPath(testing.allocator, &tmp, "fallback_a.airdb");
-    defer testing.allocator.free(path_a);
-    const path_b = try bulkTmpPath(testing.allocator, &tmp, "fallback_b.airdb");
-    defer testing.allocator.free(path_b);
+    const pathA = try bulkTmpPath(testing.allocator, &tmp, "fallback_a.airdb");
+    defer testing.allocator.free(pathA);
+    const pathB = try bulkTmpPath(testing.allocator, &tmp, "fallback_b.airdb");
+    defer testing.allocator.free(pathB);
 
     const BASE: u64 = 100;
     // Scattered batch: all primaryKeys new (>= BASE) and distinct, but out of order, so
@@ -774,7 +774,7 @@ test "bulkAppendOrInsert falls back and equals row-by-row for a scattered batch"
     // database A: base via insert, then the scattered batch via bulkAppendOrInsert,
     // inside a one-type directory so verifyIntegrity audits it.
     {
-        var database = try Database.create(testing.allocator, path_a);
+        var database = try Database.create(testing.allocator, pathA);
         defer database.deinit();
         var w = try database.beginWrite();
         const dir = try typedir.createTypes(&w, &.{&appendDefinitions}, &.{false});
@@ -782,8 +782,8 @@ test "bulkAppendOrInsert falls back and equals row-by-row for a scattered batch"
         var primaryKey: u64 = 0;
         while (primaryKey < BASE) : (primaryKey += 1) catalogRef = (try rawRows.insert(&w, catalogRef, &.{ primaryKey, primaryKey * 3 })).catalogRef;
         const newCatalog = try bulkAppendOrInsert(&w, catalogRef, &batch);
-        const new_dir = try typedir.setCatalogRef(&w, dir, 0, newCatalog);
-        w.setRoot(new_dir);
+        const newDir = try typedir.setCatalogRef(&w, dir, 0, newCatalog);
+        w.setRoot(newDir);
         _ = try w.commit();
         try verification.verifyIntegrity(&database);
     }
@@ -791,7 +791,7 @@ test "bulkAppendOrInsert falls back and equals row-by-row for a scattered batch"
     // database B: base via insert, then the same scattered rows inserted one at a time
     // in the SAME order the fallback uses.
     {
-        var database = try Database.create(testing.allocator, path_b);
+        var database = try Database.create(testing.allocator, pathB);
         defer database.deinit();
         var w = try database.beginWrite();
         var catalogRef = try catalog.createFromDefinitions(&w, &appendDefinitions);
@@ -802,10 +802,10 @@ test "bulkAppendOrInsert falls back and equals row-by-row for a scattered batch"
         _ = try w.commit();
     }
 
-    var da = try Database.open(testing.allocator, path_a);
+    var da = try Database.open(testing.allocator, pathA);
     defer da.deinit();
     try verification.verifyIntegrity(&da);
-    var databaseB = try Database.open(testing.allocator, path_b);
+    var databaseB = try Database.open(testing.allocator, pathB);
     defer databaseB.deinit();
 
     var ra = try da.beginRead();

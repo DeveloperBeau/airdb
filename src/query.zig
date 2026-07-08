@@ -46,25 +46,25 @@ const Scan = struct {
     // index. Captured so the planner can drive a query off the index without a
     // second catalog deref.
     indexed: [MAX_PROPS]bool,
-    value_index_refs: [MAX_PROPS]Reference,
+    valueIndexRefs: [MAX_PROPS]Reference,
     propertyCount: usize,
-    live_ref: Reference,
-    keyrow_index_ref: Reference,
-    next_row: u64,
+    liveRef: Reference,
+    keyrowIndexRef: Reference,
+    nextRow: u64,
 };
 
 fn openScan(transaction: anytype, catalogRef: Reference) !Scan {
     const view = try catalog.loadCatalog(transaction, catalogRef);
     var scan: Scan = undefined;
     scan.propertyCount = view.propertyCount;
-    scan.live_ref = view.live_col_ref;
-    scan.keyrow_index_ref = view.keyrow_index_ref;
-    scan.next_row = view.next_row;
+    scan.liveRef = view.liveColRef;
+    scan.keyrowIndexRef = view.keyrowIndexRef;
+    scan.nextRow = view.nextRow;
     var propertyIndex: usize = 0;
     while (propertyIndex < view.propertyCount) : (propertyIndex += 1) {
         scan.propertyRefs[propertyIndex] = view.propertyColumnRef(propertyIndex);
         scan.indexed[propertyIndex] = view.indexed(propertyIndex);
-        scan.value_index_refs[propertyIndex] = view.valueIndexRef(propertyIndex);
+        scan.valueIndexRefs[propertyIndex] = view.valueIndexRef(propertyIndex);
     }
     return scan;
 }
@@ -83,7 +83,7 @@ fn rowMatches(transaction: anytype, scan: *const Scan, row: u64, predicates: []c
 
 // Full row evaluation: live check plus every predicate (logical AND).
 fn evalRow(transaction: anytype, scan: *const Scan, row: u64, predicates: []const Predicate) !bool {
-    if ((try Column.get(transaction, scan.live_ref, row)) == 0) return false;
+    if ((try Column.get(transaction, scan.liveRef, row)) == 0) return false;
     return rowMatches(transaction, scan, row, predicates);
 }
 
@@ -122,18 +122,18 @@ const Pair = struct { objectKey: u64, row: u64 };
 // Prefers an indexed eq predicate (most selective); otherwise the first indexed
 // range predicate. `ne` is never index-driven (negation is not index-friendly).
 fn pickDriving(scan: *const Scan, predicates: []const Predicate) ?usize {
-    var range_choice: ?usize = null;
+    var rangeChoice: ?usize = null;
     for (predicates, 0..) |predicate, rowIndex| {
         if (predicate.property >= scan.propertyCount or !scan.indexed[predicate.property]) continue;
         switch (predicate.operator) {
             .eq => return rowIndex, // most selective: drive off it immediately
-            .lt, .le, .gt, .ge => if (range_choice == null) {
-                range_choice = rowIndex;
+            .lt, .le, .gt, .ge => if (rangeChoice == null) {
+                rangeChoice = rowIndex;
             },
             .ne => {},
         }
     }
-    return range_choice;
+    return rangeChoice;
 }
 
 // Translate a range operator + value into an inclusive [lo, hi] over u64.
@@ -182,29 +182,29 @@ fn collectCandidatePairs(
     pairs: *std.ArrayList(Pair),
     allocator: std.mem.Allocator,
 ) !void {
-    const valueIndexRef = scan.value_index_refs[driver.property];
+    const valueIndexRef = scan.valueIndexRefs[driver.property];
     var objectKeys = std.ArrayList(u64).empty;
     defer objectKeys.deinit(allocator);
 
     if (driver.operator == .eq) {
-        if (try index.get(transaction, valueIndexRef, driver.value)) |inner_root| {
-            if (inner_root != 0) {
-                try index.forEachKey(transaction, inner_root, ObjectKeyCollector{ .list = &objectKeys, .allocator = allocator }, ObjectKeyCollector.onKey);
+        if (try index.get(transaction, valueIndexRef, driver.value)) |innerRoot| {
+            if (innerRoot != 0) {
+                try index.forEachKey(transaction, innerRoot, ObjectKeyCollector{ .list = &objectKeys, .allocator = allocator }, ObjectKeyCollector.onKey);
             }
         }
     } else {
         const bounds = rangeBounds(driver.operator, driver.value) orelse return; // empty range
-        var inner_roots = std.ArrayList(u64).empty;
-        defer inner_roots.deinit(allocator);
-        try index.forEachEntryInRange(transaction, valueIndexRef, bounds.lo, bounds.hi, InnerRootCollector{ .list = &inner_roots, .allocator = allocator }, InnerRootCollector.onEntry);
-        for (inner_roots.items) |inner_root| {
-            if (inner_root == 0) continue;
-            try index.forEachKey(transaction, inner_root, ObjectKeyCollector{ .list = &objectKeys, .allocator = allocator }, ObjectKeyCollector.onKey);
+        var innerRoots = std.ArrayList(u64).empty;
+        defer innerRoots.deinit(allocator);
+        try index.forEachEntryInRange(transaction, valueIndexRef, bounds.lo, bounds.hi, InnerRootCollector{ .list = &innerRoots, .allocator = allocator }, InnerRootCollector.onEntry);
+        for (innerRoots.items) |innerRoot| {
+            if (innerRoot == 0) continue;
+            try index.forEachKey(transaction, innerRoot, ObjectKeyCollector{ .list = &objectKeys, .allocator = allocator }, ObjectKeyCollector.onKey);
         }
     }
 
     for (objectKeys.items) |objectKey| {
-        const row = (try index.get(transaction, scan.keyrow_index_ref, objectKey)) orelse continue;
+        const row = (try index.get(transaction, scan.keyrowIndexRef, objectKey)) orelse continue;
         try pairs.append(allocator, .{ .objectKey = objectKey, .row = row });
     }
     std.mem.sort(Pair, pairs.items, {}, struct {
@@ -245,7 +245,7 @@ fn runQuery(
             if (try evalRow(self.transaction, self.scan, row, self.predicates)) try onMatch(self.inner, objectKey, row);
         }
     };
-    try index.forEachEntry(transaction, scan.keyrow_index_ref, Stream{ .transaction = transaction, .scan = scan, .predicates = predicates, .inner = ctx }, Stream.onEntry);
+    try index.forEachEntry(transaction, scan.keyrowIndexRef, Stream{ .transaction = transaction, .scan = scan, .predicates = predicates, .inner = ctx }, Stream.onEntry);
 }
 
 // Test-only: expose the driving-predicate choice so equivalence tests can assert

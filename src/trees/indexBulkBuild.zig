@@ -19,14 +19,14 @@ const index = @import("index.zig");
 // Local aliases for the on-disk node format and the shared tree walkers.
 const leafCap = node.leafCap;
 const fanout = node.fanout;
-const kind_leaf = node.kind_leaf;
-const leaf_node_size = node.leaf_node_size;
-const inner_node_size = node.inner_node_size;
+const kindLeaf = node.kindLeaf;
+const leafNodeSize = node.leafNodeSize;
+const innerNodeSize = node.innerNodeSize;
 const encodeLeaf = node.encodeLeaf;
 const parseLeaf = node.parseLeaf;
 const encodeInner = node.encodeInner;
 const parseInner = node.parseInner;
-const max_depth = index.max_depth;
+const maxDepth = index.maxDepth;
 const derefNode = index.derefNode;
 
 /// A node together with the low key (smallest key in its subtree) and its
@@ -49,7 +49,7 @@ pub fn packLeaves(
     var start: usize = 0;
     while (start < keys.len) {
         const end = @min(start + capacity, keys.len);
-        const allocation = try transaction.alloc(leaf_node_size);
+        const allocation = try transaction.alloc(leafNodeSize);
         _ = encodeLeaf(allocation.bytes, keys[start..end], values[start..end]);
         try out.append(allocator, .{ .ref = allocation.ref, .low = keys[start], .count = @intCast(end - start) });
         start = end;
@@ -58,7 +58,7 @@ pub fn packLeaves(
 }
 
 /// Build one inner level over `children`, packed in runs of fanout. An inner
-/// node stores (child_ref, low_key, subtree_count); a parent's low key is the
+/// node stores (childRef, lowKey, subtreeCount); a parent's low key is the
 /// low key of its first child and its count is the sum of its run.
 pub fn stackInner(
     transaction: anytype,
@@ -83,7 +83,7 @@ pub fn stackInner(
             total += children[childPosition].count;
         }
         const runLength = end - runStart;
-        const allocation = try transaction.alloc(inner_node_size);
+        const allocation = try transaction.alloc(innerNodeSize);
         _ = encodeInner(allocation.bytes, refs[0..runLength], lows[0..runLength], counts[0..runLength]);
         try out.append(allocator, .{ .ref = allocation.ref, .low = children[runStart].low, .count = total });
         runStart = end;
@@ -112,21 +112,21 @@ pub fn collapseToRoot(
 fn descendRightEdge(
     transaction: anytype,
     root: Reference,
-    path_refs: *std.ArrayList(Reference),
-    path_rightmost: *std.ArrayList(usize),
+    pathRefs: *std.ArrayList(Reference),
+    pathRightmost: *std.ArrayList(usize),
     allocator: std.mem.Allocator,
 ) !Reference {
     var currentRef: Reference = root;
     var hops: usize = 0;
     while (true) : (hops += 1) {
-        if (hops >= max_depth) return error.Corrupt; // ref cycle guard
+        if (hops >= maxDepth) return error.Corrupt; // ref cycle guard
         const nodeBytes = try derefNode(transaction, currentRef);
-        if (nodeBytes[0] == kind_leaf) return currentRef;
+        if (nodeBytes[0] == kindLeaf) return currentRef;
         const innerView = try parseInner(nodeBytes);
-        const rightmostIndex: usize = innerView.child_count - 1;
+        const rightmostIndex: usize = innerView.childCount - 1;
         const child = innerView.childRef(rightmostIndex);
-        try path_refs.append(allocator, currentRef);
-        try path_rightmost.append(allocator, rightmostIndex);
+        try pathRefs.append(allocator, currentRef);
+        try pathRightmost.append(allocator, rightmostIndex);
         currentRef = child;
     }
 }
@@ -141,12 +141,12 @@ const CombinedRun = struct { keys: []u64, values: []u64 };
 /// run's first key clears the leaf's current max.
 fn combineLeafAndRun(
     transaction: anytype,
-    leaf_ref: Reference,
+    leafRef: Reference,
     keys: []const u64,
     values: []const u64,
     allocator: std.mem.Allocator,
 ) !CombinedRun {
-    const leafView = try parseLeaf(try derefNode(transaction, leaf_ref));
+    const leafView = try parseLeaf(try derefNode(transaction, leafRef));
     if (std.debug.runtime_safety and leafView.count > 0) {
         std.debug.assert(keys[0] > leafView.key(leafView.count - 1));
     }
@@ -175,16 +175,16 @@ fn combineLeafAndRun(
 /// as additional children of the next level. Replaces `level` in place.
 fn rebuildRightSpine(
     transaction: anytype,
-    path_refs: []const Reference,
-    path_rightmost: []const usize,
+    pathRefs: []const Reference,
+    pathRightmost: []const usize,
     level: *std.ArrayList(Child),
     allocator: std.mem.Allocator,
 ) !void {
-    var levelIndex: usize = path_refs.len;
+    var levelIndex: usize = pathRefs.len;
     while (levelIndex > 0) {
         levelIndex -= 1;
-        const innerView = try parseInner(try derefNode(transaction, path_refs[levelIndex]));
-        const rightmostIndex = path_rightmost[levelIndex];
+        const innerView = try parseInner(try derefNode(transaction, pathRefs[levelIndex]));
+        const rightmostIndex = pathRightmost[levelIndex];
         var full = std.ArrayList(Child).empty;
         defer full.deinit(allocator);
         var childIndex: usize = 0;
@@ -223,17 +223,17 @@ pub fn appendRun(
     }
 
     // 1. Record the rightmost path: it is the only part of the tree rebuilt.
-    var path_refs = std.ArrayList(Reference).empty;
-    defer path_refs.deinit(allocator);
-    var path_rightmost = std.ArrayList(usize).empty;
-    defer path_rightmost.deinit(allocator);
-    const leaf_ref = try descendRightEdge(transaction, root, &path_refs, &path_rightmost, allocator);
+    var pathRefs = std.ArrayList(Reference).empty;
+    defer pathRefs.deinit(allocator);
+    var pathRightmost = std.ArrayList(usize).empty;
+    defer pathRightmost.deinit(allocator);
+    const leafRef = try descendRightEdge(transaction, root, &pathRefs, &pathRightmost, allocator);
 
     // 2. Combine the rightmost leaf's pairs with the run, then pack the
     //    combined run into leaves filled to leafCap: the first new leaf reuses
     //    the old leaf's content topped up from the front of the run, the rest
     //    are full leaves.
-    const combined = try combineLeafAndRun(transaction, leaf_ref, keys, values, allocator);
+    const combined = try combineLeafAndRun(transaction, leafRef, keys, values, allocator);
     defer allocator.free(combined.keys);
     defer allocator.free(combined.values);
     var level = try packLeaves(transaction, combined.keys, combined.values, allocator);
@@ -243,7 +243,7 @@ pub fn appendRun(
     //    levels until a single root remains (the rebuilt root level may have
     //    overflowed fanout into several nodes), growing the tree height by one
     //    or more as needed.
-    try rebuildRightSpine(transaction, path_refs.items, path_rightmost.items, &level, allocator);
+    try rebuildRightSpine(transaction, pathRefs.items, pathRightmost.items, &level, allocator);
     try collapseToRoot(transaction, &level, allocator);
 
     const result = level.items[0].ref;
@@ -254,8 +254,8 @@ pub fn appendRun(
     //    (MVCC-safe) reclaim; transaction-private ones become immediately reusable.
     //    These frees are fallible, so they run BEFORE the manual level.deinit:
     //    the errdefer must never fire on an already-deinitialized list.
-    try transaction.free(leaf_ref, leaf_node_size);
-    for (path_refs.items) |old_ref| try transaction.free(old_ref, inner_node_size);
+    try transaction.free(leafRef, leafNodeSize);
+    for (pathRefs.items) |oldRef| try transaction.free(oldRef, innerNodeSize);
 
     level.deinit(allocator);
     return result;

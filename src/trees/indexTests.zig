@@ -20,8 +20,8 @@ const forEachEntryInRange = index.forEachEntryInRange;
 const appendRun = index.appendRun;
 const makeInnerForTest = index.makeInnerForTest;
 
-const leaf_node_size = node.leaf_node_size;
-const inner_node_size = node.inner_node_size;
+const leafNodeSize = node.leafNodeSize;
+const innerNodeSize = node.innerNodeSize;
 const encodeLeaf = node.encodeLeaf;
 const encodeInner = node.encodeInner;
 
@@ -44,7 +44,7 @@ test "a ref cycle or unknown kind byte fails with error.Corrupt" {
     // An inner node whose only child is itself: every walk must hit the depth
     // cap and error out rather than overflow the stack. (count is exempt: it is
     // a single-node read of the stored subtree counts and never descends.)
-    const a = try w.alloc(inner_node_size);
+    const a = try w.alloc(innerNodeSize);
     _ = encodeInner(a.bytes, &.{a.ref}, &.{0}, &.{1});
     try testing.expectError(error.Corrupt, get(&w, a.ref, 5));
     try testing.expectError(error.Corrupt, maxKey(&w, a.ref));
@@ -56,7 +56,7 @@ test "a ref cycle or unknown kind byte fails with error.Corrupt" {
     try testing.expectError(error.Corrupt, forEachKey(&w, a.ref, NopSink{}, NopSink.onKey));
 
     // A node with an out-of-range kind byte is rejected outright.
-    const b = try w.alloc(leaf_node_size);
+    const b = try w.alloc(leafNodeSize);
     _ = encodeLeaf(b.bytes, &.{}, &.{});
     // Rewrite the kind byte through the arena (b.bytes is mutable).
     b.bytes[0] = 7;
@@ -102,15 +102,15 @@ test "insert builds a balanced tree across many leaves and reads back correctly"
         const k = (i *% 2654435761) % 1_000_003; // scattered keys force mid-splits
         root = try insert(&w, root, k, k +% 7);
     }
-    var ref_map = std.AutoHashMap(u64, u64).init(testing.allocator);
-    defer ref_map.deinit();
+    var refMap = std.AutoHashMap(u64, u64).init(testing.allocator);
+    defer refMap.deinit();
     i = 0;
     while (i < N) : (i += 1) {
         const k = (i *% 2654435761) % 1_000_003;
-        try ref_map.put(k, k +% 7);
+        try refMap.put(k, k +% 7);
     }
-    try testing.expectEqual(@as(u64, ref_map.count()), try count(&w, root));
-    var it = ref_map.iterator();
+    try testing.expectEqual(@as(u64, refMap.count()), try count(&w, root));
+    var it = refMap.iterator();
     while (it.next()) |e| {
         try testing.expectEqual(@as(?u64, e.value_ptr.*), try get(&w, root, e.key_ptr.*));
     }
@@ -162,13 +162,13 @@ test "a committed index version stays intact for a pinned reader while a later c
 
     // Pin a reader on version 1.
     var r1 = try database.beginRead();
-    const root_v1 = r1.root();
-    try testing.expectEqual(@as(?u64, 1234 * 10), try get(&r1, root_v1, 1234));
+    const rootV1 = r1.root();
+    try testing.expectEqual(@as(?u64, 1234 * 10), try get(&r1, rootV1, 1234));
 
     // Commit version 2: update key 1234, remove key 500.
     {
         var w = try database.beginWrite();
-        var root = w.new_root; // start from the latest committed root (refreshed in beginWrite)
+        var root = w.newRoot; // start from the latest committed root (refreshed in beginWrite)
         root = try insert(&w, root, 1234, 999999);
         root = try remove(&w, root, 500);
         w.setRoot(root);
@@ -176,8 +176,8 @@ test "a committed index version stays intact for a pinned reader while a later c
     }
 
     // The pinned v1 reader still sees the original values (committed snapshot intact).
-    try testing.expectEqual(@as(?u64, 1234 * 10), try get(&r1, root_v1, 1234));
-    try testing.expectEqual(@as(?u64, 500 * 10), try get(&r1, root_v1, 500));
+    try testing.expectEqual(@as(?u64, 1234 * 10), try get(&r1, rootV1, 1234));
+    try testing.expectEqual(@as(?u64, 500 * 10), try get(&r1, rootV1, 500));
     r1.end();
 
     // A fresh read sees version 2.
@@ -483,8 +483,8 @@ test "ordered index persists across reopen and matches a reference map under chu
     defer tmp.cleanup();
     const path = try idxTmpPath(testing.allocator, &tmp, "idx6.airdb");
     defer testing.allocator.free(path);
-    var ref_map = std.AutoHashMap(u64, u64).init(testing.allocator);
-    defer ref_map.deinit();
+    var refMap = std.AutoHashMap(u64, u64).init(testing.allocator);
+    defer refMap.deinit();
     const N: u64 = 100_000;
     {
         var database = try Database.create(testing.allocator, path);
@@ -495,14 +495,14 @@ test "ordered index persists across reopen and matches a reference map under chu
         while (i < N) : (i += 1) {
             const k = (i *% 2654435761) % 5_000_011;
             root = try insert(&w, root, k, i);
-            try ref_map.put(k, i);
+            try refMap.put(k, i);
         }
         // Remove every 3rd inserted key.
         i = 0;
         while (i < N) : (i += 3) {
             const k = (i *% 2654435761) % 5_000_011;
             root = try remove(&w, root, k);
-            _ = ref_map.remove(k);
+            _ = refMap.remove(k);
         }
         w.setRoot(root);
         _ = try w.commit();
@@ -511,8 +511,8 @@ test "ordered index persists across reopen and matches a reference map under chu
         var database = try Database.open(testing.allocator, path);
         defer database.deinit();
         var r = try database.beginRead();
-        try testing.expectEqual(@as(u64, ref_map.count()), try count(&r, r.root()));
-        var it = ref_map.iterator();
+        try testing.expectEqual(@as(u64, refMap.count()), try count(&r, r.root()));
+        var it = refMap.iterator();
         while (it.next()) |e| {
             try testing.expectEqual(@as(?u64, e.value_ptr.*), try get(&r, r.root(), e.key_ptr.*));
         }
@@ -520,7 +520,7 @@ test "ordered index persists across reopen and matches a reference map under chu
         var j: u64 = 0;
         while (j < 30) : (j += 3) {
             const k = (j *% 2654435761) % 5_000_011;
-            if (!ref_map.contains(k)) try testing.expect((try get(&r, r.root(), k)) == null);
+            if (!refMap.contains(k)) try testing.expect((try get(&r, r.root(), k)) == null);
         }
         r.end();
     }
@@ -540,9 +540,9 @@ fn appendTmpDatabase(tmp: *testing.TmpDir, name: []const u8) !Database {
 // base..base+run via appendRun, and assert the result is logically identical
 // to inserting all keys 0..base+run sequentially.
 fn checkAppendEquiv(w: *WriteTransaction, base: u64, run: u64) !void {
-    var base_root = try create(w);
+    var baseRoot = try create(w);
     var k: u64 = 0;
-    while (k < base) : (k += 1) base_root = try insert(w, base_root, k, appendRunVal(k));
+    while (k < base) : (k += 1) baseRoot = try insert(w, baseRoot, k, appendRunVal(k));
 
     const rk = try testing.allocator.alloc(u64, run);
     defer testing.allocator.free(rk);
@@ -554,7 +554,7 @@ fn checkAppendEquiv(w: *WriteTransaction, base: u64, run: u64) !void {
         rv[r] = appendRunVal(base + r);
     }
 
-    const appended = try appendRun(w, base_root, rk, rv, testing.allocator);
+    const appended = try appendRun(w, baseRoot, rk, rv, testing.allocator);
 
     var expected = try create(w);
     k = 0;
@@ -662,12 +662,12 @@ test "appendRun empty run is a no-op" {
     var database = try appendTmpDatabase(&tmp, "append6.airdb");
     defer database.deinit();
     var w = try database.beginWrite();
-    var base_root = try create(&w);
+    var baseRoot = try create(&w);
     var k: u64 = 0;
-    while (k < 100) : (k += 1) base_root = try insert(&w, base_root, k, appendRunVal(k));
-    const before = try count(&w, base_root);
-    const appended = try appendRun(&w, base_root, &.{}, &.{}, testing.allocator);
-    try testing.expectEqual(base_root, appended); // same ref, unchanged
+    while (k < 100) : (k += 1) baseRoot = try insert(&w, baseRoot, k, appendRunVal(k));
+    const before = try count(&w, baseRoot);
+    const appended = try appendRun(&w, baseRoot, &.{}, &.{}, testing.allocator);
+    try testing.expectEqual(baseRoot, appended); // same ref, unchanged
     try testing.expectEqual(before, try count(&w, appended));
     w.deinit();
 }

@@ -12,32 +12,32 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-const is_windows = builtin.os.tag == .windows;
+const isWindows = builtin.os.tag == .windows;
 
 /// Compile-time lower bound on the page size; the alignment the kernel guarantees
 /// for mmap return pointers.
 const page = std.heap.page_size_min;
 
 /// Per-open maximum file size. The file is mapped as a list of fixed-size sections;
-/// this caps how many sections may be created (max_sections = max_reserved / section_size),
+/// this caps how many sections may be created (maxSections = maxReserved / sectionSize),
 /// keeping the section array bounded.
 /// 64-bit: 1 TiB. 32-bit: 1 GiB.
-pub const max_reserved: usize = if (@bitSizeOf(usize) >= 64) (1 << 40) else (1 << 30);
+pub const maxReserved: usize = if (@bitSizeOf(usize) >= 64) (1 << 40) else (1 << 30);
 
 /// The file is mapped in fixed-size sections. A ref (an absolute byte offset into the
 /// logical arena) is translated to a pointer via the section it falls in:
-///   section_index   = ref >> section_shift
-///   offset_in_section = ref & section_mask
+///   sectionIndex   = ref >> sectionShift
+///   offsetInSection = ref & sectionMask
 /// Existing sections are never remapped or moved on growth (growth only ADDS sections),
 /// so every live pointer stays valid. No single allocation may cross a section boundary,
-/// which also makes section_size the maximum single allocation size.
-pub const section_shift: u6 = 24;
-pub const section_size: usize = 1 << section_shift; // 16 MiB
-pub const section_mask: usize = section_size - 1;
+/// which also makes sectionSize the maximum single allocation size.
+pub const sectionShift: u6 = 24;
+pub const sectionSize: usize = 1 << sectionShift; // 16 MiB
+pub const sectionMask: usize = sectionSize - 1;
 
 // Windows API bindings, declared locally so the module is self-contained. Gated so
 // the .winapi externs are only present when compiling for Windows.
-const win = if (is_windows) struct {
+const win = if (isWindows) struct {
     const windows = std.os.windows;
     const HANDLE = windows.HANDLE;
     const DWORD = windows.DWORD;
@@ -68,8 +68,8 @@ const win = if (is_windows) struct {
     };
     const WAIT_OBJECT_0: DWORD = 0x00000000;
     const WAIT_TIMEOUT: DWORD = 0x00000102;
-    const lock_all_low: DWORD = 0xFFFFFFFF;
-    const lock_all_high: DWORD = 0xFFFFFFFF;
+    const lockAllLow: DWORD = 0xFFFFFFFF;
+    const lockAllHigh: DWORD = 0xFFFFFFFF;
 
     extern "kernel32" fn CreateFileMappingW(hFile: HANDLE, lpAttrs: ?*anyopaque, flProtect: DWORD, dwMaxHigh: DWORD, dwMaxLow: DWORD, lpName: ?[*:0]const u16) callconv(.winapi) ?HANDLE;
     extern "kernel32" fn MapViewOfFile(hMap: HANDLE, access: DWORD, offHigh: DWORD, offLow: DWORD, bytes: usize) callconv(.winapi) ?*anyopaque;
@@ -117,11 +117,11 @@ fn windowsPeakWorkingSet() usize {
 /// creating additional Sections, never by remapping or moving an existing one.
 pub const Section = struct {
     map: []align(page) u8,
-    handle: if (is_windows) win.HANDLE else void,
+    handle: if (isWindows) win.HANDLE else void,
 
     /// Release this section's mapping.
     pub fn unmap(self: *Section) void {
-        if (is_windows) {
+        if (isWindows) {
             _ = win.UnmapViewOfFile(self.map.ptr);
             _ = win.CloseHandle(self.handle);
         } else {
@@ -130,20 +130,20 @@ pub const Section = struct {
     }
 };
 
-/// Map `[file_offset, file_offset + length)` of `file` as a shared, read/write section.
-/// The caller guarantees the file is at least `file_offset + length` bytes long and that
-/// `file_offset` is a multiple of the OS allocation granularity (it is: every caller
-/// passes a multiple of `section_size`, which is 16 MiB).
-pub fn mapSection(file: std.Io.File, file_offset: u64, length: usize) !Section {
-    if (is_windows) {
+/// Map `[fileOffset, fileOffset + length)` of `file` as a shared, read/write section.
+/// The caller guarantees the file is at least `fileOffset + length` bytes long and that
+/// `fileOffset` is a multiple of the OS allocation granularity (it is: every caller
+/// passes a multiple of `sectionSize`, which is 16 MiB).
+pub fn mapSection(file: std.Io.File, fileOffset: u64, length: usize) !Section {
+    if (isWindows) {
         // One file-mapping object per section. Passing max-size 0 makes the object track
         // the current file size; the view starts at the section's file offset. The file
         // has already been extended to cover this section, so the view is fully backed.
         const mappingHandle = win.CreateFileMappingW(file.handle, null, win.PAGE_READWRITE, 0, 0, null) orelse return error.MapFailed;
         errdefer _ = win.CloseHandle(mappingHandle);
-        const off_high: win.DWORD = @intCast(file_offset >> 32);
-        const off_low: win.DWORD = @intCast(file_offset & 0xFFFFFFFF);
-        const ptr = win.MapViewOfFile(mappingHandle, win.FILE_MAP_READ | win.FILE_MAP_WRITE, off_high, off_low, length) orelse return error.MapFailed;
+        const offHigh: win.DWORD = @intCast(fileOffset >> 32);
+        const offLow: win.DWORD = @intCast(fileOffset & 0xFFFFFFFF);
+        const ptr = win.MapViewOfFile(mappingHandle, win.FILE_MAP_READ | win.FILE_MAP_WRITE, offHigh, offLow, length) orelse return error.MapFailed;
         const base: [*]align(page) u8 = @ptrCast(@alignCast(ptr));
         return .{ .map = base[0..length], .handle = mappingHandle };
     } else {
@@ -153,7 +153,7 @@ pub fn mapSection(file: std.Io.File, file_offset: u64, length: usize) !Section {
             .{ .READ = true, .WRITE = true },
             .{ .TYPE = .SHARED },
             file.handle,
-            file_offset,
+            fileOffset,
         );
         return .{ .map = mapped, .handle = {} };
     }
@@ -167,11 +167,11 @@ pub fn mapSection(file: std.Io.File, file_offset: u64, length: usize) !Section {
 /// Returns true once the lock is held. When `blocking` is false and another holder
 /// owns the lock, returns false immediately instead of blocking. Other failures error.
 pub fn lockFileExclusive(file: std.Io.File, blocking: bool) !bool {
-    if (is_windows) {
+    if (isWindows) {
         var overlapped = std.mem.zeroes(win.OVERLAPPED);
         var flags: win.DWORD = win.LOCKFILE_EXCLUSIVE_LOCK;
         if (!blocking) flags |= win.LOCKFILE_FAIL_IMMEDIATELY;
-        if (win.LockFileEx(file.handle, flags, 0, win.lock_all_low, win.lock_all_high, &overlapped) != 0) return true;
+        if (win.LockFileEx(file.handle, flags, 0, win.lockAllLow, win.lockAllHigh, &overlapped) != 0) return true;
         if (!blocking) return false; // contended (ERROR_LOCK_VIOLATION / IO_PENDING)
         return error.LockFailed;
     } else {
@@ -190,9 +190,9 @@ pub fn lockFileExclusive(file: std.Io.File, blocking: bool) !bool {
 
 /// Release the advisory lock held on `file`.
 pub fn unlockFile(file: std.Io.File) void {
-    if (is_windows) {
+    if (isWindows) {
         var overlapped = std.mem.zeroes(win.OVERLAPPED);
-        _ = win.UnlockFileEx(file.handle, 0, win.lock_all_low, win.lock_all_high, &overlapped);
+        _ = win.UnlockFileEx(file.handle, 0, win.lockAllLow, win.lockAllHigh, &overlapped);
     } else {
         _ = std.c.flock(file.handle, std.posix.LOCK.UN);
     }
@@ -204,7 +204,7 @@ pub fn unlockFile(file: std.Io.File) void {
 
 /// The current process id.
 pub fn currentPid() u32 {
-    if (is_windows) {
+    if (isWindows) {
         return @intCast(win.GetCurrentProcessId());
     } else {
         return @intCast(std.c.getpid());
@@ -219,7 +219,7 @@ pub fn currentPid() u32 {
 /// a recycled pid AND a start-time collision in the same microsecond class.
 pub fn processStartToken(pid: u32) ?u64 {
     if (pid == 0) return null;
-    if (is_windows) {
+    if (isWindows) {
         const processHandle = win.OpenProcess(win.PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) orelse return null;
         defer _ = win.CloseHandle(processHandle);
         var creation: win.FILETIME = undefined;
@@ -266,7 +266,7 @@ pub fn processStartToken(pid: u32) ?u64 {
 /// pid==0 is always considered dead (free slot sentinel).
 pub fn processAlive(pid: u32) bool {
     if (pid == 0) return false;
-    if (is_windows) {
+    if (isWindows) {
         const processHandle = win.OpenProcess(win.SYNCHRONIZE, 0, pid) orelse return false; // gone
         defer _ = win.CloseHandle(processHandle);
         // Alive if it has not become signaled (exited) within a 0ms wait.
@@ -293,7 +293,7 @@ pub fn processAlive(pid: u32) bool {
 // uses this as its memory signal. getrusage reports ru_maxrss in KiB on Linux
 // and in bytes on Darwin; Windows reports PeakWorkingSetSize in bytes.
 pub fn peakResidentBytes() usize {
-    if (is_windows) return windowsPeakWorkingSet();
+    if (isWindows) return windowsPeakWorkingSet();
     const usage = std.posix.getrusage(std.posix.rusage.SELF);
     const maxrss: usize = @intCast(usage.maxrss);
     return if (builtin.os.tag == .macos) maxrss else maxrss * 1024;
@@ -318,7 +318,7 @@ test "peakResidentBytes returns a plausible nonzero value" {
 // available, so this reports the single PageFaultCount (which does not split
 // minor/major) as `minor` and 0 as `major`.
 pub fn pageFaults() struct { minor: u64, major: u64 } {
-    if (is_windows) {
+    if (isWindows) {
         var counters = std.mem.zeroes(win.PROCESS_MEMORY_COUNTERS);
         counters.cb = @sizeOf(win.PROCESS_MEMORY_COUNTERS);
         if (win.GetProcessMemoryInfo(win.GetCurrentProcess(), &counters, counters.cb) == 0) {

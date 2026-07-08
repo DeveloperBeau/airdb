@@ -5,10 +5,10 @@ const Column = @import("../trees/column.zig");
 const Index = @import("../trees/index.zig");
 
 pub const PropertyCount = u16;
-pub const PropertyKind = enum(u8) { int = 0, blob = 1, list = 2, set = 3, link = 4, link_set = 5, dict = 6 };
+pub const PropertyKind = enum(u8) { int = 0, blob = 1, list = 2, set = 3, link = 4, linkSet = 5, dict = 6 };
 pub const ElementKind = enum(u8) { int = 0, blob = 1 };
 pub const DeletionRule = enum(u8) { nullify = 0, cascade = 1, block = 2 };
-pub const PropertyDefinition = struct { kind: PropertyKind, element: ElementKind = .int, link_target: u16 = 0, del_rule: DeletionRule = .nullify, indexed: bool = false };
+pub const PropertyDefinition = struct { kind: PropertyKind, element: ElementKind = .int, linkTarget: u16 = 0, delRule: DeletionRule = .nullify, indexed: bool = false };
 // A single byte-keyed dictionary entry: a byte-string key mapped to a u64 value
 // (an int, or an object key for a "dict of links" -- u64 covers both).
 pub const DictEntry = struct { key: []const u8, value: u64 };
@@ -21,37 +21,37 @@ pub const Value = union(enum) {
     //                routes a transaction-private node to the immediate-reuse pool, so
     //                the next allocation may scribble it. Copy the bytes out
     //                before mutating if they must survive.
-    //   .blob_ref -- a blob larger than the inline cap, stored chunked and thus
+    //   .blobRef -- a blob larger than the inline cap, stored chunked and thus
     //                without a single contiguous slice. The caller materializes
     //                it with `blob.getAlloc(transaction, ref, allocator)` and frees the
     //                returned buffer.
     bytes: []const u8,
-    blob_ref: Reference,
-    list_int: []const u64,
-    list_blob: []const []const u8,
-    set_int: []const u64,
-    set_blob: []const []const u8,
-    dict_int: []const DictEntry,
-    coll_root: Reference, // read side: getTyped returns this for list/set/dict/link_set properties
+    blobRef: Reference,
+    listInt: []const u64,
+    listBlob: []const []const u8,
+    setInt: []const u64,
+    setBlob: []const []const u8,
+    dictInt: []const DictEntry,
+    collRoot: Reference, // read side: getTyped returns this for list/set/dict/linkSet properties
     link: ?u64,
-    link_set: []const u64, // to-many: initial set of target objectKeys
+    linkSet: []const u64, // to-many: initial set of target objectKeys
 };
 
 // Catalog node layout:
-// [propertyCount u16][next_row u64][primaryKeyIndexRef u64][version_col_ref u64][live_col_ref u64]
+// [propertyCount u16][nextRow u64][primaryKeyIndexRef u64][versionColRef u64][liveColRef u64]
 // [propertyCount * (propertyColumnRef u64)][propertyCount * (kind u8)][propertyCount * (element u8)]
-// [propertyCount * (backlink_ref u64)][propertyCount * (link_target u16)][propertyCount * (del_rule u8)]
-// [propertyCount * (value_index_ref u64)][propertyCount * (indexed u8)]
+// [propertyCount * (backlinkRef u64)][propertyCount * (linkTarget u16)][propertyCount * (delRule u8)]
+// [propertyCount * (valueIndexRef u64)][propertyCount * (indexed u8)]
 //
 // The value-index ref and indexed flag arrays are appended last so the earlier
 // per-property arrays keep their existing offsets unchanged.
 const propertyCountOffset: usize = 0;
-const off_next_row: usize = 2;
+const offNextRow: usize = 2;
 const primaryKeyIndexRefOffset: usize = 10;
-const off_version_col_ref: usize = 18;
-const off_live_col_ref: usize = 26;
-const off_keyrow_index_ref: usize = 34;
-const off_next_key: usize = 42;
+const offVersionColRef: usize = 18;
+const offLiveColRef: usize = 26;
+const offKeyrowIndexRef: usize = 34;
+const offNextKey: usize = 42;
 const propertyColumnsOffset: usize = 50;
 
 pub const maxPropertyCount: usize = 256;
@@ -92,29 +92,29 @@ fn indexedFlagsOffset(propertyCount: PropertyCount) usize {
 pub fn writeCatalog(
     transaction: *WriteTransaction,
     propertyCount: PropertyCount,
-    next_row: u64,
-    keyrow_index_ref: Reference,
-    next_key: u64,
+    nextRow: u64,
+    keyrowIndexRef: Reference,
+    nextKey: u64,
     primaryKeyIndexRef: Reference,
-    version_col_ref: Reference,
-    live_col_ref: Reference,
+    versionColRef: Reference,
+    liveColRef: Reference,
     propertyColumnRefs: []const Reference,
     kinds: []const PropertyKind,
     elements: []const ElementKind,
     backlinks: []const Reference,
     targets: []const u16,
     rules: []const DeletionRule,
-    value_index_refs: []const Reference,
-    indexed_flags: []const bool,
+    valueIndexRefs: []const Reference,
+    indexedFlags: []const bool,
 ) !Reference {
     const allocation = try transaction.alloc(catalogSize(propertyCount));
     std.mem.writeInt(u16, allocation.bytes[propertyCountOffset..][0..2], propertyCount, .little);
-    std.mem.writeInt(u64, allocation.bytes[off_next_row..][0..8], next_row, .little);
-    std.mem.writeInt(u64, allocation.bytes[off_keyrow_index_ref..][0..8], keyrow_index_ref, .little);
-    std.mem.writeInt(u64, allocation.bytes[off_next_key..][0..8], next_key, .little);
+    std.mem.writeInt(u64, allocation.bytes[offNextRow..][0..8], nextRow, .little);
+    std.mem.writeInt(u64, allocation.bytes[offKeyrowIndexRef..][0..8], keyrowIndexRef, .little);
+    std.mem.writeInt(u64, allocation.bytes[offNextKey..][0..8], nextKey, .little);
     std.mem.writeInt(u64, allocation.bytes[primaryKeyIndexRefOffset..][0..8], primaryKeyIndexRef, .little);
-    std.mem.writeInt(u64, allocation.bytes[off_version_col_ref..][0..8], version_col_ref, .little);
-    std.mem.writeInt(u64, allocation.bytes[off_live_col_ref..][0..8], live_col_ref, .little);
+    std.mem.writeInt(u64, allocation.bytes[offVersionColRef..][0..8], versionColRef, .little);
+    std.mem.writeInt(u64, allocation.bytes[offLiveColRef..][0..8], liveColRef, .little);
     for (propertyColumnRefs, 0..) |ref, propertyIndex| {
         std.mem.writeInt(u64, allocation.bytes[propertyColumnsOffset + propertyIndex * 8 ..][0..8], ref, .little);
     }
@@ -131,11 +131,11 @@ pub fn writeCatalog(
     const rulesBase = rulesOffset(propertyCount);
     for (rules, 0..) |rule, propertyIndex| allocation.bytes[rulesBase + propertyIndex] = @intFromEnum(rule);
     const valueIndexOffset = valueIndexRefsOffset(propertyCount);
-    for (value_index_refs, 0..) |vref, propertyIndex| {
+    for (valueIndexRefs, 0..) |vref, propertyIndex| {
         std.mem.writeInt(u64, allocation.bytes[valueIndexOffset + propertyIndex * 8 ..][0..8], vref, .little);
     }
     const ifo = indexedFlagsOffset(propertyCount);
-    for (indexed_flags, 0..) |flag, propertyIndex| allocation.bytes[ifo + propertyIndex] = @intFromBool(flag);
+    for (indexedFlags, 0..) |flag, propertyIndex| allocation.bytes[ifo + propertyIndex] = @intFromBool(flag);
     return allocation.ref;
 }
 
@@ -151,21 +151,21 @@ pub fn createFromDefinitions(transaction: *WriteTransaction, definitions: []cons
     var backlinks: [maxPropertyCount]Reference = undefined;
     var targets: [maxPropertyCount]u16 = undefined;
     var rules: [maxPropertyCount]DeletionRule = undefined;
-    var value_index_refs: [maxPropertyCount]Reference = undefined;
-    var indexed_flags: [maxPropertyCount]bool = undefined;
+    var valueIndexRefs: [maxPropertyCount]Reference = undefined;
+    var indexedFlags: [maxPropertyCount]bool = undefined;
     var propertyIndex: usize = 0;
     while (propertyIndex < propertyCount) : (propertyIndex += 1) {
         propertyColumnRefs[propertyIndex] = try Column.create(transaction);
         kinds[propertyIndex] = definitions[propertyIndex].kind;
         elements[propertyIndex] = definitions[propertyIndex].element;
-        backlinks[propertyIndex] = if (definitions[propertyIndex].kind == .link or definitions[propertyIndex].kind == .link_set) try Index.create(transaction) else 0;
-        targets[propertyIndex] = definitions[propertyIndex].link_target;
-        rules[propertyIndex] = definitions[propertyIndex].del_rule;
-        indexed_flags[propertyIndex] = definitions[propertyIndex].indexed;
-        value_index_refs[propertyIndex] = if (definitions[propertyIndex].indexed) try Index.create(transaction) else 0;
+        backlinks[propertyIndex] = if (definitions[propertyIndex].kind == .link or definitions[propertyIndex].kind == .linkSet) try Index.create(transaction) else 0;
+        targets[propertyIndex] = definitions[propertyIndex].linkTarget;
+        rules[propertyIndex] = definitions[propertyIndex].delRule;
+        indexedFlags[propertyIndex] = definitions[propertyIndex].indexed;
+        valueIndexRefs[propertyIndex] = if (definitions[propertyIndex].indexed) try Index.create(transaction) else 0;
     }
-    const version_col_ref = try Column.create(transaction);
-    const live_col_ref = try Column.create(transaction);
+    const versionColRef = try Column.create(transaction);
+    const liveColRef = try Column.create(transaction);
     const primaryKeyIndexRef = try Index.create(transaction);
     const keyrow = try Index.create(transaction);
     return writeCatalog(
@@ -175,16 +175,16 @@ pub fn createFromDefinitions(transaction: *WriteTransaction, definitions: []cons
         keyrow,
         0,
         primaryKeyIndexRef,
-        version_col_ref,
-        live_col_ref,
+        versionColRef,
+        liveColRef,
         propertyColumnRefs[0..propertyCount],
         kinds[0..propertyCount],
         elements[0..propertyCount],
         backlinks[0..propertyCount],
         targets[0..propertyCount],
         rules[0..propertyCount],
-        value_index_refs[0..propertyCount],
-        indexed_flags[0..propertyCount],
+        valueIndexRefs[0..propertyCount],
+        indexedFlags[0..propertyCount],
     );
 }
 
@@ -203,20 +203,20 @@ pub fn createTyped(transaction: *WriteTransaction, kinds: []const PropertyKind) 
 // empty primaryKey index. All property kinds default to .int.
 pub fn create(transaction: *WriteTransaction, propertyCount: PropertyCount) !Reference {
     std.debug.assert(propertyCount <= maxPropertyCount);
-    var all_int: [maxPropertyCount]PropertyKind = undefined;
+    var allInt: [maxPropertyCount]PropertyKind = undefined;
     var propertyIndex: usize = 0;
-    while (propertyIndex < propertyCount) : (propertyIndex += 1) all_int[propertyIndex] = .int;
-    return createTyped(transaction, all_int[0..propertyCount]);
+    while (propertyIndex < propertyCount) : (propertyIndex += 1) allInt[propertyIndex] = .int;
+    return createTyped(transaction, allInt[0..propertyCount]);
 }
 
 pub const CatalogView = struct {
     propertyCount: PropertyCount,
-    next_row: u64,
-    keyrow_index_ref: Reference,
-    next_key: u64,
+    nextRow: u64,
+    keyrowIndexRef: Reference,
+    nextKey: u64,
     primaryKeyIndexRef: Reference,
-    version_col_ref: Reference,
-    live_col_ref: Reference,
+    versionColRef: Reference,
+    liveColRef: Reference,
     bytes: []const u8,
 
     pub fn propertyColumnRef(self: CatalogView, propertyIndex: usize) Reference {
@@ -224,8 +224,7 @@ pub const CatalogView = struct {
     }
 
     pub fn kind(self: CatalogView, propertyIndex: usize) PropertyKind {
-        const kinds_offset = propertyColumnsOffset + @as(usize, self.propertyCount) * 8;
-        return @enumFromInt(self.bytes[kinds_offset + propertyIndex]);
+        return @enumFromInt(self.bytes[kindsOffset(self.propertyCount) + propertyIndex]);
     }
 
     pub fn elementKind(self: CatalogView, propertyIndex: usize) ElementKind {
@@ -286,12 +285,12 @@ pub fn loadCatalog(transaction: anytype, catalogRef: Reference) !CatalogView {
     }
     return CatalogView{
         .propertyCount = propertyCount,
-        .next_row = std.mem.readInt(u64, bytes[off_next_row..][0..8], .little),
-        .keyrow_index_ref = std.mem.readInt(u64, bytes[off_keyrow_index_ref..][0..8], .little),
-        .next_key = std.mem.readInt(u64, bytes[off_next_key..][0..8], .little),
+        .nextRow = std.mem.readInt(u64, bytes[offNextRow..][0..8], .little),
+        .keyrowIndexRef = std.mem.readInt(u64, bytes[offKeyrowIndexRef..][0..8], .little),
+        .nextKey = std.mem.readInt(u64, bytes[offNextKey..][0..8], .little),
         .primaryKeyIndexRef = std.mem.readInt(u64, bytes[primaryKeyIndexRefOffset..][0..8], .little),
-        .version_col_ref = std.mem.readInt(u64, bytes[off_version_col_ref..][0..8], .little),
-        .live_col_ref = std.mem.readInt(u64, bytes[off_live_col_ref..][0..8], .little),
+        .versionColRef = std.mem.readInt(u64, bytes[offVersionColRef..][0..8], .little),
+        .liveColRef = std.mem.readInt(u64, bytes[offLiveColRef..][0..8], .little),
         .bytes = bytes,
     };
 }
@@ -304,7 +303,7 @@ pub const PropertySnapshot = struct {
     backlink: Reference,
     target: u16,
     rule: DeletionRule,
-    value_index: Reference,
+    valueIndex: Reference,
     indexed: bool,
 };
 
@@ -317,31 +316,31 @@ pub const PropertySnapshot = struct {
 /// the CatalogView invalidation hazard: file growth cannot invalidate it.
 pub const CatalogSnapshot = struct {
     propertyCount: PropertyCount,
-    next_row: u64,
-    keyrow_index_ref: Reference,
-    next_key: u64,
+    nextRow: u64,
+    keyrowIndexRef: Reference,
+    nextKey: u64,
     primaryKeyIndexRef: Reference,
-    version_col_ref: Reference,
-    live_col_ref: Reference,
+    versionColRef: Reference,
+    liveColRef: Reference,
     properties: [maxPropertyCount]PropertySnapshot,
     /// The node this snapshot was loaded from and its on-disk size, so
     /// replace() can free it. propertyCount may change after load (migrations),
     /// so the size is captured here, not recomputed.
     source: Reference,
-    source_len: usize,
+    sourceLen: usize,
 
     pub fn load(transaction: anytype, catalogRef: Reference) !CatalogSnapshot {
         const view = try loadCatalog(transaction, catalogRef);
         var snapshot: CatalogSnapshot = undefined;
         snapshot.source = catalogRef;
-        snapshot.source_len = catalogSize(view.propertyCount);
+        snapshot.sourceLen = catalogSize(view.propertyCount);
         snapshot.propertyCount = view.propertyCount;
-        snapshot.next_row = view.next_row;
-        snapshot.keyrow_index_ref = view.keyrow_index_ref;
-        snapshot.next_key = view.next_key;
+        snapshot.nextRow = view.nextRow;
+        snapshot.keyrowIndexRef = view.keyrowIndexRef;
+        snapshot.nextKey = view.nextKey;
         snapshot.primaryKeyIndexRef = view.primaryKeyIndexRef;
-        snapshot.version_col_ref = view.version_col_ref;
-        snapshot.live_col_ref = view.live_col_ref;
+        snapshot.versionColRef = view.versionColRef;
+        snapshot.liveColRef = view.liveColRef;
         var propertyIndex: usize = 0;
         while (propertyIndex < view.propertyCount) : (propertyIndex += 1) {
             snapshot.properties[propertyIndex] = .{
@@ -351,7 +350,7 @@ pub const CatalogSnapshot = struct {
                 .backlink = view.backlinkRef(propertyIndex),
                 .target = view.linkTarget(propertyIndex),
                 .rule = view.delRule(propertyIndex),
-                .value_index = view.valueIndexRef(propertyIndex),
+                .valueIndex = view.valueIndexRef(propertyIndex),
                 .indexed = view.indexed(propertyIndex),
             };
         }
@@ -378,18 +377,18 @@ pub const CatalogSnapshot = struct {
             backlinks[propertyIndex] = property.backlink;
             targets[propertyIndex] = property.target;
             rules[propertyIndex] = property.rule;
-            valueIndexRefs[propertyIndex] = property.value_index;
+            valueIndexRefs[propertyIndex] = property.valueIndex;
             indexedFlags[propertyIndex] = property.indexed;
         }
         return writeCatalog(
             transaction,
             propertyCount,
-            self.next_row,
-            self.keyrow_index_ref,
-            self.next_key,
+            self.nextRow,
+            self.keyrowIndexRef,
+            self.nextKey,
             self.primaryKeyIndexRef,
-            self.version_col_ref,
-            self.live_col_ref,
+            self.versionColRef,
+            self.liveColRef,
             cols[0..propertyCount],
             kinds[0..propertyCount],
             elements[0..propertyCount],
@@ -408,9 +407,9 @@ pub const CatalogSnapshot = struct {
     /// so catalog churn stops growing the file. Do NOT use when the source
     /// lives in a different database (copyTypeRows) or must stay readable.
     pub fn replace(self: *const CatalogSnapshot, transaction: *WriteTransaction) !Reference {
-        const new_ref = try self.write(transaction);
-        try transaction.free(self.source, self.source_len);
-        return new_ref;
+        const newRef = try self.write(transaction);
+        try transaction.free(self.source, self.sourceLen);
+        return newRef;
     }
 };
 
@@ -429,7 +428,7 @@ pub fn liveCount(transaction: anytype, catalogRef: Reference) !u64 {
 // Returns null if the objectKey has no mapping.
 pub fn objectKeyToRow(transaction: anytype, catalogRef: Reference, objectKey: u64) !?u64 {
     const view = try loadCatalog(transaction, catalogRef);
-    return Index.get(transaction, view.keyrow_index_ref, objectKey);
+    return Index.get(transaction, view.keyrowIndexRef, objectKey);
 }
 
 // Resolve a primary key to its stable object key via the primaryKey index.
@@ -445,17 +444,17 @@ pub fn primaryKeyToObjectKey(transaction: anytype, catalogRef: Reference, primar
 pub fn resolveProperty(transaction: anytype, catalogRef: Reference, primaryKey: u64, property: usize) !?struct { row: u64, propertyColumn: Reference } {
     const view = try loadCatalog(transaction, catalogRef);
     const objectKey = (try Index.get(transaction, view.primaryKeyIndexRef, primaryKey)) orelse return null;
-    const row = (try Index.get(transaction, view.keyrow_index_ref, objectKey)) orelse return null;
-    if ((try Column.get(transaction, view.live_col_ref, row)) == 0) return null;
+    const row = (try Index.get(transaction, view.keyrowIndexRef, objectKey)) orelse return null;
+    if ((try Column.get(transaction, view.liveColRef, row)) == 0) return null;
     return .{ .row = row, .propertyColumn = view.propertyColumnRef(property) };
 }
 
-// Write new_root into property `property` at `row`, bump that row's version stamp,
+// Write newRoot into property `property` at `row`, bump that row's version stamp,
 // return the new catalog ref.
-pub fn replaceCollRoot(transaction: *WriteTransaction, catalogRef: Reference, row: u64, property: usize, new_root: Reference) !Reference {
+pub fn replaceCollRoot(transaction: *WriteTransaction, catalogRef: Reference, row: u64, property: usize, newRoot: Reference) !Reference {
     var snapshot = try CatalogSnapshot.load(transaction, catalogRef);
-    snapshot.properties[property].col = try Column.set(transaction, snapshot.properties[property].col, row, new_root);
-    snapshot.version_col_ref = try Column.set(transaction, snapshot.version_col_ref, row, transaction.new_version);
+    snapshot.properties[property].col = try Column.set(transaction, snapshot.properties[property].col, row, newRoot);
+    snapshot.versionColRef = try Column.set(transaction, snapshot.versionColRef, row, transaction.newVersion);
     return snapshot.replace(transaction);
 }
 
@@ -469,7 +468,7 @@ pub fn setBacklinkRef(transaction: *WriteTransaction, catalogRef: Reference, pro
 // Write a new value-index ref into property `p`, preserving everything else.
 pub fn setValueIndexRef(transaction: *WriteTransaction, catalogRef: Reference, propertyIndex: usize, newValueIndex: Reference) !Reference {
     var snapshot = try CatalogSnapshot.load(transaction, catalogRef);
-    snapshot.properties[propertyIndex].value_index = newValueIndex;
+    snapshot.properties[propertyIndex].valueIndex = newValueIndex;
     return snapshot.replace(transaction);
 }
 
@@ -519,20 +518,20 @@ test "CatalogSnapshot round-trips every field through load and write" {
     const catalogRef = try createFromDefinitions(&writeTransaction, &.{
         .{ .kind = .int },
         .{ .kind = .int, .indexed = true },
-        .{ .kind = .link, .link_target = 3, .del_rule = .cascade },
+        .{ .kind = .link, .linkTarget = 3, .delRule = .cascade },
         .{ .kind = .list, .element = .blob },
     });
     const snapshot = try CatalogSnapshot.load(&writeTransaction, catalogRef);
-    const copy_ref = try snapshot.write(&writeTransaction);
+    const copyRef = try snapshot.write(&writeTransaction);
     const view0 = try loadCatalog(&writeTransaction, catalogRef);
-    const view1 = try loadCatalog(&writeTransaction, copy_ref);
+    const view1 = try loadCatalog(&writeTransaction, copyRef);
     try testing.expectEqual(view0.propertyCount, view1.propertyCount);
-    try testing.expectEqual(view0.next_row, view1.next_row);
-    try testing.expectEqual(view0.next_key, view1.next_key);
+    try testing.expectEqual(view0.nextRow, view1.nextRow);
+    try testing.expectEqual(view0.nextKey, view1.nextKey);
     try testing.expectEqual(view0.primaryKeyIndexRef, view1.primaryKeyIndexRef);
-    try testing.expectEqual(view0.keyrow_index_ref, view1.keyrow_index_ref);
-    try testing.expectEqual(view0.version_col_ref, view1.version_col_ref);
-    try testing.expectEqual(view0.live_col_ref, view1.live_col_ref);
+    try testing.expectEqual(view0.keyrowIndexRef, view1.keyrowIndexRef);
+    try testing.expectEqual(view0.versionColRef, view1.versionColRef);
+    try testing.expectEqual(view0.liveColRef, view1.liveColRef);
     var propertyIndex: usize = 0;
     while (propertyIndex < view0.propertyCount) : (propertyIndex += 1) {
         try testing.expectEqual(view0.propertyColumnRef(propertyIndex), view1.propertyColumnRef(propertyIndex));
@@ -560,11 +559,11 @@ test "loadCatalog rejects corrupt disk values instead of panicking" {
 
     // Corrupt a kind byte (out-of-range enum value) directly in the mapping.
     const catalogOffset: usize = @intCast(catalogRef);
-    const kind_byte_off = catalogOffset + propertyColumnsOffset + 2 * 8; // kindsOffset(2), property 0
-    const saved_kind = database.store.map[kind_byte_off];
-    database.store.map[kind_byte_off] = 200;
+    const kindByteOff = catalogOffset + propertyColumnsOffset + 2 * 8; // kindsOffset(2), property 0
+    const savedKind = database.store.map[kindByteOff];
+    database.store.map[kindByteOff] = 200;
     try testing.expectError(error.Corrupt, loadCatalog(&writeTransaction, catalogRef));
-    database.store.map[kind_byte_off] = saved_kind;
+    database.store.map[kindByteOff] = savedKind;
     _ = try loadCatalog(&writeTransaction, catalogRef); // restored
 
     // Corrupt the property count to an implausible value.
@@ -653,8 +652,8 @@ test "createDefs records a link target type id" {
     var writeTransaction = try database.beginWrite();
     const catalogRef = try createFromDefinitions(&writeTransaction, &.{
         .{ .kind = .int },
-        .{ .kind = .link, .link_target = 3 },
-        .{ .kind = .link_set, .link_target = 7 },
+        .{ .kind = .link, .linkTarget = 3 },
+        .{ .kind = .linkSet, .linkTarget = 7 },
     });
     const view = try loadCatalog(&writeTransaction, catalogRef);
     try testing.expectEqual(@as(u16, 0), view.linkTarget(0));
@@ -673,8 +672,8 @@ test "createDefs creates an empty key-to-row index and zero next_key" {
     var writeTransaction = try database.beginWrite();
     const catalogRef = try createFromDefinitions(&writeTransaction, &.{ .{ .kind = .int }, .{ .kind = .int } });
     const view = try loadCatalog(&writeTransaction, catalogRef);
-    try testing.expect(view.keyrow_index_ref != 0);
-    try testing.expectEqual(@as(u64, 0), view.next_key);
+    try testing.expect(view.keyrowIndexRef != 0);
+    try testing.expectEqual(@as(u64, 0), view.nextKey);
     writeTransaction.deinit();
 }
 
@@ -723,7 +722,7 @@ test "non-indexed catalog: value index refs zero and existing fields intact" {
     const catalogRef = try createFromDefinitions(&writeTransaction, &.{
         .{ .kind = .int },
         .{ .kind = .list, .element = .blob },
-        .{ .kind = .link, .link_target = 4, .del_rule = .cascade },
+        .{ .kind = .link, .linkTarget = 4, .delRule = .cascade },
     });
     const view = try loadCatalog(&writeTransaction, catalogRef);
     var propertyIndex: usize = 0;
@@ -759,8 +758,8 @@ test "createDefs records a per-property deletion rule" {
     var writeTransaction = try database.beginWrite();
     const catalogRef = try createFromDefinitions(&writeTransaction, &.{
         .{ .kind = .int },
-        .{ .kind = .link, .link_target = 2, .del_rule = .cascade },
-        .{ .kind = .link, .link_target = 3, .del_rule = .block },
+        .{ .kind = .link, .linkTarget = 2, .delRule = .cascade },
+        .{ .kind = .link, .linkTarget = 3, .delRule = .block },
     });
     const view = try loadCatalog(&writeTransaction, catalogRef);
     try testing.expectEqual(DeletionRule.nullify, view.delRule(0));

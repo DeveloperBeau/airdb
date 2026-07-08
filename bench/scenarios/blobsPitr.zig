@@ -31,16 +31,16 @@ pub const name = "blobs_pitr";
 // --- Part A knobs -----------------------------------------------------------
 // Bounded, NOT scaled by ctx.n. 24 MiB > the ~16 MiB inline cap, so each blob
 // takes the chunked path. Eight blobs is ~192 MiB total.
-const blob_bytes: usize = 24 * 1024 * 1024;
-const blob_count: usize = 8;
+const blobBytes: usize = 24 * 1024 * 1024;
+const blobCount: usize = 8;
 
 // --- Part B knobs -----------------------------------------------------------
 // Rows committed per write transaction during the (untimed) insert phase. The
-// first batch establishes the historical version, so only primaryKeys in [0, pitr_batch)
-// are guaranteed to exist at v_old; lookups stay inside that range.
-const pitr_batch: usize = 100;
-const pitr_rows: usize = 1_000;
-const pitr_lookups: usize = 10_000;
+// first batch establishes the historical version, so only primaryKeys in [0, pitrBatch)
+// are guaranteed to exist at vOld; lookups stay inside that range.
+const pitrBatch: usize = 100;
+const pitrRows: usize = 1_000;
+const pitrLookups: usize = 10_000;
 
 // Monotonic wall-clock instance, matching the convention in fileStore.zig.
 inline fn sysIo() Io {
@@ -63,63 +63,63 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     const io = sysIo();
 
     // --- Part A: large-blob throughput --------------------------------------
-    const blob_path = try harness.scratchPath(ctx.*, name ++ "-blobs.airdb");
-    defer alloc.free(blob_path);
-    defer harness.removeScratch(ctx.*, blob_path);
+    const blobPath = try harness.scratchPath(ctx.*, name ++ "-blobs.airdb");
+    defer alloc.free(blobPath);
+    defer harness.removeScratch(ctx.*, blobPath);
 
     // One deterministic 24 MiB source buffer, reused for every blob.
-    const buffer = try alloc.alloc(u8, blob_bytes);
+    const buffer = try alloc.alloc(u8, blobBytes);
     defer alloc.free(buffer);
     for (buffer, 0..) |*b, i| b.* = @truncate(i *% 2654435761);
 
-    var database = try airdb.Database.create(alloc, blob_path);
+    var database = try airdb.Database.create(alloc, blobPath);
     errdefer database.deinit();
 
-    var refs: [blob_count]Reference = undefined;
+    var refs: [blobCount]Reference = undefined;
 
     // PUT: one blob per write transaction.
-    var put_bytes: u64 = 0;
-    const put_start = nowNs(io);
+    var putBytes: u64 = 0;
+    const putStart = nowNs(io);
     var i: usize = 0;
-    while (i < blob_count) : (i += 1) {
+    while (i < blobCount) : (i += 1) {
         var w = try database.beginWrite();
         refs[i] = try blob.put(&w, buffer);
         _ = try w.commit();
-        put_bytes += blob_bytes;
+        putBytes += blobBytes;
     }
-    const put_ns: u64 = @intCast(nowNs(io) - put_start);
+    const putNs: u64 = @intCast(nowNs(io) - putStart);
 
     // GET: read every blob back in a single read snapshot.
-    var get_bytes: u64 = 0;
-    const get_start = nowNs(io);
+    var getBytes: u64 = 0;
+    const getStart = nowNs(io);
     var rd = try database.beginRead();
     i = 0;
-    while (i < blob_count) : (i += 1) {
+    while (i < blobCount) : (i += 1) {
         const out = try blob.getAlloc(&rd, refs[i], alloc);
         defer alloc.free(out);
-        get_bytes += out.len;
+        getBytes += out.len;
         // Correctness guard on the last blob: a chunked round-trip that silently
         // dropped or reordered bytes must fail the bench loudly.
-        if (i == blob_count - 1) {
-            if (out.len != blob_bytes or out[0] != buffer[0] or out[out.len - 1] != buffer[buffer.len - 1]) {
+        if (i == blobCount - 1) {
+            if (out.len != blobBytes or out[0] != buffer[0] or out[out.len - 1] != buffer[buffer.len - 1]) {
                 return error.BlobRoundTripMismatch;
             }
         }
     }
     rd.end();
-    const get_ns: u64 = @intCast(nowNs(io) - get_start);
+    const getNs: u64 = @intCast(nowNs(io) - getStart);
 
     // Capture the (large) blob-database metrics before closing it.
-    const file_bytes = try database.fileSize();
-    const logical_bytes = database.logicalSize();
+    const fileBytes = try database.fileSize();
+    const logicalBytes = database.logicalSize();
     database.deinit();
 
     // --- Part B: point-in-time read overhead --------------------------------
-    const pitr_path = try harness.scratchPath(ctx.*, name ++ "-pitr.airdb");
-    defer alloc.free(pitr_path);
-    defer harness.removeScratch(ctx.*, pitr_path);
+    const pitrPath = try harness.scratchPath(ctx.*, name ++ "-pitr.airdb");
+    defer alloc.free(pitrPath);
+    defer harness.removeScratch(ctx.*, pitrPath);
 
-    var pitrDatabase = try airdb.Database.create(alloc, pitr_path);
+    var pitrDatabase = try airdb.Database.create(alloc, pitrPath);
     defer pitrDatabase.deinit();
 
     // Retain everything so the early version's nodes stay readable.
@@ -134,37 +134,37 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     }
 
     // Insert in batches; the first batch's commit fixes the historical version.
-    var v_old: u64 = 0;
+    var vOld: u64 = 0;
     var inserted: usize = 0;
-    while (inserted < pitr_rows) {
-        const this_batch = @min(pitr_batch, pitr_rows - inserted);
+    while (inserted < pitrRows) {
+        const thisBatch = @min(pitrBatch, pitrRows - inserted);
         var w = try pitrDatabase.beginWrite();
-        var catalogRef = pitrDatabase.active_root;
+        var catalogRef = pitrDatabase.activeRoot;
         var j: usize = 0;
-        while (j < this_batch) : (j += 1) {
+        while (j < thisBatch) : (j += 1) {
             const primaryKey: u64 = inserted + j;
             const r = try rows.insert(&w, catalogRef, &.{ primaryKey, primaryKey *% 7 });
             catalogRef = r.catalogRef;
         }
         w.setRoot(catalogRef);
         const v = try w.commit();
-        if (inserted == 0) v_old = v; // primaryKeys [0, pitr_batch) exist from here on
-        inserted += this_batch;
+        if (inserted == 0) vOld = v; // primaryKeys [0, pitrBatch) exist from here on
+        inserted += thisBatch;
     }
 
-    // Deterministic xorshift64 over a fixed seed; primaryKey stays in [0, pitr_batch) so
+    // Deterministic xorshift64 over a fixed seed; primaryKey stays in [0, pitrBatch) so
     // every lookup resolves at both the latest and the historical version.
-    const primaryKeyModulus: u64 = pitr_batch;
+    const primaryKeyModulus: u64 = pitrBatch;
 
     // Latest-snapshot lookups.
-    var lat_latest = harness.Latencies.init();
-    defer lat_latest.deinit(alloc);
+    var latLatest = harness.Latencies.init();
+    defer latLatest.deinit(alloc);
     {
         var rl = try pitrDatabase.beginRead();
         const catalogRef = rl.root();
         var x: u64 = 0x9E3779B97F4A7C15;
         var k: usize = 0;
-        while (k < pitr_lookups) : (k += 1) {
+        while (k < pitrLookups) : (k += 1) {
             x ^= x << 13;
             x ^= x >> 7;
             x ^= x << 17;
@@ -173,20 +173,20 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
             const t0 = nowNs(io);
             _ = try rows.getByPrimaryKey(&rl, catalogRef, primaryKey, &out);
             const dt: u64 = @intCast(nowNs(io) - t0);
-            try lat_latest.add(alloc, dt);
+            try latLatest.add(alloc, dt);
         }
         rl.end();
     }
 
-    // Historical-snapshot lookups at v_old (same primaryKey sequence).
-    var lat_hist = harness.Latencies.init();
-    defer lat_hist.deinit(alloc);
+    // Historical-snapshot lookups at vOld (same primaryKey sequence).
+    var latHist = harness.Latencies.init();
+    defer latHist.deinit(alloc);
     {
-        var rh = try pitrDatabase.beginReadAt(v_old);
+        var rh = try pitrDatabase.beginReadAt(vOld);
         const catalogRef = rh.root();
         var x: u64 = 0x9E3779B97F4A7C15;
         var k: usize = 0;
-        while (k < pitr_lookups) : (k += 1) {
+        while (k < pitrLookups) : (k += 1) {
             x ^= x << 13;
             x ^= x >> 7;
             x ^= x << 17;
@@ -195,18 +195,18 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
             const t0 = nowNs(io);
             _ = try rows.getByPrimaryKey(&rh, catalogRef, primaryKey, &out);
             const dt: u64 = @intCast(nowNs(io) - t0);
-            try lat_hist.add(alloc, dt);
+            try latHist.add(alloc, dt);
         }
         rh.end();
     }
 
-    const latest_p50 = lat_latest.percentile(50);
-    const hist_p50 = lat_hist.percentile(50);
-    const overheadPercent: f64 = if (latest_p50 == 0)
+    const latestP50 = latLatest.percentile(50);
+    const histP50 = latHist.percentile(50);
+    const overheadPercent: f64 = if (latestP50 == 0)
         0
     else
-        (@as(f64, @floatFromInt(hist_p50)) - @as(f64, @floatFromInt(latest_p50))) /
-            @as(f64, @floatFromInt(latest_p50)) * 100.0;
+        (@as(f64, @floatFromInt(histP50)) - @as(f64, @floatFromInt(latestP50))) /
+            @as(f64, @floatFromInt(latestP50)) * 100.0;
 
     const note = try std.fmt.allocPrint(
         alloc,
@@ -214,26 +214,26 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
             "latest_p50_us={d:.2} hist_p50_us={d:.2} overhead_pct={d:.1} " ++
             "(file/logical from blob db; latencies from latest reads)",
         .{
-            blob_count,
-            blob_bytes / (1024 * 1024),
-            mibPerSec(put_bytes, put_ns),
-            mibPerSec(get_bytes, get_ns),
-            @as(f64, @floatFromInt(latest_p50)) / 1000.0,
-            @as(f64, @floatFromInt(hist_p50)) / 1000.0,
+            blobCount,
+            blobBytes / (1024 * 1024),
+            mibPerSec(putBytes, putNs),
+            mibPerSec(getBytes, getNs),
+            @as(f64, @floatFromInt(latestP50)) / 1000.0,
+            @as(f64, @floatFromInt(histP50)) / 1000.0,
             overheadPercent,
         },
     );
 
     return .{
         .name = name,
-        .ops = blob_count,
-        .wall_ns = put_ns + get_ns,
-        .p50_ns = latest_p50,
-        .p99_ns = lat_latest.percentile(99),
-        .max_ns = lat_latest.percentile(100),
-        .file_bytes = file_bytes,
-        .logical_bytes = logical_bytes,
-        .peak_rss_bytes = airdb.peakResidentBytes(),
+        .ops = blobCount,
+        .wallNs = putNs + getNs,
+        .p50Ns = latestP50,
+        .p99Ns = latLatest.percentile(99),
+        .maxNs = latLatest.percentile(100),
+        .fileBytes = fileBytes,
+        .logicalBytes = logicalBytes,
+        .peakRssBytes = airdb.peakResidentBytes(),
         .note = note,
     };
 }

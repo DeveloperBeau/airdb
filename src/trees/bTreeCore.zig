@@ -23,12 +23,12 @@ const indexNode = @import("indexNode.zig");
 // Local aliases for the on-disk node format, which lives in indexNode.zig.
 const leafCapacity = indexNode.leafCap;
 const fanout = indexNode.fanout;
-const kindLeaf = indexNode.kind_leaf;
-const kindInner = indexNode.kind_inner;
+const kindLeaf = indexNode.kindLeaf;
+const kindInner = indexNode.kindInner;
 const headerSize = indexNode.headerSize;
-const leafNodeSize = indexNode.leaf_node_size;
-const innerNodeSize = indexNode.inner_node_size;
-const innerStride = indexNode.inner_stride;
+const leafNodeSize = indexNode.leafNodeSize;
+const innerNodeSize = indexNode.innerNodeSize;
+const innerStride = indexNode.innerStride;
 const encodeLeaf = indexNode.encodeLeaf;
 const parseLeaf = indexNode.parseLeaf;
 const LeafView = indexNode.LeafView;
@@ -89,7 +89,7 @@ pub fn BTreeCore(comptime Keying: type) type {
         pub fn childIndexForKey(transaction: anytype, inner: InnerView, probeKey: Keying.ProbeKey) !usize {
             var best: usize = 0;
             var childIndex: usize = 0;
-            while (childIndex < inner.child_count) : (childIndex += 1) {
+            while (childIndex < inner.childCount) : (childIndex += 1) {
                 // lowKey <= probeKey  <=>  order(lowKey, probeKey) is not .gt.
                 if ((try Keying.order(transaction, inner.lowKey(childIndex), probeKey)) != .gt) {
                     best = childIndex;
@@ -258,14 +258,14 @@ pub fn BTreeCore(comptime Keying: type) type {
 
             // Child split but this inner node is not full: shift and insert
             // the new right sibling at childIndex+1.
-            if (inner.child_count < fanout) {
+            if (inner.childCount < fanout) {
                 const updated = try transaction.writableCopy(nodeRef, innerNodeSize);
                 // Update the split child's ref+count (its low key is
                 // unchanged: the left half keeps the same minimum).
                 std.mem.writeInt(u64, updated.bytes[headerSize + childIndex * innerStride ..][0..8], childResult.ref, .little);
                 std.mem.writeInt(u64, updated.bytes[headerSize + childIndex * innerStride + 16 ..][0..8], childResult.count, .little);
-                // Shift slots [childIndex+1, child_count) right by one.
-                var moveSlot: usize = inner.child_count;
+                // Shift slots [childIndex+1, childCount) right by one.
+                var moveSlot: usize = inner.childCount;
                 while (moveSlot > childIndex + 1) : (moveSlot -= 1) {
                     const source = headerSize + (moveSlot - 1) * innerStride;
                     const destination = headerSize + moveSlot * innerStride;
@@ -274,7 +274,7 @@ pub fn BTreeCore(comptime Keying: type) type {
                 std.mem.writeInt(u64, updated.bytes[headerSize + (childIndex + 1) * innerStride ..][0..8], childSplit.ref, .little);
                 std.mem.writeInt(u64, updated.bytes[headerSize + (childIndex + 1) * innerStride + 8 ..][0..8], childSplit.low, .little);
                 std.mem.writeInt(u64, updated.bytes[headerSize + (childIndex + 1) * innerStride + 16 ..][0..8], childSplit.count, .little);
-                std.mem.writeInt(u16, updated.bytes[1..3], inner.child_count + 1, .little);
+                std.mem.writeInt(u16, updated.bytes[1..3], inner.childCount + 1, .little);
                 return InsertResult{ .ref = updated.ref, .count = newTotal, .split = null };
             }
 
@@ -286,7 +286,7 @@ pub fn BTreeCore(comptime Keying: type) type {
             var lowKeys: [fanout + 1]u64 = undefined;
             var subtreeCounts: [fanout + 1]u64 = undefined;
             var copySlot: usize = 0;
-            while (copySlot < inner.child_count) : (copySlot += 1) {
+            while (copySlot < inner.childCount) : (copySlot += 1) {
                 childRefs[copySlot] = inner.childRef(copySlot);
                 lowKeys[copySlot] = inner.lowKey(copySlot);
                 subtreeCounts[copySlot] = inner.subtreeCount(copySlot);
@@ -295,7 +295,7 @@ pub fn BTreeCore(comptime Keying: type) type {
             childRefs[childIndex] = childResult.ref;
             subtreeCounts[childIndex] = childResult.count;
             // Insert the new right sibling immediately after childIndex.
-            copySlot = inner.child_count; // = fanout
+            copySlot = inner.childCount; // = fanout
             while (copySlot > childIndex + 1) : (copySlot -= 1) {
                 childRefs[copySlot] = childRefs[copySlot - 1];
                 lowKeys[copySlot] = lowKeys[copySlot - 1];
@@ -434,7 +434,7 @@ pub fn BTreeCore(comptime Keying: type) type {
             }
             const inner = try parseInner(bytes);
             var childIndex: usize = 0;
-            while (childIndex < inner.child_count) : (childIndex += 1) {
+            while (childIndex < inner.childCount) : (childIndex += 1) {
                 try freeTreeAt(transaction, inner.childRef(childIndex), depth + 1);
                 try Keying.freeKey(transaction, inner.lowKey(childIndex));
             }
@@ -483,7 +483,7 @@ pub fn BTreeCore(comptime Keying: type) type {
             }
             const inner = try parseInner(bytes);
             var childIndex: usize = 0;
-            while (childIndex < inner.child_count) : (childIndex += 1) {
+            while (childIndex < inner.childCount) : (childIndex += 1) {
                 try forEachKeyAt(transaction, inner.childRef(childIndex), context, onKey, depth + 1);
             }
         }
@@ -518,7 +518,7 @@ pub fn BTreeCore(comptime Keying: type) type {
             }
             const inner = try parseInner(bytes);
             var childIndex: usize = 0;
-            while (childIndex < inner.child_count) : (childIndex += 1) {
+            while (childIndex < inner.childCount) : (childIndex += 1) {
                 try forEachEntryAt(transaction, inner.childRef(childIndex), context, onEntry, depth + 1);
             }
         }

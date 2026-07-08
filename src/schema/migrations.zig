@@ -25,32 +25,32 @@ const maxPropertyCount = catalog.maxPropertyCount;
 // ---------------------------------------------------------------------------
 
 // Append a new property to the type. The new column is filled with
-// `default_value` for every existing row (live or tombstoned). For a link or
-// link_set property a fresh backlink index is created. Returns the new catalog.
-pub fn addProperty(transaction: *WriteTransaction, catalogRef: Reference, def: PropertyDefinition, default_value: u64) !Reference {
+// `defaultValue` for every existing row (live or tombstoned). For a link or
+// linkSet property a fresh backlink index is created. Returns the new catalog.
+pub fn addProperty(transaction: *WriteTransaction, catalogRef: Reference, def: PropertyDefinition, defaultValue: u64) !Reference {
     var snapshot = try catalog.CatalogSnapshot.load(transaction, catalogRef);
     const propertyCount = snapshot.propertyCount;
     std.debug.assert(propertyCount + 1 <= maxPropertyCount);
 
-    const is_collection = switch (def.kind) {
-        .list, .set, .dict, .link_set => true,
+    const isCollection = switch (def.kind) {
+        .list, .set, .dict, .linkSet => true,
         .int, .blob, .link => false,
     };
     // Indexing a collection property would index its per-row root refs --
     // meaningless as values and impossible to backfill coherently.
-    if (def.indexed and is_collection) return error.Unsupported;
+    if (def.indexed and isCollection) return error.Unsupported;
 
-    const new_col = try buildBackfilledColumn(transaction, &snapshot, def, default_value, is_collection);
-    const valueIndexRef: Reference = if (def.indexed) try backfillValueIndex(transaction, snapshot.keyrow_index_ref, new_col) else 0;
+    const newCol = try buildBackfilledColumn(transaction, &snapshot, def, defaultValue, isCollection);
+    const valueIndexRef: Reference = if (def.indexed) try backfillValueIndex(transaction, snapshot.keyrowIndexRef, newCol) else 0;
 
     snapshot.properties[propertyCount] = .{
-        .col = new_col,
+        .col = newCol,
         .kind = def.kind,
         .element = def.element,
-        .backlink = if (def.kind == .link or def.kind == .link_set) try Index.create(transaction) else 0,
-        .target = def.link_target,
-        .rule = def.del_rule,
-        .value_index = valueIndexRef,
+        .backlink = if (def.kind == .link or def.kind == .linkSet) try Index.create(transaction) else 0,
+        .target = def.linkTarget,
+        .rule = def.delRule,
+        .valueIndex = valueIndexRef,
         .indexed = def.indexed,
     };
     snapshot.propertyCount = propertyCount + 1;
@@ -61,7 +61,7 @@ pub fn addProperty(transaction: *WriteTransaction, catalogRef: Reference, def: P
 // row. Storage-bearing kinds are backfilled PER LIVE ROW, never shared.
 // Collections: a raw zero root breaks every collection accessor and made
 // pre-migration rows undeletable through the graph-safe delete (its outbound
-// cleanup walks link_set roots), while a SHARED root would be freed by the
+// cleanup walks linkSet roots), while a SHARED root would be freed by the
 // first row's delete underneath every other row. Blobs have the same aliasing
 // hazard: writing the caller's single default ref into every row meant the
 // first row's delete freed the node under all the others, planting a
@@ -72,17 +72,17 @@ fn buildBackfilledColumn(
     transaction: *WriteTransaction,
     snapshot: *const catalog.CatalogSnapshot,
     def: PropertyDefinition,
-    default_value: u64,
-    is_collection: bool,
+    defaultValue: u64,
+    isCollection: bool,
 ) !Reference {
-    var new_col = try Column.create(transaction);
+    var newCol = try Column.create(transaction);
     var row: u64 = 0;
-    while (row < snapshot.next_row) : (row += 1) {
-        const live = (try Column.get(transaction, snapshot.live_col_ref, row)) != 0;
+    while (row < snapshot.nextRow) : (row += 1) {
+        const live = (try Column.get(transaction, snapshot.liveColRef, row)) != 0;
         const fill: u64 = if (def.kind == .blob)
-            (if (live and default_value != 0) try blobDup(transaction, default_value) else if (live) default_value else 0)
-        else if (!is_collection)
-            default_value
+            (if (live and defaultValue != 0) try blobDup(transaction, defaultValue) else if (live) defaultValue else 0)
+        else if (!isCollection)
+            defaultValue
         else if (!live)
             0
         else switch (def.kind) {
@@ -91,13 +91,13 @@ fn buildBackfilledColumn(
                 .int => try Index.create(transaction),
                 .blob => try bindex.create(transaction),
             },
-            .link_set => try Index.create(transaction),
+            .linkSet => try Index.create(transaction),
             .dict => try bindex.create(transaction),
             else => unreachable,
         };
-        new_col = try Column.append(transaction, new_col, fill);
+        newCol = try Column.append(transaction, newCol, fill);
     }
-    return new_col;
+    return newCol;
 }
 
 // Backfill the new property's value index for existing LIVE rows: the query
@@ -106,7 +106,7 @@ fn buildBackfilledColumn(
 // audit). Each row is indexed under its OWN raw column value (mirroring the
 // insert path) -- blob backfills give every row a distinct ref, so a single
 // shared key would diverge from what reads and audits expect.
-fn backfillValueIndex(transaction: *WriteTransaction, keyrow_ref: Reference, new_col: Reference) !Reference {
+fn backfillValueIndex(transaction: *WriteTransaction, keyrowRef: Reference, newCol: Reference) !Reference {
     var valueIndexRef = try Index.create(transaction);
     const Sink = struct {
         transaction: *WriteTransaction,
@@ -117,7 +117,7 @@ fn backfillValueIndex(transaction: *WriteTransaction, keyrow_ref: Reference, new
             self.valueIndexRef.* = try rows.valueIndexAdd(self.transaction, self.valueIndexRef.*, raw, objectKey);
         }
     };
-    try Index.forEachEntry(transaction, keyrow_ref, Sink{ .transaction = transaction, .valueIndexRef = &valueIndexRef, .col = new_col }, Sink.onEntry);
+    try Index.forEachEntry(transaction, keyrowRef, Sink{ .transaction = transaction, .valueIndexRef = &valueIndexRef, .col = newCol }, Sink.onEntry);
     return valueIndexRef;
 }
 

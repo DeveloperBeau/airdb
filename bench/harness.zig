@@ -38,24 +38,24 @@ fn scaleStr(scale: Scale) []const u8 {
     };
 }
 
-/// Parsed command-line options. `json_path` and `only`, when set, are owned
+/// Parsed command-line options. `jsonPath` and `only`, when set, are owned
 /// (duped) heap strings; call `deinit` to free them.
 pub const Opts = struct {
     scale: Scale = .m1,
-    json_path: ?[]const u8 = null,
+    jsonPath: ?[]const u8 = null,
     only: ?[]const u8 = null,
 
     pub fn deinit(self: Opts, alloc: Allocator) void {
-        if (self.json_path) |p| alloc.free(p);
+        if (self.jsonPath) |p| alloc.free(p);
         if (self.only) |o| alloc.free(o);
     }
 };
 
-/// Per-scenario context. Scenarios open their own Database under `tmp_dir`.
+/// Per-scenario context. Scenarios open their own Database under `tmpDir`.
 pub const Ctx = struct {
     alloc: Allocator,
     n: usize,
-    tmp_dir: []const u8,
+    tmpDir: []const u8,
 };
 
 // ---------------------------------------------------------------------------
@@ -65,22 +65,22 @@ pub const Ctx = struct {
 pub const Result = struct {
     name: []const u8,
     ops: u64,
-    wall_ns: u64,
-    p50_ns: u64 = 0,
-    p99_ns: u64 = 0,
-    max_ns: u64 = 0,
-    file_bytes: u64 = 0,
-    logical_bytes: u64 = 0,
-    peak_rss_bytes: u64 = 0,
+    wallNs: u64,
+    p50Ns: u64 = 0,
+    p99Ns: u64 = 0,
+    maxNs: u64 = 0,
+    fileBytes: u64 = 0,
+    logicalBytes: u64 = 0,
+    peakRssBytes: u64 = 0,
     note: []const u8 = "",
 
     /// Operations per second over the wall-clock window. Returns 0 when no time
     /// elapsed (avoids divide-by-zero).
     pub fn throughputPerSec(self: Result) f64 {
-        if (self.wall_ns == 0) return 0;
-        const ops_f: f64 = @floatFromInt(self.ops);
-        const wall_f: f64 = @floatFromInt(self.wall_ns);
-        return ops_f * 1e9 / wall_f;
+        if (self.wallNs == 0) return 0;
+        const opsF: f64 = @floatFromInt(self.ops);
+        const wallF: f64 = @floatFromInt(self.wallNs);
+        return opsF * 1e9 / wallF;
     }
 };
 
@@ -130,33 +130,33 @@ fn bytesToMib(bytes: u64) f64 {
 
 /// Writes an ASCII table of results to `w` (a `*std.Io.Writer`). Numbers are
 /// right-aligned in fixed columns; latency columns show "-" for scenarios that
-/// recorded no per-op samples (p99_ns == 0).
+/// recorded no per-op samples (p99Ns == 0).
 pub fn printTable(results: []const Result, w: anytype) !void {
     try w.print(
         "{s:<24} {s:>12} {s:>14} {s:>10} {s:>10} {s:>10} {s:>11} {s:>11} {s:>11}\n",
         .{ "name", "ops", "ops/s", "p50 us", "p99 us", "max us", "file MiB", "logical MiB", "rss MiB" },
     );
     for (results) |r| {
-        if (r.p99_ns == 0) {
+        if (r.p99Ns == 0) {
             try w.print(
                 "{s:<24} {d:12} {d:14.0} {s:>10} {s:>10} {s:>10} {d:11.1} {d:11.1} {d:11.1}\n",
                 .{
-                    r.name,                       r.ops,
-                    r.throughputPerSec(),         "-",
-                    "-",                          "-",
-                    bytesToMib(r.file_bytes),     bytesToMib(r.logical_bytes),
-                    bytesToMib(r.peak_rss_bytes),
+                    r.name,                     r.ops,
+                    r.throughputPerSec(),       "-",
+                    "-",                        "-",
+                    bytesToMib(r.fileBytes),    bytesToMib(r.logicalBytes),
+                    bytesToMib(r.peakRssBytes),
                 },
             );
         } else {
             try w.print(
                 "{s:<24} {d:12} {d:14.0} {d:10.1} {d:10.1} {d:10.1} {d:11.1} {d:11.1} {d:11.1}\n",
                 .{
-                    r.name,                       r.ops,
-                    r.throughputPerSec(),         nsToUs(r.p50_ns),
-                    nsToUs(r.p99_ns),             nsToUs(r.max_ns),
-                    bytesToMib(r.file_bytes),     bytesToMib(r.logical_bytes),
-                    bytesToMib(r.peak_rss_bytes),
+                    r.name,                     r.ops,
+                    r.throughputPerSec(),       nsToUs(r.p50Ns),
+                    nsToUs(r.p99Ns),            nsToUs(r.maxNs),
+                    bytesToMib(r.fileBytes),    bytesToMib(r.logicalBytes),
+                    bytesToMib(r.peakRssBytes),
                 },
             );
         }
@@ -197,12 +197,12 @@ pub fn appendJson(path: []const u8, scale: Scale, results: []const Result, alloc
             .scale = scaleStr(scale),
             .ops = r.ops,
             .ops_per_sec = r.throughputPerSec(),
-            .p50_us = nsToUs(r.p50_ns),
-            .p99_us = nsToUs(r.p99_ns),
-            .max_us = nsToUs(r.max_ns),
-            .file_mib = bytesToMib(r.file_bytes),
-            .logical_mib = bytesToMib(r.logical_bytes),
-            .rss_mib = bytesToMib(r.peak_rss_bytes),
+            .p50_us = nsToUs(r.p50Ns),
+            .p99_us = nsToUs(r.p99Ns),
+            .max_us = nsToUs(r.maxNs),
+            .file_mib = bytesToMib(r.fileBytes),
+            .logical_mib = bytesToMib(r.logicalBytes),
+            .rss_mib = bytesToMib(r.peakRssBytes),
             .note = r.note,
         };
         const line = try std.fmt.allocPrint(alloc, "{f}\n", .{std.json.fmt(rec, .{})});
@@ -217,9 +217,9 @@ pub fn appendJson(path: []const u8, scale: Scale, results: []const Result, alloc
 // Scratch-file helpers
 // ---------------------------------------------------------------------------
 
-/// Joins `ctx.tmp_dir` and `name` into an absolute path. Caller frees.
+/// Joins `ctx.tmpDir` and `name` into an absolute path. Caller frees.
 pub fn scratchPath(ctx: Ctx, name: []const u8) ![]const u8 {
-    return std.fs.path.join(ctx.alloc, &.{ ctx.tmp_dir, name });
+    return std.fs.path.join(ctx.alloc, &.{ ctx.tmpDir, name });
 }
 
 /// Deletes a scratch file, ignoring any error (best-effort cleanup).
@@ -232,7 +232,7 @@ pub fn removeScratch(ctx: Ctx, path: []const u8) void {
 // Argument parsing
 // ---------------------------------------------------------------------------
 
-const default_json_path = "bench-results.json";
+const defaultJsonPath = "bench-results.json";
 
 fn usage() void {
     std.debug.print(
@@ -241,7 +241,7 @@ fn usage() void {
         \\  --json[=PATH]    append results as JSON (default {s})
         \\  --only=NAME      run only the named scenario
         \\
-    , .{default_json_path});
+    , .{defaultJsonPath});
 }
 
 /// Parses argv (slice from `init.minimal.args.toSlice`) into `Opts`. Retained
@@ -265,7 +265,7 @@ pub fn parseArgs(alloc: Allocator, args: []const [:0]const u8) !Opts {
                 return error.InvalidScale;
             }
         } else if (std.mem.eql(u8, arg, "--json")) {
-            try setJsonPath(&opts, alloc, default_json_path);
+            try setJsonPath(&opts, alloc, defaultJsonPath);
         } else if (std.mem.startsWith(u8, arg, "--json=")) {
             try setJsonPath(&opts, alloc, arg["--json=".len..]);
         } else if (std.mem.startsWith(u8, arg, "--only=")) {
@@ -280,8 +280,8 @@ pub fn parseArgs(alloc: Allocator, args: []const [:0]const u8) !Opts {
 }
 
 fn setJsonPath(opts: *Opts, alloc: Allocator, path: []const u8) !void {
-    if (opts.json_path) |p| alloc.free(p);
-    opts.json_path = try alloc.dupe(u8, path);
+    if (opts.jsonPath) |p| alloc.free(p);
+    opts.jsonPath = try alloc.dupe(u8, path);
 }
 
 // ---------------------------------------------------------------------------
@@ -306,25 +306,25 @@ pub fn runAll(alloc: Allocator, opts: Opts) !void {
     defer Io.Dir.cwd().deleteTree(io, scratch) catch {};
 
     // scenarios registered here as they land
-    const insert_recovery = @import("scenarios/insertRecovery.zig");
-    const lookup_query = @import("scenarios/lookupQuery.zig");
-    const churn_compaction = @import("scenarios/churnCompaction.zig");
-    const blobs_pitr = @import("scenarios/blobsPitr.zig");
-    const types_crud = @import("scenarios/typesCrud.zig");
-    const embedded_crud = @import("scenarios/embeddedCrud.zig");
-    const nested_embedded = @import("scenarios/nestedEmbedded.zig");
-    const bulk_import = @import("scenarios/bulkImport.zig");
-    const bulk_append = @import("scenarios/bulkAppend.zig");
+    const insertRecovery = @import("scenarios/insertRecovery.zig");
+    const lookupQuery = @import("scenarios/lookupQuery.zig");
+    const churnCompaction = @import("scenarios/churnCompaction.zig");
+    const blobsPitr = @import("scenarios/blobsPitr.zig");
+    const typesCrud = @import("scenarios/typesCrud.zig");
+    const embeddedCrud = @import("scenarios/embeddedCrud.zig");
+    const nestedEmbedded = @import("scenarios/nestedEmbedded.zig");
+    const bulkImport = @import("scenarios/bulkImport.zig");
+    const bulkAppend = @import("scenarios/bulkAppend.zig");
     const scenarios = [_]Scenario{
-        .{ .name = insert_recovery.name, .run = insert_recovery.run },
-        .{ .name = lookup_query.name, .run = lookup_query.run },
-        .{ .name = churn_compaction.name, .run = churn_compaction.run },
-        .{ .name = blobs_pitr.name, .run = blobs_pitr.run },
-        .{ .name = types_crud.name, .run = types_crud.run },
-        .{ .name = embedded_crud.name, .run = embedded_crud.run },
-        .{ .name = nested_embedded.name, .run = nested_embedded.run },
-        .{ .name = bulk_import.name, .run = bulk_import.run },
-        .{ .name = bulk_append.name, .run = bulk_append.run },
+        .{ .name = insertRecovery.name, .run = insertRecovery.run },
+        .{ .name = lookupQuery.name, .run = lookupQuery.run },
+        .{ .name = churnCompaction.name, .run = churnCompaction.run },
+        .{ .name = blobsPitr.name, .run = blobsPitr.run },
+        .{ .name = typesCrud.name, .run = typesCrud.run },
+        .{ .name = embeddedCrud.name, .run = embeddedCrud.run },
+        .{ .name = nestedEmbedded.name, .run = nestedEmbedded.run },
+        .{ .name = bulkImport.name, .run = bulkImport.run },
+        .{ .name = bulkAppend.name, .run = bulkAppend.run },
     };
 
     var results: std.ArrayList(Result) = .empty;
@@ -334,7 +334,7 @@ pub fn runAll(alloc: Allocator, opts: Opts) !void {
         if (opts.only) |only| {
             if (!std.mem.eql(u8, only, s.name)) continue;
         }
-        var ctx = Ctx{ .alloc = alloc, .n = n, .tmp_dir = scratch };
+        var ctx = Ctx{ .alloc = alloc, .n = n, .tmpDir = scratch };
         try results.append(alloc, try s.run(&ctx));
     }
 
@@ -344,7 +344,7 @@ pub fn runAll(alloc: Allocator, opts: Opts) !void {
     try printTable(results.items, w);
     try w.flush();
 
-    if (opts.json_path) |jp| {
+    if (opts.jsonPath) |jp| {
         try appendJson(jp, opts.scale, results.items, alloc);
     }
 }
@@ -383,11 +383,11 @@ test "Latencies percentiles on an empty set are zero" {
 }
 
 test "Result throughput math" {
-    const r = Result{ .name = "x", .ops = 1000, .wall_ns = 1_000_000_000 };
+    const r = Result{ .name = "x", .ops = 1000, .wallNs = 1_000_000_000 };
     try std.testing.expectEqual(@as(f64, 1000), r.throughputPerSec());
 }
 
 test "Result throughput guards zero wall time" {
-    const r = Result{ .name = "x", .ops = 1000, .wall_ns = 0 };
+    const r = Result{ .name = "x", .ops = 1000, .wallNs = 0 };
     try std.testing.expectEqual(@as(f64, 0), r.throughputPerSec());
 }

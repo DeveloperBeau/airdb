@@ -7,11 +7,11 @@
 // run is reproducible without any banned clock/RNG source.
 //
 // Property 1 (category) is declared indexed, so each insert also maintains a
-// value index for it. The equality query (category == eq_category) is routed
+// value index for it. The equality query (category == eqCategory) is routed
 // by the planner through that value index -- it is index-backed, not a scan.
 // The full scan has no predicate and still walks the key->row index. Labels:
 // "eq" is the single-eq query (index-backed), "full" is the no-predicate scan,
-// and "idx_eq_us" is the measured per-call latency of the index-backed eq.
+// and "idxEqUs" is the measured per-call latency of the index-backed eq.
 
 const std = @import("std");
 const airdb = @import("airdb");
@@ -26,16 +26,16 @@ const query = airdb.query;
 pub const name = "lookup_query";
 
 // Rows committed per write transaction during the (untimed) insert phase.
-const batch_size: usize = 10_000;
+const batchSize: usize = 10_000;
 
 // Number of point lookups to sample for latency percentiles.
-const lookup_count: usize = 100_000;
+const lookupCount: usize = 100_000;
 
-// Distinct category values; each row gets category = primaryKey % category_mod.
-const category_mod: u64 = 100;
+// Distinct category values; each row gets category = primaryKey % categoryMod.
+const categoryMod: u64 = 100;
 
 // The category the equality query selects on.
-const eq_category: u64 = 42;
+const eqCategory: u64 = 42;
 
 // Repetitions of the index-backed equality query used to derive its per-call
 // latency (averaged), small enough to keep the run well under a minute.
@@ -78,18 +78,18 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
 
     var inserted: usize = 0;
     while (inserted < ctx.n) {
-        const this_batch = @min(batch_size, ctx.n - inserted);
+        const thisBatch = @min(batchSize, ctx.n - inserted);
         var w = try database.beginWrite();
-        catalogRef = database.active_root; // reload the committed catalog ref
+        catalogRef = database.activeRoot; // reload the committed catalog ref
         var j: usize = 0;
-        while (j < this_batch) : (j += 1) {
+        while (j < thisBatch) : (j += 1) {
             const primaryKey: u64 = inserted + j;
-            const r = try rows.insert(&w, catalogRef, &.{ primaryKey, primaryKey % category_mod });
+            const r = try rows.insert(&w, catalogRef, &.{ primaryKey, primaryKey % categoryMod });
             catalogRef = r.catalogRef;
         }
         w.setRoot(catalogRef);
         _ = try w.commit();
-        inserted += this_batch;
+        inserted += thisBatch;
     }
 
     // --- Point-lookup latency ------------------------------------------------
@@ -102,45 +102,45 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     // Deterministic xorshift64 over a fixed seed; index = x % n keeps every
     // lookup inside [0, n). No clock/RNG dependency, so the run is reproducible.
     var x: u64 = 0x9E3779B97F4A7C15;
-    const n_u64: u64 = @intCast(ctx.n);
+    const nU64: u64 = @intCast(ctx.n);
 
-    const lookup_start = nowNs(io);
+    const lookupStart = nowNs(io);
     var k: usize = 0;
-    while (k < lookup_count) : (k += 1) {
+    while (k < lookupCount) : (k += 1) {
         x ^= x << 13;
         x ^= x >> 7;
         x ^= x << 17;
-        const primaryKey: u64 = x % n_u64;
+        const primaryKey: u64 = x % nU64;
         var out: [2]u64 = undefined;
         const t0 = nowNs(io);
         _ = try rows.getByPrimaryKey(&rd, catalogRef, primaryKey, &out);
         const dt: u64 = @intCast(nowNs(io) - t0);
         try lat.add(alloc, dt);
     }
-    const lookup_ns: u64 = @intCast(nowNs(io) - lookup_start);
+    const lookupNs: u64 = @intCast(nowNs(io) - lookupStart);
 
     // --- Query scans ---------------------------------------------------------
-    // Index-backed equality query: category == eq_category. The planner routes
+    // Index-backed equality query: category == eqCategory. The planner routes
     // this through the value index on property 1. Timed once for the "eq" note
-    // and over many repetitions for the per-call "idx_eq_us" latency.
-    var rows_eq: u64 = 0;
-    const eq_start = nowNs(io);
+    // and over many repetitions for the per-call "idxEqUs" latency.
+    var rowsEq: u64 = 0;
+    const eqStart = nowNs(io);
     var e: usize = 0;
     while (e < indexedEqRepetitions) : (e += 1) {
-        rows_eq = try query.countWhere(
+        rowsEq = try query.countWhere(
             &rd,
             catalogRef,
-            &.{.{ .property = 1, .operator = .eq, .value = eq_category }},
+            &.{.{ .property = 1, .operator = .eq, .value = eqCategory }},
             alloc,
         );
     }
-    const eq_total_ns: u64 = @intCast(nowNs(io) - eq_start);
-    const indexedEqNs: u64 = eq_total_ns / indexedEqRepetitions;
+    const eqTotalNs: u64 = @intCast(nowNs(io) - eqStart);
+    const indexedEqNs: u64 = eqTotalNs / indexedEqRepetitions;
 
     // Full scan: no predicate matches every live row.
-    const full_start = nowNs(io);
+    const fullStart = nowNs(io);
     _ = try query.countWhere(&rd, catalogRef, &.{}, alloc);
-    const full_ns: u64 = @intCast(nowNs(io) - full_start);
+    const fullNs: u64 = @intCast(nowNs(io) - fullStart);
 
     rd.end();
 
@@ -149,22 +149,22 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         "eq={d}us full={d}ms idx_eq_us={d} rows_eq={d}",
         .{
             indexedEqNs / std.time.ns_per_us,
-            full_ns / std.time.ns_per_ms,
+            fullNs / std.time.ns_per_ms,
             indexedEqNs / std.time.ns_per_us,
-            rows_eq,
+            rowsEq,
         },
     );
 
     return .{
         .name = name,
-        .ops = lookup_count,
-        .wall_ns = lookup_ns,
-        .p50_ns = lat.percentile(50),
-        .p99_ns = lat.percentile(99),
-        .max_ns = lat.percentile(100),
-        .file_bytes = try database.fileSize(),
-        .logical_bytes = database.logicalSize(),
-        .peak_rss_bytes = airdb.peakResidentBytes(),
+        .ops = lookupCount,
+        .wallNs = lookupNs,
+        .p50Ns = lat.percentile(50),
+        .p99Ns = lat.percentile(99),
+        .maxNs = lat.percentile(100),
+        .fileBytes = try database.fileSize(),
+        .logicalBytes = database.logicalSize(),
+        .peakRssBytes = airdb.peakResidentBytes(),
         .note = note,
     };
 }

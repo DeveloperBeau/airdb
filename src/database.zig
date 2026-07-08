@@ -2,7 +2,7 @@
 //
 // Slot A byte range in the header page: [64, 64+Slot.size).
 // Slot B byte range in the header page: [128, 128+Slot.size).
-// Data arena starts at default_page_size.
+// Data arena starts at defaultPageSize.
 
 const std = @import("std");
 const testing = std.testing;
@@ -11,44 +11,44 @@ const platform = @import("platform.zig");
 const FileStore = @import("storage/fileStore.zig").FileStore;
 const FileSyncer = @import("storage/syncer.zig").FileSyncer;
 const Syncing = @import("storage/syncer.zig").Syncing;
-const default_page_size = @import("storage/fileStore.zig").default_page_size;
+const defaultPageSize = @import("storage/fileStore.zig").defaultPageSize;
 const Arena = @import("storage/arena.zig").Arena;
 const Allocation = @import("storage/arena.zig").Allocation;
 const Reference = @import("storage/reference.zig").Reference;
 const Slot = @import("storage/slots.zig").Slot;
 const FreeList = @import("storage/freeList.zig").FreeList;
 const Coordination = @import("transactions/coordination.zig").Coordination;
-const coord_mod = @import("transactions/coordination.zig");
+const coordMod = @import("transactions/coordination.zig");
 const versioning = @import("transactions/versioning.zig");
 const freeListRecovery = @import("storage/freeListRecovery.zig");
 
 /// Byte offset of commit slot A in the header page.
-pub const slot_a_off: usize = 64;
+pub const slotAOff: usize = 64;
 /// Byte offset of commit slot B in the header page.
-pub const slot_b_off: usize = 128;
+pub const slotBOff: usize = 128;
 
-// Version->root ring log, in the reserved header page (page 0, [0, default_page_size)).
-// The arena's data starts at default_page_size, so the header page has free room past
+// Version->root ring log, in the reserved header page (page 0, [0, defaultPageSize)).
+// The arena's data starts at defaultPageSize, so the header page has free room past
 // the FileStore header ([0,32)) and the two commit slots (A: [64,100), B: [128,164)).
-//   ring_head_off: u64 LE, monotonically increasing count of entries ever written.
-//                  The live head index is ring_head % ring_capacity. u64 so the
+//   ringHeadOff: u64 LE, monotonically increasing count of entries ever written.
+//                  The live head index is ringHead % ringCapacity. u64 so the
 //                  counter cannot overflow within any plausible commit volume (a
 //                  u32 wraps after ~4 billion commits and would panic mid-commit).
-//   ring_off:      ring_capacity entries, each 16 bytes [version u64 LE][root_ref u64 LE].
-// End of ring = ring_off + ring_capacity*16 = 1024 + 128*16 = 3072 < 4096. No overlap.
-pub const ring_head_off: usize = 1016;
-pub const ring_off: usize = 1024;
-pub const ring_capacity: u32 = 128;
+//   ringOff:      ringCapacity entries, each 16 bytes [version u64 LE][rootRef u64 LE].
+// End of ring = ringOff + ringCapacity*16 = 1024 + 128*16 = 3072 < 4096. No overlap.
+pub const ringHeadOff: usize = 1016;
+pub const ringOff: usize = 1024;
+pub const ringCapacity: u32 = 128;
 
 // Retention window, persisted in the header page so EVERY process honors the
 // same reclaim floor: committed-free space is withheld from reuse until it is
-// older than `active_version - retain`. A per-instance in-memory setting would
+// older than `activeVersion - retain`. A per-instance in-memory setting would
 // let a default-configured writer in another process reuse space under a
 // point-in-time reader that relies on the window. u64 LE at [192, 200);
 // 8-aligned, clear of slot B ([128, 164)) and the ring head (1016). Zero on a
 // fresh (zero-filled) file, matching the old default. maxInt means "retain
 // everything". Read/written atomically through the shared mapping.
-pub const retain_off: usize = 192;
+pub const retainOff: usize = 192;
 
 // ---------------------------------------------------------------------------
 // Database
@@ -57,58 +57,58 @@ pub const retain_off: usize = 192;
 /// Two-pointer packing cursor for one in-flight incremental-compaction run.
 /// Owned by the Database (it persists across the write transactions that drive the
 /// run) but read and advanced exclusively by compaction.compactStep, which
-/// documents the resume/reset rules. live_count and next_row pin the run to a
-/// specific catalog shape; hole_lo scans upward for dead relocation targets
-/// and high_hi scans downward for live rows that must move.
+/// documents the resume/reset rules. liveCount and nextRow pin the run to a
+/// specific catalog shape; holeLo scans upward for dead relocation targets
+/// and highHi scans downward for live rows that must move.
 pub const CompactCursor = struct {
     /// The TYPE this cursor belongs to plus the catalog ref it was persisted
-    /// against. Both are required for a resume: live_count/next_row are a
+    /// against. Both are required for a resume: liveCount/nextRow are a
     /// heuristic two different types can momentarily share, and the catalog
     /// ref ALONE is recyclable (freed catalog nodes are exact-size-class
     /// reused, so another type's catalog can land on the same ref). Resuming
     /// a foreign cursor would leave rows unexamined ahead of the tail
     /// truncate -- silent live-row loss in release builds.
-    type_id: u16,
+    typeId: u16,
     catalogRef: Reference,
-    live_count: u64,
-    next_row: u64,
-    hole_lo: u64,
-    high_hi: u64,
+    liveCount: u64,
+    nextRow: u64,
+    holeLo: u64,
+    highHi: u64,
 };
 
 pub const Database = struct {
     store: FileStore,
     arena: Arena,
-    active_version: u64,
-    active_root: Reference,
+    activeVersion: u64,
+    activeRoot: Reference,
     pins: std.AutoHashMap(u64, u32),
     /// Currently-committed free list. Owns its memory; deinit'd in Database.deinit.
-    free_list: FreeList,
+    freeList: FreeList,
     /// Offset of the live free-list node on disk (0 if none).
-    free_list_node_ref: Reference,
+    freeListNodeRef: Reference,
     /// Byte length of the live free-list node on disk (0 if none).
-    free_list_node_len: usize,
+    freeListNodeLen: usize,
     /// Coordination file for multi-process attach count and latest-version signal.
     coord: Coordination,
     /// Index into the coord participant slot array claimed by this Database instance, or null
     /// if all 64 slots were occupied at open/create time.
-    participant_slot: ?usize,
+    participantSlot: ?usize,
     // NOTE: the retention window is NOT an in-memory field. It lives in the
-    // header page (see retain_off) so all attached processes share one floor;
+    // header page (see retainOff) so all attached processes share one floor;
     // read it with retainVersions() and set it with setRetainVersions().
     /// Opt-in: when set, the caller drives `maintenance.maybeCompactStep` to
     /// amortize compaction.
-    auto_compact: bool = false,
+    autoCompact: bool = false,
     /// In-flight cursor for budget-proportional packing. Holds the two-pointer
     /// state for the type currently being compacted across successive
     /// `compactStep` calls; null between runs (and reset on any churn that moves
-    /// the type's live_count/next_row). See `compaction.compactStep`.
-    compact_cursor: ?CompactCursor = null,
+    /// the type's liveCount/nextRow). See `compaction.compactStep`.
+    compactCursor: ?CompactCursor = null,
     /// Set when recovery could not use the primary commit slot (its checksum or
     /// the header's was bad) and fell back to the other slot -- i.e. the database
     /// silently resumed from the previous version. Surfaced via metrics() so
     /// callers can log/alert on it; never set on a clean open.
-    recovered_fallback: bool = false,
+    recoveredFallback: bool = false,
     /// Set when a commit's HEADER flush (the commit point) failed. The flipped
     /// commit pointer was already in the mapped header page before the failed
     /// barrier, so async writeback may persist it regardless -- the commit's
@@ -119,19 +119,19 @@ pub const Database = struct {
     poisoned: bool = false,
 
     /// Measurement-only counters accumulated since open. Updated by commit; never
-    /// affect behavior. fl_encode_ns is the total nanoseconds spent encoding the
+    /// affect behavior. flEncodeNs is the total nanoseconds spent encoding the
     /// persistent free list onto the arena (byteLen + bump alloc + encode), and
-    /// fl_extents_encoded is the sum of free-list extent counts encoded across all
-    /// commits. commit_count is the number of commits whose encode completed.
-    /// fl_rebuild_ns is the total nanoseconds spent rebuilding the new persistent
-    /// free list from work_freelist + in_flight_frees in commit (the O(extent count)
-    /// copy loops). fl_clone_ns is the total nanoseconds spent cloning the committed
-    /// free list into work_freelist in beginWriteLocked (also O(extent count)).
-    fl_encode_ns: u64 = 0,
-    fl_extents_encoded: u64 = 0,
-    commit_count: u64 = 0,
-    fl_rebuild_ns: u64 = 0,
-    fl_clone_ns: u64 = 0,
+    /// flExtentsEncoded is the sum of free-list extent counts encoded across all
+    /// commits. commitCount is the number of commits whose encode completed.
+    /// flRebuildNs is the total nanoseconds spent rebuilding the new persistent
+    /// free list from workFreelist + inFlightFrees in commit (the O(extent count)
+    /// copy loops). flCloneNs is the total nanoseconds spent cloning the committed
+    /// free list into workFreelist in beginWriteLocked (also O(extent count)).
+    flEncodeNs: u64 = 0,
+    flExtentsEncoded: u64 = 0,
+    commitCount: u64 = 0,
+    flRebuildNs: u64 = 0,
+    flCloneNs: u64 = 0,
 
     /// Create a new database file at the given absolute path.
     pub fn create(allocator: std.mem.Allocator, path: []const u8) !Database {
@@ -146,23 +146,23 @@ pub const Database = struct {
         // Write version-1 into slot A; mark it active.
         const initial = Slot{
             .version = 1,
-            .root_ref = 0,
-            .free_list_ref = 0,
-            .logical_size = default_page_size,
+            .rootRef = 0,
+            .freeListRef = 0,
+            .logicalSize = defaultPageSize,
         };
-        initial.encode(store.map[slot_a_off..][0..Slot.size]);
-        store.header.active_slot = 0;
+        initial.encode(store.map[slotAOff..][0..Slot.size]);
+        store.header.activeSlot = 0;
         // Zero the version->root ring region so head starts at 0 and all entries are
         // empty. The ring is left empty; the first real commit populates it. A fresh
         // file is already zero-filled, but zero explicitly so create is self-contained.
-        @memset(store.map[ring_head_off .. ring_off + @as(usize, ring_capacity) * 16], 0);
+        @memset(store.map[ringHeadOff .. ringOff + @as(usize, ringCapacity) * 16], 0);
         store.persistHeader();
         try store.syncer.flush(store.file);
 
         // Coord setup -- done last so the errdefer has no further try-s after it.
-        const coord_path = try std.fmt.allocPrint(allocator, "{s}.coord", .{path});
-        defer allocator.free(coord_path);
-        var coord = try Coordination.openOrCreate(coord_path);
+        const coordPath = try std.fmt.allocPrint(allocator, "{s}.coord", .{path});
+        defer allocator.free(coordPath);
+        var coord = try Coordination.openOrCreate(coordPath);
         var slot: ?usize = null;
         errdefer {
             if (slot) |claimed| coord.releaseSlot(claimed);
@@ -178,16 +178,16 @@ pub const Database = struct {
 
         return Database{
             .store = store,
-            .arena = Arena.init(store.sectionsView(), default_page_size),
-            .active_version = 1,
-            .active_root = 0,
+            .arena = Arena.init(store.sectionsView(), defaultPageSize),
+            .activeVersion = 1,
+            .activeRoot = 0,
             .pins = std.AutoHashMap(u64, u32).init(allocator),
-            .free_list = FreeList.init(allocator),
-            .free_list_node_ref = 0,
-            .free_list_node_len = 0,
+            .freeList = FreeList.init(allocator),
+            .freeListNodeRef = 0,
+            .freeListNodeLen = 0,
             .coord = coord,
-            .participant_slot = slot,
-            .auto_compact = false,
+            .participantSlot = slot,
+            .autoCompact = false,
         };
     }
 
@@ -203,39 +203,39 @@ pub const Database = struct {
         // Capture the section table before store is copied into the partial Database below.
         // The slice points at heap memory owned by store.sections, which survives the
         // by-value move of store into database.store.
-        const store_sections = store.sectionsView();
+        const storeSections = store.sectionsView();
 
         // Build a partial Database so versioning.selectActiveSlot and
         // freeListRecovery.loadFreeList can run against it.
         // coord is left undefined; it is set at the very end.
         // On any error path, errdefer store.deinit() (above) frees the file+mmap,
-        // and errdefer database.free_list.deinit() (below) frees any allocated extents.
+        // and errdefer database.freeList.deinit() (below) frees any allocated extents.
         // database.pins is always empty here (no allocation), so it is safe to drop.
         var database: Database = .{
             .store = store,
-            .arena = Arena.init(store_sections, default_page_size),
-            .active_version = 0,
-            .active_root = 0,
+            .arena = Arena.init(storeSections, defaultPageSize),
+            .activeVersion = 0,
+            .activeRoot = 0,
             .pins = std.AutoHashMap(u64, u32).init(allocator),
-            .free_list = FreeList.init(allocator),
-            .free_list_node_ref = 0,
-            .free_list_node_len = 0,
+            .freeList = FreeList.init(allocator),
+            .freeListNodeRef = 0,
+            .freeListNodeLen = 0,
             .coord = undefined,
-            .participant_slot = null,
-            .auto_compact = false,
+            .participantSlot = null,
+            .autoCompact = false,
         };
-        errdefer database.free_list.deinit();
+        errdefer database.freeList.deinit();
 
         const active = try versioning.selectActiveSlot(&database);
-        database.active_version = active.version;
-        database.active_root = active.root_ref;
-        database.arena.top = @intCast(active.logical_size);
-        if (active.free_list_ref != 0) try freeListRecovery.loadFreeList(&database, active.free_list_ref);
+        database.activeVersion = active.version;
+        database.activeRoot = active.rootRef;
+        database.arena.top = @intCast(active.logicalSize);
+        if (active.freeListRef != 0) try freeListRecovery.loadFreeList(&database, active.freeListRef);
 
         // Coord setup -- done last so the errdefer has no further try-s after it.
-        const coord_path = try std.fmt.allocPrint(allocator, "{s}.coord", .{path});
-        defer allocator.free(coord_path);
-        var coord = try Coordination.openOrCreate(coord_path);
+        const coordPath = try std.fmt.allocPrint(allocator, "{s}.coord", .{path});
+        defer allocator.free(coordPath);
+        var coord = try Coordination.openOrCreate(coordPath);
         var slot: ?usize = null;
         errdefer {
             if (slot) |claimed| coord.releaseSlot(claimed);
@@ -248,15 +248,15 @@ pub const Database = struct {
         slot = (try coord.claimSlot()) orelse return error.TooManyAttachments;
 
         database.coord = coord;
-        database.participant_slot = slot;
+        database.participantSlot = slot;
         return database;
     }
 
     pub fn deinit(self: *Database) void {
-        if (self.participant_slot) |slotIndex| self.coord.releaseSlot(slotIndex);
+        if (self.participantSlot) |slotIndex| self.coord.releaseSlot(slotIndex);
         _ = self.coord.detach();
         self.coord.deinit();
-        self.free_list.deinit();
+        self.freeList.deinit();
         self.pins.deinit();
         self.store.deinit();
     }
@@ -277,16 +277,16 @@ pub const Database = struct {
         // window: if the world moved past the pinned version while it was in
         // flight, unpin and chase the new version. The loop terminates because
         // versions only move forward and each retry pins the newest one seen.
-        var prev_v: ?u64 = null;
+        var prevV: ?u64 = null;
         while (true) {
             try versioning.refreshToLatest(self);
-            const activeVersion = self.active_version;
-            const root = self.active_root;
+            const activeVersion = self.activeVersion;
+            const root = self.activeRoot;
             // A retry that made no progress means the published version keeps
             // running ahead of anything this instance can adopt (e.g. newer
             // slots do not decode). Fail rather than spin forever.
-            if (prev_v != null and prev_v.? == activeVersion) return error.Corrupt;
-            prev_v = activeVersion;
+            if (prevV != null and prevV.? == activeVersion) return error.Corrupt;
+            prevV = activeVersion;
             if (self.pins.getPtr(activeVersion)) |ptr| {
                 ptr.* += 1;
             } else {
@@ -295,12 +295,12 @@ pub const Database = struct {
             self.publishPins();
             const latestVersion = self.coord.latestVersion();
             const retain = self.retainVersions();
-            const floor = if (retain == coord_mod.sentinel_max) 0 else latestVersion -| retain;
+            const floor = if (retain == coordMod.sentinelMax) 0 else latestVersion -| retain;
             if (activeVersion >= floor) {
-                return ReadTransaction{ .database = self, .root_ref = root, .version = activeVersion };
+                return ReadTransaction{ .database = self, .rootRef = root, .version = activeVersion };
             }
             // The pin landed too late; release it and pin the newer version.
-            var stale = ReadTransaction{ .database = self, .root_ref = root, .version = activeVersion };
+            var stale = ReadTransaction{ .database = self, .rootRef = root, .version = activeVersion };
             stale.end();
         }
     }
@@ -311,15 +311,15 @@ pub const Database = struct {
     /// Pins the version so its nodes are held for the life of the read.
     pub fn beginReadAt(self: *Database, version: u64) !ReadTransaction {
         try versioning.refreshToLatest(self);
-        if (version > self.active_version) return error.VersionUnavailable;
+        if (version > self.activeVersion) return error.VersionUnavailable;
         // Must be inside the retention window: older versions' nodes may already
         // be reclaimed. maxInt means "retain everything".
         const retain = self.retainVersions();
-        if (retain != coord_mod.sentinel_max) {
-            if (version < self.active_version -| retain) return error.VersionUnavailable;
+        if (retain != coordMod.sentinelMax) {
+            if (version < self.activeVersion -| retain) return error.VersionUnavailable;
         }
-        const root = if (version == self.active_version)
-            self.active_root
+        const root = if (version == self.activeVersion)
+            self.activeRoot
         else
             (self.versionRoot(version) orelse return error.VersionUnavailable);
         if (self.pins.getPtr(version)) |ptr| {
@@ -330,21 +330,21 @@ pub const Database = struct {
         self.publishPins();
         // Pin-then-validate. A writer in another process whose reclaim-horizon
         // load happened BEFORE our pin became visible may reuse extents freed
-        // above `version` -- but only extents with freed_version <= its
-        // active_version - retain. So once the pin is published, re-read the
+        // above `version` -- but only extents with freedVersion <= its
+        // activeVersion - retain. So once the pin is published, re-read the
         // published latest version: if `version` still clears the shared
         // retention floor of the newest possible in-flight writer, no such
         // writer can have reused a node this snapshot references. Otherwise
         // unpin and refuse the read rather than risk a corrupt snapshot.
-        if (retain != coord_mod.sentinel_max) {
+        if (retain != coordMod.sentinelMax) {
             const latestVersion = self.coord.latestVersion();
             if (version < latestVersion -| retain) {
-                var transaction = ReadTransaction{ .database = self, .root_ref = root, .version = version };
+                var transaction = ReadTransaction{ .database = self, .rootRef = root, .version = version };
                 transaction.end(); // unpin
                 return error.VersionUnavailable;
             }
         }
-        return ReadTransaction{ .database = self, .root_ref = root, .version = version };
+        return ReadTransaction{ .database = self, .rootRef = root, .version = version };
     }
 
     /// The minimum version pinned by a live reader in this process, or the
@@ -392,7 +392,7 @@ pub const Database = struct {
         return versioning.versionRoot(self, version);
     }
 
-    /// Oldest version still recorded in the ring, or active_version if the
+    /// Oldest version still recorded in the ring, or activeVersion if the
     /// ring is empty.
     pub fn oldestRetainedVersion(self: *Database) u64 {
         return versioning.oldestRetainedVersion(self);
@@ -414,25 +414,25 @@ pub const Database = struct {
         if (self.poisoned) return error.CommitIndeterminate;
         // Refresh under the lock so the writer sees the truly-latest committed version.
         try versioning.refreshToLatest(self);
-        // Clone the committed free list into work_freelist so the transaction
-        // can reuse extents from it. database.free_list is untouched during the transaction;
-        // work_freelist is the mutable clone that reuse() shrinks.
-        var work_freelist = FreeList.init(self.store.allocator);
-        errdefer work_freelist.deinit();
+        // Clone the committed free list into workFreelist so the transaction
+        // can reuse extents from it. database.freeList is untouched during the transaction;
+        // workFreelist is the mutable clone that reuse() shrinks.
+        var workFreelist = FreeList.init(self.store.allocator);
+        errdefer workFreelist.deinit();
         // Measurement only: time the O(extent count) clone of the committed free
         // list. No behavior change; counter lives on the Database.
-        const clone_io = std.Io.Threaded.global_single_threaded.io();
-        const clone_start = Io.Clock.now(.awake, clone_io).nanoseconds;
-        for (self.free_list.extents.items) |extent| {
-            try work_freelist.add(extent);
+        const cloneIo = std.Io.Threaded.global_single_threaded.io();
+        const cloneStart = Io.Clock.now(.awake, cloneIo).nanoseconds;
+        for (self.freeList.extents.items) |extent| {
+            try workFreelist.add(extent);
         }
-        self.fl_clone_ns += @intCast(Io.Clock.now(.awake, clone_io).nanoseconds - clone_start);
+        self.flCloneNs += @intCast(Io.Clock.now(.awake, cloneIo).nanoseconds - cloneStart);
         return WriteTransaction{
             .database = self,
-            .new_root = self.active_root,
-            .new_version = self.active_version + 1,
-            .in_flight_frees = .empty,
-            .work_freelist = work_freelist,
+            .newRoot = self.activeRoot,
+            .newVersion = self.activeVersion + 1,
+            .inFlightFrees = .empty,
+            .workFreelist = workFreelist,
             .transactionReuse = FreeList.init(self.store.allocator),
             .transactionStartTop = self.arena.top,
         };
@@ -456,7 +456,7 @@ pub const Database = struct {
     }
 
     /// Bump-allocate `size` bytes, mapping additional sections if the arena is full.
-    /// `error.AllocTooLarge` (size > section_size) is propagated; `error.OutOfSpace`
+    /// `error.AllocTooLarge` (size > sectionSize) is propagated; `error.OutOfSpace`
     /// maps one more section and retries. Each retry adds exactly one section, which is
     /// always enough: a single allocation never crosses more than one section boundary.
     pub fn bumpGrowing(self: *Database, size: usize) !Allocation {
@@ -466,7 +466,7 @@ pub const Database = struct {
             } else |err| switch (err) {
                 error.AllocTooLarge => return err,
                 error.OutOfSpace => {
-                    const target = (self.store.sectionsView().len + 1) << platform.section_shift;
+                    const target = (self.store.sectionsView().len + 1) << platform.sectionShift;
                     try self.store.ensureMapped(target);
                     self.arena.sections = self.store.sectionsView();
                 },
@@ -476,48 +476,48 @@ pub const Database = struct {
 
     /// Test-only accessor: number of extents in the committed free list.
     pub fn freeListLenForTest(self: *Database) usize {
-        return self.free_list.extents.items.len;
+        return self.freeList.extents.items.len;
     }
 
     pub const Metrics = struct {
-        mapped_len: u64,
-        latest_version: u64,
-        oldest_pinned_version: u64,
-        free_extent_count: usize,
-        reclaimable_bytes: u64,
+        mappedLen: u64,
+        latestVersion: u64,
+        oldestPinnedVersion: u64,
+        freeExtentCount: usize,
+        reclaimableBytes: u64,
         // Measurement-only cost counters accumulated since open.
-        fl_encode_ns: u64,
-        fl_extents_encoded: u64,
-        commit_count: u64,
-        fl_rebuild_ns: u64,
-        fl_clone_ns: u64,
-        setlength_ns: u64,
-        setlength_calls: u64,
+        flEncodeNs: u64,
+        flExtentsEncoded: u64,
+        commitCount: u64,
+        flRebuildNs: u64,
+        flCloneNs: u64,
+        setlengthNs: u64,
+        setlengthCalls: u64,
         /// True when open had to fall back past a corrupt primary slot or header
         /// and resumed from the previous version. Worth logging/alerting on.
-        recovered_fallback: bool,
+        recoveredFallback: bool,
         /// True when a commit-point flush failed and the instance refuses
-        /// writes until reopen. Strictly more alarming than recovered_fallback.
+        /// writes until reopen. Strictly more alarming than recoveredFallback.
         poisoned: bool,
     };
 
     pub fn metrics(self: *Database) Metrics {
         var reclaimable: u64 = 0;
-        for (self.free_list.extents.items) |extent| reclaimable += extent.len;
+        for (self.freeList.extents.items) |extent| reclaimable += extent.len;
         return .{
-            .mapped_len = @intCast(self.store.sectionsView().len * platform.section_size),
-            .latest_version = self.active_version,
-            .oldest_pinned_version = self.horizon(),
-            .free_extent_count = self.free_list.extents.items.len,
-            .reclaimable_bytes = reclaimable,
-            .fl_encode_ns = self.fl_encode_ns,
-            .fl_extents_encoded = self.fl_extents_encoded,
-            .commit_count = self.commit_count,
-            .fl_rebuild_ns = self.fl_rebuild_ns,
-            .fl_clone_ns = self.fl_clone_ns,
-            .setlength_ns = self.store.setlength_ns,
-            .setlength_calls = self.store.setlength_calls,
-            .recovered_fallback = self.recovered_fallback,
+            .mappedLen = @intCast(self.store.sectionsView().len * platform.sectionSize),
+            .latestVersion = self.activeVersion,
+            .oldestPinnedVersion = self.horizon(),
+            .freeExtentCount = self.freeList.extents.items.len,
+            .reclaimableBytes = reclaimable,
+            .flEncodeNs = self.flEncodeNs,
+            .flExtentsEncoded = self.flExtentsEncoded,
+            .commitCount = self.commitCount,
+            .flRebuildNs = self.flRebuildNs,
+            .flCloneNs = self.flCloneNs,
+            .setlengthNs = self.store.setlengthNs,
+            .setlengthCalls = self.store.setlengthCalls,
+            .recoveredFallback = self.recoveredFallback,
             .poisoned = self.poisoned,
         };
     }

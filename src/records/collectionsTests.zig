@@ -56,10 +56,10 @@ test "collection accessors return error.NotFound for an absent primaryKey" {
     });
     catalogRef = (try insertTyped(&w, catalogRef, &.{
         .{ .int = 1 },
-        .{ .list_int = &.{1} },
-        .{ .set_int = &.{1} },
-        .{ .dict_int = &.{} },
-        .{ .set_blob = &.{} },
+        .{ .listInt = &.{1} },
+        .{ .setInt = &.{1} },
+        .{ .dictInt = &.{} },
+        .{ .setBlob = &.{} },
     })).catalogRef;
 
     const missing: u64 = 999;
@@ -86,13 +86,13 @@ test "list of int: insert seeds members and reads back" {
     defer database.deinit();
     var w = try database.beginWrite();
     var catalogRef = try catalog.createFromDefinitions(&w, &.{ .{ .kind = .int }, .{ .kind = .list, .element = .int } });
-    catalogRef = (try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .list_int = &.{ 10, 20, 30 } } })).catalogRef;
+    catalogRef = (try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .listInt = &.{ 10, 20, 30 } } })).catalogRef;
     try testing.expectEqual(@as(?u64, 3), try listLen(&w, catalogRef, 1, 1));
     try testing.expectEqual(@as(u64, 20), try listGetInt(&w, catalogRef, 1, 1, 1));
     var out: [2]Value = undefined;
     _ = (try getTyped(&w, catalogRef, 1, &out)).?;
     try testing.expectEqual(@as(u64, 1), out[0].int);
-    try testing.expect(out[1].coll_root != 0);
+    try testing.expect(out[1].collRoot != 0);
     w.deinit();
 }
 
@@ -105,7 +105,7 @@ test "list of int: append grows the list" {
     defer database.deinit();
     var w = try database.beginWrite();
     var catalogRef = try catalog.createFromDefinitions(&w, &.{ .{ .kind = .int }, .{ .kind = .list, .element = .int } });
-    catalogRef = (try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .list_int = &.{ 10, 20, 30 } } })).catalogRef;
+    catalogRef = (try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .listInt = &.{ 10, 20, 30 } } })).catalogRef;
     catalogRef = try listAppendInt(&w, catalogRef, 1, 1, 40);
     try testing.expectEqual(@as(?u64, 4), try listLen(&w, catalogRef, 1, 1));
     try testing.expectEqual(@as(u64, 40), try listGetInt(&w, catalogRef, 1, 1, 3));
@@ -121,7 +121,7 @@ test "list of int: set overwrites an element" {
     defer database.deinit();
     var w = try database.beginWrite();
     var catalogRef = try catalog.createFromDefinitions(&w, &.{ .{ .kind = .int }, .{ .kind = .list, .element = .int } });
-    catalogRef = (try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .list_int = &.{ 10, 20, 30 } } })).catalogRef;
+    catalogRef = (try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .listInt = &.{ 10, 20, 30 } } })).catalogRef;
     catalogRef = try listSetInt(&w, catalogRef, 1, 1, 0, 99);
     try testing.expectEqual(@as(u64, 99), try listGetInt(&w, catalogRef, 1, 1, 0));
     w.deinit();
@@ -136,7 +136,7 @@ test "list of blob: insert and read back element strings" {
     defer database.deinit();
     var w = try database.beginWrite();
     var catalogRef = try catalog.createFromDefinitions(&w, &.{ .{ .kind = .int }, .{ .kind = .list, .element = .blob } });
-    catalogRef = (try insertTyped(&w, catalogRef, &.{ .{ .int = 7 }, .{ .list_blob = &.{ "alpha", "beta", "gamma" } } })).catalogRef;
+    catalogRef = (try insertTyped(&w, catalogRef, &.{ .{ .int = 7 }, .{ .listBlob = &.{ "alpha", "beta", "gamma" } } })).catalogRef;
     try testing.expectEqual(@as(?u64, 3), try listLen(&w, catalogRef, 7, 1));
     try testing.expectEqualStrings("beta", try listGetBlob(&w, catalogRef, 7, 1, 1));
     catalogRef = try listAppendBlob(&w, catalogRef, 7, 1, "delta");
@@ -153,7 +153,7 @@ test "set of int: build from initial members dedups and counts" {
     defer database.deinit();
     var w = try database.beginWrite();
     var catalogRef = try catalog.createFromDefinitions(&w, &.{ .{ .kind = .int }, .{ .kind = .set, .element = .int } });
-    catalogRef = (try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .set_int = &.{ 5, 9, 5, 12 } } })).catalogRef;
+    catalogRef = (try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .setInt = &.{ 5, 9, 5, 12 } } })).catalogRef;
     try testing.expectEqual(@as(?u64, 3), try setCountInt(&w, catalogRef, 1, 1));
     w.deinit();
 }
@@ -167,7 +167,7 @@ test "set of int: membership reports contains true and false" {
     defer database.deinit();
     var w = try database.beginWrite();
     var catalogRef = try catalog.createFromDefinitions(&w, &.{ .{ .kind = .int }, .{ .kind = .set, .element = .int } });
-    catalogRef = (try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .set_int = &.{ 5, 9, 5, 12 } } })).catalogRef;
+    catalogRef = (try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .setInt = &.{ 5, 9, 5, 12 } } })).catalogRef;
     try testing.expect(try setContainsInt(&w, catalogRef, 1, 1, 9));
     try testing.expect(!(try setContainsInt(&w, catalogRef, 1, 1, 7)));
     w.deinit();
@@ -182,7 +182,7 @@ test "set of int: add inserts a new member" {
     defer database.deinit();
     var w = try database.beginWrite();
     var catalogRef = try catalog.createFromDefinitions(&w, &.{ .{ .kind = .int }, .{ .kind = .set, .element = .int } });
-    catalogRef = (try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .set_int = &.{ 5, 9, 12 } } })).catalogRef;
+    catalogRef = (try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .setInt = &.{ 5, 9, 12 } } })).catalogRef;
     catalogRef = try setAddInt(&w, catalogRef, 1, 1, 7);
     try testing.expect(try setContainsInt(&w, catalogRef, 1, 1, 7));
     try testing.expectEqual(@as(?u64, 4), try setCountInt(&w, catalogRef, 1, 1));
@@ -198,7 +198,7 @@ test "set of int: adding an existing member is a no-op" {
     defer database.deinit();
     var w = try database.beginWrite();
     var catalogRef = try catalog.createFromDefinitions(&w, &.{ .{ .kind = .int }, .{ .kind = .set, .element = .int } });
-    catalogRef = (try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .set_int = &.{ 5, 7, 9, 12 } } })).catalogRef;
+    catalogRef = (try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .setInt = &.{ 5, 7, 9, 12 } } })).catalogRef;
     try testing.expectEqual(@as(?u64, 4), try setCountInt(&w, catalogRef, 1, 1));
     catalogRef = try setAddInt(&w, catalogRef, 1, 1, 7); // dedup: no change
     try testing.expectEqual(@as(?u64, 4), try setCountInt(&w, catalogRef, 1, 1));
@@ -214,7 +214,7 @@ test "set of int: remove drops a member" {
     defer database.deinit();
     var w = try database.beginWrite();
     var catalogRef = try catalog.createFromDefinitions(&w, &.{ .{ .kind = .int }, .{ .kind = .set, .element = .int } });
-    catalogRef = (try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .set_int = &.{ 5, 7, 9, 12 } } })).catalogRef;
+    catalogRef = (try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .setInt = &.{ 5, 7, 9, 12 } } })).catalogRef;
     catalogRef = try setRemoveInt(&w, catalogRef, 1, 1, 9);
     try testing.expect(!(try setContainsInt(&w, catalogRef, 1, 1, 9)));
     try testing.expectEqual(@as(?u64, 3), try setCountInt(&w, catalogRef, 1, 1));
@@ -230,7 +230,7 @@ test "set of int: collect returns ascending members" {
     defer database.deinit();
     var w = try database.beginWrite();
     var catalogRef = try catalog.createFromDefinitions(&w, &.{ .{ .kind = .int }, .{ .kind = .set, .element = .int } });
-    catalogRef = (try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .set_int = &.{ 12, 5, 7 } } })).catalogRef;
+    catalogRef = (try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .setInt = &.{ 12, 5, 7 } } })).catalogRef;
     var members = std.ArrayList(u64).empty;
     defer members.deinit(testing.allocator);
     try setCollectInt(&w, catalogRef, 1, 1, &members, testing.allocator);
@@ -258,9 +258,9 @@ test "collections persist across commit and reopen" {
         });
         catalogRef = (try insertTyped(&w, catalogRef, &.{
             .{ .int = 42 },
-            .{ .list_int = &.{ 1, 2, 3 } },
-            .{ .set_int = &.{ 100, 200, 300 } },
-            .{ .list_blob = &.{ "x", "yy", "zzz" } },
+            .{ .listInt = &.{ 1, 2, 3 } },
+            .{ .setInt = &.{ 100, 200, 300 } },
+            .{ .listBlob = &.{ "x", "yy", "zzz" } },
         })).catalogRef;
         catalogRef = try listAppendInt(&w, catalogRef, 42, 1, 4);
         catalogRef = try setAddInt(&w, catalogRef, 42, 2, 400);
@@ -295,7 +295,7 @@ test "large list and set: 50k elements each, append and membership" {
         .{ .kind = .list, .element = .int },
         .{ .kind = .set, .element = .int },
     });
-    catalogRef = (try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .list_int = &.{} }, .{ .set_int = &.{} } })).catalogRef;
+    catalogRef = (try insertTyped(&w, catalogRef, &.{ .{ .int = 1 }, .{ .listInt = &.{} }, .{ .setInt = &.{} } })).catalogRef;
     var i: u64 = 0;
     while (i < N) : (i += 1) {
         catalogRef = try listAppendInt(&w, catalogRef, 1, 1, i);
@@ -320,7 +320,7 @@ test "dict: insert, get, put, remove, count, collect" {
     var catalogRef = try catalog.createFromDefinitions(&w, &.{ .{ .kind = .int }, .{ .kind = .dict } });
     catalogRef = (try insertTyped(&w, catalogRef, &.{
         .{ .int = 1 },
-        .{ .dict_int = &.{ .{ .key = "apple", .value = 1 }, .{ .key = "banana", .value = 2 } } },
+        .{ .dictInt = &.{ .{ .key = "apple", .value = 1 }, .{ .key = "banana", .value = 2 } } },
     })).catalogRef;
     try testing.expectEqual(@as(?u64, 1), try dictGet(&w, catalogRef, 1, 1, "apple"));
     try testing.expectEqual(@as(?u64, null), try dictGet(&w, catalogRef, 1, 1, "missing"));
@@ -363,7 +363,7 @@ test "set of blob: insert, membership, add(dedup), remove, count, collect" {
     var catalogRef = try catalog.createFromDefinitions(&w, &.{ .{ .kind = .int }, .{ .kind = .set, .element = .blob } });
     catalogRef = (try insertTyped(&w, catalogRef, &.{
         .{ .int = 1 },
-        .{ .set_blob = &.{ "x", "yy", "x" } }, // duplicate "x"
+        .{ .setBlob = &.{ "x", "yy", "x" } }, // duplicate "x"
     })).catalogRef;
     try testing.expectEqual(@as(?u64, 2), try setCountBlob(&w, catalogRef, 1, 1));
     try testing.expect(try setContainsBlob(&w, catalogRef, 1, 1, "yy"));
@@ -406,8 +406,8 @@ test "dict and set-of-blob persist across reopen" {
         });
         catalogRef = (try insertTyped(&w, catalogRef, &.{
             .{ .int = 42 },
-            .{ .dict_int = &.{ .{ .key = "one", .value = 1 }, .{ .key = "two", .value = 2 } } },
-            .{ .set_blob = &.{ "alpha", "beta" } },
+            .{ .dictInt = &.{ .{ .key = "one", .value = 1 }, .{ .key = "two", .value = 2 } } },
+            .{ .setBlob = &.{ "alpha", "beta" } },
         })).catalogRef;
         catalogRef = try dictPut(&w, catalogRef, 42, 1, "three", 3);
         catalogRef = try setAddBlob(&w, catalogRef, 42, 2, "gamma");

@@ -15,59 +15,59 @@ const Database = databaseModule.Database;
 const Reference = @import("../storage/reference.zig").Reference;
 const Slot = @import("../storage/slots.zig").Slot;
 const FreeList = @import("../storage/freeList.zig").FreeList;
-const coord_mod = @import("coordination.zig");
+const coordMod = @import("coordination.zig");
 const freeListRecovery = @import("../storage/freeListRecovery.zig");
-const default_page_size = @import("../storage/fileStore.zig").default_page_size;
+const defaultPageSize = @import("../storage/fileStore.zig").defaultPageSize;
 
-const slot_a_off = databaseModule.slot_a_off;
-const slot_b_off = databaseModule.slot_b_off;
-const ring_head_off = databaseModule.ring_head_off;
-const ring_off = databaseModule.ring_off;
-const ring_capacity = databaseModule.ring_capacity;
-const retain_off = databaseModule.retain_off;
+const slotAOff = databaseModule.slotAOff;
+const slotBOff = databaseModule.slotBOff;
+const ringHeadOff = databaseModule.ringHeadOff;
+const ringOff = databaseModule.ringOff;
+const ringCapacity = databaseModule.ringCapacity;
+const retainOff = databaseModule.retainOff;
 
 /// Select the active Slot from the shared mapping.
-/// Reads database.store.header_checksum_ok and database.store.header.active_slot.
+/// Reads database.store.headerChecksumOk and database.store.header.activeSlot.
 /// The caller must have called database.store.readHeader() before this when refreshing.
 pub fn selectActiveSlot(database: *Database) !Slot {
-    if (database.store.header_checksum_ok) {
-        // The durable header.active_slot is the source of truth for which version is
+    if (database.store.headerChecksumOk) {
+        // The durable header.activeSlot is the source of truth for which version is
         // committed. The max-version heuristic would wrongly resurrect an aborted
         // commit whose new slot was durably written in the data barrier but never
         // published (i.e., header flush failed after the data barrier succeeded).
-        const primarySlotIndex = database.store.header.active_slot;
+        const primarySlotIndex = database.store.header.activeSlot;
         if (primarySlotIndex > 1) return error.Corrupt;
-        const primary_off: usize = if (primarySlotIndex == 0) slot_a_off else slot_b_off;
-        const other_off: usize = if (primarySlotIndex == 0) slot_b_off else slot_a_off;
+        const primaryOff: usize = if (primarySlotIndex == 0) slotAOff else slotBOff;
+        const otherOff: usize = if (primarySlotIndex == 0) slotBOff else slotAOff;
 
         // Try the primary slot first (normal path and correct crash-recovery path).
         // Fall back to the other slot only if the primary checksum is bad, which
         // indicates a crash mid-slot-write into the primary region itself. The
         // fallback silently resumes from the previous version, so it is recorded
         // on the Database and surfaced via metrics().
-        return Slot.decode(database.store.map[primary_off..][0..Slot.size]) catch {
-            const slot = Slot.decode(database.store.map[other_off..][0..Slot.size]) catch return error.Corrupt;
-            database.recovered_fallback = true;
+        return Slot.decode(database.store.map[primaryOff..][0..Slot.size]) catch {
+            const slot = Slot.decode(database.store.map[otherOff..][0..Slot.size]) catch return error.Corrupt;
+            database.recoveredFallback = true;
             return slot;
         };
     } else {
-        // Header checksum failed: the authoritative active_slot pointer is unreadable,
+        // Header checksum failed: the authoritative activeSlot pointer is unreadable,
         // so fall back to the highest valid-version slot. This last-resort heuristic is
         // used ONLY when the header itself is corrupt, and is likewise surfaced.
-        const maybe_a: ?Slot = Slot.decode(database.store.map[slot_a_off..][0..Slot.size]) catch null;
-        const maybe_b: ?Slot = Slot.decode(database.store.map[slot_b_off..][0..Slot.size]) catch null;
+        const maybeA: ?Slot = Slot.decode(database.store.map[slotAOff..][0..Slot.size]) catch null;
+        const maybeB: ?Slot = Slot.decode(database.store.map[slotBOff..][0..Slot.size]) catch null;
         const chosen: Slot = blk: {
-            if (maybe_a != null and maybe_b != null) {
-                break :blk if (maybe_a.?.version >= maybe_b.?.version) maybe_a.? else maybe_b.?;
-            } else if (maybe_a != null) {
-                break :blk maybe_a.?;
-            } else if (maybe_b != null) {
-                break :blk maybe_b.?;
+            if (maybeA != null and maybeB != null) {
+                break :blk if (maybeA.?.version >= maybeB.?.version) maybeA.? else maybeB.?;
+            } else if (maybeA != null) {
+                break :blk maybeA.?;
+            } else if (maybeB != null) {
+                break :blk maybeB.?;
             } else {
                 return error.Corrupt;
             }
         };
-        database.recovered_fallback = true;
+        database.recoveredFallback = true;
         return chosen;
     }
 }
@@ -78,10 +78,10 @@ pub fn selectActiveSlot(database: *Database) !Slot {
 /// if no qualifying slot exists. Slots with version > lv are in-flight or
 /// aborted and must never be returned.
 fn selectPublishedSlot(database: *Database, latestVersion: u64) ?Slot {
-    const maybe_a: ?Slot = Slot.decode(database.store.map[slot_a_off..][0..Slot.size]) catch null;
-    const maybe_b: ?Slot = Slot.decode(database.store.map[slot_b_off..][0..Slot.size]) catch null;
+    const maybeA: ?Slot = Slot.decode(database.store.map[slotAOff..][0..Slot.size]) catch null;
+    const maybeB: ?Slot = Slot.decode(database.store.map[slotBOff..][0..Slot.size]) catch null;
     var best: ?Slot = null;
-    for ([_]?Slot{ maybe_a, maybe_b }) |maybeSlot| {
+    for ([_]?Slot{ maybeA, maybeB }) |maybeSlot| {
         const slot = maybeSlot orelse continue;
         if (slot.version > latestVersion) continue;
         if (best == null or slot.version > best.?.version) best = slot;
@@ -92,47 +92,47 @@ fn selectPublishedSlot(database: *Database, latestVersion: u64) ?Slot {
 /// Refresh the instance's in-memory view from the shared memory mapping.
 /// Gates advancement on coord.latestVersion() so that a slot written by an
 /// aborted commit (durable data barrier but failed header flush) is never
-/// observed. Only a version <= the published latest_version may be adopted.
+/// observed. Only a version <= the published latestVersion may be adopted.
 ///
 /// Safety: must only be called when no write transaction is in progress.
 /// It is called at the start of beginRead and beginWrite (before any transaction
 /// state is built), which is safe.
 pub fn refreshToLatest(database: *Database) !void {
     const latestVersion = database.coord.latestVersion(); // acquire-load of the published version
-    if (latestVersion <= database.active_version) return; // nothing newer has been published
-    try database.store.readHeader(); // refresh header_checksum_ok / mapping view (for integrity use elsewhere)
+    if (latestVersion <= database.activeVersion) return; // nothing newer has been published
+    try database.store.readHeader(); // refresh headerChecksumOk / mapping view (for integrity use elsewhere)
     // If another process extended the file, map the new sections before dereferencing
     // slot descriptors or free-list nodes that may live in the grown region.
     const flen = try database.store.fileLen();
-    const mapped = database.store.sectionsView().len * platform.section_size;
+    const mapped = database.store.sectionsView().len * platform.sectionSize;
     if (flen > mapped) {
         try database.store.grow(@intCast(flen));
         database.arena.sections = database.store.sectionsView();
     }
     const published = selectPublishedSlot(database, latestVersion) orelse return; // no qualifying published slot visible yet
-    if (published.version <= database.active_version) return;
+    if (published.version <= database.activeVersion) return;
     // Decode the published free list into a temporary FIRST. A decode
     // failure must leave this instance's committed state (version, root,
     // top, free list) fully intact: advancing the version with an empty
     // free list would make the next commit durably persist that empty list
     // and permanently drop every reclaimable-extent record.
-    var new_fl = FreeList.init(database.store.allocator);
-    errdefer new_fl.deinit();
-    var node_len: usize = 0;
-    if (published.free_list_ref != 0) {
-        node_len = try freeListRecovery.decodeFreeListNode(database, published.free_list_ref, &new_fl);
+    var newFl = FreeList.init(database.store.allocator);
+    errdefer newFl.deinit();
+    var nodeLen: usize = 0;
+    if (published.freeListRef != 0) {
+        nodeLen = try freeListRecovery.decodeFreeListNode(database, published.freeListRef, &newFl);
     }
     // All decoding succeeded: install everything together.
-    database.active_version = published.version;
-    database.active_root = published.root_ref;
-    database.arena.top = @intCast(published.logical_size);
-    database.free_list.deinit();
-    database.free_list = new_fl;
-    database.free_list_node_ref = published.free_list_ref;
-    database.free_list_node_len = node_len;
+    database.activeVersion = published.version;
+    database.activeRoot = published.rootRef;
+    database.arena.top = @intCast(published.logicalSize);
+    database.freeList.deinit();
+    database.freeList = newFl;
+    database.freeListNodeRef = published.freeListRef;
+    database.freeListNodeLen = nodeLen;
 }
 
-/// Returns the minimum pinned version among all active readers, or sentinel_max if none.
+/// Returns the minimum pinned version among all active readers, or sentinelMax if none.
 fn localMinPinned(database: *Database) u64 {
     var min: ?u64 = null;
     var iterator = database.pins.iterator();
@@ -140,13 +140,13 @@ fn localMinPinned(database: *Database) u64 {
         if (entry.value_ptr.* == 0) continue;
         if (min == null or entry.key_ptr.* < min.?) min = entry.key_ptr.*;
     }
-    return min orelse coord_mod.sentinel_max;
+    return min orelse coordMod.sentinelMax;
 }
 
 /// Publish the local minimum pinned version to the instance's participant slot
 /// (if it has one), making the pins visible to other processes' reclaim horizons.
 pub fn publishPins(database: *Database) void {
-    if (database.participant_slot) |slotIndex| database.coord.publishMinPinned(slotIndex, localMinPinned(database));
+    if (database.participantSlot) |slotIndex| database.coord.publishMinPinned(slotIndex, localMinPinned(database));
 }
 
 /// The minimum version pinned by a live reader in this process, or the active
@@ -158,11 +158,11 @@ pub fn horizon(database: *Database) u64 {
         if (entry.value_ptr.* == 0) continue;
         if (min == null or entry.key_ptr.* < min.?) min = entry.key_ptr.*;
     }
-    return min orelse database.active_version;
+    return min orelse database.activeVersion;
 }
 
 fn retainPtr(database: *Database) *u64 {
-    return @ptrCast(@alignCast(&database.store.map[retain_off]));
+    return @ptrCast(@alignCast(&database.store.map[retainOff]));
 }
 
 /// The shared retention window: recently-freed space is withheld from reuse
@@ -181,7 +181,7 @@ pub fn setRetainVersions(database: *Database, count: u64) void {
 }
 
 /// Root ref for a committed version, or null if not retained / not yet committed.
-/// The `version > active_version` guard rejects a ring entry written during a
+/// The `version > activeVersion` guard rejects a ring entry written during a
 /// commit that crashed/aborted before publishing (the slot flip never happened),
 /// so a recorded-but-unpublished pair is never trusted.
 ///
@@ -191,53 +191,53 @@ pub fn setRetainVersions(database: *Database, count: u64) void {
 /// version. The retry's entry is always written later, so the newest match is
 /// the committed root and the aborted duplicate is never returned.
 pub fn versionRoot(database: *Database, version: u64) ?u64 {
-    if (version > database.active_version) return null;
+    if (version > database.activeVersion) return null;
     const map = database.store.map;
-    const head = std.mem.readInt(u64, map[ring_head_off..][0..8], .little);
-    const entryCount = @min(head, ring_capacity);
+    const head = std.mem.readInt(u64, map[ringHeadOff..][0..8], .little);
+    const entryCount = @min(head, ringCapacity);
     var entryIndex: u64 = 0;
     while (entryIndex < entryCount) : (entryIndex += 1) {
-        const slotIndex: usize = @intCast((head - 1 - entryIndex) % ring_capacity);
-        const entryOffset = ring_off + slotIndex * 16;
+        const slotIndex: usize = @intCast((head - 1 - entryIndex) % ringCapacity);
+        const entryOffset = ringOff + slotIndex * 16;
         const entryVersion = std.mem.readInt(u64, map[entryOffset..][0..8], .little);
         if (entryVersion == version) return std.mem.readInt(u64, map[entryOffset + 8 ..][0..8], .little);
     }
     return null;
 }
 
-/// Oldest version still recorded in the ring, or active_version if the ring is
+/// Oldest version still recorded in the ring, or activeVersion if the ring is
 /// empty. As the ring wraps, the recovery window's lower bound advances. Entries
-/// above active_version (an unpublished/aborted commit) are ignored.
+/// above activeVersion (an unpublished/aborted commit) are ignored.
 pub fn oldestRetainedVersion(database: *Database) u64 {
     const map = database.store.map;
-    const head = std.mem.readInt(u64, map[ring_head_off..][0..8], .little);
-    const entryCount = @min(head, ring_capacity);
+    const head = std.mem.readInt(u64, map[ringHeadOff..][0..8], .little);
+    const entryCount = @min(head, ringCapacity);
     var entryIndex: u64 = 0;
     var min: ?u64 = null;
     while (entryIndex < entryCount) : (entryIndex += 1) {
-        const entryOffset = ring_off + @as(usize, @intCast(entryIndex)) * 16;
+        const entryOffset = ringOff + @as(usize, @intCast(entryIndex)) * 16;
         const entryVersion = std.mem.readInt(u64, map[entryOffset..][0..8], .little);
-        if (entryVersion > database.active_version) continue;
+        if (entryVersion > database.activeVersion) continue;
         if (min == null or entryVersion < min.?) min = entryVersion;
     }
-    return min orelse database.active_version;
+    return min orelse database.activeVersion;
 }
 
 /// Oldest version `beginReadAt` can open: the later of the oldest ring entry
-/// and the retention-window floor. Versions in [this, active_version] open.
+/// and the retention-window floor. Versions in [this, activeVersion] open.
 pub fn oldestReadableVersion(database: *Database) u64 {
-    const ring_floor = oldestRetainedVersion(database);
+    const ringFloor = oldestRetainedVersion(database);
     const retain = retainVersions(database);
-    if (retain == coord_mod.sentinel_max) return ring_floor;
-    return @max(ring_floor, database.active_version -| retain);
+    if (retain == coordMod.sentinelMax) return ringFloor;
+    return @max(ringFloor, database.activeVersion -| retain);
 }
 
 // Tests of this file's own invariants.
 
 fn tmpFilePath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const u8) ![]const u8 {
     var pathBuffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const path_len = try tmp.dir.realPath(testing.io, &pathBuffer);
-    return std.fs.path.join(allocator, &.{ pathBuffer[0..path_len], name });
+    const pathLen = try tmp.dir.realPath(testing.io, &pathBuffer);
+    return std.fs.path.join(allocator, &.{ pathBuffer[0..pathLen], name });
 }
 
 test "refresh does not advance to a durable-but-unpublished (aborted) slot" {
@@ -252,30 +252,30 @@ test "refresh does not advance to a durable-but-unpublished (aborted) slot" {
         const allocation = try writeTransaction.alloc(8);
         @memcpy(allocation.bytes, "PUBLISH_");
         writeTransaction.setRoot(allocation.ref);
-        _ = try writeTransaction.commit(); // publishes; coord.latest_version advances to this version
+        _ = try writeTransaction.commit(); // publishes; coord.latestVersion advances to this version
     }
-    const published_version = database.active_version;
+    const publishedVersion = database.activeVersion;
     // Forge a VALID slot with a much higher version into the inactive slot bytes,
-    // WITHOUT advancing coord.latest_version (simulates an aborted-but-durable commit).
-    const forged = Slot{ .version = published_version + 50, .root_ref = 0, .free_list_ref = 0, .logical_size = default_page_size };
+    // WITHOUT advancing coord.latestVersion (simulates an aborted-but-durable commit).
+    const forged = Slot{ .version = publishedVersion + 50, .rootRef = 0, .freeListRef = 0, .logicalSize = defaultPageSize };
     var buffer: [Slot.size]u8 = undefined;
     forged.encode(&buffer);
-    // Write it into whichever slot is currently inactive. The active slot is header.active_slot.
-    const inactive_off: usize = if (database.store.header.active_slot == 0) slot_b_off else slot_a_off;
-    @memcpy(database.store.map[inactive_off .. inactive_off + Slot.size], &buffer);
-    // Refresh must NOT advance to the forged version (coord.latest_version unchanged).
+    // Write it into whichever slot is currently inactive. The active slot is header.activeSlot.
+    const inactiveOff: usize = if (database.store.header.activeSlot == 0) slotBOff else slotAOff;
+    @memcpy(database.store.map[inactiveOff .. inactiveOff + Slot.size], &buffer);
+    // Refresh must NOT advance to the forged version (coord.latestVersion unchanged).
     try refreshToLatest(&database);
-    try testing.expectEqual(published_version, database.active_version);
+    try testing.expectEqual(publishedVersion, database.activeVersion);
 }
-test "recovery follows header active_slot pointer, not max version" {
+test "recovery follows header activeSlot pointer, not max version" {
     // Regression test: after a crash where the data barrier (step 3 of commit) made
     // the new slot durable but the header flush (step 5) never completed, Database.open must
-    // recover the version that header.active_slot points to, not the highest-version
+    // recover the version that header.activeSlot points to, not the highest-version
     // slot on disk.
     //
-    // Setup: header.active_slot=0 (slot A, version 1). We manually write a valid
+    // Setup: header.activeSlot=0 (slot A, version 1). We manually write a valid
     // higher-version slot (version 50) into slot B's byte range WITHOUT updating
-    // header.active_slot. This is exactly the dangerous on-disk state that a
+    // header.activeSlot. This is exactly the dangerous on-disk state that a
     // max-version heuristic would mishandle.
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -286,18 +286,18 @@ test "recovery follows header active_slot pointer, not max version" {
         var database = try Database.create(testing.allocator, path);
         defer database.deinit();
         // Inject a plausible-but-aborted slot into slot B without touching the header.
-        const aborted = Slot{ .version = 50, .root_ref = 0, .free_list_ref = 0, .logical_size = default_page_size };
-        aborted.encode(database.store.map[slot_b_off..][0..Slot.size]);
+        const aborted = Slot{ .version = 50, .rootRef = 0, .freeListRef = 0, .logicalSize = defaultPageSize };
+        aborted.encode(database.store.map[slotBOff..][0..Slot.size]);
         try database.store.syncer.flush(database.store.file);
-        // header.active_slot remains 0 (slot A, version 1).
+        // header.activeSlot remains 0 (slot A, version 1).
     }
 
-    // On reopen the correct recovery path must pick slot A (header.active_slot=0,
+    // On reopen the correct recovery path must pick slot A (header.activeSlot=0,
     // version 1), not slot B (version 50).
     {
         var database = try Database.open(testing.allocator, path);
         defer database.deinit();
-        try testing.expectEqual(@as(u64, 1), database.active_version);
+        try testing.expectEqual(@as(u64, 1), database.activeVersion);
     }
 }
 
@@ -314,17 +314,17 @@ test "falling back past a corrupt primary slot is surfaced in metrics" {
         @memcpy(allocation.bytes, "VERSION2");
         writeTransaction.setRoot(allocation.ref);
         _ = try writeTransaction.commit();
-        try testing.expect(!database.metrics().recovered_fallback); // clean session
+        try testing.expect(!database.metrics().recoveredFallback); // clean session
         // Corrupt the PRIMARY (active) slot's checksum region on disk.
-        const primary_off: usize = if (database.store.header.active_slot == 0) slot_a_off else slot_b_off;
-        database.store.map[primary_off + 4] ^= 0xFF;
+        const primaryOff: usize = if (database.store.header.activeSlot == 0) slotAOff else slotBOff;
+        database.store.map[primaryOff + 4] ^= 0xFF;
         try database.store.syncer.flush(database.store.file);
     }
     {
         var database = try Database.open(testing.allocator, path);
         defer database.deinit();
         // Recovery used the other slot (the previous version) and says so.
-        try testing.expect(database.metrics().recovered_fallback);
-        try testing.expectEqual(@as(u64, 1), database.active_version);
+        try testing.expect(database.metrics().recoveredFallback);
+        try testing.expectEqual(@as(u64, 1), database.activeVersion);
     }
 }

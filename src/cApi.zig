@@ -49,8 +49,8 @@ fn commitErrCode(self: *DatabaseHandle) i64 {
 // `propertyCount` properties (property 0 is the primary key) if it does not exist.
 // On an existing database the stored property count is used. Returns null on
 // failure.
-export fn airdb_open(path_ptr: [*:0]const u8, propertyCount: u16) ?*DatabaseHandle {
-    const path = std.mem.span(path_ptr);
+export fn airdb_open(pathPtr: [*:0]const u8, propertyCount: u16) ?*DatabaseHandle {
+    const path = std.mem.span(pathPtr);
     // The storage layer requires an absolute path. Reject anything else here so
     // a relative path returns a clean error instead of aborting the host.
     if (!std.fs.path.isAbsolute(path)) return null;
@@ -62,12 +62,12 @@ export fn airdb_open(path_ptr: [*:0]const u8, propertyCount: u16) ?*DatabaseHand
 
     if (Database.open(allocator, path)) |opened| {
         return adoptExisting(self, opened);
-    } else |open_err| {
+    } else |openErr| {
         // Create only when the file genuinely does not exist. Any other open
         // failure (corruption, resources, permissions) must NOT fall through to
         // create: FileStore.create truncates, which would destroy a database
         // that may still be recoverable.
-        if (open_err != error.FileNotFound) {
+        if (openErr != error.FileNotFound) {
             allocator.destroy(self);
             return null;
         }
@@ -136,7 +136,7 @@ export fn airdb_insert(handle: ?*DatabaseHandle, values: [*]const u64, length: u
     const self = handle orelse return AIRDB_E_GENERIC;
     if (length != self.propertyCount) return AIRDB_E_BAD_ARGS;
     var writeTransaction = self.database.beginWrite() catch return commitErrCode(self);
-    const result = rows.insert(&writeTransaction, writeTransaction.new_root, values[0..length]) catch |err| {
+    const result = rows.insert(&writeTransaction, writeTransaction.newRoot, values[0..length]) catch |err| {
         writeTransaction.deinit();
         return if (err == error.DuplicateKey) AIRDB_E_DUPLICATE else AIRDB_E_GENERIC;
     };
@@ -174,7 +174,7 @@ export fn airdb_update(handle: ?*DatabaseHandle, values: [*]const u64, length: u
     const primaryKey = values[0];
     var writeTransaction = self.database.beginWrite() catch return commitErrCode(self);
     var currentValues: [maxProperties]u64 = undefined;
-    const version = rows.getByPrimaryKey(&writeTransaction, writeTransaction.new_root, primaryKey, currentValues[0..length]) catch {
+    const version = rows.getByPrimaryKey(&writeTransaction, writeTransaction.newRoot, primaryKey, currentValues[0..length]) catch {
         writeTransaction.deinit();
         return AIRDB_E_GENERIC;
     };
@@ -182,7 +182,7 @@ export fn airdb_update(handle: ?*DatabaseHandle, values: [*]const u64, length: u
         writeTransaction.deinit();
         return AIRDB_E_NOT_FOUND;
     }
-    const result = rows.update(&writeTransaction, writeTransaction.new_root, primaryKey, values[0..length], version.?) catch {
+    const result = rows.update(&writeTransaction, writeTransaction.newRoot, primaryKey, values[0..length], version.?) catch {
         writeTransaction.deinit();
         return AIRDB_E_GENERIC;
     };
@@ -196,7 +196,7 @@ export fn airdb_update(handle: ?*DatabaseHandle, values: [*]const u64, length: u
             writeTransaction.deinit();
             return AIRDB_E_CONFLICT;
         },
-        .not_found => {
+        .notFound => {
             writeTransaction.deinit();
             return AIRDB_E_NOT_FOUND;
         },
@@ -208,7 +208,7 @@ export fn airdb_delete(handle: ?*DatabaseHandle, primaryKey: u64) i64 {
     const self = handle orelse return AIRDB_E_GENERIC;
     var writeTransaction = self.database.beginWrite() catch return commitErrCode(self);
     var currentValues: [maxProperties]u64 = undefined;
-    const version = rows.getByPrimaryKey(&writeTransaction, writeTransaction.new_root, primaryKey, currentValues[0..self.propertyCount]) catch {
+    const version = rows.getByPrimaryKey(&writeTransaction, writeTransaction.newRoot, primaryKey, currentValues[0..self.propertyCount]) catch {
         writeTransaction.deinit();
         return AIRDB_E_GENERIC;
     };
@@ -216,7 +216,7 @@ export fn airdb_delete(handle: ?*DatabaseHandle, primaryKey: u64) i64 {
         writeTransaction.deinit();
         return AIRDB_E_NOT_FOUND;
     }
-    const result = rows.delete(&writeTransaction, writeTransaction.new_root, primaryKey, version.?) catch {
+    const result = rows.delete(&writeTransaction, writeTransaction.newRoot, primaryKey, version.?) catch {
         writeTransaction.deinit();
         return AIRDB_E_GENERIC;
     };
@@ -230,15 +230,15 @@ export fn airdb_delete(handle: ?*DatabaseHandle, primaryKey: u64) i64 {
             writeTransaction.deinit();
             return AIRDB_E_CONFLICT;
         },
-        .not_found => {
+        .notFound => {
             writeTransaction.deinit();
             return AIRDB_E_NOT_FOUND;
         },
     }
 }
 
-// Bulk-load `row_count` rows of `propertyCount` u64 values each from the flat,
-// row-major buffer `rows_flat` (row i occupies rows_flat[i*propertyCount ..][0..
+// Bulk-load `rowCount` rows of `propertyCount` u64 values each from the flat,
+// row-major buffer `rowsFlat` (row i occupies rowsFlat[i*propertyCount ..][0..
 // propertyCount]; element 0 of each row is the primary key) into an EMPTY type, in
 // a single durable commit. The whole import succeeds atomically or nothing
 // becomes durable. Returns the number of rows loaded on success, or a negative
@@ -246,21 +246,21 @@ export fn airdb_delete(handle: ?*DatabaseHandle, primaryKey: u64) i64 {
 // on a repeated primary key, AIRDB_E_UNSUPPORTED for a type bulk import cannot
 // build (e.g. links), AIRDB_E_BAD_ARGS on a propertyCount mismatch. On every error
 // the write lock is released and nothing is made durable.
-export fn airdb_bulk_insert(handle: ?*DatabaseHandle, rows_flat: [*]const u64, row_count: usize, propertyCount: usize) i64 {
+export fn airdb_bulk_insert(handle: ?*DatabaseHandle, rowsFlat: [*]const u64, rowCount: usize, propertyCount: usize) i64 {
     const self = handle orelse return AIRDB_E_GENERIC;
     if (propertyCount != self.propertyCount) return AIRDB_E_BAD_ARGS;
-    if (row_count > std.math.maxInt(i64)) return AIRDB_E_BAD_ARGS; // return value is i64
+    if (rowCount > std.math.maxInt(i64)) return AIRDB_E_BAD_ARGS; // return value is i64
 
     // Build a []const []const u64 view over the flat buffer: each row slice
     // points at its propertyCount-wide window. Freed regardless of outcome.
-    const rows_slices = allocator.alloc([]const u64, row_count) catch return AIRDB_E_GENERIC;
-    defer allocator.free(rows_slices);
-    for (rows_slices, 0..) |*row, rowIndex| {
-        row.* = rows_flat[rowIndex * propertyCount ..][0..propertyCount];
+    const rowsSlices = allocator.alloc([]const u64, rowCount) catch return AIRDB_E_GENERIC;
+    defer allocator.free(rowsSlices);
+    for (rowsSlices, 0..) |*row, rowIndex| {
+        row.* = rowsFlat[rowIndex * propertyCount ..][0..propertyCount];
     }
 
     var writeTransaction = self.database.beginWrite() catch return commitErrCode(self);
-    const newCatalog = bulk.bulkImport(&writeTransaction, writeTransaction.new_root, rows_slices, .{}) catch |err| {
+    const newCatalog = bulk.bulkImport(&writeTransaction, writeTransaction.newRoot, rowsSlices, .{}) catch |err| {
         writeTransaction.deinit(); // releases the write lock; nothing was made durable
         return switch (err) {
             error.TypeNotEmpty => AIRDB_E_NOT_EMPTY,
@@ -274,11 +274,11 @@ export fn airdb_bulk_insert(handle: ?*DatabaseHandle, rows_flat: [*]const u64, r
     // commit releases the lock on BOTH its success and its own error paths, so
     // do not unlock again here.
     _ = writeTransaction.commit() catch return commitErrCode(self);
-    return @intCast(row_count);
+    return @intCast(rowCount);
 }
 
-// Append `row_count` rows of `propertyCount` u64 values each from the flat,
-// row-major buffer `rows_flat` (row i occupies rows_flat[i*propertyCount ..][0..
+// Append `rowCount` rows of `propertyCount` u64 values each from the flat,
+// row-major buffer `rowsFlat` (row i occupies rowsFlat[i*propertyCount ..][0..
 // propertyCount]; element 0 of each row is the primary key) to a POPULATED type in
 // a single durable commit. A batch whose primary keys are strictly ascending and
 // all clear the type's current max key lands on the right edge via the fast path;
@@ -286,23 +286,23 @@ export fn airdb_bulk_insert(handle: ?*DatabaseHandle, rows_flat: [*]const u64, r
 // durable atomically or nothing does. Returns the number of rows appended on
 // success, or a negative error code: AIRDB_E_DUPLICATE on a repeated primary key
 // (from the fallback), AIRDB_E_BAD_ARGS on a propertyCount mismatch. On every error
-// the write lock is released and nothing is made durable. A row_count of 0 is a
+// the write lock is released and nothing is made durable. A rowCount of 0 is a
 // no-op that commits no change and returns 0.
-export fn airdb_bulk_append(handle: ?*DatabaseHandle, rows_flat: [*]const u64, row_count: usize, propertyCount: usize) i64 {
+export fn airdb_bulk_append(handle: ?*DatabaseHandle, rowsFlat: [*]const u64, rowCount: usize, propertyCount: usize) i64 {
     const self = handle orelse return AIRDB_E_GENERIC;
     if (propertyCount != self.propertyCount) return AIRDB_E_BAD_ARGS;
-    if (row_count > std.math.maxInt(i64)) return AIRDB_E_BAD_ARGS; // return value is i64
+    if (rowCount > std.math.maxInt(i64)) return AIRDB_E_BAD_ARGS; // return value is i64
 
     // Build a []const []const u64 view over the flat buffer: each row slice
     // points at its propertyCount-wide window. Freed regardless of outcome.
-    const rows_slices = allocator.alloc([]const u64, row_count) catch return AIRDB_E_GENERIC;
-    defer allocator.free(rows_slices);
-    for (rows_slices, 0..) |*row, rowIndex| {
-        row.* = rows_flat[rowIndex * propertyCount ..][0..propertyCount];
+    const rowsSlices = allocator.alloc([]const u64, rowCount) catch return AIRDB_E_GENERIC;
+    defer allocator.free(rowsSlices);
+    for (rowsSlices, 0..) |*row, rowIndex| {
+        row.* = rowsFlat[rowIndex * propertyCount ..][0..propertyCount];
     }
 
     var writeTransaction = self.database.beginWrite() catch return commitErrCode(self);
-    const newCatalog = bulk.bulkAppendOrInsert(&writeTransaction, writeTransaction.new_root, rows_slices) catch |err| {
+    const newCatalog = bulk.bulkAppendOrInsert(&writeTransaction, writeTransaction.newRoot, rowsSlices) catch |err| {
         writeTransaction.deinit(); // releases the write lock; nothing was made durable
         return switch (err) {
             error.BadRow => AIRDB_E_BAD_ARGS,
@@ -314,7 +314,7 @@ export fn airdb_bulk_append(handle: ?*DatabaseHandle, rows_flat: [*]const u64, r
     // commit releases the lock on BOTH its success and its own error paths, so
     // do not unlock again here.
     _ = writeTransaction.commit() catch return commitErrCode(self);
-    return @intCast(row_count);
+    return @intCast(rowCount);
 }
 
 // ---------------------------------------------------------------------------
@@ -359,7 +359,7 @@ export fn airdb_begin(handle: ?*DatabaseHandle) ?*Transaction {
         allocator.destroy(created);
         return null;
     };
-    created.catalogRef = created.writeTransaction.new_root;
+    created.catalogRef = created.writeTransaction.newRoot;
     created.poisoned = false;
     return created;
 }
@@ -410,7 +410,7 @@ export fn airdb_txn_update(transaction: ?*Transaction, values: [*]const u64, len
             return AIRDB_OK;
         },
         .conflict => return AIRDB_E_CONFLICT,
-        .not_found => return AIRDB_E_NOT_FOUND,
+        .notFound => return AIRDB_E_NOT_FOUND,
     }
 }
 
@@ -433,7 +433,7 @@ export fn airdb_txn_delete(transaction: ?*Transaction, primaryKey: u64) i64 {
             return AIRDB_OK;
         },
         .conflict => return AIRDB_E_CONFLICT,
-        .not_found => return AIRDB_E_NOT_FOUND,
+        .notFound => return AIRDB_E_NOT_FOUND,
     }
 }
 
@@ -563,11 +563,11 @@ test "ffi: open of a corrupt database returns null and never truncates the file"
 
     // Corrupt the magic so Database.open fails with something other than FileNotFound.
     const io = std.Io.Threaded.global_single_threaded.io();
-    var len_before: u64 = 0;
+    var lenBefore: u64 = 0;
     {
         var file = try std.Io.Dir.openFileAbsolute(io, path, .{ .mode = .read_write });
         defer file.close(io);
-        len_before = try file.length(io);
+        lenBefore = try file.length(io);
         try file.writePositionalAll(io, &[_]u8{ 0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF }, 0);
         try file.sync(io);
     }
@@ -577,7 +577,7 @@ test "ffi: open of a corrupt database returns null and never truncates the file"
 
     var file = try std.Io.Dir.openFileAbsolute(io, path, .{ .mode = .read_only });
     defer file.close(io);
-    try testing.expectEqual(len_before, try file.length(io));
+    try testing.expectEqual(lenBefore, try file.length(io));
     var magic: [8]u8 = undefined;
     _ = try file.readPositionalAll(io, &magic, 0);
     // The corrupted magic is still there: nothing rewrote the header.

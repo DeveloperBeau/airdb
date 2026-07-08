@@ -10,8 +10,8 @@ const appendRun = Column.appendRun;
 const set = Column.set;
 const truncate = Column.truncate;
 const makeInnerForTest = Column.makeInnerForTest;
-const leaf_node_size = node.leaf_node_size;
-const inner_node_size = node.inner_node_size;
+const leafNodeSize = node.leafNodeSize;
+const innerNodeSize = node.innerNodeSize;
 const encodeLeaf = node.encodeLeaf;
 const parseLeaf = node.parseLeaf;
 const encodeInner = node.encodeInner;
@@ -28,7 +28,7 @@ fn colTmpPath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const 
 }
 
 test "leaf encode/decode round-trips values" {
-    var buffer: [leaf_node_size]u8 = undefined;
+    var buffer: [leafNodeSize]u8 = undefined;
     const vals = [_]u64{ 10, 20, 30 };
     const n = encodeLeaf(&buffer, &vals);
     const view = try parseLeaf(buffer[0..n]);
@@ -55,7 +55,7 @@ test "a column ref cycle fails with error.Corrupt" {
 
     // Inner node whose only child is itself with a nonzero claimed count:
     // get/set/append must hit the depth cap, not overflow the stack.
-    const a = try w.alloc(inner_node_size);
+    const a = try w.alloc(innerNodeSize);
     _ = encodeInner(a.bytes, &.{a.ref}, &.{10});
     try testing.expectError(error.Corrupt, get(&w, a.ref, 0));
     try testing.expectError(error.Corrupt, set(&w, a.ref, 0, 1));
@@ -139,14 +139,14 @@ test "set on a multi-level column leaves the old root snapshot unchanged" {
     var root = try create(&w);
     var i: u64 = 0;
     while (i < 1000) : (i += 1) root = try append(&w, root, i);
-    const old_root = root;
-    const new_root = try set(&w, root, 500, 999999);
-    try testing.expectEqual(@as(u64, 500), try get(&w, old_root, 500)); // old snapshot unchanged
-    try testing.expectEqual(@as(u64, 999999), try get(&w, new_root, 500)); // new root updated
-    try testing.expectEqual(try length(&w, old_root), try length(&w, new_root));
+    const oldRoot = root;
+    const newRoot = try set(&w, root, 500, 999999);
+    try testing.expectEqual(@as(u64, 500), try get(&w, oldRoot, 500)); // old snapshot unchanged
+    try testing.expectEqual(@as(u64, 999999), try get(&w, newRoot, 500)); // new root updated
+    try testing.expectEqual(try length(&w, oldRoot), try length(&w, newRoot));
     // a few other indices match between old and new (shared subtrees)
-    try testing.expectEqual(try get(&w, old_root, 0), try get(&w, new_root, 0));
-    try testing.expectEqual(try get(&w, old_root, 999), try get(&w, new_root, 999));
+    try testing.expectEqual(try get(&w, oldRoot, 0), try get(&w, newRoot, 0));
+    try testing.expectEqual(try get(&w, oldRoot, 999), try get(&w, newRoot, 999));
     w.deinit();
 }
 
@@ -309,16 +309,16 @@ fn appendTmpDatabase(tmp: *testing.TmpDir, name: []const u8) !Database {
 // appending all base+run values sequentially: same length, and get(i) matches
 // the sequential twin at every index.
 fn checkColAppendEquiv(w: *WriteTransaction, base: u64, run: u64) !void {
-    var base_root = try create(w);
+    var baseRoot = try create(w);
     var k: u64 = 0;
-    while (k < base) : (k += 1) base_root = try append(w, base_root, appendColVal(k));
+    while (k < base) : (k += 1) baseRoot = try append(w, baseRoot, appendColVal(k));
 
     const rv = try testing.allocator.alloc(u64, run);
     defer testing.allocator.free(rv);
     var r: u64 = 0;
     while (r < run) : (r += 1) rv[r] = appendColVal(base + r);
 
-    const appended = try appendRun(w, base_root, rv, testing.allocator);
+    const appended = try appendRun(w, baseRoot, rv, testing.allocator);
 
     var expected = try create(w);
     k = 0;
@@ -383,12 +383,12 @@ test "appendRun empty run is a no-op" {
     var database = try appendTmpDatabase(&tmp, "colappend5.airdb");
     defer database.deinit();
     var w = try database.beginWrite();
-    var base_root = try create(&w);
+    var baseRoot = try create(&w);
     var k: u64 = 0;
-    while (k < 100) : (k += 1) base_root = try append(&w, base_root, appendColVal(k));
-    const before = try length(&w, base_root);
-    const appended = try appendRun(&w, base_root, &.{}, testing.allocator);
-    try testing.expectEqual(base_root, appended); // same ref, unchanged
+    while (k < 100) : (k += 1) baseRoot = try append(&w, baseRoot, appendColVal(k));
+    const before = try length(&w, baseRoot);
+    const appended = try appendRun(&w, baseRoot, &.{}, testing.allocator);
+    try testing.expectEqual(baseRoot, appended); // same ref, unchanged
     try testing.expectEqual(before, try length(&w, appended));
     w.deinit();
 }

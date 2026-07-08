@@ -13,9 +13,9 @@ const bTreeCore = @import("bTreeCore.zig");
 // Local aliases for the on-disk node format, used by the numeric-only extras
 // below (maxKey, range iteration, test helpers).
 const fanout = node.fanout;
-const kind_leaf = node.kind_leaf;
-const leaf_node_size = node.leaf_node_size;
-const inner_node_size = node.inner_node_size;
+const kindLeaf = node.kindLeaf;
+const leafNodeSize = node.leafNodeSize;
+const innerNodeSize = node.innerNodeSize;
 const encodeLeaf = node.encodeLeaf;
 const parseLeaf = node.parseLeaf;
 const encodeInner = node.encodeInner;
@@ -48,7 +48,7 @@ const NumericKeying = struct {
 const Tree = bTreeCore.BTreeCore(NumericKeying);
 
 /// Corrupt-cycle guard shared by every recursive walker (see bTreeCore.zig).
-pub const max_depth = bTreeCore.maxDepth;
+pub const maxDepth = bTreeCore.maxDepth;
 
 /// Deref a node, sizing the read by its kind byte (leaf vs inner).
 pub const derefNode = Tree.derefNode;
@@ -69,7 +69,7 @@ pub fn insert(transaction: anytype, root: Reference, key: u64, value: u64) !Refe
 /// Returns the (possibly new) root Reference. No-op if key is absent.
 pub const remove = Tree.remove;
 
-/// Recursively free every node of the tree rooted at node_ref so the space
+/// Recursively free every node of the tree rooted at nodeRef so the space
 /// becomes reclaimable. Only the NODES are freed; for trees whose leaf values
 /// are refs to other structures (e.g. value-index inner sets) the caller owns
 /// those separately.
@@ -98,15 +98,15 @@ pub const forEachEntry = Tree.forEachEntry;
 pub fn maxKey(transaction: anytype, root: Reference) !?u64 {
     var currentRef: Reference = root;
     var depth: usize = 0;
-    while (depth < max_depth) : (depth += 1) {
+    while (depth < maxDepth) : (depth += 1) {
         const bytes = try derefNode(transaction, currentRef);
-        if (bytes[0] == kind_leaf) {
+        if (bytes[0] == kindLeaf) {
             const view = try parseLeaf(bytes);
             if (view.count == 0) return null; // only the empty root reaches here
             return view.key(view.count - 1);
         }
         const view = try parseInner(bytes);
-        var childIndex: usize = view.child_count;
+        var childIndex: usize = view.childCount;
         currentRef = blk: {
             while (childIndex > 0) {
                 childIndex -= 1;
@@ -165,9 +165,9 @@ fn forEachEntryInRangeAt(
     depth: usize,
 ) !void {
     if (root == 0 or low > high) return;
-    if (depth >= max_depth) return error.Corrupt;
+    if (depth >= maxDepth) return error.Corrupt;
     const bytes = try derefNode(transaction, root);
-    if (bytes[0] == kind_leaf) {
+    if (bytes[0] == kindLeaf) {
         const leaf = try parseLeaf(bytes);
         var childIndex: usize = leaf.lowerBound(low);
         while (childIndex < leaf.count) : (childIndex += 1) {
@@ -179,10 +179,10 @@ fn forEachEntryInRangeAt(
     }
     const inner = try parseInner(bytes);
     var childIndex: usize = try Tree.childIndexForKey(transaction, inner, low);
-    while (childIndex < inner.child_count) : (childIndex += 1) {
+    while (childIndex < inner.childCount) : (childIndex += 1) {
         if (inner.lowKey(childIndex) > high) return;
-        const child_ref: Reference = inner.childRef(childIndex);
-        try forEachEntryInRangeAt(transaction, child_ref, low, high, ctx, onEntry, depth + 1);
+        const childRef: Reference = inner.childRef(childIndex);
+        try forEachEntryInRangeAt(transaction, childRef, low, high, ctx, onEntry, depth + 1);
     }
 }
 
@@ -196,13 +196,13 @@ pub fn makeInnerForTest(transaction: anytype, children: []const struct { ref: u6
         lows[childIndex] = child.low;
         counts[childIndex] = child.count;
     }
-    const allocation = try transaction.alloc(inner_node_size);
+    const allocation = try transaction.alloc(innerNodeSize);
     _ = encodeInner(allocation.bytes, refs[0..children.len], lows[0..children.len], counts[0..children.len]);
     return allocation.ref;
 }
 
 test "leaf encode/decode round-trips sorted pairs" {
-    var buffer: [leaf_node_size]u8 = undefined;
+    var buffer: [leafNodeSize]u8 = undefined;
     const keys = [_]u64{ 1, 5, 9 };
     const vals = [_]u64{ 10, 50, 90 };
     const encodedLength = encodeLeaf(&buffer, &keys, &vals);
@@ -213,7 +213,7 @@ test "leaf encode/decode round-trips sorted pairs" {
 }
 
 test "lowerBound finds the first index whose key is >= the search key" {
-    var buffer: [leaf_node_size]u8 = undefined;
+    var buffer: [leafNodeSize]u8 = undefined;
     const keys = [_]u64{ 2, 4, 6, 8 };
     const vals = [_]u64{ 0, 0, 0, 0 };
     const encodedLength = encodeLeaf(&buffer, &keys, &vals);
