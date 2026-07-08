@@ -4,17 +4,21 @@ const Ref = @import("ref.zig").Ref;
 const Column = @import("column.zig");
 const Index = @import("index.zig");
 const catalog = @import("catalog.zig");
-const blob = @import("blob.zig");
-const links = @import("links.zig");
 const typedir = @import("typedir.zig");
 const objects = @import("objects.zig");
-const bindex = @import("bindex.zig");
 const relocateRow = @import("relocation.zig").relocateRow;
 const file_store = @import("file_store.zig");
+const compactionCopy = @import("compactionCopy.zig");
 
 const max_prop_count = catalog.max_prop_count;
 
-const Pair = struct { okey: u64, row: u64 };
+const Pair = compactionCopy.Pair;
+const collectKeyRowPairs = compactionCopy.collectKeyRowPairs;
+
+// Cross-database row/value deep-copying lives in compactionCopy.zig;
+// re-exported here for the whole-file compaction callers below.
+pub const copyTypeRows = compactionCopy.copyTypeRows;
+pub const rebuildBacklinks = compactionCopy.rebuildBacklinks;
 
 pub fn liveCount(txn: anytype, cat: Ref) !u64 {
     const v = try catalog.loadCatalog(txn, cat);
@@ -47,16 +51,8 @@ pub fn compactType(txn: *WriteTxn, cat: Ref) !Ref {
     const old_keyrow = s.keyrow_index_ref;
 
     const alloc = txn.db.store.allocator;
-    var pairs = std.ArrayList(Pair).empty;
+    var pairs = try collectKeyRowPairs(alloc, txn, old_keyrow);
     defer pairs.deinit(alloc);
-    const Collector = struct {
-        list: *std.ArrayList(Pair),
-        alloc: std.mem.Allocator,
-        fn onEntry(self: @This(), key: u64, val: u64) !void {
-            try self.list.append(self.alloc, .{ .okey = key, .row = val });
-        }
-    };
-    try Index.forEachEntry(txn, old_keyrow, Collector{ .list = &pairs, .alloc = alloc }, Collector.onEntry);
 
     // Build fresh dense columns.
     {
@@ -140,6 +136,32 @@ fn rowToOkey(txn: anytype, v: catalog.CatalogView, row: u64) !u64 {
     return (try Index.get(txn, v.pk_index_ref, pk)) orelse error.Corrupt;
 }
 
+// Hard safety check before truncating a packed type's dead tail: no live row
+// may survive in [live_count, next_row). Bounded, debug-only, and runs once
+// per pack at the final step.
+fn assertTailDead(txn: *WriteTxn, cat: Ref, live_count: u64, next_row: u64) !void {
+    if (!std.debug.runtime_safety) return;
+    const v = try catalog.loadCatalog(txn, cat);
+    var r: u64 = live_count;
+    while (r < next_row) : (r += 1) {
+        std.debug.assert((try Column.get(txn, v.live_col_ref, r)) == 0);
+    }
+}
+
+// Advance cursor.hole_lo upward to the next dead slot (relocation target) in
+// [0, live_count).
+fn advanceHoleCursor(txn: *WriteTxn, cat: Ref, live_count: u64, cursor: *CompactCursor) !void {
+    const v = try catalog.loadCatalog(txn, cat);
+    while (cursor.hole_lo < live_count and (try Column.get(txn, v.live_col_ref, cursor.hole_lo)) == 1) : (cursor.hole_lo += 1) {}
+}
+
+// Advance cursor.high_hi down past dead rows to the next live row at
+// >= live_count.
+fn advanceHighCursor(txn: *WriteTxn, cat: Ref, live_count: u64, cursor: *CompactCursor) !void {
+    const v = try catalog.loadCatalog(txn, cat);
+    while (cursor.high_hi > live_count and (try Column.get(txn, v.live_col_ref, cursor.high_hi - 1)) == 0) : (cursor.high_hi -= 1) {}
+}
+
 // Incrementally pack a type toward dense storage, doing at most `budget`
 // relocations per call, using a budget-proportional two-pointer tail scan
 // instead of a full index walk.
@@ -189,16 +211,8 @@ pub fn compactStep(txn: *WriteTxn, cat: Ref, type_id: u16, budget: usize) !struc
 
     var moved: usize = 0;
     while (moved < budget) {
-        // Advance hole_lo to the next dead slot (relocation target) in [0, lc).
-        {
-            const v = try catalog.loadCatalog(txn, cur);
-            while (cursor.hole_lo < lc and (try Column.get(txn, v.live_col_ref, cursor.hole_lo)) == 1) : (cursor.hole_lo += 1) {}
-        }
-        // Advance high_hi down past dead rows to the next live row at >= lc.
-        {
-            const v = try catalog.loadCatalog(txn, cur);
-            while (cursor.high_hi > lc and (try Column.get(txn, v.live_col_ref, cursor.high_hi - 1)) == 0) : (cursor.high_hi -= 1) {}
-        }
+        try advanceHoleCursor(txn, cur, lc, &cursor);
+        try advanceHighCursor(txn, cur, lc, &cursor);
         // No high live rows left to move, or (defensively) no holes to fill.
         if (cursor.high_hi <= lc or cursor.hole_lo >= lc) break;
 
@@ -213,21 +227,10 @@ pub fn compactStep(txn: *WriteTxn, cat: Ref, type_id: u16, budget: usize) !struc
 
     // Skip any trailing dead rows the budget loop left unexamined so the guard
     // sees the true frontier (lets `done` fire as early as it is provably safe).
-    {
-        const v = try catalog.loadCatalog(txn, cur);
-        while (cursor.high_hi > lc and (try Column.get(txn, v.live_col_ref, cursor.high_hi - 1)) == 0) : (cursor.high_hi -= 1) {}
-    }
+    try advanceHighCursor(txn, cur, lc, &cursor);
 
     if (cursor.high_hi <= lc) {
-        // Hard safety check: no live row may survive in the tail we are about to
-        // drop. Bounded, runs only once per pack at the final step.
-        if (std.debug.runtime_safety) {
-            const v = try catalog.loadCatalog(txn, cur);
-            var r: u64 = lc;
-            while (r < next_row) : (r += 1) {
-                std.debug.assert((try Column.get(txn, v.live_col_ref, r)) == 0);
-            }
-        }
+        try assertTailDead(txn, cur, lc, next_row);
         cur = try truncatePacked(txn, cur, lc);
         txn.db.compact_cursor = null;
         return .{ .cat = cur, .moved = moved, .done = true };
@@ -238,211 +241,6 @@ pub fn compactStep(txn: *WriteTxn, cat: Ref, type_id: u16, budget: usize) !struc
     cursor.cat = cur;
     txn.db.compact_cursor = cursor;
     return .{ .cat = cur, .moved = moved, .done = false };
-}
-
-// Deep-copy a single property value from the source db into the destination db.
-// kind/elem describe the property. Returns the destination-local raw u64.
-fn copyValue(src: anytype, dst: *WriteTxn, kind: catalog.PropKind, elem: catalog.ElemKind, src_raw: u64) !u64 {
-    return switch (kind) {
-        .int, .link => src_raw, // verbatim (a link stores an object key, preserved)
-        .blob => try blob.copyInto(src, dst, src_raw),
-        .list => blk: {
-            var newc = try Column.create(dst);
-            const n = try Column.len(src, src_raw);
-            var i: u64 = 0;
-            while (i < n) : (i += 1) {
-                const el = try Column.get(src, src_raw, i);
-                const dv = if (elem == .blob) try blob.copyInto(src, dst, el) else el;
-                newc = try Column.append(dst, newc, dv);
-            }
-            break :blk newc;
-        },
-        .set => switch (elem) {
-            .blob => try copyBindex(src, dst, src_raw), // byte-keyed set -> bindex deep-copy
-            else => blk: {
-                // int-keyed set: a u64-keyed Index.
-                var newi = try Index.create(dst);
-                const Sink = struct {
-                    idx: *Ref,
-                    dstp: *WriteTxn,
-                    fn onKey(self: @This(), key: u64) !void {
-                        self.idx.* = try Index.insert(self.dstp, self.idx.*, key, 1);
-                    }
-                };
-                try Index.forEachKey(src, src_raw, Sink{ .idx = &newi, .dstp = dst }, Sink.onKey);
-                break :blk newi;
-            },
-        },
-        .link_set => blk: {
-            var newi = try Index.create(dst);
-            const Sink = struct {
-                idx: *Ref,
-                dstp: *WriteTxn,
-                fn onKey(self: @This(), key: u64) !void {
-                    self.idx.* = try Index.insert(self.dstp, self.idx.*, key, 1);
-                }
-            };
-            try Index.forEachKey(src, src_raw, Sink{ .idx = &newi, .dstp = dst }, Sink.onKey);
-            break :blk newi;
-        },
-        .dict => try copyBindex(src, dst, src_raw), // byte-keyed dict -> bindex deep-copy
-    };
-}
-
-// Deep-copy a bindex root (dict or byte-keyed set) from `src` into `dst` by
-// iterating the source tree and re-inserting each entry. bindex.insert re-puts
-// the key into the destination's blob heap, so this is a correct cross-database
-// deep-copy. forEachEntry hands the callback a key slice into the SOURCE mapping;
-// bindex.insert grows only the DST arena (a different mapping), so the source key
-// stays valid for the duration of the insert -- keep the insert inside onEntry.
-fn copyBindex(src: anytype, dst: *WriteTxn, src_root: u64) !u64 {
-    var newr = try bindex.create(dst);
-    const Sink = struct {
-        dstp: *WriteTxn,
-        root: *u64,
-        fn onEntry(self: @This(), key: []const u8, val: u64) !void {
-            self.root.* = try bindex.insert(self.dstp, self.root.*, key, val);
-        }
-    };
-    try bindex.forEachEntry(src, src_root, Sink{ .dstp = dst, .root = &newr }, Sink.onEntry);
-    return newr;
-}
-
-// Add okey under `value` in a value index (value -> {okey -> 1}), mirroring the
-// shape the object layer's maintenance keeps. Local to the copy path, which
-// must rebuild value indexes in the destination database.
-fn viAddInto(dst: *WriteTxn, vi_ref: Ref, value: u64, okey: u64) !Ref {
-    const existing = try Index.get(dst, vi_ref, value);
-    var set_root = existing orelse try Index.create(dst);
-    set_root = try Index.insert(dst, set_root, okey, 1);
-    return try Index.insert(dst, vi_ref, value, set_root);
-}
-
-// Copy all live rows of `src_cat` (in the source db) into a fresh catalog in the
-// destination db, preserving object keys, primary keys, and next_key. Backlink
-// indexes are created empty (rebuild with rebuildBacklinks afterward); value
-// indexes are repopulated inline. Returns the new destination catalog ref.
-pub fn copyTypeRows(src: anytype, src_cat: Ref, dst: *WriteTxn) !Ref {
-    // Load the source snapshot, then re-point every ref field at structures
-    // created in the DESTINATION db before writing. Kinds, elem kinds, targets,
-    // rules, and indexed flags carry over as plain values.
-    var s = try catalog.CatalogSnapshot.load(src, src_cat);
-    const pc = s.prop_count;
-    // Keep the source refs to read from.
-    var s_prop: [catalog.max_prop_count]Ref = undefined;
-    {
-        var j: usize = 0;
-        while (j < pc) : (j += 1) s_prop[j] = s.props[j].col;
-    }
-    const s_ver = s.version_col_ref;
-    const s_live = s.live_col_ref;
-    const s_keyrow = s.keyrow_index_ref;
-
-    // Collect live (okey, src_row) pairs.
-    const alloc = dst.db.store.allocator;
-    var pairs = std.ArrayList(Pair).empty;
-    defer pairs.deinit(alloc);
-    const Collector = struct {
-        list: *std.ArrayList(Pair),
-        a: std.mem.Allocator,
-        fn onEntry(self: @This(), k: u64, val: u64) !void {
-            try self.list.append(self.a, .{ .okey = k, .row = val });
-        }
-    };
-    try Index.forEachEntry(src, s_keyrow, Collector{ .list = &pairs, .a = alloc }, Collector.onEntry);
-
-    // Fresh destination structures. Backlink and value indexes are created empty
-    // in the destination db (the source refs live in the source db's address
-    // space) and repopulated separately; the indexed flag carries through.
-    {
-        var j: usize = 0;
-        while (j < pc) : (j += 1) {
-            s.props[j].col = try Column.create(dst);
-            s.props[j].backlink = if (s.props[j].kind == .link or s.props[j].kind == .link_set) try Index.create(dst) else 0;
-            s.props[j].value_index = if (s.props[j].indexed) try Index.create(dst) else 0;
-        }
-    }
-    s.version_col_ref = try Column.create(dst);
-    s.live_col_ref = try Column.create(dst);
-    s.keyrow_index_ref = try Index.create(dst);
-    s.pk_index_ref = try Index.create(dst);
-
-    var d_row: u64 = 0;
-    for (pairs.items) |pr| {
-        if ((try Column.get(src, s_live, pr.row)) == 0) continue; // defensive
-        var j: usize = 0;
-        while (j < pc) : (j += 1) {
-            const sraw = try Column.get(src, s_prop[j], pr.row);
-            const draw = try copyValue(src, dst, s.props[j].kind, s.props[j].elem, sraw);
-            s.props[j].col = try Column.append(dst, s.props[j].col, draw);
-            // Repopulate the destination value index in the same pass. Leaving
-            // it empty while the catalog still says indexed=true silently
-            // empties every indexed query after a full-file compaction (the
-            // planner trusts the flag) and fails the value-index audit.
-            if (s.props[j].indexed) {
-                s.props[j].value_index = try viAddInto(dst, s.props[j].value_index, draw, pr.okey);
-            }
-        }
-        const ver = try Column.get(src, s_ver, pr.row);
-        s.version_col_ref = try Column.append(dst, s.version_col_ref, ver);
-        s.live_col_ref = try Column.append(dst, s.live_col_ref, 1);
-        s.keyrow_index_ref = try Index.insert(dst, s.keyrow_index_ref, pr.okey, d_row);
-        const pk = try Column.get(src, s_prop[0], pr.row);
-        s.pk_index_ref = try Index.insert(dst, s.pk_index_ref, pk, pr.okey);
-        d_row += 1;
-    }
-
-    s.next_row = d_row;
-    return s.write(dst);
-}
-
-// Rebuild backlink indexes for `cat` (in dst) from its copied forward links.
-pub fn rebuildBacklinks(dst: *WriteTxn, cat: Ref) !Ref {
-    var cur = cat;
-    const v0 = try catalog.loadCatalog(dst, cat);
-    const pc = v0.prop_count;
-    const alloc = dst.db.store.allocator;
-    var p: usize = 0;
-    while (p < pc) : (p += 1) {
-        const k = (try catalog.loadCatalog(dst, cur)).kind(p);
-        if (k != .link and k != .link_set) continue;
-        // collect (okey,row) of cur
-        var pairs = std.ArrayList(Pair).empty;
-        defer pairs.deinit(alloc);
-        const C = struct {
-            list: *std.ArrayList(Pair),
-            a: std.mem.Allocator,
-            fn onEntry(self: @This(), kk: u64, vv: u64) !void {
-                try self.list.append(self.a, .{ .okey = kk, .row = vv });
-            }
-        };
-        {
-            const vv = try catalog.loadCatalog(dst, cur);
-            try Index.forEachEntry(dst, vv.keyrow_index_ref, C{ .list = &pairs, .a = alloc }, C.onEntry);
-        }
-        for (pairs.items) |pr| {
-            const vv = try catalog.loadCatalog(dst, cur);
-            const col = vv.propColRef(p);
-            const raw = try Column.get(dst, col, pr.row);
-            if (k == .link) {
-                if (raw != 0) cur = try links.addBacklink(dst, cur, p, raw - 1, pr.okey);
-            } else {
-                // link_set: the column holds a set-root of target okeys
-                var members = std.ArrayList(u64).empty;
-                defer members.deinit(alloc);
-                const M = struct {
-                    list: *std.ArrayList(u64),
-                    a: std.mem.Allocator,
-                    fn onKey(self: @This(), key: u64) !void {
-                        try self.list.append(self.a, key);
-                    }
-                };
-                try Index.forEachKey(dst, raw, M{ .list = &members, .a = alloc }, M.onKey);
-                for (members.items) |t| cur = try links.addBacklink(dst, cur, p, t, pr.okey);
-            }
-        }
-    }
-    return cur;
 }
 
 // ---------------------------------------------------------------------------
@@ -462,18 +260,9 @@ inline fn mixPk(pk: u64) u64 {
 // fold is identity-preserving and order-independent.
 fn foldPks(allocator: std.mem.Allocator, txn: anytype, cat: Ref, fold: *u64, count: *u64) !void {
     const v = try catalog.loadCatalog(txn, cat);
-    const keyrow = v.keyrow_index_ref;
     const prop0 = v.propColRef(0);
-    var pairs = std.ArrayList(Pair).empty;
+    var pairs = try collectKeyRowPairs(allocator, txn, v.keyrow_index_ref);
     defer pairs.deinit(allocator);
-    const C = struct {
-        list: *std.ArrayList(Pair),
-        a: std.mem.Allocator,
-        fn onEntry(self: @This(), k: u64, val: u64) !void {
-            try self.list.append(self.a, .{ .okey = k, .row = val });
-        }
-    };
-    try Index.forEachEntry(txn, keyrow, C{ .list = &pairs, .a = allocator }, C.onEntry);
     for (pairs.items) |pr| {
         const pk = try Column.get(txn, prop0, pr.row);
         fold.* ^= mixPk(pk);
@@ -507,16 +296,8 @@ fn foldPksAndCheck(allocator: std.mem.Allocator, src: anytype, sc: Ref, dst: any
     const s_prop0 = s_prop[0];
 
     // Collect SRC's live (okey, row) pairs.
-    var pairs = std.ArrayList(Pair).empty;
+    var pairs = try collectKeyRowPairs(allocator, src, sv.keyrow_index_ref);
     defer pairs.deinit(allocator);
-    const C = struct {
-        list: *std.ArrayList(Pair),
-        a: std.mem.Allocator,
-        fn onEntry(self: @This(), k: u64, val: u64) !void {
-            try self.list.append(self.a, .{ .okey = k, .row = val });
-        }
-    };
-    try Index.forEachEntry(src, sv.keyrow_index_ref, C{ .list = &pairs, .a = allocator }, C.onEntry);
 
     var out: [max_prop_count]catalog.Value = undefined;
     for (pairs.items) |pr| {
@@ -528,23 +309,37 @@ fn foldPksAndCheck(allocator: std.mem.Allocator, src: anytype, sc: Ref, dst: any
         // (a) readability: the same object key must decode in dst.
         if ((try objects.getTypedByOkey(dst, dc, pr.okey, out[0..pc])) == null) return error.CompactionMismatch;
 
-        // (b) to-one forward links must carry the identical raw target in dst,
-        //     and (c) every indexed property value must be covered by the
-        //     destination's value index -- an empty or stale index passes the
-        //     row-readability checks but silently empties queries.
         const drow = (try catalog.okeyToRow(dst, dc, pr.okey)) orelse return error.CompactionMismatch;
-        var p: usize = 0;
-        while (p < pc) : (p += 1) {
-            if (kinds[p] == .link) {
-                const s_raw = try Column.get(src, s_prop[p], pr.row);
-                const d_raw = try Column.get(dst, d_prop[p], drow);
-                if (s_raw != d_raw) return error.CompactionMismatch;
-            }
-            if (dv.indexed(p)) {
-                const d_raw = try Column.get(dst, d_prop[p], drow);
-                const inner = (try Index.get(dst, dv.valueIndexRef(p), d_raw)) orelse return error.CompactionMismatch;
-                if ((try Index.get(dst, inner, pr.okey)) == null) return error.CompactionMismatch;
-            }
+        try checkRowProperties(src, dst, dv, kinds[0..pc], s_prop[0..pc], d_prop[0..pc], pr, drow);
+    }
+}
+
+// Per-property preservation checks for one copied row: (b) to-one forward
+// links must carry the identical raw target in dst, and (c) every indexed
+// property value must be covered by the destination's value index -- an empty
+// or stale index passes the row-readability checks but silently empties
+// queries. Returns error.CompactionMismatch on any divergence.
+fn checkRowProperties(
+    src: anytype,
+    dst: anytype,
+    dv: catalog.CatalogView,
+    kinds: []const catalog.PropKind,
+    s_prop: []const Ref,
+    d_prop: []const Ref,
+    pr: Pair,
+    drow: u64,
+) !void {
+    var p: usize = 0;
+    while (p < kinds.len) : (p += 1) {
+        if (kinds[p] == .link) {
+            const s_raw = try Column.get(src, s_prop[p], pr.row);
+            const d_raw = try Column.get(dst, d_prop[p], drow);
+            if (s_raw != d_raw) return error.CompactionMismatch;
+        }
+        if (dv.indexed(p)) {
+            const d_raw = try Column.get(dst, d_prop[p], drow);
+            const inner = (try Index.get(dst, dv.valueIndexRef(p), d_raw)) orelse return error.CompactionMismatch;
+            if ((try Index.get(dst, inner, pr.okey)) == null) return error.CompactionMismatch;
         }
     }
 }

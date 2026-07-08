@@ -6,6 +6,7 @@ const create = Column.create;
 const len = Column.len;
 const get = Column.get;
 const append = Column.append;
+const appendRun = Column.appendRun;
 const set = Column.set;
 const truncate = Column.truncate;
 const makeInnerForTest = Column.makeInnerForTest;
@@ -18,6 +19,7 @@ const encodeInner = node.encodeInner;
 const testing = std.testing;
 
 const Db = @import("db.zig").Db;
+const WriteTxn = @import("db.zig").WriteTxn;
 
 fn colTmpPath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const u8) ![]const u8 {
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
@@ -290,4 +292,103 @@ test "two million element column built in a single transaction" {
         try testing.expectEqual(N - 1, try get(&r, r.root(), N - 1));
         r.end();
     }
+}
+
+fn appendColVal(i: u64) u64 {
+    return i *% 11 +% 5;
+}
+
+fn appendTmpDb(tmp: *testing.TmpDir, name: []const u8) !Db {
+    const path = try colTmpPath(testing.allocator, tmp, name);
+    defer testing.allocator.free(path);
+    return Db.create(testing.allocator, path);
+}
+
+// Build a base column of `base` values via sequential append, append `run` more
+// values via appendRun, and assert the result is logically identical to
+// appending all base+run values sequentially: same length, and get(i) matches
+// the sequential twin at every index.
+fn checkColAppendEquiv(w: *WriteTxn, base: u64, run: u64) !void {
+    var base_root = try create(w);
+    var k: u64 = 0;
+    while (k < base) : (k += 1) base_root = try append(w, base_root, appendColVal(k));
+
+    const rv = try testing.allocator.alloc(u64, run);
+    defer testing.allocator.free(rv);
+    var r: u64 = 0;
+    while (r < run) : (r += 1) rv[r] = appendColVal(base + r);
+
+    const appended = try appendRun(w, base_root, rv, testing.allocator);
+
+    var expected = try create(w);
+    k = 0;
+    while (k < base + run) : (k += 1) expected = try append(w, expected, appendColVal(k));
+
+    const total = base + run;
+    try testing.expectEqual(total, try len(w, appended));
+    try testing.expectEqual(try len(w, expected), try len(w, appended));
+
+    var i: u64 = 0;
+    while (i < total) : (i += 1) {
+        try testing.expectEqual(try get(w, expected, i), try get(w, appended, i));
+    }
+    if (total > 0) try testing.expectError(error.IndexOutOfBounds, get(w, appended, total));
+}
+
+test "appendRun partial last leaf then new leaves" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try appendTmpDb(&tmp, "colappend1.airdb");
+    defer db.deinit();
+    var w = try db.beginWrite();
+    try checkColAppendEquiv(&w, 100, 200); // 100 % 64 == 36 in the last leaf
+    w.deinit();
+}
+
+test "appendRun grows height" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try appendTmpDb(&tmp, "colappend2.airdb");
+    defer db.deinit();
+    var w = try db.beginWrite();
+    // Single-leaf base, run crossing FANOUT*LEAF_CAP (== 4096) so the result
+    // must be three levels tall.
+    try checkColAppendEquiv(&w, 50, 4200);
+    w.deinit();
+}
+
+test "appendRun single-leaf base" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try appendTmpDb(&tmp, "colappend3.airdb");
+    defer db.deinit();
+    var w = try db.beginWrite();
+    try checkColAppendEquiv(&w, 40, 50); // base < LEAF_CAP
+    w.deinit();
+}
+
+test "appendRun run far larger than base" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try appendTmpDb(&tmp, "colappend4.airdb");
+    defer db.deinit();
+    var w = try db.beginWrite();
+    try checkColAppendEquiv(&w, 10, 5000);
+    w.deinit();
+}
+
+test "appendRun empty run is a no-op" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try appendTmpDb(&tmp, "colappend5.airdb");
+    defer db.deinit();
+    var w = try db.beginWrite();
+    var base_root = try create(&w);
+    var k: u64 = 0;
+    while (k < 100) : (k += 1) base_root = try append(&w, base_root, appendColVal(k));
+    const before = try len(&w, base_root);
+    const appended = try appendRun(&w, base_root, &.{}, testing.allocator);
+    try testing.expectEqual(base_root, appended); // same ref, unchanged
+    try testing.expectEqual(before, try len(&w, appended));
+    w.deinit();
 }

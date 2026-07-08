@@ -145,6 +145,10 @@ fn minKey(txn: anytype, ref: Ref) !u64 {
 /// Recursive insert. `key_ref` is the blob ref for `key` (pre-allocated by the
 /// public insert). On an in-place overwrite the redundant `key_ref` blob is
 /// freed here, since the existing entry already references the key bytes.
+/// Deliberately one long function: a single-pass B+tree insert whose
+/// leaf/inner upsert, shift, and midpoint-split cases all share the
+/// split-propagation state -- one irreducible algorithm rather than separable
+/// steps.
 fn insertInto(txn: anytype, node_ref: Ref, key_ref: u64, key: []const u8, val: u64, depth: usize) !InsertResult {
     if (depth >= max_depth) return error.Corrupt;
     const node_bytes = try txn.deref(node_ref, 1);

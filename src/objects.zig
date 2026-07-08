@@ -166,6 +166,9 @@ pub fn deleteAndNullify(txn: *WriteTxn, cat: Ref, pk: u64, expected_version: u64
 // updateTyped is MVCC-safe: it does NOT free any blob unless the version check
 // passes. Steps: read current row, check version, then on the apply path free
 // old blobs and allocate new ones before delegating to rows.update.
+// Deliberately one long function: the read/check/free/allocate/update sequence
+// is one irreducible MVCC step -- splitting it would scatter the frees from
+// the version check that alone makes them safe.
 pub fn updateTyped(
     txn: *WriteTxn,
     cat: Ref,

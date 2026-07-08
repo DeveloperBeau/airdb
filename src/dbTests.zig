@@ -10,6 +10,7 @@ const Ref = @import("ref.zig").Ref;
 const FreeList = @import("freelist.zig").FreeList;
 const coord_mod = @import("coord.zig");
 const typedir = @import("typedir.zig");
+const typeRouting = @import("typeRouting.zig");
 const compaction = @import("compaction.zig");
 const catalog = @import("catalog.zig");
 const Index = @import("index.zig");
@@ -222,7 +223,7 @@ test "verifyIntegrity passes after churn on an indexed type" {
         var dir = db.active_root;
         var pk: u64 = 0;
         while (pk < 200) : (pk += 1) {
-            dir = (try typedir.insert(&w, dir, tid, &.{ .{ .int = pk }, .{ .int = pk % 16 } })).dir;
+            dir = (try typeRouting.insert(&w, dir, tid, &.{ .{ .int = pk }, .{ .int = pk % 16 } })).dir;
         }
         w.setRoot(dir);
         _ = try w.commit();
@@ -235,20 +236,20 @@ test "verifyIntegrity passes after churn on an indexed type" {
         var pk: u64 = 0;
         while (pk < 200) : (pk += 1) {
             var out: [2]catalog.Value = undefined;
-            const ver = (try typedir.get(&w, dir, tid, pk, &out)).?;
+            const ver = (try typeRouting.get(&w, dir, tid, pk, &out)).?;
             if (pk % 5 == 0) {
-                dir = switch (try typedir.delete(&w, dir, tid, pk, ver)) {
+                dir = switch (try typeRouting.delete(&w, dir, tid, pk, ver)) {
                     .ok => |d| d,
                     else => unreachable,
                 };
             } else if (pk % 2 == 0) {
-                const ur = try typedir.update(&w, dir, tid, pk, &.{ .{ .int = pk }, .{ .int = (pk + 7) % 16 } }, ver);
+                const ur = try typeRouting.update(&w, dir, tid, pk, &.{ .{ .int = pk }, .{ .int = (pk + 7) % 16 } }, ver);
                 dir = ur.ok.dir;
             }
         }
         // Insert a fresh batch with reused values.
         while (pk < 260) : (pk += 1) {
-            dir = (try typedir.insert(&w, dir, tid, &.{ .{ .int = pk }, .{ .int = pk % 16 } })).dir;
+            dir = (try typeRouting.insert(&w, dir, tid, &.{ .{ .int = pk }, .{ .int = pk % 16 } })).dir;
         }
         w.setRoot(dir);
         _ = try w.commit();
@@ -272,7 +273,7 @@ test "verifyIntegrity detects a corrupted value index" {
         var dir = try typedir.createTypes(&w, &.{&.{ .{ .kind = .int }, .{ .kind = .int, .indexed = true } }}, &.{false});
         var pk: u64 = 0;
         while (pk < 8) : (pk += 1) {
-            dir = (try typedir.insert(&w, dir, tid, &.{ .{ .int = pk }, .{ .int = pk } })).dir;
+            dir = (try typeRouting.insert(&w, dir, tid, &.{ .{ .int = pk }, .{ .int = pk } })).dir;
         }
         w.setRoot(dir);
         _ = try w.commit();
@@ -317,14 +318,14 @@ test "verifyIntegrity passes on a clean link graph after churn" {
             &.{ .{ .kind = .int }, .{ .kind = .blob } }, // 0: target type
             &.{ .{ .kind = .int }, .{ .kind = .link, .link_target = 0 }, .{ .kind = .link_set, .link_target = 0 } }, // 1: source
         }, &.{ false, false });
-        const a = try typedir.insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .bytes = "A" } });
+        const a = try typeRouting.insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .bytes = "A" } });
         dir = a.dir;
-        const b = try typedir.insert(&w, dir, 0, &.{ .{ .int = 2 }, .{ .bytes = "B" } });
+        const b = try typeRouting.insert(&w, dir, 0, &.{ .{ .int = 2 }, .{ .bytes = "B" } });
         dir = b.dir;
-        dir = (try typedir.insert(&w, dir, 1, &.{ .{ .int = 1 }, .{ .link = a.row }, .{ .link_set = &.{ a.row, b.row } } })).dir;
-        dir = (try typedir.insert(&w, dir, 1, &.{ .{ .int = 2 }, .{ .link = b.row }, .{ .link_set = &.{} } })).dir;
+        dir = (try typeRouting.insert(&w, dir, 1, &.{ .{ .int = 1 }, .{ .link = a.row }, .{ .link_set = &.{ a.row, b.row } } })).dir;
+        dir = (try typeRouting.insert(&w, dir, 1, &.{ .{ .int = 2 }, .{ .link = b.row }, .{ .link_set = &.{} } })).dir;
         // Churn: move source 1's to-one link, drop one set member.
-        dir = try typedir.setLink(&w, dir, 1, 1, 1, b.row);
+        dir = try typeRouting.setLink(&w, dir, 1, 1, 1, b.row);
         const src_cat = try typedir.catalogRef(&w, dir, 1);
         const new_cat = try links.linkSetRemove(&w, src_cat, 1, 2, a.row);
         dir = try typedir.setCatalogRef(&w, dir, 1, new_cat);
@@ -348,10 +349,10 @@ test "verifyIntegrity detects a corrupted backlink index" {
         var dir = try typedir.createTypes(&w, &.{
             &.{ .{ .kind = .int }, .{ .kind = .link, .link_target = 0 } },
         }, &.{false});
-        const a = try typedir.insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .link = null } });
+        const a = try typeRouting.insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .link = null } });
         dir = a.dir;
         target_okey = a.row;
-        dir = (try typedir.insert(&w, dir, 0, &.{ .{ .int = 2 }, .{ .link = target_okey } })).dir;
+        dir = (try typeRouting.insert(&w, dir, 0, &.{ .{ .int = 2 }, .{ .link = target_okey } })).dir;
         w.setRoot(dir);
         _ = try w.commit();
     }
@@ -387,7 +388,7 @@ test "verifyIntegrity passes on a non-indexed type" {
         var dir = try typedir.createTypes(&w, &.{&.{ .{ .kind = .int }, .{ .kind = .int } }}, &.{false});
         var pk: u64 = 0;
         while (pk < 50) : (pk += 1) {
-            dir = (try typedir.insert(&w, dir, tid, &.{ .{ .int = pk }, .{ .int = pk * 3 } })).dir;
+            dir = (try typeRouting.insert(&w, dir, tid, &.{ .{ .int = pk }, .{ .int = pk * 3 } })).dir;
         }
         w.setRoot(dir);
         _ = try w.commit();
@@ -953,7 +954,7 @@ fn churnNetZero(path: []const u8, live: u64, iters: u64, auto: bool) !struct { n
         var w = try db.beginWrite();
         var dir = db.active_root;
         while (hi < live) : (hi += 1) {
-            dir = (try typedir.insert(&w, dir, tid, &.{ .{ .int = hi }, .{ .int = hi } })).dir;
+            dir = (try typeRouting.insert(&w, dir, tid, &.{ .{ .int = hi }, .{ .int = hi } })).dir;
         }
         w.setRoot(dir);
         _ = try w.commit();
@@ -968,15 +969,15 @@ fn churnNetZero(path: []const u8, live: u64, iters: u64, auto: bool) !struct { n
             // Insert `live` fresh rows.
             var k: u64 = 0;
             while (k < live) : (k += 1) {
-                dir = (try typedir.insert(&w, dir, tid, &.{ .{ .int = hi }, .{ .int = hi } })).dir;
+                dir = (try typeRouting.insert(&w, dir, tid, &.{ .{ .int = hi }, .{ .int = hi } })).dir;
                 hi += 1;
             }
             // Delete the `live` oldest live rows.
             k = 0;
             while (k < live) : (k += 1) {
                 var out: [2]catalog.Value = undefined;
-                const ver = (try typedir.get(&w, dir, tid, lo, &out)).?;
-                dir = switch (try typedir.delete(&w, dir, tid, lo, ver)) {
+                const ver = (try typeRouting.get(&w, dir, tid, lo, &out)).?;
+                dir = switch (try typeRouting.delete(&w, dir, tid, lo, ver)) {
                     .ok => |d| d,
                     else => unreachable,
                 };
@@ -1068,12 +1069,12 @@ test "a failed commit inside maybeCompactStep neither crashes nor wedges the wri
         var w = try db.beginWrite();
         var dir = db.active_root;
         var pk: u64 = 0;
-        while (pk < 10) : (pk += 1) dir = (try typedir.insert(&w, dir, tid, &.{ .{ .int = pk }, .{ .int = pk } })).dir;
+        while (pk < 10) : (pk += 1) dir = (try typeRouting.insert(&w, dir, tid, &.{ .{ .int = pk }, .{ .int = pk } })).dir;
         var out: [2]catalog.Value = undefined;
         pk = 0;
         while (pk < 8) : (pk += 1) {
-            const ver = (try typedir.get(&w, dir, tid, pk, &out)).?;
-            dir = switch (try typedir.delete(&w, dir, tid, pk, ver)) {
+            const ver = (try typeRouting.get(&w, dir, tid, pk, &out)).?;
+            dir = switch (try typeRouting.delete(&w, dir, tid, pk, ver)) {
                 .ok => |d| d,
                 else => unreachable,
             };
@@ -1090,7 +1091,7 @@ test "a failed commit inside maybeCompactStep neither crashes nor wedges the wri
     w.deinit();
     var r = try db.beginRead();
     defer r.end();
-    try testing.expectEqual(@as(u64, 2), try typedir.liveCount(&r, r.root(), tid));
+    try testing.expectEqual(@as(u64, 2), try typeRouting.liveCount(&r, r.root(), tid));
 }
 
 test "the compaction cursor never resumes across types" {
@@ -1122,12 +1123,12 @@ test "the compaction cursor never resumes across types" {
         var t: u16 = 0;
         while (t < 2) : (t += 1) {
             var pk: u64 = 0;
-            while (pk < 12) : (pk += 1) dir = (try typedir.insert(&w, dir, t, &.{ .{ .int = pk }, .{ .int = pk } })).dir;
+            while (pk < 12) : (pk += 1) dir = (try typeRouting.insert(&w, dir, t, &.{ .{ .int = pk }, .{ .int = pk } })).dir;
             var out: [2]catalog.Value = undefined;
             pk = 0;
             while (pk < 8) : (pk += 1) {
-                const ver = (try typedir.get(&w, dir, t, pk, &out)).?;
-                dir = switch (try typedir.delete(&w, dir, t, pk, ver)) {
+                const ver = (try typeRouting.get(&w, dir, t, pk, &out)).?;
+                dir = switch (try typeRouting.delete(&w, dir, t, pk, ver)) {
                     .ok => |d| d,
                     else => unreachable,
                 };
@@ -1153,11 +1154,11 @@ test "the compaction cursor never resumes across types" {
     defer r.end();
     var t: u16 = 0;
     while (t < 2) : (t += 1) {
-        try testing.expectEqual(@as(u64, 4), try typedir.liveCount(&r, r.root(), t));
+        try testing.expectEqual(@as(u64, 4), try typeRouting.liveCount(&r, r.root(), t));
         var out: [2]catalog.Value = undefined;
         var pk: u64 = 8;
         while (pk < 12) : (pk += 1) {
-            try testing.expect((try typedir.get(&r, r.root(), t, pk, &out)) != null);
+            try testing.expect((try typeRouting.get(&r, r.root(), t, pk, &out)) != null);
         }
         const cat = try typedir.catalogRef(&r, r.root(), t);
         try testing.expectEqual(@as(u64, 4), (try catalog.loadCatalog(&r, cat)).next_row);
@@ -1232,7 +1233,7 @@ test "maybeCompactStep is a no-op when nothing to compact" {
         var dir = try typedir.createTypes(&w, &.{&.{ .{ .kind = .int }, .{ .kind = .int } }}, &.{false});
         var pk: u64 = 0;
         while (pk < 3) : (pk += 1) {
-            dir = (try typedir.insert(&w, dir, tid, &.{ .{ .int = pk }, .{ .int = pk } })).dir;
+            dir = (try typeRouting.insert(&w, dir, tid, &.{ .{ .int = pk }, .{ .int = pk } })).dir;
         }
         w.setRoot(dir);
         _ = try w.commit();

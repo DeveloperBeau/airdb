@@ -5,6 +5,7 @@ const compaction = @import("compaction.zig");
 const catalog = @import("catalog.zig");
 const links = @import("links.zig");
 const typedir = @import("typedir.zig");
+const typeRouting = @import("typeRouting.zig");
 const objects = @import("objects.zig");
 const rows = @import("rows.zig");
 const blob = @import("blob.zig");
@@ -352,22 +353,22 @@ test "compactToNewFile produces a verified, smaller, equivalent file" {
         var nbuf: [32]u8 = undefined;
         while (i < 300) : (i += 1) {
             const s = try std.fmt.bufPrint(&nbuf, "author-{d}", .{i});
-            const r = try typedir.insert(&w, dir, 0, &.{ .{ .int = i }, .{ .bytes = s } });
+            const r = try typeRouting.insert(&w, dir, 0, &.{ .{ .int = i }, .{ .bytes = s } });
             dir = r.dir;
             author_okeys[@intCast(i)] = r.row;
         }
         i = 0;
         while (i < 300) : (i += 1) {
             const a_okey = author_okeys[@intCast(i % 300)];
-            const r = try typedir.insert(&w, dir, 1, &.{ .{ .int = i }, .{ .link = a_okey }, .{ .set_int = &.{ i, i + 1000 } } });
+            const r = try typeRouting.insert(&w, dir, 1, &.{ .{ .int = i }, .{ .link = a_okey }, .{ .set_int = &.{ i, i + 1000 } } });
             dir = r.dir;
         }
         // Delete every third book (~100): pks 0,3,...,297.
         i = 0;
         while (i < 300) : (i += 3) {
             var out: [3]catalog.Value = undefined;
-            const ver = (try typedir.get(&w, dir, 1, i, &out)).?;
-            const dres = try typedir.deleteNullifyX(&w, dir, 1, i, ver);
+            const ver = (try typeRouting.get(&w, dir, 1, i, &out)).?;
+            const dres = try typeRouting.deleteNullifyX(&w, dir, 1, i, ver);
             dir = dres.ok;
         }
         w.setRoot(dir);
@@ -399,27 +400,27 @@ test "compactToNewFile produces a verified, smaller, equivalent file" {
     defer r.end();
     const dir = r.root();
 
-    try testing.expectEqual(@as(u64, 300), try typedir.liveCount(&r, dir, 0));
-    try testing.expectEqual(@as(u64, 200), try typedir.liveCount(&r, dir, 1));
+    try testing.expectEqual(@as(u64, 300), try typeRouting.liveCount(&r, dir, 0));
+    try testing.expectEqual(@as(u64, 200), try typeRouting.liveCount(&r, dir, 1));
 
     // A surviving author reads back with identical values.
     var ao: [2]catalog.Value = undefined;
-    _ = (try typedir.get(&r, dir, 0, 42, &ao)).?;
+    _ = (try typeRouting.get(&r, dir, 0, 42, &ao)).?;
     try testing.expectEqual(@as(u64, 42), ao[0].int);
     try testing.expectEqualStrings("author-42", ao[1].bytes);
 
     // A surviving book (pk 1, not divisible by 3) keeps its author link, and the
     // link resolves to the same author object.
     var bo: [3]catalog.Value = undefined;
-    _ = (try typedir.get(&r, dir, 1, 1, &bo)).?;
-    try testing.expectEqual(@as(?u64, author_okeys[1]), try typedir.getLink(&r, dir, 1, 1, 1));
+    _ = (try typeRouting.get(&r, dir, 1, 1, &bo)).?;
+    try testing.expectEqual(@as(?u64, author_okeys[1]), try typeRouting.getLink(&r, dir, 1, 1, 1));
     var la: [2]catalog.Value = undefined;
-    _ = (try typedir.getLinked(&r, dir, 1, 1, 1, &la)).?;
+    _ = (try typeRouting.getLinked(&r, dir, 1, 1, 1, &la)).?;
     try testing.expectEqual(@as(u64, 1), la[0].int);
 
     // A deleted book (pk 3) is absent.
     var b3: [3]catalog.Value = undefined;
-    try testing.expectEqual(@as(?u64, null), try typedir.get(&r, dir, 1, 3, &b3));
+    try testing.expectEqual(@as(?u64, null), try typeRouting.get(&r, dir, 1, 3, &b3));
 }
 
 test "compaction preserves dict and set-of-blob" {
@@ -443,13 +444,13 @@ test "compaction preserves dict and set-of-blob" {
         };
         var dir = try typedir.createTypes(&w, &schema, &.{false});
 
-        const r1 = try typedir.insert(&w, dir, 0, &.{
+        const r1 = try typeRouting.insert(&w, dir, 0, &.{
             .{ .int = 1 },
             .{ .dict_int = &.{ .{ .key = "a", .val = 1 }, .{ .key = "b", .val = 2 } } },
             .{ .set_blob = &.{ "x", "yy" } },
         });
         dir = r1.dir;
-        const r2 = try typedir.insert(&w, dir, 0, &.{
+        const r2 = try typeRouting.insert(&w, dir, 0, &.{
             .{ .int = 2 },
             .{ .dict_int = &.{.{ .key = "c", .val = 3 }} },
             .{ .set_blob = &.{"zzz"} },
@@ -458,8 +459,8 @@ test "compaction preserves dict and set-of-blob" {
 
         // Delete pk 2 -- leaves a gap in the source.
         var out: [3]catalog.Value = undefined;
-        const ver = (try typedir.get(&w, dir, 0, 2, &out)).?;
-        const dres = try typedir.deleteNullifyX(&w, dir, 0, 2, ver);
+        const ver = (try typeRouting.get(&w, dir, 0, 2, &out)).?;
+        const dres = try typeRouting.deleteNullifyX(&w, dir, 0, 2, ver);
         dir = dres.ok;
 
         w.setRoot(dir);
@@ -478,7 +479,7 @@ test "compaction preserves dict and set-of-blob" {
         const dir = r.root();
         const cat = try typedir.catalogRef(&r, dir, 0);
 
-        try testing.expectEqual(@as(u64, 1), try typedir.liveCount(&r, dir, 0));
+        try testing.expectEqual(@as(u64, 1), try typeRouting.liveCount(&r, dir, 0));
 
         // Surviving row pk 1: dict entries preserved.
         try testing.expectEqual(@as(?u64, 2), try collections.dictCount(&r, cat, 1, 1));
@@ -494,7 +495,7 @@ test "compaction preserves dict and set-of-blob" {
 
         // Deleted row pk 2 is absent.
         var o2: [3]catalog.Value = undefined;
-        try testing.expectEqual(@as(?u64, null), try typedir.get(&r, dir, 0, 2, &o2));
+        try testing.expectEqual(@as(?u64, null), try typeRouting.get(&r, dir, 0, 2, &o2));
     }
 }
 
@@ -523,8 +524,8 @@ test "compaction preserves a large (chunked) blob" {
             &.{ .{ .kind = .int }, .{ .kind = .blob } },
         };
         var dir = try typedir.createTypes(&w, &schema, &.{false});
-        dir = (try typedir.insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .bytes = big } })).dir;
-        dir = (try typedir.insert(&w, dir, 0, &.{ .{ .int = 2 }, .{ .bytes = "small" } })).dir;
+        dir = (try typeRouting.insert(&w, dir, 0, &.{ .{ .int = 1 }, .{ .bytes = big } })).dir;
+        dir = (try typeRouting.insert(&w, dir, 0, &.{ .{ .int = 2 }, .{ .bytes = "small" } })).dir;
         w.setRoot(dir);
         _ = try w.commit();
     }
@@ -542,7 +543,7 @@ test "compaction preserves a large (chunked) blob" {
 
         // The large blob materializes byte-identical via its ref.
         var o1: [2]catalog.Value = undefined;
-        try testing.expect((try typedir.get(&r, dir, 0, 1, &o1)) != null);
+        try testing.expect((try typeRouting.get(&r, dir, 0, 1, &o1)) != null);
         try testing.expect(o1[1] == .blob_ref);
         const got = try blob.getAlloc(&r, o1[1].blob_ref, testing.allocator);
         defer testing.allocator.free(got);
@@ -550,7 +551,7 @@ test "compaction preserves a large (chunked) blob" {
 
         // The small blob still reads via a zero-copy slice.
         var o2: [2]catalog.Value = undefined;
-        try testing.expect((try typedir.get(&r, dir, 0, 2, &o2)) != null);
+        try testing.expect((try typeRouting.get(&r, dir, 0, 2, &o2)) != null);
         try testing.expect(o2[1] == .bytes);
         try testing.expectEqualStrings("small", o2[1].bytes);
     }
@@ -897,7 +898,7 @@ test "compactInPlace preserves value indexes and passes verifyIntegrity" {
         }, &.{false});
         var pk: u64 = 0;
         while (pk < 50) : (pk += 1) {
-            dir = (try typedir.insert(&w, dir, 0, &.{ .{ .int = pk }, .{ .int = pk % 5 } })).dir;
+            dir = (try typeRouting.insert(&w, dir, 0, &.{ .{ .int = pk }, .{ .int = pk % 5 } })).dir;
         }
         w.setRoot(dir);
         _ = try w.commit();
@@ -944,21 +945,21 @@ test "compactInPlace shrinks and preserves data" {
         var nbuf: [32]u8 = undefined;
         while (i < 200) : (i += 1) {
             const s = try std.fmt.bufPrint(&nbuf, "author-{d}", .{i});
-            const r = try typedir.insert(&w, dir, 0, &.{ .{ .int = i }, .{ .bytes = s } });
+            const r = try typeRouting.insert(&w, dir, 0, &.{ .{ .int = i }, .{ .bytes = s } });
             dir = r.dir;
             author_okeys[@intCast(i)] = r.row;
         }
         i = 0;
         while (i < 200) : (i += 1) {
-            const r = try typedir.insert(&w, dir, 1, &.{ .{ .int = i }, .{ .link = author_okeys[@intCast(i)] } });
+            const r = try typeRouting.insert(&w, dir, 1, &.{ .{ .int = i }, .{ .link = author_okeys[@intCast(i)] } });
             dir = r.dir;
         }
         // Churn: delete every even-pk book (~100 holes).
         i = 0;
         while (i < 200) : (i += 2) {
             var out: [2]catalog.Value = undefined;
-            const ver = (try typedir.get(&w, dir, 1, i, &out)).?;
-            const dres = try typedir.deleteNullifyX(&w, dir, 1, i, ver);
+            const ver = (try typeRouting.get(&w, dir, 1, i, &out)).?;
+            const dres = try typeRouting.deleteNullifyX(&w, dir, 1, i, ver);
             dir = dres.ok;
         }
         w.setRoot(dir);
@@ -991,24 +992,24 @@ test "compactInPlace shrinks and preserves data" {
     const dir = r.root();
 
     // All 200 authors survive; only the 100 odd-pk books remain.
-    try testing.expectEqual(@as(u64, 200), try typedir.liveCount(&r, dir, 0));
-    try testing.expectEqual(@as(u64, 100), try typedir.liveCount(&r, dir, 1));
+    try testing.expectEqual(@as(u64, 200), try typeRouting.liveCount(&r, dir, 0));
+    try testing.expectEqual(@as(u64, 100), try typeRouting.liveCount(&r, dir, 1));
 
     // A surviving author reads back identically.
     var ao: [2]catalog.Value = undefined;
-    _ = (try typedir.get(&r, dir, 0, 137, &ao)).?;
+    _ = (try typeRouting.get(&r, dir, 0, 137, &ao)).?;
     try testing.expectEqual(@as(u64, 137), ao[0].int);
     try testing.expectEqualStrings("author-137", ao[1].bytes);
 
     // A surviving (odd-pk) book keeps its author link, resolving to the same author.
     var bo: [2]catalog.Value = undefined;
-    _ = (try typedir.get(&r, dir, 1, 137, &bo)).?;
-    try testing.expectEqual(@as(?u64, author_okeys[137]), try typedir.getLink(&r, dir, 1, 137, 1));
+    _ = (try typeRouting.get(&r, dir, 1, 137, &bo)).?;
+    try testing.expectEqual(@as(?u64, author_okeys[137]), try typeRouting.getLink(&r, dir, 1, 137, 1));
     var la: [2]catalog.Value = undefined;
-    _ = (try typedir.getLinked(&r, dir, 1, 137, 1, &la)).?;
+    _ = (try typeRouting.getLinked(&r, dir, 1, 137, 1, &la)).?;
     try testing.expectEqual(@as(u64, 137), la[0].int);
 
     // A deleted (even-pk) book is absent.
     var b2: [2]catalog.Value = undefined;
-    try testing.expectEqual(@as(?u64, null), try typedir.get(&r, dir, 1, 42, &b2));
+    try testing.expectEqual(@as(?u64, null), try typeRouting.get(&r, dir, 1, 42, &b2));
 }

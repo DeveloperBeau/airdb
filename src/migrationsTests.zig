@@ -132,6 +132,7 @@ test "addProperty(link_set) leaves pre-migration rows deletable" {
     // undeletable through the graph-safe delete (its outbound cleanup walks
     // link_set roots and hit error.BadRef).
     const typedir = @import("typedir.zig");
+    const typeRouting = @import("typeRouting.zig");
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try objTmpPath(testing.allocator, &tmp, "mig_collroot.airdb");
@@ -141,7 +142,7 @@ test "addProperty(link_set) leaves pre-migration rows deletable" {
     {
         var w = try db.beginWrite();
         var dir = try typedir.createTypes(&w, &.{&.{.{ .kind = .int }}}, &.{false});
-        dir = (try typedir.insert(&w, dir, 0, &.{.{ .int = 1 }})).dir;
+        dir = (try typeRouting.insert(&w, dir, 0, &.{.{ .int = 1 }})).dir;
         // Migrate: add a link_set property targeting the same type.
         const cat = try typedir.catalogRef(&w, dir, 0);
         const new_cat = try addProperty(&w, cat, .{ .kind = .link_set, .link_target = 0 }, 0);
@@ -153,8 +154,8 @@ test "addProperty(link_set) leaves pre-migration rows deletable" {
     {
         var w = try db.beginWrite();
         var out: [2]catalog.Value = undefined;
-        const ver = (try typedir.get(&w, w.new_root, 0, 1, &out)).?;
-        const res = try typedir.deleteNullifyX(&w, w.new_root, 0, 1, ver);
+        const ver = (try typeRouting.get(&w, w.new_root, 0, 1, &out)).?;
+        const res = try typeRouting.deleteNullifyX(&w, w.new_root, 0, 1, ver);
         try testing.expect(res == .ok); // previously error.BadRef
         w.setRoot(res.ok);
         _ = try w.commit();

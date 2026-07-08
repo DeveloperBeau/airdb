@@ -254,7 +254,7 @@ pub fn getByObjectKey(txn: anytype, cat: Ref, okey: u64, out: []u64) !?u64 {
 /// `raw` holds the row's column values captured before the tombstone (the
 /// tombstone leaves the physical columns intact, so a pre-delete read stays
 /// accurate). Shared by objects.deleteTyped and the directory-level delete
-/// (typedir.deleteWorker); before that sharing, every row deleted through the
+/// (typeRouting.deleteWorker); before that sharing, every row deleted through the
 /// directory path -- including every cascade-deleted child -- leaked its blobs
 /// and list/set/dict trees permanently. A raw of 0 (no storage, e.g. a row
 /// written with caller-supplied raws or a dead-row migration backfill) frees

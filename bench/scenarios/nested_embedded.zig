@@ -32,6 +32,7 @@ const harness = @import("../harness.zig");
 const Io = std.Io;
 const catalog = airdb.catalog;
 const typedir = airdb.typedir;
+const typeRouting = airdb.typeRouting;
 const Value = catalog.Value;
 
 pub const name = "nested_embedded";
@@ -122,7 +123,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
                     const key: u64 = key_base + inserted + j;
                     const t0 = nowNs(io);
                     // Root row of type 0.
-                    dir = (try typedir.insert(&w, dir, 0, &.{ .{ .int = key }, .{ .link = null } })).dir;
+                    dir = (try typeRouting.insert(&w, dir, 0, &.{ .{ .int = key }, .{ .link = null } })).dir;
                     // Embedded levels 1..d. Each shares `key` in its own pk space.
                     var level: u16 = 0;
                     while (level < d) : (level += 1) {
@@ -156,7 +157,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
                 const t0 = nowNs(io);
                 var level: u16 = 0;
                 while (level < d) : (level += 1) {
-                    _ = try typedir.getLinked(&r, dir, level, key, link_prop, &out);
+                    _ = try typeRouting.getLinked(&r, dir, level, key, link_prop, &out);
                 }
                 const dt: u64 = @intCast(nowNs(io) - t0);
                 try read_lat.add(alloc, dt);

@@ -47,7 +47,8 @@ fn childIndexForKey(v: InnerView, k: u64) usize {
 // carries a depth and fails with error.Corrupt instead of overflowing the stack.
 pub const max_depth: usize = 16;
 
-fn derefNode(txn: anytype, ref: Ref) ![]const u8 {
+/// Deref a node, sizing the read by its kind byte (leaf vs inner).
+pub fn derefNode(txn: anytype, ref: Ref) ![]const u8 {
     const kind_bytes = try txn.deref(ref, 1);
     return switch (kind_bytes[0]) {
         kind_leaf => txn.deref(ref, leaf_node_size),
@@ -189,7 +190,10 @@ fn minKey(txn: anytype, ref: Ref) !u64 {
 }
 
 /// Recursive insert. Returns the (possibly new) node ref and an optional right
-/// sibling produced by a midpoint split.
+/// sibling produced by a midpoint split. Deliberately one long function: it is
+/// a single-pass B+tree insert whose leaf/inner upsert, shift, and
+/// midpoint-split cases all share the split-propagation state -- one
+/// irreducible algorithm rather than separable steps.
 fn insertInto(txn: anytype, node_ref: Ref, key: u64, val: u64, depth: usize) !InsertResult {
     if (depth >= max_depth) return error.Corrupt;
     const node_bytes = try txn.deref(node_ref, 1);
@@ -359,6 +363,27 @@ pub fn insert(txn: anytype, root: Ref, key: u64, val: u64) !Ref {
     _ = encodeInner(new_root.bytes, &root_refs, &root_lows, &root_counts);
     return new_root.ref;
 }
+
+// Bottom-up level builders and right-edge run append (one abstraction, housed
+// in its own file; re-exported here so callers keep the Index.* surface).
+const bulkBuild = @import("indexBulkBuild.zig");
+
+/// A node together with the low key and subtree count its parent records for
+/// it; the per-level work item of packLeaves/stackInner/appendRun.
+pub const Child = bulkBuild.Child;
+
+/// Pack strictly-ascending (keys, values) into leaves filled to LEAF_CAP.
+pub const packLeaves = bulkBuild.packLeaves;
+
+/// Build one inner level over a slice of children, packed in runs of FANOUT.
+pub const stackInner = bulkBuild.stackInner;
+
+/// Stack inner levels until a single root remains, replacing `level` in place.
+pub const collapseToRoot = bulkBuild.collapseToRoot;
+
+/// Append a sorted run of (keys, values), all above the current max key, to
+/// the tree's right edge; only the rightmost path is rebuilt.
+pub const appendRun = bulkBuild.appendRun;
 
 const RemoveResult = struct { ref: Ref, count: u64 };
 

@@ -25,6 +25,7 @@ const Io = std.Io;
 const Ref = airdb.Ref;
 const catalog = airdb.catalog;
 const typedir = airdb.typedir;
+const typeRouting = airdb.typeRouting;
 const Value = catalog.Value;
 
 pub const name = "embedded_crud";
@@ -105,7 +106,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
             while (j < this_batch) : (j += 1) {
                 const pk: u64 = inserted + j;
                 const t0 = nowNs(io);
-                dir = (try typedir.insert(&w, dir, owner_type, &.{ .{ .int = pk }, .{ .link = null } })).dir;
+                dir = (try typeRouting.insert(&w, dir, owner_type, &.{ .{ .int = pk }, .{ .link = null } })).dir;
                 dir = try typedir.insertEmbedded(&w, dir, owner_type, pk, embed_prop, &.{ .{ .int = pk }, .{ .int = pk *% 2654435761 } });
                 const dt: u64 = @intCast(nowNs(io) - t0);
                 try create_lat.add(alloc, dt);
@@ -136,7 +137,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         while (k < read_n) : (k += 1) {
             const pk: u64 = (k * read_stride) % owners;
             const t0 = nowNs(io);
-            _ = try typedir.getLinked(&r, dir, owner_type, pk, embed_prop, &out);
+            _ = try typeRouting.getLinked(&r, dir, owner_type, pk, embed_prop, &out);
             const dt: u64 = @intCast(nowNs(io) - t0);
             try read_lat.add(alloc, dt);
             try combined.add(alloc, dt);
@@ -182,7 +183,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
             var j: usize = 0;
             while (j < this_batch) : (j += 1) {
                 const pk: u64 = ((done + j) * delete_stride) % owners;
-                const had_child = (try typedir.getLink(&w, dir, owner_type, pk, embed_prop)) != null;
+                const had_child = (try typeRouting.getLink(&w, dir, owner_type, pk, embed_prop)) != null;
                 const t0 = nowNs(io);
                 dir = try typedir.clearEmbedded(&w, dir, owner_type, pk, embed_prop);
                 const dt: u64 = @intCast(nowNs(io) - t0);

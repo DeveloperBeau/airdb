@@ -232,38 +232,57 @@ pub fn nullifyInboundInCatalog(txn: *WriteTxn, cat: Ref, okey: u64, target_type:
             // root -- so mutating it here made that reclamation a double free.
             // The backlink set for okey is dropped below regardless.
             if (self_source and kind == .link_set) continue;
-            var s = try catalog.CatalogSnapshot.load(txn, cur);
-            if (kind == .link) {
-                s.props[p].col = try Column.set(txn, s.props[p].col, src_row, 0);
-            } else {
-                const src_set = try Column.get(txn, s.props[p].col, src_row);
-                const new_set = try Index.remove(txn, src_set, okey);
-                s.props[p].col = try Column.set(txn, s.props[p].col, src_row, new_set);
-            }
-            // Bump the source row's version: its link column changed, and a
-            // client holding the pre-nullify version must get a conflict on
-            // update rather than silently resurrecting a dangling link. The
-            // SELF-link case is exempt: bumping the row being deleted would
-            // make the follow-up tombstone's version check fail forever,
-            // leaving self-linked objects undeletable.
-            if (!self_source) {
-                s.version_col_ref = try Column.set(txn, s.version_col_ref, src_row, txn.new_version);
-            }
-            cur = try s.replace(txn);
+            cur = if (kind == .link)
+                try nullifySourceLink(txn, cur, p, src_row, !self_source)
+            else
+                try nullifySourceLinkSet(txn, cur, p, src_row, okey, !self_source);
         }
-        // Drop the whole backlink set for okey (its inbound links are now
-        // clear): remove the outer entry and free the set's nodes, rather than
-        // inserting a fresh empty set and orphaning the old tree.
-        {
-            const vv = try catalog.loadCatalog(txn, cur);
-            if (try Index.get(txn, vv.backlinkRef(p), okey)) |set_root| {
-                const new_bl = try Index.remove(txn, vv.backlinkRef(p), okey);
-                try Index.freeTree(txn, set_root);
-                cur = try catalog.setBacklinkRef(txn, cur, p, new_bl);
-            }
-        }
+        cur = try dropBacklinkSet(txn, cur, p, okey);
     }
     return cur;
+}
+
+// Nullify one source row's to-one link (the link path of inbound nullify):
+// set its link column to null. With `bump_version`, also bump the source
+// row's version: its link column changed, and a client holding the
+// pre-nullify version must get a conflict on update rather than silently
+// resurrecting a dangling link. The SELF-link case passes false: bumping the
+// row being deleted would make the follow-up tombstone's version check fail
+// forever, leaving self-linked objects undeletable.
+fn nullifySourceLink(txn: *WriteTxn, cat: Ref, prop: usize, src_row: u64, bump_version: bool) !Ref {
+    var s = try catalog.CatalogSnapshot.load(txn, cat);
+    s.props[prop].col = try Column.set(txn, s.props[prop].col, src_row, 0);
+    if (bump_version) {
+        s.version_col_ref = try Column.set(txn, s.version_col_ref, src_row, txn.new_version);
+    }
+    return s.replace(txn);
+}
+
+// Nullify one source row's to-many link (the link_set path of inbound
+// nullify): remove `okey` from the source's set. `bump_version` follows the
+// same conflict-surfacing rule as nullifySourceLink.
+fn nullifySourceLinkSet(txn: *WriteTxn, cat: Ref, prop: usize, src_row: u64, okey: u64, bump_version: bool) !Ref {
+    var s = try catalog.CatalogSnapshot.load(txn, cat);
+    const src_set = try Column.get(txn, s.props[prop].col, src_row);
+    const new_set = try Index.remove(txn, src_set, okey);
+    s.props[prop].col = try Column.set(txn, s.props[prop].col, src_row, new_set);
+    if (bump_version) {
+        s.version_col_ref = try Column.set(txn, s.version_col_ref, src_row, txn.new_version);
+    }
+    return s.replace(txn);
+}
+
+// Drop the whole backlink set for okey under property `prop` (its inbound
+// links are now clear): remove the outer entry and free the set's nodes,
+// rather than inserting a fresh empty set and orphaning the old tree.
+fn dropBacklinkSet(txn: *WriteTxn, cat: Ref, prop: usize, okey: u64) !Ref {
+    const vv = try catalog.loadCatalog(txn, cat);
+    if (try Index.get(txn, vv.backlinkRef(prop), okey)) |set_root| {
+        const new_bl = try Index.remove(txn, vv.backlinkRef(prop), okey);
+        try Index.freeTree(txn, set_root);
+        return catalog.setBacklinkRef(txn, cat, prop, new_bl);
+    }
+    return cat;
 }
 
 // Remove `okey`'s own outbound link entries from its targets' backlink sets for

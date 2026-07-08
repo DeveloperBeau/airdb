@@ -60,7 +60,7 @@ var w = try db.beginWrite();
 var dir = try airdb.typedir.createWithDefs(&w, &.{
     &.{ .{ .kind = .int }, .{ .kind = .blob }, .{ .kind = .int, .indexed = true } },
 });
-dir = (try airdb.typedir.insert(&w, dir, 0, &.{
+dir = (try airdb.typeRouting.insert(&w, dir, 0, &.{
     .{ .int = 1 }, .{ .bytes = "Ada" }, .{ .int = 1815 },
 })).dir;
 w.setRoot(dir);
@@ -69,7 +69,7 @@ _ = try w.commit(); // durable here
 var r = try db.beginRead();
 defer r.end();
 var out: [3]airdb.typedir.Value = undefined;
-_ = try airdb.typedir.get(&r, r.root(), 0, 1, &out);
+_ = try airdb.typeRouting.get(&r, r.root(), 0, 1, &out);
 ```
 
 ## Quick look (C)

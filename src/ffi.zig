@@ -61,22 +61,7 @@ export fn airdb_open(path_ptr: [*:0]const u8, prop_count: u16) ?*Database {
     const self = alloc.create(Database) catch return null;
 
     if (Db.open(alloc, path)) |opened| {
-        self.db = opened;
-        // Adopt the stored property count from the catalog.
-        var r = self.db.beginRead() catch {
-            self.db.deinit();
-            alloc.destroy(self);
-            return null;
-        };
-        const pc = catalog.propCount(&r, r.root()) catch {
-            r.end();
-            self.db.deinit();
-            alloc.destroy(self);
-            return null;
-        };
-        r.end();
-        self.prop_count = pc;
-        return self;
+        return adoptExisting(self, opened);
     } else |open_err| {
         // Create only when the file genuinely does not exist. Any other open
         // failure (corruption, resources, permissions) must NOT fall through to
@@ -86,30 +71,50 @@ export fn airdb_open(path_ptr: [*:0]const u8, prop_count: u16) ?*Database {
             alloc.destroy(self);
             return null;
         }
-        self.db = Db.create(alloc, path) catch {
-            alloc.destroy(self);
-            return null;
-        };
-        var w = self.db.beginWrite() catch {
-            self.db.deinit();
-            alloc.destroy(self);
-            return null;
-        };
-        const cat = catalog.create(&w, prop_count) catch {
-            w.deinit();
-            self.db.deinit();
-            alloc.destroy(self);
-            return null;
-        };
-        w.setRoot(cat);
-        _ = w.commit() catch {
-            self.db.deinit();
-            alloc.destroy(self);
-            return null;
-        };
-        self.prop_count = prop_count;
-        return self;
+        return createFresh(self, path, prop_count);
     }
+}
+
+// Tear down a partially-opened handle after a failed open/create step and
+// return the null that airdb_open reports to the host.
+fn abandonHandle(self: *Database) ?*Database {
+    self.db.deinit();
+    alloc.destroy(self);
+    return null;
+}
+
+// airdb_open, existing-file path: adopt the opened database and read the
+// stored property count from its catalog. Any failure tears the handle down
+// and returns null.
+fn adoptExisting(self: *Database, opened: Db) ?*Database {
+    self.db = opened;
+    var r = self.db.beginRead() catch return abandonHandle(self);
+    const pc = catalog.propCount(&r, r.root()) catch {
+        r.end();
+        return abandonHandle(self);
+    };
+    r.end();
+    self.prop_count = pc;
+    return self;
+}
+
+// airdb_open, fresh-file path: create the database and commit an int-property
+// object type of `prop_count` properties. Any failure tears the handle down
+// and returns null.
+fn createFresh(self: *Database, path: []const u8, prop_count: u16) ?*Database {
+    self.db = Db.create(alloc, path) catch {
+        alloc.destroy(self);
+        return null;
+    };
+    var w = self.db.beginWrite() catch return abandonHandle(self);
+    const cat = catalog.create(&w, prop_count) catch {
+        w.deinit();
+        return abandonHandle(self);
+    };
+    w.setRoot(cat);
+    _ = w.commit() catch return abandonHandle(self);
+    self.prop_count = prop_count;
+    return self;
 }
 
 // Close the database and free the handle. Safe to call with null.
