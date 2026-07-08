@@ -20,11 +20,11 @@ const byteKeyIndex = @import("../trees/byteKeyIndex.zig");
 pub const Pair = struct { objectKey: u64, row: u64 };
 
 /// Collect every (objectKey, row) entry of the key->row index rooted at
-/// `keyrowRef` into a list the caller owns. O(live rows).
+/// `keyToRowIndexReference` into a list the caller owns. O(live rows).
 pub fn collectKeyRowPairs(
     allocator: std.mem.Allocator,
     transaction: anytype,
-    keyrowRef: Reference,
+    keyToRowIndexReference: Reference,
 ) !std.ArrayList(Pair) {
     var pairs = std.ArrayList(Pair).empty;
     errdefer pairs.deinit(allocator);
@@ -35,7 +35,7 @@ pub fn collectKeyRowPairs(
             try self.list.append(self.allocator, .{ .objectKey = key, .row = value });
         }
     };
-    try Index.forEachEntry(transaction, keyrowRef, Collector{ .list = &pairs, .allocator = allocator }, Collector.onEntry);
+    try Index.forEachEntry(transaction, keyToRowIndexReference, Collector{ .list = &pairs, .allocator = allocator }, Collector.onEntry);
     return pairs;
 }
 
@@ -70,13 +70,13 @@ fn copyValue(source: anytype, destination: *WriteTransaction, kind: catalog.Prop
 fn copyKeySet(source: anytype, destination: *WriteTransaction, srcRoot: u64) !u64 {
     var newi = try Index.create(destination);
     const Sink = struct {
-        indexRef: *Reference,
+        indexReference: *Reference,
         dstp: *WriteTransaction,
         fn onKey(self: @This(), key: u64) !void {
-            self.indexRef.* = try Index.insert(self.dstp, self.indexRef.*, key, 1);
+            self.indexReference.* = try Index.insert(self.dstp, self.indexReference.*, key, 1);
         }
     };
-    try Index.forEachKey(source, srcRoot, Sink{ .indexRef = &newi, .dstp = destination }, Sink.onKey);
+    try Index.forEachKey(source, srcRoot, Sink{ .indexReference = &newi, .dstp = destination }, Sink.onKey);
     return newi;
 }
 
@@ -102,16 +102,16 @@ fn copyBindex(source: anytype, destination: *WriteTransaction, srcRoot: u64) !u6
 // Add objectKey under `value` in a value index (value -> {objectKey -> 1}), mirroring the
 // shape the object layer's maintenance keeps. Local to the copy path, which
 // must rebuild value indexes in the destination database.
-fn viAddInto(destination: *WriteTransaction, valueIndexRef: Reference, value: u64, objectKey: u64) !Reference {
-    const existing = try Index.get(destination, valueIndexRef, value);
+fn viAddInto(destination: *WriteTransaction, valueIndexReference: Reference, value: u64, objectKey: u64) !Reference {
+    const existing = try Index.get(destination, valueIndexReference, value);
     var setRoot = existing orelse try Index.create(destination);
     setRoot = try Index.insert(destination, setRoot, objectKey, 1);
-    return try Index.insert(destination, valueIndexRef, value, setRoot);
+    return try Index.insert(destination, valueIndexReference, value, setRoot);
 }
 
-// Re-point every ref field of the snapshot at fresh structures created in the
+// Re-point every reference field of the snapshot at fresh structures created in the
 // DESTINATION database. Backlink and value indexes are created empty in the
-// destination (the source refs live in the source database's address space) and
+// destination (the source references live in the source database's address space) and
 // repopulated separately; the indexed flag carries through.
 fn createDestinationStructures(destination: *WriteTransaction, snapshot: *catalog.CatalogSnapshot) !void {
     var propertyIndex: usize = 0;
@@ -120,36 +120,36 @@ fn createDestinationStructures(destination: *WriteTransaction, snapshot: *catalo
         snapshot.properties[propertyIndex].backlink = if (snapshot.properties[propertyIndex].kind == .link or snapshot.properties[propertyIndex].kind == .linkSet) try Index.create(destination) else 0;
         snapshot.properties[propertyIndex].valueIndex = if (snapshot.properties[propertyIndex].indexed) try Index.create(destination) else 0;
     }
-    snapshot.versionColumnRef = try Column.create(destination);
-    snapshot.liveColumnRef = try Column.create(destination);
-    snapshot.keyrowIndexRef = try Index.create(destination);
-    snapshot.primaryKeyIndexRef = try Index.create(destination);
+    snapshot.versionColumnReference = try Column.create(destination);
+    snapshot.liveColumnReference = try Column.create(destination);
+    snapshot.keyToRowIndexReference = try Index.create(destination);
+    snapshot.primaryKeyIndexReference = try Index.create(destination);
 }
 
 /// Copy all live rows of `sourceCatalog` (in the source database) into a fresh catalog in the
 /// destination database, preserving object keys, primary keys, and nextKey. Backlink
 /// indexes are created empty (rebuild with rebuildBacklinks afterward); value
-/// indexes are repopulated inline. Returns the new destination catalog ref.
+/// indexes are repopulated inline. Returns the new destination catalog reference.
 /// O(live rows x properties), plus the deep copies' own costs.
 pub fn copyTypeRows(source: anytype, sourceCatalog: Reference, destination: *WriteTransaction) !Reference {
-    // Load the source snapshot, then re-point every ref field at structures
+    // Load the source snapshot, then re-point every reference field at structures
     // created in the DESTINATION database before writing. Kinds, element kinds, targets,
     // rules, and indexed flags carry over as plain values.
     var snapshot = try catalog.CatalogSnapshot.load(source, sourceCatalog);
     const propertyCount = snapshot.propertyCount;
-    // Keep the source refs to read from.
+    // Keep the source references to read from.
     var sourcePropertyColumns: [catalog.maxPropertyCount]Reference = undefined;
     {
         var propertyIndex: usize = 0;
         while (propertyIndex < propertyCount) : (propertyIndex += 1) sourcePropertyColumns[propertyIndex] = snapshot.properties[propertyIndex].column;
     }
-    const sourceVersionColumn = snapshot.versionColumnRef;
-    const sLive = snapshot.liveColumnRef;
-    const sKeyrow = snapshot.keyrowIndexRef;
+    const sourceVersionColumn = snapshot.versionColumnReference;
+    const sLive = snapshot.liveColumnReference;
+    const sourceKeyToRowIndexReference = snapshot.keyToRowIndexReference;
 
     // Collect live (objectKey, srcRow) pairs, then re-point at fresh dst structures.
     const scratchAllocator = destination.database.store.allocator;
-    var pairs = try collectKeyRowPairs(scratchAllocator, source, sKeyrow);
+    var pairs = try collectKeyRowPairs(scratchAllocator, source, sourceKeyToRowIndexReference);
     defer pairs.deinit(scratchAllocator);
     try createDestinationStructures(destination, &snapshot);
 
@@ -170,11 +170,11 @@ pub fn copyTypeRows(source: anytype, sourceCatalog: Reference, destination: *Wri
             }
         }
         const version = try Column.get(source, sourceVersionColumn, pair.row);
-        snapshot.versionColumnRef = try Column.append(destination, snapshot.versionColumnRef, version);
-        snapshot.liveColumnRef = try Column.append(destination, snapshot.liveColumnRef, 1);
-        snapshot.keyrowIndexRef = try Index.insert(destination, snapshot.keyrowIndexRef, pair.objectKey, dRow);
+        snapshot.versionColumnReference = try Column.append(destination, snapshot.versionColumnReference, version);
+        snapshot.liveColumnReference = try Column.append(destination, snapshot.liveColumnReference, 1);
+        snapshot.keyToRowIndexReference = try Index.insert(destination, snapshot.keyToRowIndexReference, pair.objectKey, dRow);
         const primaryKey = try Column.get(source, sourcePropertyColumns[0], pair.row);
-        snapshot.primaryKeyIndexRef = try Index.insert(destination, snapshot.primaryKeyIndexRef, primaryKey, pair.objectKey);
+        snapshot.primaryKeyIndexReference = try Index.insert(destination, snapshot.primaryKeyIndexReference, primaryKey, pair.objectKey);
         dRow += 1;
     }
 
@@ -182,11 +182,11 @@ pub fn copyTypeRows(source: anytype, sourceCatalog: Reference, destination: *Wri
     return snapshot.write(destination);
 }
 
-/// Rebuild backlink indexes for `catalogRef` (in dst) from its copied forward links.
+/// Rebuild backlink indexes for `catalogReference` (in dst) from its copied forward links.
 /// O(live rows x link properties x link fan-out).
-pub fn rebuildBacklinks(destination: *WriteTransaction, catalogRef: Reference) !Reference {
-    var currentCatalog = catalogRef;
-    const baseView = try catalog.loadCatalog(destination, catalogRef);
+pub fn rebuildBacklinks(destination: *WriteTransaction, catalogReference: Reference) !Reference {
+    var currentCatalog = catalogReference;
+    const baseView = try catalog.loadCatalog(destination, catalogReference);
     const propertyCount = baseView.propertyCount;
     const scratchAllocator = destination.database.store.allocator;
     var propertyIndex: usize = 0;
@@ -196,12 +196,12 @@ pub fn rebuildBacklinks(destination: *WriteTransaction, catalogRef: Reference) !
         // collect (objectKey,row) of cur
         var pairs = blk: {
             const currentView = try catalog.loadCatalog(destination, currentCatalog);
-            break :blk try collectKeyRowPairs(scratchAllocator, destination, currentView.keyrowIndexRef);
+            break :blk try collectKeyRowPairs(scratchAllocator, destination, currentView.keyToRowIndexReference);
         };
         defer pairs.deinit(scratchAllocator);
         for (pairs.items) |pair| {
             const currentView = try catalog.loadCatalog(destination, currentCatalog);
-            const column = currentView.propertyColumnRef(propertyIndex);
+            const column = currentView.propertyColumnReference(propertyIndex);
             const raw = try Column.get(destination, column, pair.row);
             if (kind == .link) {
                 if (raw != 0) currentCatalog = try links.addBacklink(destination, currentCatalog, propertyIndex, raw - 1, pair.objectKey);

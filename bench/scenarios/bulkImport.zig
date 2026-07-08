@@ -64,8 +64,8 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     // sees it via w.newRoot. bulkImport requires the type to be empty.
     {
         var writeTransaction = try databaseA.beginWrite();
-        const catalogRef = try catalog.create(&writeTransaction, 2);
-        writeTransaction.setRoot(catalogRef);
+        const catalogReference = try catalog.create(&writeTransaction, 2);
+        writeTransaction.setRoot(catalogReference);
         _ = try writeTransaction.commit();
     }
 
@@ -89,12 +89,12 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     // --- Path B: row-by-row inserts in batched commits ----------------------
     var databaseB = try airdb.Database.create(alloc, pathB);
     errdefer databaseB.deinit();
-    var catalogRef: Reference = blk: {
+    var catalogReference: Reference = blk: {
         var writeTransaction = try databaseB.beginWrite();
-        const catalogRef = try catalog.create(&writeTransaction, 2);
-        writeTransaction.setRoot(catalogRef);
+        const catalogReference = try catalog.create(&writeTransaction, 2);
+        writeTransaction.setRoot(catalogReference);
         _ = try writeTransaction.commit();
-        break :blk catalogRef;
+        break :blk catalogReference;
     };
 
     const bCommitsBefore = databaseB.metrics().commitCount;
@@ -104,14 +104,14 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     while (inserted < ctx.rowCount) {
         const thisBatch = @min(batchSize, ctx.rowCount - inserted);
         var writeTransaction = try databaseB.beginWrite();
-        catalogRef = databaseB.activeRoot; // reload the committed catalog ref
+        catalogReference = databaseB.activeRoot; // reload the committed catalog reference
         var innerIndex: usize = 0;
         while (innerIndex < thisBatch) : (innerIndex += 1) {
             const primaryKey: u64 = inserted + innerIndex;
-            const result = try rawRows.insert(&writeTransaction, catalogRef, &.{ primaryKey, primaryKey });
-            catalogRef = result.catalogRef;
+            const result = try rawRows.insert(&writeTransaction, catalogReference, &.{ primaryKey, primaryKey });
+            catalogReference = result.catalogReference;
         }
-        writeTransaction.setRoot(catalogRef);
+        writeTransaction.setRoot(catalogReference);
         _ = try writeTransaction.commit();
         inserted += thisBatch;
     }

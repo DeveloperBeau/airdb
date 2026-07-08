@@ -7,16 +7,16 @@ const sectionShift = platform.sectionShift;
 const sectionSize = platform.sectionSize;
 const sectionMask = platform.sectionMask;
 
-/// A fresh or reused arena extent: its stable ref and the writable mapped
+/// A fresh or reused arena extent: its stable reference and the writable mapped
 /// bytes behind it.
-pub const Allocation = struct { ref: Reference, bytes: []u8 };
+pub const Allocation = struct { reference: Reference, bytes: []u8 };
 
 /// Bump allocator over the file's mapped sections, with exact-class reuse
-/// from a FreeList pool, and the single bounds-checked deref chokepoint every
-/// ref read goes through.
+/// from a FreeList pool, and the single bounds-checked dereference chokepoint every
+/// reference read goes through.
 pub const Arena = struct {
     /// Append-only list of fixed-size sections owned by the FileStore. Never moved or
-    /// remapped; growth appends new sections, so refs into existing sections stay valid.
+    /// remapped; growth appends new sections, so references into existing sections stay valid.
     sections: []const platform.Section,
     top: usize, // next free offset (append-only in Phase 1)
 
@@ -50,9 +50,9 @@ pub const Arena = struct {
         }
         const sectionIndex = aligned >> sectionShift;
         if (sectionIndex >= self.sections.len) return error.OutOfSpace; // caller grows + maps, then retries
-        const ref: Reference = @intCast(aligned);
+        const reference: Reference = @intCast(aligned);
         self.top = aligned + size;
-        return .{ .ref = ref, .bytes = self.translate(aligned, size) };
+        return .{ .reference = reference, .bytes = self.translate(aligned, size) };
     }
 
     /// Reuse an EXACT-size node extent from `pool` whose freedVersion <=
@@ -63,23 +63,23 @@ pub const Arena = struct {
     pub fn allocFromPool(self: *Arena, pool: *FreeList, size: usize, horizon: u64) ?Allocation {
         if (pool.reuseExact(@intCast(size), horizon)) |offset| {
             const offu: usize = @intCast(offset);
-            return .{ .ref = offset, .bytes = self.translate(offu, size) };
+            return .{ .reference = offset, .bytes = self.translate(offu, size) };
         }
         return null;
     }
 
-    /// Translate `ref` into a read-only slice of `length` bytes. The single
+    /// Translate `reference` into a read-only slice of `length` bytes. The single
     /// bounds-checked chokepoint all reads go through: a null, misaligned,
-    /// unmapped, oversize, or section-crossing ref is error.BadRef.
-    pub fn deref(self: *Arena, ref: Reference, length: usize) error{BadRef}![]const u8 {
-        const offset: usize = @intCast(ref);
-        if (offset == 0) return error.BadRef; // null ref
-        if (offset % 8 != 0) return error.BadRef; // misaligned
-        if (length > sectionSize) return error.BadRef; // cannot span a section
+    /// unmapped, oversize, or section-crossing reference is error.BadReference.
+    pub fn dereference(self: *Arena, reference: Reference, length: usize) error{BadReference}![]const u8 {
+        const offset: usize = @intCast(reference);
+        if (offset == 0) return error.BadReference; // null reference
+        if (offset % 8 != 0) return error.BadReference; // misaligned
+        if (length > sectionSize) return error.BadReference; // cannot span a section
         const sectionIndex = offset >> sectionShift;
         const withinSection = offset & sectionMask;
-        if (sectionIndex >= self.sections.len) return error.BadRef; // section not mapped
-        if (withinSection + length > sectionSize) return error.BadRef; // would cross a section boundary
+        if (sectionIndex >= self.sections.len) return error.BadReference; // section not mapped
+        if (withinSection + length > sectionSize) return error.BadReference; // would cross a section boundary
         return self.sections[sectionIndex].map[withinSection .. withinSection + length];
     }
 };
@@ -98,26 +98,26 @@ fn testSection(backing: []align(page) u8) platform.Section {
     return .{ .map = backing, .handle = handle };
 }
 
-test "alloc returns a writable slice that deref reads back" {
+test "alloc returns a writable slice that dereference reads back" {
     const backing = try testing.allocator.alignedAlloc(u8, pageAlign, 4096 * 4);
     defer testing.allocator.free(backing);
     var secs = [_]platform.Section{testSection(backing)};
     var arena = Arena.init(&secs, 4096); // data starts after the first (header) page
     const allocation = try arena.alloc(8);
     @memcpy(allocation.bytes, "ABCDEFGH");
-    const got = try arena.deref(allocation.ref, 8);
+    const got = try arena.dereference(allocation.reference, 8);
     try testing.expectEqualStrings("ABCDEFGH", got);
 }
 
-test "deref rejects an out-of-range or misaligned or null ref" {
+test "dereference rejects an out-of-range or misaligned or null reference" {
     const backing = try testing.allocator.alignedAlloc(u8, pageAlign, 4096 * 4);
     defer testing.allocator.free(backing);
     var secs = [_]platform.Section{testSection(backing)};
     var arena = Arena.init(&secs, 4096);
-    // A ref in section 1, which is not mapped (only section 0 exists).
-    try testing.expectError(error.BadRef, arena.deref(sectionSize, 8));
-    try testing.expectError(error.BadRef, arena.deref(7, 8)); // misaligned
-    try testing.expectError(error.BadRef, arena.deref(0, 8)); // null ref
+    // A reference in section 1, which is not mapped (only section 0 exists).
+    try testing.expectError(error.BadReference, arena.dereference(sectionSize, 8));
+    try testing.expectError(error.BadReference, arena.dereference(7, 8)); // misaligned
+    try testing.expectError(error.BadReference, arena.dereference(0, 8)); // null reference
 }
 
 test "alloc fails cleanly when the arena is full" {
@@ -143,9 +143,9 @@ test "alloc pads across a section boundary and AllocTooLarge on oversize" {
     // to section 1's base.
     arena.top = sectionSize - 16;
     const allocation = try arena.alloc(32);
-    try testing.expectEqual(@as(Reference, @intCast(sectionSize)), allocation.ref); // landed at section 1 base
+    try testing.expectEqual(@as(Reference, @intCast(sectionSize)), allocation.reference); // landed at section 1 base
     @memcpy(allocation.bytes, "0123456789ABCDEF0123456789ABCDEF");
-    const got = try arena.deref(allocation.ref, 32);
+    const got = try arena.dereference(allocation.reference, 32);
     try testing.expectEqualStrings("0123456789ABCDEF0123456789ABCDEF", got);
 
     // A single allocation larger than a section is rejected.

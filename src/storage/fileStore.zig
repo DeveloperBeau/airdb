@@ -28,7 +28,7 @@ const FileSyncer = @import("syncer.zig").FileSyncer;
 
 /// File magic doubling as the format version ("airdb" + _NNNN).
 /// _0002: the free list is persisted as a chain of bounded chunks
-/// ([count u32][nextRef u64][extents...]), not a single unbounded node.
+/// ([count u32][nextReference u64][extents...]), not a single unbounded node.
 pub const airdbMagic: u64 = 0x6169726462_0002;
 /// Size of the header page; the header and both commit slots live in it.
 pub const defaultPageSize: u32 = 4096;
@@ -163,7 +163,7 @@ pub const FileStore = struct {
         // Map all sections covering the existing file. ensureMapped rounds the file up to
         // a whole-section multiple first (an old file whose length is not a section
         // multiple is extended via setLength before mapping), so every section is fully
-        // backed before any deref.
+        // backed before any dereference.
         try store.ensureMapped(@intCast(openedLength));
         try store.readHeader();
         return store;
@@ -289,7 +289,7 @@ pub const FileStore = struct {
         return self.file.length(sysIo());
     }
 
-    /// The live section table, for the arena's ref translation.
+    /// The live section table, for the arena's reference translation.
     pub fn sectionsView(self: *FileStore) []const platform.Section {
         return self.sections.items;
     }
@@ -329,10 +329,10 @@ pub fn deleteAbsoluteIgnoreMissing(io: Io, absPath: []const u8) void {
 pub fn syncParentDirectory(path: []const u8) void {
     if (@import("builtin").os.tag == .windows) return;
     const io = std.Io.Threaded.global_single_threaded.io();
-    const dirPath = std.fs.path.dirname(path) orelse return;
-    var dir = std.Io.Dir.openDirAbsolute(io, dirPath, .{}) catch return;
-    defer dir.close(io);
-    _ = std.c.fsync(dir.handle);
+    const directoryPath = std.fs.path.dirname(path) orelse return;
+    var parentDirectory = std.Io.Dir.openDirAbsolute(io, directoryPath, .{}) catch return;
+    defer parentDirectory.close(io);
+    _ = std.c.fsync(parentDirectory.handle);
 }
 
 // ---------------------------------------------------------------------------
@@ -344,8 +344,8 @@ test "real syncer flush succeeds (exercises the platform durability path)" {
     defer tmp.cleanup();
     var pathBuffer: [Io.Dir.max_path_bytes]u8 = undefined;
     const pathLen = try tmp.dir.realPath(testing.io, &pathBuffer);
-    const dirPath = pathBuffer[0..pathLen];
-    const filePath = try std.fs.path.join(testing.allocator, &.{ dirPath, "fsync.airdb" });
+    const directoryPath = pathBuffer[0..pathLen];
+    const filePath = try std.fs.path.join(testing.allocator, &.{ directoryPath, "fsync.airdb" });
     defer testing.allocator.free(filePath);
     var store = try FileStore.create(testing.allocator, filePath, FileSyncer.any());
     defer store.deinit();
@@ -382,9 +382,9 @@ test "create writes a header that reopen reads back" {
     // Use Dir.realPath(io, buffer) with a stack buffer instead.
     var pathBuffer: [Io.Dir.max_path_bytes]u8 = undefined;
     const pathLen = try tmp.dir.realPath(testing.io, &pathBuffer);
-    const dirPath = pathBuffer[0..pathLen];
+    const directoryPath = pathBuffer[0..pathLen];
 
-    const filePath = try std.fs.path.join(testing.allocator, &.{ dirPath, "wsk.airdb" });
+    const filePath = try std.fs.path.join(testing.allocator, &.{ directoryPath, "wsk.airdb" });
     defer testing.allocator.free(filePath);
 
     {

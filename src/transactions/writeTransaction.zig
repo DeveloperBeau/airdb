@@ -33,8 +33,8 @@ pub const WriteTransaction = struct {
     /// (no committed version or reader references them), so they are reused immediately
     /// within the same transaction instead of accumulating as copy-on-write garbage.
     transactionReuse: FreeList,
-    /// arena.top at transaction start. A freed ref >= this was bump-allocated during this
-    /// transaction and is transaction-private; a ref below it belongs to a committed version.
+    /// arena.top at transaction start. A freed reference >= this was bump-allocated during this
+    /// transaction and is transaction-private; a reference below it belongs to a committed version.
     transactionStartTop: u64,
     /// Pin/liveness part of the reclaim horizon, computed lazily on the first
     /// pool allocation and reused for the rest of the transaction. Computing
@@ -52,13 +52,13 @@ pub const WriteTransaction = struct {
     /// bookkeeping lists or double-unlocking the cross-process write lock.
     done: bool = false,
 
-    /// Read `length` bytes at `ref` as a zero-copy slice into mapped storage.
+    /// Read `length` bytes at `reference` as a zero-copy slice into mapped storage.
     /// Sections never move, so the slice stays addressable; its contents are
     /// stable only until this transaction frees the node (a private free is
     /// routed to the immediate-reuse pool and may be scribbled by the next
     /// allocation).
-    pub fn deref(self: *WriteTransaction, ref: Reference, length: usize) ![]const u8 {
-        return self.database.arena.deref(ref, length);
+    pub fn dereference(self: *WriteTransaction, reference: Reference, length: usize) ![]const u8 {
+        return self.database.arena.dereference(reference, length);
     }
 
     fn reclaimHorizon(self: *WriteTransaction) u64 {
@@ -99,25 +99,25 @@ pub const WriteTransaction = struct {
         return self.database.bumpGrowing(size);
     }
 
-    /// Record `ref` as the root commit() will publish.
-    pub fn setRoot(self: *WriteTransaction, ref: Reference) void {
-        self.newRoot = ref;
+    /// Record `reference` as the root commit() will publish.
+    pub fn setRoot(self: *WriteTransaction, reference: Reference) void {
+        self.newRoot = reference;
     }
 
-    /// Mark the node at `ref` reclaimable. A node this transaction allocated
+    /// Mark the node at `reference` reclaimable. A node this transaction allocated
     /// returns to the private immediate-reuse pool; a committed node's extent
     /// is deferred to the committed free list, tagged with this version, so
     /// pinned readers keep their snapshot intact.
-    pub fn free(self: *WriteTransaction, ref: Reference, length: usize) !void {
-        if (ref >= self.transactionStartTop) {
+    pub fn free(self: *WriteTransaction, reference: Reference, length: usize) !void {
+        if (reference >= self.transactionStartTop) {
             // Allocated within this uncommitted transaction: private, immediately reusable.
             // (freedVersion is irrelevant for the transaction-private pool; allocFromPool ignores it.)
-            try self.transactionReuse.add(.{ .offset = ref, .len = @intCast(length), .freedVersion = 0 });
+            try self.transactionReuse.add(.{ .offset = reference, .len = @intCast(length), .freedVersion = 0 });
         } else {
             // Belongs to a committed version a reader may still pin: defer reclamation to the
             // committed free list, tagged with this transaction's version (the freeing version).
             try self.inFlightFrees.append(self.database.store.allocator, .{
-                .offset = ref,
+                .offset = reference,
                 .len = @intCast(length),
                 .freedVersion = self.newVersion,
             });
@@ -125,12 +125,12 @@ pub const WriteTransaction = struct {
     }
 
     /// Copy-on-write step: allocate a fresh node, copy `length` bytes from
-    /// `ref` into it, free the original, and return the writable copy.
-    pub fn writableCopy(self: *WriteTransaction, ref: Reference, length: usize) !Allocation {
-        const old = try self.database.arena.deref(ref, length);
+    /// `reference` into it, free the original, and return the writable copy.
+    pub fn writableCopy(self: *WriteTransaction, reference: Reference, length: usize) !Allocation {
+        const old = try self.database.arena.dereference(reference, length);
         const fresh = try self.alloc(length);
         @memcpy(fresh.bytes, old);
-        try self.free(ref, length);
+        try self.free(reference, length);
         return fresh;
     }
 
@@ -145,7 +145,7 @@ pub const WriteTransaction = struct {
 
     // Shared conclusion for abort, commit failure, and (minus the rollback)
     // the moment before a successful commit publishes. Rolls the bump pointer
-    // back: no committed version references any ref >= transactionStartTop (they
+    // back: no committed version references any reference >= transactionStartTop (they
     // were allocated by this uncommitted transaction only), so the rollback is
     // safe and prevents aborted/failed bytes from being folded into the next
     // commit's logicalSize as permanently unreclaimable garbage. Extents this
@@ -164,7 +164,7 @@ pub const WriteTransaction = struct {
     ///
     /// Protocol:
     ///   1. Build the new persistent free list and encode it onto the mmap.
-    ///   2. Encode the new slot (including freeListRef) into the INACTIVE slot.
+    ///   2. Encode the new slot (including freeListReference) into the INACTIVE slot.
     ///   3. Flush -- ensures new data, free-list node, and slot descriptor are durable.
     ///      If this flush fails, return error.Durability immediately;
     ///      the old active slot is untouched and the old version remains live.
@@ -202,7 +202,7 @@ pub const WriteTransaction = struct {
         var newFl = try self.buildNewFreeList();
         errdefer newFl.deinit();
         const chain = try self.encodeFreeListChain(&newFl);
-        const inactiveSlotIndex = self.writeSlotAndRing(prevActiveSlot, chain.headRef);
+        const inactiveSlotIndex = self.writeSlotAndRing(prevActiveSlot, chain.headReference);
 
         // Step 3: flush new data + inactive slot to durable storage.
         // Failure here: old active slot is still valid; no in-memory state
@@ -220,7 +220,7 @@ pub const WriteTransaction = struct {
         // because we are on the success return path (return self.newVersion below).
         database.freeList.deinit();
         database.freeList = newFl; // ownership transferred; do not call newFl.deinit()
-        database.freeListNodeRef = chain.headRef;
+        database.freeListNodeReference = chain.headReference;
         database.freeListNodeLen = chain.headLen;
         self.done = true; // a later deinit must not roll back the committed state
         self.inFlightFrees.deinit(self.database.store.allocator);
@@ -258,22 +258,22 @@ pub const WriteTransaction = struct {
         //    pool. Every chunk is walked: reclaiming only the head would leak
         //    the tail chunks on each commit.
         {
-            var cref = database.freeListNodeRef;
+            var catalogReference = database.freeListNodeReference;
             var hops: usize = 0;
-            while (cref != 0) : (hops += 1) {
+            while (catalogReference != 0) : (hops += 1) {
                 if (hops >= FreeList.maxChunks) return error.Corrupt;
-                const header = try self.deref(cref, FreeList.chunkHeaderBytes);
+                const header = try self.dereference(catalogReference, FreeList.chunkHeaderBytes);
                 const extentCount = std.mem.readInt(u32, header[0..4], .little);
                 const next = std.mem.readInt(u64, header[4..12], .little);
                 // Legitimate chains strictly decrease (written back-to-front);
                 // anything else is corruption and must not feed the free list.
-                if (next != 0 and next >= cref) return error.Corrupt;
+                if (next != 0 and next >= catalogReference) return error.Corrupt;
                 try newFl.add(.{
-                    .offset = cref,
+                    .offset = catalogReference,
                     .len = @intCast(FreeList.chunkByteLength(extentCount)),
                     .freedVersion = self.newVersion,
                 });
-                cref = next;
+                catalogReference = next;
             }
         }
         // 3b. Reclaim any leftover transaction-private nodes that were freed but not reused
@@ -287,9 +287,9 @@ pub const WriteTransaction = struct {
     }
 
     /// The on-disk location of an encoded free-list chain: the head chunk's
-    /// ref and byte length (0/0 for an empty chain of zero chunks -- never
+    /// reference and byte length (0/0 for an empty chain of zero chunks -- never
     /// produced, a single empty chunk is always written).
-    const FreeListChain = struct { headRef: u64, headLen: usize };
+    const FreeListChain = struct { headReference: u64, headLen: usize };
 
     /// Commit phase: encode the new free list onto the arena via BUMP
     /// allocations (never reuse, to avoid recursion: the chunks must not
@@ -304,7 +304,7 @@ pub const WriteTransaction = struct {
         const encStart = Io.Clock.now(.awake, encIo).nanoseconds;
         const items = newFl.extents.items;
         const chunkCount = @max(1, (items.len + FreeList.chunkExtentCap - 1) / FreeList.chunkExtentCap);
-        var headRef: u64 = 0;
+        var headReference: u64 = 0;
         var headLen: usize = 0;
         {
             var chunkIndex = chunkCount;
@@ -314,16 +314,16 @@ pub const WriteTransaction = struct {
                 const chunkEnd = @min(chunkStart + FreeList.chunkExtentCap, items.len);
                 const chunkLen = FreeList.chunkByteLength(chunkEnd - chunkStart);
                 const node = try database.bumpGrowing(chunkLen);
-                const written = FreeList.encodeChunk(items[chunkStart..chunkEnd], headRef, node.bytes);
+                const written = FreeList.encodeChunk(items[chunkStart..chunkEnd], headReference, node.bytes);
                 std.debug.assert(written == chunkLen);
-                headRef = node.ref;
+                headReference = node.reference;
                 headLen = chunkLen;
             }
         }
         database.flEncodeNs += @intCast(Io.Clock.now(.awake, encIo).nanoseconds - encStart);
         database.flExtentsEncoded += items.len;
         database.commitCount += 1;
-        return .{ .headRef = headRef, .headLen = headLen };
+        return .{ .headReference = headReference, .headLen = headLen };
     }
 
     /// Commit phase (protocol step 2): write the new slot descriptor into
@@ -331,7 +331,7 @@ pub const WriteTransaction = struct {
     /// version->root ring. Mapped-memory writes only -- nothing is durable
     /// until the step-3 flush. Returns the inactive slot index for the
     /// commit-point flip.
-    fn writeSlotAndRing(self: *WriteTransaction, prevActiveSlot: u8, freeListHeadRef: u64) u8 {
+    fn writeSlotAndRing(self: *WriteTransaction, prevActiveSlot: u8, freeListHeadReference: u64) u8 {
         const database = self.database;
 
         // Determine the inactive slot and its byte offset.
@@ -342,8 +342,8 @@ pub const WriteTransaction = struct {
         // logicalSize is captured AFTER the node alloc so it covers the node bytes.
         const newSlot = Slot{
             .version = self.newVersion,
-            .rootRef = self.newRoot,
-            .freeListRef = freeListHeadRef,
+            .rootReference = self.newRoot,
+            .freeListReference = freeListHeadReference,
             .logicalSize = @intCast(database.arena.top),
         };
         newSlot.encode(database.store.map[inactiveOff..][0..Slot.size]);

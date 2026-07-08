@@ -57,13 +57,13 @@ defer database.deinit();
 
 // Define a type: primaryKey (int) + name (blob) + an indexed int.
 var w = try database.beginWrite();
-var dir = try airdb.typeDirectory.createWithDefinitions(&w, &.{
+var directoryReference = try airdb.typeDirectory.createWithDefinitions(&w, &.{
     &.{ .{ .kind = .int }, .{ .kind = .blob }, .{ .kind = .int, .indexed = true } },
 });
-dir = (try airdb.typeRouting.insert(&w, dir, 0, &.{
+directoryReference = (try airdb.typeRouting.insert(&w, directoryReference, 0, &.{
     .{ .int = 1 }, .{ .bytes = "Ada" }, .{ .int = 1815 },
-})).dir;
-w.setRoot(dir);
+})).directoryReference;
+w.setRoot(directoryReference);
 _ = try w.commit(); // durable here
 
 var r = try database.beginRead();

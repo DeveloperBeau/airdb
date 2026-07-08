@@ -36,15 +36,15 @@ pub fn bulkColumn(transaction: *WriteTransaction, values: []const u64) !Referenc
     var level = try Column.packLeaves(transaction, values, allocator);
     defer level.deinit(allocator);
     try Column.collapseToRoot(transaction, &level, allocator);
-    return level.items[0].ref;
+    return level.items[0].reference;
 }
 
-// Deref an index node, sizing the read by its kind byte (leaf vs inner).
-fn derefIndexNode(transaction: *WriteTransaction, ref: Reference) ![]const u8 {
-    const kb = try transaction.deref(ref, 1);
+// Dereference an index node, sizing the read by its kind byte (leaf vs inner).
+fn dereferenceIndexNode(transaction: *WriteTransaction, reference: Reference) ![]const u8 {
+    const kb = try transaction.dereference(reference, 1);
     return switch (kb[0]) {
-        indexNode.kindLeaf => transaction.deref(ref, indexNode.leafNodeSize),
-        indexNode.kindInner => transaction.deref(ref, indexNode.innerNodeSize),
+        indexNode.kindLeaf => transaction.dereference(reference, indexNode.leafNodeSize),
+        indexNode.kindInner => transaction.dereference(reference, indexNode.innerNodeSize),
         else => error.Corrupt,
     };
 }
@@ -55,19 +55,19 @@ fn derefIndexNode(transaction: *WriteTransaction, ref: Reference) ![]const u8 {
 // identically up every level of the rightmost path, so it is the single value
 // an appended run's first key must clear (see the qualification in bulkAppend).
 fn emptyRightmostLow(transaction: *WriteTransaction, root: Reference) !?u64 {
-    var currentRef: Reference = root;
+    var currentReference: Reference = root;
     var recordedLow: ?u64 = null;
     var hops: usize = 0;
     while (true) : (hops += 1) {
         if (hops >= Index.maxDepth) return error.Corrupt;
-        const nodeBytes = try derefIndexNode(transaction, currentRef);
+        const nodeBytes = try dereferenceIndexNode(transaction, currentReference);
         if (nodeBytes[0] == indexNode.kindLeaf) {
             if ((try indexNode.parseLeaf(nodeBytes)).count != 0) return null;
             return recordedLow; // null when the empty leaf IS the root
         }
         const innerView = try indexNode.parseInner(nodeBytes);
         recordedLow = innerView.lowKey(innerView.childCount - 1);
-        currentRef = innerView.childRef(innerView.childCount - 1);
+        currentReference = innerView.childReference(innerView.childCount - 1);
     }
 }
 
@@ -86,7 +86,7 @@ pub fn bulkIndex(transaction: *WriteTransaction, keys: []const u64, values: []co
     var level = try Index.packLeaves(transaction, keys, values, allocator);
     defer level.deinit(allocator);
     try Index.collapseToRoot(transaction, &level, allocator);
-    return level.items[0].ref;
+    return level.items[0].reference;
 }
 
 /// Build a value index (value -> inner objectKey-set) from `entries`, sorted by
@@ -117,7 +117,7 @@ pub fn bulkValueIndex(transaction: *WriteTransaction, entries: []const ValueObje
 }
 
 /// Ingest a whole table of rows into an EMPTY type in one shot, returning the
-/// new catalog ref. Builds every column and index bottom-up so the result is
+/// new catalog reference. Builds every column and index bottom-up so the result is
 /// indistinguishable from inserting the same rows one at a time in
 /// primary-key order: the columns, version/live columns, primaryKey index,
 /// key->row index, and per-indexed-property value indexes are all built
@@ -137,11 +137,11 @@ pub fn bulkValueIndex(transaction: *WriteTransaction, entries: []const ValueObje
 /// half-commit. Phase 1 excludes link/linkSet properties. The CALLER commits.
 pub fn bulkImport(
     transaction: *WriteTransaction,
-    catalogRef: Reference,
+    catalogReference: Reference,
     rows: []const []const u64,
     opts: struct { presorted: bool = false },
 ) !Reference {
-    var snapshot = try catalog.CatalogSnapshot.load(transaction, catalogRef);
+    var snapshot = try catalog.CatalogSnapshot.load(transaction, catalogReference);
     if (snapshot.nextRow != 0) return error.TypeNotEmpty;
     const oldNextKey = snapshot.nextKey;
     try validateImportInput(&snapshot, rows);
@@ -215,10 +215,10 @@ fn freePreallocatedTrees(transaction: *WriteTransaction, snapshot: *const catalo
         try Column.freeTree(transaction, snapshot.properties[propertyIndex].column);
         if (snapshot.properties[propertyIndex].indexed) try Index.freeTree(transaction, snapshot.properties[propertyIndex].valueIndex);
     }
-    try Column.freeTree(transaction, snapshot.versionColumnRef);
-    try Column.freeTree(transaction, snapshot.liveColumnRef);
-    try Index.freeTree(transaction, snapshot.primaryKeyIndexRef);
-    try Index.freeTree(transaction, snapshot.keyrowIndexRef);
+    try Column.freeTree(transaction, snapshot.versionColumnReference);
+    try Column.freeTree(transaction, snapshot.liveColumnReference);
+    try Index.freeTree(transaction, snapshot.primaryKeyIndexReference);
+    try Index.freeTree(transaction, snapshot.keyToRowIndexReference);
 }
 
 // Build the property columns, version/live columns, and primaryKey/key->row indexes
@@ -250,9 +250,9 @@ fn buildImportTrees(
     const stamps = try allocator.alloc(u64, rowCount);
     defer allocator.free(stamps);
     @memset(stamps, transaction.newVersion);
-    snapshot.versionColumnRef = try bulkColumn(transaction, stamps[0..rowCount]);
+    snapshot.versionColumnReference = try bulkColumn(transaction, stamps[0..rowCount]);
     @memset(stamps, 1);
-    snapshot.liveColumnRef = try bulkColumn(transaction, stamps[0..rowCount]);
+    snapshot.liveColumnReference = try bulkColumn(transaction, stamps[0..rowCount]);
 
     // primaryKey index (primaryKey -> objectKey) and key->row index (objectKey -> physical row). objectKeys are
     // assigned in sorted-primaryKey order from the type's current nextKey, so
@@ -268,8 +268,8 @@ fn buildImportTrees(
         objectKeys[rank] = oldNextKey + @as(u64, @intCast(rank));
         physicalRows[rank] = @intCast(rank);
     }
-    snapshot.primaryKeyIndexRef = try bulkIndex(transaction, primaryKeys[0..rowCount], objectKeys[0..rowCount]);
-    snapshot.keyrowIndexRef = try bulkIndex(transaction, objectKeys[0..rowCount], physicalRows[0..rowCount]);
+    snapshot.primaryKeyIndexReference = try bulkIndex(transaction, primaryKeys[0..rowCount], objectKeys[0..rowCount]);
+    snapshot.keyToRowIndexReference = try bulkIndex(transaction, objectKeys[0..rowCount], physicalRows[0..rowCount]);
 }
 
 // Value indexes: for each indexed property, group its objectKeys by value and store
@@ -335,7 +335,7 @@ fn buildPropertyValueIndex(
 
 /// Fast-path a batch of rows whose primary keys all land strictly to the
 /// RIGHT of the type's current key space onto the right edge of every tree,
-/// without touching any left subtree; returns the new catalog ref. The result
+/// without touching any left subtree; returns the new catalog reference. The result
 /// is byte-identical to inserting the same rows one at a time in
 /// ascending-primaryKey order: each new row gets the next physical row and
 /// object key in batch order, the version stamp matches rows.insert
@@ -353,14 +353,14 @@ fn buildPropertyValueIndex(
 /// Crucially, every qualification check is read-only and runs BEFORE the first
 /// node is allocated, so a NotAppendable return leaves the catalog and all trees
 /// untouched. The CALLER commits.
-pub fn bulkAppend(transaction: *WriteTransaction, catalogRef: Reference, rows: []const []const u64) !Reference {
-    var snapshot = try catalog.CatalogSnapshot.load(transaction, catalogRef);
+pub fn bulkAppend(transaction: *WriteTransaction, catalogReference: Reference, rows: []const []const u64) !Reference {
+    var snapshot = try catalog.CatalogSnapshot.load(transaction, catalogReference);
 
     // Validate row widths first: a single malformed row aborts before any work.
     for (rows) |row| {
         if (row.len != snapshot.propertyCount) return error.BadRow;
     }
-    if (rows.len == 0) return catalogRef;
+    if (rows.len == 0) return catalogReference;
 
     try qualifyRightEdgeAppend(transaction, &snapshot, rows);
 
@@ -390,8 +390,8 @@ pub fn bulkAppend(transaction: *WriteTransaction, catalogRef: Reference, rows: [
     // primaryKey index (primaryKey -> objectKey) and key->row index (objectKey -> physical row). Both runs
     // land on the right edge: batch primaryKeys are ascending and above the current max,
     // and objectKeys are consecutive from nextKey (thus above every existing objectKey).
-    snapshot.primaryKeyIndexRef = try Index.appendRun(transaction, snapshot.primaryKeyIndexRef, primaryKeys[0..rowCount], objectKeys[0..rowCount], allocator);
-    snapshot.keyrowIndexRef = try Index.appendRun(transaction, snapshot.keyrowIndexRef, objectKeys[0..rowCount], physicalRows[0..rowCount], allocator);
+    snapshot.primaryKeyIndexReference = try Index.appendRun(transaction, snapshot.primaryKeyIndexReference, primaryKeys[0..rowCount], objectKeys[0..rowCount], allocator);
+    snapshot.keyToRowIndexReference = try Index.appendRun(transaction, snapshot.keyToRowIndexReference, objectKeys[0..rowCount], physicalRows[0..rowCount], allocator);
 
     snapshot.nextRow = oldNextRow + @as(u64, @intCast(rowCount));
     snapshot.nextKey = oldNextKey + @as(u64, @intCast(rowCount));
@@ -425,9 +425,9 @@ fn appendColumnRuns(
     const stamps = try allocator.alloc(u64, rowCount);
     defer allocator.free(stamps);
     @memset(stamps, transaction.newVersion);
-    snapshot.versionColumnRef = try Column.appendRun(transaction, snapshot.versionColumnRef, stamps[0..rowCount], allocator);
+    snapshot.versionColumnReference = try Column.appendRun(transaction, snapshot.versionColumnReference, stamps[0..rowCount], allocator);
     @memset(stamps, 1);
-    snapshot.liveColumnRef = try Column.appendRun(transaction, snapshot.liveColumnRef, stamps[0..rowCount], allocator);
+    snapshot.liveColumnReference = try Column.appendRun(transaction, snapshot.liveColumnReference, stamps[0..rowCount], allocator);
 }
 
 // Qualify a batch for the right-edge fast path, returning error.NotAppendable
@@ -462,7 +462,7 @@ fn qualifyRightEdgeAppend(
 
     // The smallest batch primaryKey (rows[0][0], since ascending) must clear the current
     // max primaryKey in the type. An empty type (no max) admits any ascending batch.
-    if (try Index.maxKey(transaction, snapshot.primaryKeyIndexRef)) |maxPrimaryKey| {
+    if (try Index.maxKey(transaction, snapshot.primaryKeyIndexReference)) |maxPrimaryKey| {
         if (rows[0][0] <= maxPrimaryKey) return error.NotAppendable;
     }
 
@@ -472,44 +472,44 @@ fn qualifyRightEdgeAppend(
     // parent low from the batch's first key; a batch below the recorded low
     // would break the ascending-lows invariant and make the appended rows
     // unreachable. Such a batch must take the row-by-row fallback. (The
-    // keyrow index is immune: new objectKeys are allocated above every objectKey -- and
+    // key-to-row index is immune: new objectKeys are allocated above every objectKey -- and
     // therefore every stale low -- the tree has ever held.)
-    if (try emptyRightmostLow(transaction, snapshot.primaryKeyIndexRef)) |staleLow| {
+    if (try emptyRightmostLow(transaction, snapshot.primaryKeyIndexReference)) |staleLow| {
         if (rows[0][0] < staleLow) return error.NotAppendable;
     }
 }
 
 /// Try the right-edge fast path; on NotAppendable, fall back to row-by-row
 /// rows.insert, which handles any non-link schema and detects duplicate keys
-/// per row. Returns the new catalog ref. O(m) on the fast path, O(m log n)
+/// per row. Returns the new catalog reference. O(m) on the fast path, O(m log n)
 /// on the fallback.
-pub fn bulkAppendOrInsert(transaction: *WriteTransaction, catalogRef: Reference, rows: []const []const u64) !Reference {
-    return bulkAppend(transaction, catalogRef, rows) catch |err| switch (err) {
-        error.NotAppendable => fallbackInsert(transaction, catalogRef, rows),
+pub fn bulkAppendOrInsert(transaction: *WriteTransaction, catalogReference: Reference, rows: []const []const u64) !Reference {
+    return bulkAppend(transaction, catalogReference, rows) catch |err| switch (err) {
+        error.NotAppendable => fallbackInsert(transaction, catalogReference, rows),
         else => err,
     };
 }
 
-// Insert every row one at a time, threading the catalog ref. A DuplicateKey from
-// rows.insert propagates to the caller. Empty rows return catalogRef unchanged.
+// Insert every row one at a time, threading the catalog reference. A DuplicateKey from
+// rows.insert propagates to the caller. Empty rows return catalogReference unchanged.
 //
 // Link-bearing schemas are rejected outright: rows.insert writes raw column
 // values without backlink maintenance (that is insertTyped's job), so silently
 // accepting them here would corrupt the link graph -- the same reason
 // bulkImport refuses them.
-fn fallbackInsert(transaction: *WriteTransaction, catalogRef: Reference, rows: []const []const u64) !Reference {
-    if (rows.len == 0) return catalogRef;
+fn fallbackInsert(transaction: *WriteTransaction, catalogReference: Reference, rows: []const []const u64) !Reference {
+    if (rows.len == 0) return catalogReference;
     {
-        const view = try catalog.loadCatalog(transaction, catalogRef);
+        const view = try catalog.loadCatalog(transaction, catalogReference);
         var propertyIndex: usize = 0;
         while (propertyIndex < view.propertyCount) : (propertyIndex += 1) {
             const kind = view.kind(propertyIndex);
             if (kind == .link or kind == .linkSet) return error.UnsupportedForBulk;
         }
     }
-    var currentCatalog = catalogRef;
+    var currentCatalog = catalogReference;
     for (rows) |row| {
-        currentCatalog = (try rawRows.insert(transaction, currentCatalog, row)).catalogRef;
+        currentCatalog = (try rawRows.insert(transaction, currentCatalog, row)).catalogReference;
     }
     return currentCatalog;
 }

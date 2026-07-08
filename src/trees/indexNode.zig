@@ -1,6 +1,6 @@
 //! On-disk node formats for the key->value B+tree: fixed-size leaf and inner
 //! encodings shared (via bTreeCore) by index.zig's inline numeric keys and
-//! byteKeyIndex.zig's blob-ref byte keys.
+//! byteKeyIndex.zig's blob-reference byte keys.
 
 const std = @import("std");
 
@@ -19,7 +19,7 @@ pub const leafNodeSize: usize = headerSize + @as(usize, leafCap) * 16;
 
 /// Bytes per inner-node child entry.
 /// Inner layout: [kind u8][childCount u16] then childCount entries of
-/// (childRef u64, lowKey u64, subtreeCount u64). The subtree count makes
+/// (childReference u64, lowKey u64, subtreeCount u64). The subtree count makes
 /// Index.count a single-node read instead of a full-tree walk, which is what
 /// keeps liveCount / shouldCompact O(1)-per-node on the compaction hot path.
 pub const innerStride: usize = 24;
@@ -82,15 +82,15 @@ pub fn parseLeaf(bytes: []const u8) error{Corrupt}!LeafView {
 // Inner-node encoding
 // ---------------------------------------------------------------------------
 
-/// Encode the parallel (refs, lows, counts) child entries into `buffer` as an
+/// Encode the parallel (references, lows, counts) child entries into `buffer` as an
 /// inner node; returns the encoded byte length.
-pub fn encodeInner(buffer: []u8, refs: []const u64, lows: []const u64, counts: []const u64) usize {
-    std.debug.assert(refs.len == lows.len and refs.len == counts.len and refs.len <= fanout);
+pub fn encodeInner(buffer: []u8, references: []const u64, lows: []const u64, counts: []const u64) usize {
+    std.debug.assert(references.len == lows.len and references.len == counts.len and references.len <= fanout);
     buffer[0] = kindInner;
-    std.mem.writeInt(u16, buffer[1..3], @intCast(refs.len), .little);
+    std.mem.writeInt(u16, buffer[1..3], @intCast(references.len), .little);
     var offset: usize = headerSize;
-    for (refs, lows, counts) |ref, lowKey, count| {
-        std.mem.writeInt(u64, buffer[offset..][0..8], ref, .little);
+    for (references, lows, counts) |reference, lowKey, count| {
+        std.mem.writeInt(u64, buffer[offset..][0..8], reference, .little);
         std.mem.writeInt(u64, buffer[offset + 8 ..][0..8], lowKey, .little);
         std.mem.writeInt(u64, buffer[offset + 16 ..][0..8], count, .little);
         offset += innerStride;
@@ -102,8 +102,8 @@ pub fn encodeInner(buffer: []u8, refs: []const u64, lows: []const u64, counts: [
 pub const InnerView = struct {
     bytes: []const u8,
     childCount: u16,
-    /// The ref of child `entryIndex`.
-    pub fn childRef(self: InnerView, entryIndex: usize) u64 {
+    /// The reference of child `entryIndex`.
+    pub fn childReference(self: InnerView, entryIndex: usize) u64 {
         return std.mem.readInt(u64, self.bytes[headerSize + entryIndex * innerStride ..][0..8], .little);
     }
     /// The smallest key routed to child `entryIndex` (its recorded low).

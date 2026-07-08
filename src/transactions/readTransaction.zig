@@ -7,7 +7,7 @@ const Database = @import("../database.zig").Database;
 /// time and keeps that version's space from being reused until end().
 pub const ReadTransaction = struct {
     database: *Database,
-    rootRef: Reference,
+    rootReference: Reference,
     version: u64,
     /// Set by end(). A second end() must be a no-op: decrementing the pin count
     /// again would release another reader's pin at the same version and expose
@@ -16,13 +16,13 @@ pub const ReadTransaction = struct {
 
     /// The snapshot's root reference (the type directory as of begin time).
     pub fn root(self: ReadTransaction) Reference {
-        return self.rootRef;
+        return self.rootReference;
     }
 
-    /// Read `length` bytes at `ref` as a zero-copy slice into mapped storage;
+    /// Read `length` bytes at `reference` as a zero-copy slice into mapped storage;
     /// valid while this snapshot stays pinned (until end()).
-    pub fn deref(self: *ReadTransaction, ref: Reference, length: usize) ![]const u8 {
-        return self.database.arena.deref(ref, length);
+    pub fn dereference(self: *ReadTransaction, reference: Reference, length: usize) ![]const u8 {
+        return self.database.arena.dereference(reference, length);
     }
 
     /// Release this snapshot's pin and republish the process's minimum pinned

@@ -31,7 +31,7 @@ fn idxTmpPath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const 
     return std.fs.path.join(allocator, &.{ pathBuffer[0..dlen], name });
 }
 
-test "a ref cycle or unknown kind byte fails with error.Corrupt" {
+test "a reference cycle or unknown kind byte fails with error.Corrupt" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try idxTmpPath(testing.allocator, &tmp, "idx_cycle.airdb");
@@ -45,22 +45,22 @@ test "a ref cycle or unknown kind byte fails with error.Corrupt" {
     // cap and error out rather than overflow the stack. (count is exempt: it is
     // a single-node read of the stored subtree counts and never descends.)
     const allocation = try writeTransaction.alloc(innerNodeSize);
-    _ = encodeInner(allocation.bytes, &.{allocation.ref}, &.{0}, &.{1});
-    try testing.expectError(error.Corrupt, get(&writeTransaction, allocation.ref, 5));
-    try testing.expectError(error.Corrupt, maxKey(&writeTransaction, allocation.ref));
-    try testing.expectError(error.Corrupt, insert(&writeTransaction, allocation.ref, 1, 1));
-    try testing.expectError(error.Corrupt, remove(&writeTransaction, allocation.ref, 1));
+    _ = encodeInner(allocation.bytes, &.{allocation.reference}, &.{0}, &.{1});
+    try testing.expectError(error.Corrupt, get(&writeTransaction, allocation.reference, 5));
+    try testing.expectError(error.Corrupt, maxKey(&writeTransaction, allocation.reference));
+    try testing.expectError(error.Corrupt, insert(&writeTransaction, allocation.reference, 1, 1));
+    try testing.expectError(error.Corrupt, remove(&writeTransaction, allocation.reference, 1));
     const NopSink = struct {
         fn onKey(_: @This(), _: u64) !void {}
     };
-    try testing.expectError(error.Corrupt, forEachKey(&writeTransaction, allocation.ref, NopSink{}, NopSink.onKey));
+    try testing.expectError(error.Corrupt, forEachKey(&writeTransaction, allocation.reference, NopSink{}, NopSink.onKey));
 
     // A node with an out-of-range kind byte is rejected outright.
     const allocationB = try writeTransaction.alloc(leafNodeSize);
     _ = encodeLeaf(allocationB.bytes, &.{}, &.{});
     // Rewrite the kind byte through the arena (b.bytes is mutable).
     allocationB.bytes[0] = 7;
-    try testing.expectError(error.Corrupt, get(&writeTransaction, allocationB.ref, 1));
+    try testing.expectError(error.Corrupt, get(&writeTransaction, allocationB.reference, 1));
 }
 
 test "get and count traverse an inner node over two leaves" {
@@ -77,7 +77,7 @@ test "get and count traverse an inner node over two leaves" {
     var rightLeaf = try create(&writeTransaction);
     rightLeaf = try insert(&writeTransaction, rightLeaf, 5, 55);
     rightLeaf = try insert(&writeTransaction, rightLeaf, 7, 77);
-    const inner = try makeInnerForTest(&writeTransaction, &.{ .{ .ref = leftLeaf, .low = 1, .count = 2 }, .{ .ref = rightLeaf, .low = 5, .count = 2 } });
+    const inner = try makeInnerForTest(&writeTransaction, &.{ .{ .reference = leftLeaf, .low = 1, .count = 2 }, .{ .reference = rightLeaf, .low = 5, .count = 2 } });
     try testing.expectEqual(@as(u64, 4), try count(&writeTransaction, inner));
     try testing.expectEqual(@as(?u64, 11), try get(&writeTransaction, inner, 1));
     try testing.expectEqual(@as(?u64, 55), try get(&writeTransaction, inner, 5));
@@ -102,15 +102,15 @@ test "insert builds a balanced tree across many leaves and reads back correctly"
         const key = (position *% 2654435761) % 1_000_003; // scattered keys force mid-splits
         root = try insert(&writeTransaction, root, key, key +% 7);
     }
-    var refMap = std.AutoHashMap(u64, u64).init(testing.allocator);
-    defer refMap.deinit();
+    var referenceMap = std.AutoHashMap(u64, u64).init(testing.allocator);
+    defer referenceMap.deinit();
     position = 0;
     while (position < N) : (position += 1) {
         const key = (position *% 2654435761) % 1_000_003;
-        try refMap.put(key, key +% 7);
+        try referenceMap.put(key, key +% 7);
     }
-    try testing.expectEqual(@as(u64, refMap.count()), try count(&writeTransaction, root));
-    var iterator = refMap.iterator();
+    try testing.expectEqual(@as(u64, referenceMap.count()), try count(&writeTransaction, root));
+    var iterator = referenceMap.iterator();
     while (iterator.next()) |err| {
         try testing.expectEqual(@as(?u64, err.value_ptr.*), try get(&writeTransaction, root, err.key_ptr.*));
     }
@@ -483,8 +483,8 @@ test "ordered index persists across reopen and matches a reference map under chu
     defer tmp.cleanup();
     const path = try idxTmpPath(testing.allocator, &tmp, "idx6.airdb");
     defer testing.allocator.free(path);
-    var refMap = std.AutoHashMap(u64, u64).init(testing.allocator);
-    defer refMap.deinit();
+    var referenceMap = std.AutoHashMap(u64, u64).init(testing.allocator);
+    defer referenceMap.deinit();
     const N: u64 = 100_000;
     {
         var database = try Database.create(testing.allocator, path);
@@ -495,14 +495,14 @@ test "ordered index persists across reopen and matches a reference map under chu
         while (position < N) : (position += 1) {
             const key = (position *% 2654435761) % 5_000_011;
             root = try insert(&writeTransaction, root, key, position);
-            try refMap.put(key, position);
+            try referenceMap.put(key, position);
         }
         // Remove every 3rd inserted key.
         position = 0;
         while (position < N) : (position += 3) {
             const key = (position *% 2654435761) % 5_000_011;
             root = try remove(&writeTransaction, root, key);
-            _ = refMap.remove(key);
+            _ = referenceMap.remove(key);
         }
         writeTransaction.setRoot(root);
         _ = try writeTransaction.commit();
@@ -511,8 +511,8 @@ test "ordered index persists across reopen and matches a reference map under chu
         var database = try Database.open(testing.allocator, path);
         defer database.deinit();
         var readTransaction = try database.beginRead();
-        try testing.expectEqual(@as(u64, refMap.count()), try count(&readTransaction, readTransaction.root()));
-        var iterator = refMap.iterator();
+        try testing.expectEqual(@as(u64, referenceMap.count()), try count(&readTransaction, readTransaction.root()));
+        var iterator = referenceMap.iterator();
         while (iterator.next()) |err| {
             try testing.expectEqual(@as(?u64, err.value_ptr.*), try get(&readTransaction, readTransaction.root(), err.key_ptr.*));
         }
@@ -520,7 +520,7 @@ test "ordered index persists across reopen and matches a reference map under chu
         var innerPosition: u64 = 0;
         while (innerPosition < 30) : (innerPosition += 3) {
             const key = (innerPosition *% 2654435761) % 5_000_011;
-            if (!refMap.contains(key)) try testing.expect((try get(&readTransaction, readTransaction.root(), key)) == null);
+            if (!referenceMap.contains(key)) try testing.expect((try get(&readTransaction, readTransaction.root(), key)) == null);
         }
         readTransaction.end();
     }
@@ -667,7 +667,7 @@ test "appendRun empty run is a no-op" {
     while (key < 100) : (key += 1) baseRoot = try insert(&writeTransaction, baseRoot, key, appendRunVal(key));
     const before = try count(&writeTransaction, baseRoot);
     const appended = try appendRun(&writeTransaction, baseRoot, &.{}, &.{}, testing.allocator);
-    try testing.expectEqual(baseRoot, appended); // same ref, unchanged
+    try testing.expectEqual(baseRoot, appended); // same reference, unchanged
     try testing.expectEqual(before, try count(&writeTransaction, appended));
     writeTransaction.deinit();
 }

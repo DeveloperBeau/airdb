@@ -86,8 +86,8 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
 
     {
         var writeTransaction = try database.beginWrite();
-        const dir = try typeDirectory.createTypes(&writeTransaction, &chainSchema, &chainEmbedded);
-        writeTransaction.setRoot(dir);
+        const directoryReference = try typeDirectory.createTypes(&writeTransaction, &chainSchema, &chainEmbedded);
+        writeTransaction.setRoot(directoryReference);
         _ = try writeTransaction.commit();
     }
 
@@ -117,13 +117,13 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
             while (inserted < rows) {
                 const thisBatch = @min(batchSize, rows - inserted);
                 var writeTransaction = try database.beginWrite();
-                var dir = writeTransaction.newRoot;
+                var directoryReference = writeTransaction.newRoot;
                 var innerIndex: usize = 0;
                 while (innerIndex < thisBatch) : (innerIndex += 1) {
                     const key: u64 = keyBase + inserted + innerIndex;
                     const startNs = nowNs(io);
                     // Root row of type 0.
-                    dir = (try typeRouting.insert(&writeTransaction, dir, 0, &.{ .{ .int = key }, .{ .link = null } })).dir;
+                    directoryReference = (try typeRouting.insert(&writeTransaction, directoryReference, 0, &.{ .{ .int = key }, .{ .link = null } })).directoryReference;
                     // Embedded levels 1..d. Each shares `key` in its own primaryKey space.
                     var level: u16 = 0;
                     while (level < payload) : (level += 1) {
@@ -132,13 +132,13 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
                             .{ .{ .int = key }, .{ .int = key *% 2654435761 } }
                         else
                             .{ .{ .int = key }, .{ .link = null } };
-                        dir = try typeDirectory.insertEmbedded(&writeTransaction, dir, level, key, linkProperty, &childVals);
+                        directoryReference = try typeDirectory.insertEmbedded(&writeTransaction, directoryReference, level, key, linkProperty, &childVals);
                     }
                     const elapsedNs: u64 = @intCast(nowNs(io) - startNs);
                     try createLat.add(alloc, elapsedNs);
                     try combined.add(alloc, elapsedNs);
                 }
-                writeTransaction.setRoot(dir);
+                writeTransaction.setRoot(directoryReference);
                 _ = try writeTransaction.commit();
                 inserted += thisBatch;
             }
@@ -149,7 +149,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         {
             const phaseStart = nowNs(io);
             var readTransaction = try database.beginRead();
-            const dir = readTransaction.root();
+            const directoryReference = readTransaction.root();
             var out: [2]Value = undefined;
             var index: usize = 0;
             while (index < rows) : (index += 1) {
@@ -157,7 +157,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
                 const startNs = nowNs(io);
                 var level: u16 = 0;
                 while (level < payload) : (level += 1) {
-                    _ = try typeRouting.getLinked(&readTransaction, dir, level, key, linkProperty, &out);
+                    _ = try typeRouting.getLinked(&readTransaction, directoryReference, level, key, linkProperty, &out);
                 }
                 const elapsedNs: u64 = @intCast(nowNs(io) - startNs);
                 try readLat.add(alloc, elapsedNs);

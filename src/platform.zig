@@ -24,17 +24,17 @@ const page = std.heap.page_size_min;
 /// 64-bit: 1 TiB. 32-bit: 1 GiB.
 pub const maxReserved: usize = if (@bitSizeOf(usize) >= 64) (1 << 40) else (1 << 30);
 
-/// The file is mapped in fixed-size sections. A ref (an absolute byte offset into the
+/// The file is mapped in fixed-size sections. A reference (an absolute byte offset into the
 /// logical arena) is translated to a pointer via the section it falls in:
-///   sectionIndex   = ref >> sectionShift
-///   offsetInSection = ref & sectionMask
+///   sectionIndex   = reference >> sectionShift
+///   offsetInSection = reference & sectionMask
 /// Existing sections are never remapped or moved on growth (growth only ADDS sections),
 /// so every live pointer stays valid. No single allocation may cross a section boundary,
 /// which also makes sectionSize the maximum single allocation size.
 pub const sectionShift: u6 = 24;
 /// Bytes per mapped section (16 MiB) -- also the maximum single allocation.
 pub const sectionSize: usize = 1 << sectionShift;
-/// Mask extracting the within-section offset from a ref.
+/// Mask extracting the within-section offset from a reference.
 pub const sectionMask: usize = sectionSize - 1;
 
 // Windows API bindings, declared locally so the module is self-contained. Gated so

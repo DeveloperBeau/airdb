@@ -77,7 +77,7 @@ newer one. Ship a matched engine with your app.
 ## Blobs and allocation
 
 - A single arena allocation caps at one section (16 MiB); larger blobs chunk
-  transparently, but list/set/dict *elements* are u64s (blob elements are refs
+  transparently, but list/set/dict *elements* are u64s (blob elements are references
   and follow blob rules).
 - `Database.create`/`open` require absolute paths.
 

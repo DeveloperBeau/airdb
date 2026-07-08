@@ -65,7 +65,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     // Two-int type: {primaryKey, category}. Property 0 is the primary key, property 1
     // is the low-cardinality category, declared indexed so the equality query
     // is served by its value index rather than a full scan.
-    var catalogRef: Reference = blk: {
+    var catalogReference: Reference = blk: {
         var writeTransaction = try database.beginWrite();
         const valueC = try catalog.createFromDefinitions(&writeTransaction, &.{
             .{ .kind = .int },
@@ -80,14 +80,14 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     while (inserted < ctx.rowCount) {
         const thisBatch = @min(batchSize, ctx.rowCount - inserted);
         var writeTransaction = try database.beginWrite();
-        catalogRef = database.activeRoot; // reload the committed catalog ref
+        catalogReference = database.activeRoot; // reload the committed catalog reference
         var innerIndex: usize = 0;
         while (innerIndex < thisBatch) : (innerIndex += 1) {
             const primaryKey: u64 = inserted + innerIndex;
-            const result = try rows.insert(&writeTransaction, catalogRef, &.{ primaryKey, primaryKey % categoryMod });
-            catalogRef = result.catalogRef;
+            const result = try rows.insert(&writeTransaction, catalogReference, &.{ primaryKey, primaryKey % categoryMod });
+            catalogReference = result.catalogReference;
         }
-        writeTransaction.setRoot(catalogRef);
+        writeTransaction.setRoot(catalogReference);
         _ = try writeTransaction.commit();
         inserted += thisBatch;
     }
@@ -97,7 +97,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     defer lat.deinit(alloc);
 
     var readTransaction = try database.beginRead();
-    catalogRef = readTransaction.root();
+    catalogReference = readTransaction.root();
 
     // Deterministic xorshift64 over a fixed seed; index = x % n keeps every
     // lookup inside [0, n). No clock/RNG dependency, so the run is reproducible.
@@ -113,7 +113,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         const primaryKey: u64 = state % nU64;
         var out: [2]u64 = undefined;
         const startNs = nowNs(io);
-        _ = try rows.getByPrimaryKey(&readTransaction, catalogRef, primaryKey, &out);
+        _ = try rows.getByPrimaryKey(&readTransaction, catalogReference, primaryKey, &out);
         const elapsedNs: u64 = @intCast(nowNs(io) - startNs);
         try lat.add(alloc, elapsedNs);
     }
@@ -129,7 +129,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
     while (err < indexedEqRepetitions) : (err += 1) {
         rowsEq = try query.countWhere(
             &readTransaction,
-            catalogRef,
+            catalogReference,
             &.{.{ .property = 1, .operator = .eq, .value = eqCategory }},
             alloc,
         );
@@ -139,7 +139,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
 
     // Full scan: no predicate matches every live row.
     const fullStart = nowNs(io);
-    _ = try query.countWhere(&readTransaction, catalogRef, &.{}, alloc);
+    _ = try query.countWhere(&readTransaction, catalogReference, &.{}, alloc);
     const fullNs: u64 = @intCast(nowNs(io) - fullStart);
 
     readTransaction.end();

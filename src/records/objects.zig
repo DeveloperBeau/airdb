@@ -34,15 +34,15 @@ pub const DeleteResult = rows.DeleteResult;
 /// Encode a []Value row into raw u64 storage -- allocating a blob node for
 /// each .blob property and building each collection's tree -- then insert it
 /// via rows.insert, maintaining backlinks for any links the row carries.
-/// Returns the new catalog ref and the row's stable object key. One tree walk
+/// Returns the new catalog reference and the row's stable object key. One tree walk
 /// per property plus collection builds proportional to their element counts.
-pub fn insertTyped(transaction: *WriteTransaction, catalogRef: Reference, values: []const Value) !struct { catalogRef: Reference, objectKey: u64 } {
-    const view = try loadCatalog(transaction, catalogRef);
+pub fn insertTyped(transaction: *WriteTransaction, catalogReference: Reference, values: []const Value) !struct { catalogReference: Reference, objectKey: u64 } {
+    const view = try loadCatalog(transaction, catalogReference);
     const propertyCount = view.propertyCount;
     std.debug.assert(values.len == propertyCount);
     std.debug.assert(propertyCount <= maxPropertyCount);
     // Capture kinds and elements into local buffers before any mutation that could
-    // invalidate the deref slice backing CatalogView.
+    // invalidate the dereference slice backing CatalogView.
     var kinds: [maxPropertyCount]PropertyKind = undefined;
     var elements: [maxPropertyCount]ElementKind = undefined;
     {
@@ -71,9 +71,9 @@ pub fn insertTyped(transaction: *WriteTransaction, catalogRef: Reference, values
             .linkSet => try collections.buildSetInt(transaction, values[propertyIndex].linkSet),
         };
     }
-    const result = try rows.insert(transaction, catalogRef, raw[0..propertyCount]);
+    const result = try rows.insert(transaction, catalogReference, raw[0..propertyCount]);
     // Maintain backlinks for any links the new row carries.
-    var updatedCatalog = result.catalogRef;
+    var updatedCatalog = result.catalogReference;
     {
         var linkIndex: usize = 0;
         while (linkIndex < propertyCount) : (linkIndex += 1) {
@@ -92,17 +92,17 @@ pub fn insertTyped(transaction: *WriteTransaction, catalogRef: Reference, values
             }
         }
     }
-    return .{ .catalogRef = updatedCatalog, .objectKey = result.objectKey };
+    return .{ .catalogReference = updatedCatalog, .objectKey = result.objectKey };
 }
 
 /// Read a row by primary key and decode each property into `out` as a Value.
 /// A small .blob property decodes to a zero-copy .bytes slice into the mapped
 /// storage (valid until the next mutating call on the transaction); a blob
-/// larger than the inline cap (stored chunked) decodes to a .blobRef the
+/// larger than the inline cap (stored chunked) decodes to a .blobReference the
 /// caller materializes with blob.getAlloc. Returns the row version, or null
 /// when the key is not found. One tree walk per property (O(log n) each).
-pub fn getTyped(transaction: anytype, catalogRef: Reference, primaryKey: u64, out: []Value) !?u64 {
-    const view = try loadCatalog(transaction, catalogRef);
+pub fn getTyped(transaction: anytype, catalogReference: Reference, primaryKey: u64, out: []Value) !?u64 {
+    const view = try loadCatalog(transaction, catalogReference);
     const propertyCount = view.propertyCount;
     std.debug.assert(out.len == propertyCount);
     std.debug.assert(propertyCount <= maxPropertyCount);
@@ -113,13 +113,13 @@ pub fn getTyped(transaction: anytype, catalogRef: Reference, primaryKey: u64, ou
         while (propertyIndex < propertyCount) : (propertyIndex += 1) kinds[propertyIndex] = view.kind(propertyIndex);
     }
     var raw: [maxPropertyCount]u64 = undefined;
-    const version = (try rows.getByPrimaryKey(transaction, catalogRef, primaryKey, raw[0..propertyCount])) orelse return null;
+    const version = (try rows.getByPrimaryKey(transaction, catalogReference, primaryKey, raw[0..propertyCount])) orelse return null;
     var propertyIndex: usize = 0;
     while (propertyIndex < propertyCount) : (propertyIndex += 1) {
         out[propertyIndex] = switch (kinds[propertyIndex]) {
             .int => .{ .int = raw[propertyIndex] },
             .blob => if (blob.get(transaction, raw[propertyIndex])) |slice| .{ .bytes = slice } else |err| switch (err) {
-                error.BlobChunked => .{ .blobRef = raw[propertyIndex] },
+                error.BlobChunked => .{ .blobReference = raw[propertyIndex] },
                 else => return err,
             },
             .list, .set, .dict, .linkSet => .{ .collectionRoot = raw[propertyIndex] },
@@ -133,8 +133,8 @@ pub fn getTyped(transaction: anytype, catalogRef: Reference, primaryKey: u64, ou
 /// into `out` as a Value; blob decoding follows the getTyped rules. Returns
 /// the row version, or null when the objectKey is unknown or the row is
 /// tombstoned. One tree walk per property (O(log n) each).
-pub fn getTypedByObjectKey(transaction: anytype, catalogRef: Reference, objectKey: u64, out: []Value) !?u64 {
-    const view = try loadCatalog(transaction, catalogRef);
+pub fn getTypedByObjectKey(transaction: anytype, catalogReference: Reference, objectKey: u64, out: []Value) !?u64 {
+    const view = try loadCatalog(transaction, catalogReference);
     const propertyCount = view.propertyCount;
     std.debug.assert(out.len == propertyCount);
     std.debug.assert(propertyCount <= maxPropertyCount);
@@ -144,13 +144,13 @@ pub fn getTypedByObjectKey(transaction: anytype, catalogRef: Reference, objectKe
         while (propertyIndex < propertyCount) : (propertyIndex += 1) kinds[propertyIndex] = view.kind(propertyIndex);
     }
     var raw: [maxPropertyCount]u64 = undefined;
-    const version = (try rows.getByObjectKey(transaction, catalogRef, objectKey, raw[0..propertyCount])) orelse return null;
+    const version = (try rows.getByObjectKey(transaction, catalogReference, objectKey, raw[0..propertyCount])) orelse return null;
     var propertyIndex: usize = 0;
     while (propertyIndex < propertyCount) : (propertyIndex += 1) {
         out[propertyIndex] = switch (kinds[propertyIndex]) {
             .int => .{ .int = raw[propertyIndex] },
             .blob => if (blob.get(transaction, raw[propertyIndex])) |slice| .{ .bytes = slice } else |err| switch (err) {
-                error.BlobChunked => .{ .blobRef = raw[propertyIndex] },
+                error.BlobChunked => .{ .blobReference = raw[propertyIndex] },
                 else => return err,
             },
             .list, .set, .dict, .linkSet => .{ .collectionRoot = raw[propertyIndex] },
@@ -164,13 +164,13 @@ pub fn getTypedByObjectKey(transaction: anytype, catalogRef: Reference, objectKe
 /// and clean the deleted object's outbound backlink entries before the
 /// tombstone. Version-guarded like rows.delete. Cost scales with the row's
 /// inbound and outbound link counts.
-pub fn deleteAndNullify(transaction: *WriteTransaction, catalogRef: Reference, primaryKey: u64, expectedVersion: u64) !DeleteResult {
-    const view = try loadCatalog(transaction, catalogRef);
-    const objectKey = (try Index.get(transaction, view.primaryKeyIndexRef, primaryKey)) orelse return .notFound;
-    const row = (try catalog.objectKeyToRow(transaction, catalogRef, objectKey)) orelse return .notFound;
-    const currentVersion = try Column.get(transaction, view.versionColumnRef, row);
+pub fn deleteAndNullify(transaction: *WriteTransaction, catalogReference: Reference, primaryKey: u64, expectedVersion: u64) !DeleteResult {
+    const view = try loadCatalog(transaction, catalogReference);
+    const objectKey = (try Index.get(transaction, view.primaryKeyIndexReference, primaryKey)) orelse return .notFound;
+    const row = (try catalog.objectKeyToRow(transaction, catalogReference, objectKey)) orelse return .notFound;
+    const currentVersion = try Column.get(transaction, view.versionColumnReference, row);
     if (currentVersion != expectedVersion) return .{ .conflict = .{ .currentVersion = currentVersion } };
-    const fixed = try links.fixBacklinksForDelete(transaction, catalogRef, objectKey);
+    const fixed = try links.fixBacklinksForDelete(transaction, catalogReference, objectKey);
     return try rows.delete(transaction, fixed, primaryKey, expectedVersion);
 }
 
@@ -187,12 +187,12 @@ pub fn deleteAndNullify(transaction: *WriteTransaction, catalogRef: Reference, p
 /// frees from the version check that alone makes them safe.
 pub fn updateTyped(
     transaction: *WriteTransaction,
-    catalogRef: Reference,
+    catalogReference: Reference,
     primaryKey: u64,
     values: []const Value,
     expectedVersion: u64,
 ) !UpdateResult {
-    const view = try loadCatalog(transaction, catalogRef);
+    const view = try loadCatalog(transaction, catalogReference);
     const propertyCount = view.propertyCount;
     std.debug.assert(values.len == propertyCount);
     std.debug.assert(propertyCount <= maxPropertyCount);
@@ -204,7 +204,7 @@ pub fn updateTyped(
     }
     // Step 1: read the current row into curRaw.
     var curRaw: [maxPropertyCount]u64 = undefined;
-    const currentVersion = (try rows.getByPrimaryKey(transaction, catalogRef, primaryKey, curRaw[0..propertyCount])) orelse return .notFound;
+    const currentVersion = (try rows.getByPrimaryKey(transaction, catalogReference, primaryKey, curRaw[0..propertyCount])) orelse return .notFound;
     // Step 2: version check BEFORE freeing or allocating any blob.
     if (currentVersion != expectedVersion)
         return .{ .conflict = .{ .currentVersion = currentVersion } };
@@ -226,14 +226,14 @@ pub fn updateTyped(
         };
     }
     // Step 4: delegate to the core update; it will re-check the version (match).
-    const result = try rows.update(transaction, catalogRef, primaryKey, newRaw[0..propertyCount], expectedVersion);
+    const result = try rows.update(transaction, catalogReference, primaryKey, newRaw[0..propertyCount], expectedVersion);
     // Step 5: maintain backlinks for any changed to-one link, mirroring
     // setLink. Skipping this left the old target's backlink set naming this
     // source forever and the new target's set missing it -- corrupting
     // nullify/cascade/block enforcement. The backlink source is the objectKey.
     switch (result) {
         .ok => |ok| {
-            var updatedCatalog = ok.catalogRef;
+            var updatedCatalog = ok.catalogReference;
             var changed = false;
             var linkIndex: usize = 0;
             while (linkIndex < propertyCount) : (linkIndex += 1) {
@@ -246,7 +246,7 @@ pub fn updateTyped(
                 if (newRaw[linkIndex] != 0) updatedCatalog = try links.addBacklink(transaction, updatedCatalog, linkIndex, newRaw[linkIndex] - 1, objectKey);
                 changed = true;
             }
-            if (changed) return .{ .ok = .{ .catalogRef = updatedCatalog, .version = ok.version } };
+            if (changed) return .{ .ok = .{ .catalogReference = updatedCatalog, .version = ok.version } };
             return result;
         },
         else => return result,
@@ -260,11 +260,11 @@ pub fn updateTyped(
 /// collection sizes.
 pub fn deleteTyped(
     transaction: *WriteTransaction,
-    catalogRef: Reference,
+    catalogReference: Reference,
     primaryKey: u64,
     expectedVersion: u64,
 ) !DeleteResult {
-    const view = try loadCatalog(transaction, catalogRef);
+    const view = try loadCatalog(transaction, catalogReference);
     const propertyCount = view.propertyCount;
     std.debug.assert(propertyCount <= maxPropertyCount);
     // Capture kinds/elements before any mutation.
@@ -279,12 +279,12 @@ pub fn deleteTyped(
     }
     // Step 1: read the current row.
     var curRaw: [maxPropertyCount]u64 = undefined;
-    const currentVersion = (try rows.getByPrimaryKey(transaction, catalogRef, primaryKey, curRaw[0..propertyCount])) orelse return .notFound;
+    const currentVersion = (try rows.getByPrimaryKey(transaction, catalogReference, primaryKey, curRaw[0..propertyCount])) orelse return .notFound;
     // Step 2: version check BEFORE freeing any blob.
     if (currentVersion != expectedVersion)
         return .{ .conflict = .{ .currentVersion = currentVersion } };
     // Step 3: delegate to the graph-safe delete (nullifies inbound links).
-    const result = try deleteAndNullify(transaction, catalogRef, primaryKey, expectedVersion);
+    const result = try deleteAndNullify(transaction, catalogReference, primaryKey, expectedVersion);
     // Step 4: on the apply path, free the row's blob and collection storage.
     // This runs AFTER deleteAndNullify because the outbound backlink cleanup
     // reads the linkSet roots; the tombstoned row's columns still hold the
