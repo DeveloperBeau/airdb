@@ -7,16 +7,16 @@
 const std = @import("std");
 const testing = std.testing;
 const platform = @import("platform.zig");
-const Slot = @import("slots.zig").Slot;
-const Ref = @import("ref.zig").Ref;
-const Db = @import("db.zig").Db;
-const ReadTxn = @import("read_txn.zig").ReadTxn;
-const slot_a_off = @import("db.zig").slot_a_off;
-const slot_b_off = @import("db.zig").slot_b_off;
-const typedir = @import("typedir.zig");
-const catalog = @import("catalog.zig");
-const Column = @import("column.zig");
-const Index = @import("index.zig");
+const Slot = @import("storage/slots.zig").Slot;
+const Ref = @import("storage/reference.zig").Ref;
+const Db = @import("database.zig").Db;
+const ReadTxn = @import("transactions/readTransaction.zig").ReadTxn;
+const slot_a_off = @import("database.zig").slot_a_off;
+const slot_b_off = @import("database.zig").slot_b_off;
+const typedir = @import("schema/typeDirectory.zig");
+const catalog = @import("schema/catalog.zig");
+const Column = @import("trees/column.zig");
+const Index = @import("trees/index.zig");
 
 /// Everything verifyIntegrity can report about a damaged database.
 pub const VerifyError = error{

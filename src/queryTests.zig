@@ -1,11 +1,11 @@
 const std = @import("std");
 const testing = std.testing;
 const query = @import("query.zig");
-const catalog = @import("catalog.zig");
-const rows = @import("rows.zig");
-const index = @import("index.zig");
-const Ref = @import("ref.zig").Ref;
-const Db = @import("db.zig").Db;
+const catalog = @import("schema/catalog.zig");
+const rows = @import("records/rows.zig");
+const index = @import("trees/index.zig");
+const Ref = @import("storage/reference.zig").Ref;
+const Db = @import("database.zig").Db;
 const Predicate = query.Predicate;
 const where = query.where;
 const countWhere = query.countWhere;
@@ -21,7 +21,7 @@ fn qTmpPath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const u8
 
 // Build a 3-prop type: prop0 = pk, prop1 = value (indexed iff `idx`), prop2 =
 // secondary. Inserts n rows with pk=i, prop1=i%100, prop2=i.
-fn seedPlannerCat(w: *@import("db.zig").WriteTxn, idx: bool, n: u64) !Ref {
+fn seedPlannerCat(w: *@import("database.zig").WriteTxn, idx: bool, n: u64) !Ref {
     const defs = [_]catalog.PropDef{
         .{ .kind = .int },
         .{ .kind = .int, .indexed = idx },
@@ -226,7 +226,7 @@ test "query returns stable object keys after relocation" {
     w.deinit();
 }
 
-const relocation = @import("relocation.zig");
+const relocation = @import("storage/relocation.zig");
 
 fn whereSorted(txn: anytype, cat: Ref, preds: []const Predicate, out: *std.ArrayList(u64)) !void {
     try where(txn, cat, preds, out, testing.allocator);

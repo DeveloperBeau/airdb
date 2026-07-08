@@ -1,9 +1,9 @@
 const std = @import("std");
-const rows = @import("rows.zig");
-const catalog = @import("catalog.zig");
-const index = @import("index.zig");
-const Column = @import("column.zig");
-const Ref = @import("ref.zig").Ref;
+const rows = @import("records/rows.zig");
+const catalog = @import("schema/catalog.zig");
+const index = @import("trees/index.zig");
+const Column = @import("trees/column.zig");
+const Ref = @import("storage/reference.zig").Ref;
 
 // Query engine over an object catalog. Operates on the stable object key (okey)
 // space: a scan walks the per-type key->row index, so each entry maps an okey to
@@ -369,7 +369,7 @@ pub fn sortByPropAsc(
 // Tests of file-private invariants; the main suite lives in queryTests.zig.
 
 const testing = std.testing;
-const Db = @import("db.zig").Db;
+const Db = @import("database.zig").Db;
 
 fn qTmpPath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const u8) ![]const u8 {
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
@@ -390,7 +390,7 @@ fn qTmpPath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const u8
 
 // Build a 3-prop type: prop0 = pk, prop1 = value (indexed iff `idx`), prop2 =
 // secondary. Inserts n rows with pk=i, prop1=i%100, prop2=i.
-fn seedPlannerCat(w: *@import("db.zig").WriteTxn, idx: bool, n: u64) !Ref {
+fn seedPlannerCat(w: *@import("database.zig").WriteTxn, idx: bool, n: u64) !Ref {
     const defs = [_]catalog.PropDef{
         .{ .kind = .int },
         .{ .kind = .int, .indexed = idx },

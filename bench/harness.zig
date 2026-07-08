@@ -7,7 +7,7 @@
 //     rows, and measuring. The harness never opens a Db itself; it only hands a
 //     `Ctx` (allocator, row count, scratch dir) to each scenario.
 //
-// Zig 0.16 idioms used here (mirrors src/file_store.zig):
+// Zig 0.16 idioms used here (mirrors src/fileStore.zig):
 //   - Io instance       -> std.Io.Threaded.global_single_threaded.io()
 //   - stdout writer     -> Io.File.Writer over Io.File.stdout()
 //   - file create/open  -> Io.Dir.cwd().createFile(io, ...)
@@ -20,7 +20,7 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
 // Returns the blocking Io instance used for all file/dir operations. Always
-// initialized (compile-time vtable), matching the convention in file_store.zig.
+// initialized (compile-time vtable), matching the convention in fileStore.zig.
 inline fn sysIo() Io {
     return std.Io.Threaded.global_single_threaded.io();
 }
@@ -306,15 +306,15 @@ pub fn runAll(alloc: Allocator, opts: Opts) !void {
     defer Io.Dir.cwd().deleteTree(io, scratch) catch {};
 
     // scenarios registered here as they land
-    const insert_recovery = @import("scenarios/insert_recovery.zig");
-    const lookup_query = @import("scenarios/lookup_query.zig");
-    const churn_compaction = @import("scenarios/churn_compaction.zig");
-    const blobs_pitr = @import("scenarios/blobs_pitr.zig");
-    const types_crud = @import("scenarios/types_crud.zig");
-    const embedded_crud = @import("scenarios/embedded_crud.zig");
-    const nested_embedded = @import("scenarios/nested_embedded.zig");
-    const bulk_import = @import("scenarios/bulk_import.zig");
-    const bulk_append = @import("scenarios/bulk_append.zig");
+    const insert_recovery = @import("scenarios/insertRecovery.zig");
+    const lookup_query = @import("scenarios/lookupQuery.zig");
+    const churn_compaction = @import("scenarios/churnCompaction.zig");
+    const blobs_pitr = @import("scenarios/blobsPitr.zig");
+    const types_crud = @import("scenarios/typesCrud.zig");
+    const embedded_crud = @import("scenarios/embeddedCrud.zig");
+    const nested_embedded = @import("scenarios/nestedEmbedded.zig");
+    const bulk_import = @import("scenarios/bulkImport.zig");
+    const bulk_append = @import("scenarios/bulkAppend.zig");
     const scenarios = [_]Scenario{
         .{ .name = insert_recovery.name, .run = insert_recovery.run },
         .{ .name = lookup_query.name, .run = lookup_query.run },

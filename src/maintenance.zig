@@ -3,9 +3,9 @@
 // Edge-level entry points that sequence inner-layer machinery (compaction,
 // the type directory) over a Db. Nothing inner imports this file.
 
-const Db = @import("db.zig").Db;
-const typedir = @import("typedir.zig");
-const compaction = @import("compaction.zig");
+const Db = @import("database.zig").Db;
+const typedir = @import("schema/typeDirectory.zig");
+const compaction = @import("storage/compaction.zig");
 
 /// Outcome of one maybeCompactStep call: whether a step ran, the rows moved,
 /// and whether the type is now fully packed.
