@@ -5,7 +5,7 @@
 //! directorySize(tc) = 2 + tc * 8 + tc
 
 const std = @import("std");
-const WriteTransaction = @import("../database.zig").WriteTransaction;
+const WriteTransaction = @import("../transactions/writeTransaction.zig").WriteTransaction;
 const Reference = @import("../storage/reference.zig").Reference;
 const rows = @import("../records/rows.zig");
 const catalog = @import("catalog.zig");

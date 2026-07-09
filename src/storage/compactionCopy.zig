@@ -7,7 +7,7 @@
 //! destination's backlink indexes from its copied forward links.
 
 const std = @import("std");
-const WriteTransaction = @import("../database.zig").WriteTransaction;
+const WriteTransaction = @import("../transactions/writeTransaction.zig").WriteTransaction;
 const Reference = @import("reference.zig").Reference;
 const Column = @import("../trees/column.zig");
 const Index = @import("../trees/index.zig");
