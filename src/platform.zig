@@ -86,8 +86,10 @@ const win = if (isWindows) struct {
     extern "kernel32" fn GetProcessTimes(handle: HANDLE, creation: *FILETIME, exit: *FILETIME, kernel: *FILETIME, user: *FILETIME) callconv(.winapi) BOOL;
 
     // PROCESS_MEMORY_COUNTERS: SIZE_T fields are usize; cb/PageFaultCount are DWORD.
+    // Field names mirror the Win32 definition verbatim (like the C ABI, foreign
+    // interface names are frozen), which is why `cb` stays abbreviated.
     const PROCESS_MEMORY_COUNTERS = extern struct {
-        byteCount: DWORD,
+        cb: DWORD,
         PageFaultCount: DWORD,
         PeakWorkingSetSize: usize,
         WorkingSetSize: usize,
