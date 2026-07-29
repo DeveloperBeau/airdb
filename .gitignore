@@ -4,3 +4,9 @@ CLAUDE.local.md
 
 .zig-cache/
 zig-out/
+
+# Agent tooling / local-only
+.claude/
+.claire/
+skills-lock.json
+.agents/
