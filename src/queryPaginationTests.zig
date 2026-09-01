@@ -816,7 +816,10 @@ fn scrollToExhaustion(
         try where(&readTransaction, catalogReference, .{ .ordering = ordering, .page = .{ .start = start, .limit = pageSize } }, &page, testing.allocator);
         if (page.items.len > 0) {
             try allFetched.appendSlice(testing.allocator, page.items);
-            cursor = try cursorAfter(&readTransaction, catalogReference, ordering, page.items[page.items.len - 1]);
+            const nextCursor = try cursorAfter(&readTransaction, catalogReference, ordering, page.items[page.items.len - 1]);
+            // Fail fast rather than hang: see assertCursorPagesEqualOffsetPages.
+            if (cursor) |previousCursor| try testing.expect(!std.meta.eql(previousCursor, nextCursor));
+            cursor = nextCursor;
         }
         readTransaction.end();
         if (page.items.len == 0) break;
