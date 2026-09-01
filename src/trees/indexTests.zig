@@ -14,6 +14,7 @@ const get = index.get;
 const remove = index.remove;
 const count = index.count;
 const maxKey = index.maxKey;
+const minKey = index.minKey;
 const forEachKey = index.forEachKey;
 const forEachEntry = index.forEachEntry;
 const forEachEntryWhile = index.forEachEntryWhile;
@@ -51,6 +52,7 @@ test "a reference cycle or unknown kind byte fails with error.Corrupt" {
     _ = encodeInner(allocation.bytes, &.{allocation.reference}, &.{0}, &.{1});
     try testing.expectError(error.Corrupt, get(&writeTransaction, allocation.reference, 5));
     try testing.expectError(error.Corrupt, maxKey(&writeTransaction, allocation.reference));
+    try testing.expectError(error.Corrupt, minKey(&writeTransaction, allocation.reference));
     try testing.expectError(error.Corrupt, insert(&writeTransaction, allocation.reference, 1, 1));
     try testing.expectError(error.Corrupt, remove(&writeTransaction, allocation.reference, 1));
     const NopSink = struct {
@@ -218,6 +220,134 @@ test "maxKey survives an emptied rightmost leaf" {
     key = 0;
     while (key < 32) : (key += 1) root = try remove(&writeTransaction, root, key);
     try testing.expectEqual(@as(?u64, null), try maxKey(&writeTransaction, root));
+}
+
+test "minKey survives an emptied leftmost leaf" {
+    // The mirror of "maxKey survives an emptied rightmost leaf", exercised at
+    // the low end: deleting the lowest range of an indexed property's values
+    // (rows.valueIndexRemove, run once per delete) empties the value index's
+    // leftmost leaf without merging or dropping it. minKey must skip that
+    // empty leaf and keep descending rather than reporting the tree empty or
+    // returning a stale key out of it.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try idxTmpPath(testing.allocator, &tmp, "idx_minkey.airdb");
+    defer testing.allocator.free(path);
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var writeTransaction = try database.beginWrite();
+    defer writeTransaction.deinit();
+
+    var root = try create(&writeTransaction);
+    var key: u64 = 0;
+    while (key <= 64) : (key += 1) root = try insert(&writeTransaction, root, key, key); // forces a leaf split
+    try testing.expectEqual(@as(?u64, 0), try minKey(&writeTransaction, root));
+    try testing.expectEqual(@as(?u64, 64), try maxKey(&writeTransaction, root));
+    // Empty the leftmost leaf by removing the lower half.
+    key = 0;
+    while (key <= 31) : (key += 1) root = try remove(&writeTransaction, root, key);
+    // False-negative role: a "descend child 0 unconditionally" implementation
+    // returns null here (it lands on the now-empty leftmost leaf and stops); a
+    // "descend child 0 then take slot 0" implementation traps or returns a
+    // stale key out of the empty leaf. This input MUST trigger the assertion.
+    try testing.expectEqual(@as(?u64, 32), try minKey(&writeTransaction, root));
+    // Fully emptied tree reports null.
+    key = 32;
+    while (key <= 64) : (key += 1) root = try remove(&writeTransaction, root, key);
+    try testing.expectEqual(@as(?u64, null), try minKey(&writeTransaction, root));
+}
+
+test "minKey and maxKey agree on a tree with no emptied boundary" {
+    // False-positive validation for "minKey survives an emptied leftmost
+    // leaf": a naive leftmost-descent implementation of minKey passes THIS
+    // test (nothing is emptied, so descending child 0 unconditionally happens
+    // to be correct). Its passing under that same broken implementation is
+    // what proves the emptied-leaf test above is the one actually doing the
+    // work; keep the two tests together.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try idxTmpPath(testing.allocator, &tmp, "idx_minkey_noboundary.airdb");
+    defer testing.allocator.free(path);
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var writeTransaction = try database.beginWrite();
+    defer writeTransaction.deinit();
+
+    var root = try create(&writeTransaction);
+    var key: u64 = 0;
+    while (key <= 64) : (key += 1) root = try insert(&writeTransaction, root, key, key);
+    try testing.expectEqual(@as(?u64, 0), try minKey(&writeTransaction, root));
+}
+
+test "minKey on empty and single-key trees" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try idxTmpPath(testing.allocator, &tmp, "idx_minkey_edge.airdb");
+    defer testing.allocator.free(path);
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var writeTransaction = try database.beginWrite();
+    defer writeTransaction.deinit();
+
+    var root = try create(&writeTransaction);
+    try testing.expectEqual(@as(?u64, null), try minKey(&writeTransaction, root));
+    root = try insert(&writeTransaction, root, 7, 70);
+    try testing.expectEqual(@as(?u64, 7), try minKey(&writeTransaction, root));
+    try testing.expectEqual(@as(?u64, 7), try maxKey(&writeTransaction, root));
+    root = try remove(&writeTransaction, root, 7);
+    try testing.expectEqual(@as(?u64, null), try minKey(&writeTransaction, root));
+    try testing.expectEqual(@as(?u64, null), try maxKey(&writeTransaction, root));
+}
+
+test "minKey and maxKey track a model set under churn" {
+    // Fuzz: the model is the only source of expected values. Domain is small
+    // relative to operation count so leaves fill, split and empty repeatedly,
+    // including at both edges -- catching an empty boundary leaf arising at a
+    // depth or position the hand-written boundary tests above do not construct.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try idxTmpPath(testing.allocator, &tmp, "idx_minmax_fuzz.airdb");
+    defer testing.allocator.free(path);
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var writeTransaction = try database.beginWrite();
+    defer writeTransaction.deinit();
+
+    var root = try create(&writeTransaction);
+    const domain: u64 = 500;
+    var present = [_]bool{false} ** domain;
+
+    var prng = std.Random.DefaultPrng.init(0xA17D8);
+    const random = prng.random();
+    var operation: usize = 0;
+    while (operation < 2000) : (operation += 1) {
+        if (random.float(f32) < 0.6) {
+            const key = random.intRangeLessThan(u64, 0, domain);
+            root = try insert(&writeTransaction, root, key, key);
+            present[key] = true;
+        } else {
+            const key = random.intRangeLessThan(u64, 0, domain);
+            root = try remove(&writeTransaction, root, key);
+            present[key] = false;
+        }
+
+        if (operation % 25 == 0) {
+            var expectedMin: ?u64 = null;
+            var expectedMax: ?u64 = null;
+            var expectedCount: u64 = 0;
+            for (present, 0..) |isPresent, value| {
+                if (!isPresent) continue;
+                expectedCount += 1;
+                if (expectedMin == null) expectedMin = value;
+                expectedMax = value;
+            }
+            try testing.expectEqual(expectedMin, try minKey(&writeTransaction, root));
+            try testing.expectEqual(expectedMax, try maxKey(&writeTransaction, root));
+            try testing.expectEqual(expectedCount, try count(&writeTransaction, root));
+            try testing.expectEqual(expectedCount == 0, (try minKey(&writeTransaction, root)) == null);
+            if (expectedMin != null and expectedMax != null) try testing.expect(expectedMin.? <= expectedMax.?);
+        }
+    }
 }
 
 test "stored subtree counts match a full iteration under churn" {

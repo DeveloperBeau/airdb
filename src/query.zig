@@ -11,13 +11,16 @@
 //!
 //! `countWhere` and `aggregateInt` take a bare `Predicate` rather than a `Request`:
 //! neither has an order and neither has a page, so a `Request` would offer fields
-//! that do nothing for them.
+//! that do nothing for them. `minimum` and `maximum` take no predicate at all:
+//! their fast path is the value index's own endpoint, and a predicate would
+//! silently disable it.
 
 const std = @import("std");
 const catalog = @import("schema/catalog.zig");
 const Column = @import("trees/column.zig");
 const Reference = @import("storage/reference.zig").Reference;
 const Scan = @import("query/scan.zig").Scan;
+const index = @import("trees/index.zig");
 const execution = @import("query/execution.zig");
 const predicateLanguage = @import("query/predicate.zig");
 const orderingLanguage = @import("query/ordering.zig");
@@ -133,6 +136,68 @@ pub fn aggregateInt(
     return agg;
 }
 
+/// Which end of a property's value range an endpoint terminal wants.
+const Endpoint = enum { minimum, maximum };
+
+/// The smallest value of int or link property `property` over the live rows,
+/// or null when the type holds no live row. O(log n) with I/O when `property`
+/// carries a value index, because the answer is that index's first key;
+/// otherwise O(n) over the live set. `allocator` is used only by the scan
+/// path. `error.BadProperty` when `property` is outside the type,
+/// `error.UnsupportedAggregate` when its kind is neither int nor link (a blob
+/// or collection column holds a reference or a tree root, so its smallest
+/// stored word is not a value). Takes no predicate: for the smallest value
+/// over a filtered set, read `aggregateInt`'s `min`.
+pub fn minimum(
+    transaction: anytype,
+    catalogReference: Reference,
+    property: usize,
+    allocator: std.mem.Allocator,
+) !?u64 {
+    return endpointValue(transaction, catalogReference, property, .minimum, allocator);
+}
+
+/// The largest value of int or link property `property` over the live rows, or
+/// null when the type holds no live row. The mirror of `minimum`: same costs,
+/// same errors, same absence of a predicate.
+pub fn maximum(
+    transaction: anytype,
+    catalogReference: Reference,
+    property: usize,
+    allocator: std.mem.Allocator,
+) !?u64 {
+    return endpointValue(transaction, catalogReference, property, .maximum, allocator);
+}
+
+fn endpointValue(
+    transaction: anytype,
+    catalogReference: Reference,
+    property: usize,
+    endpoint: Endpoint,
+    allocator: std.mem.Allocator,
+) !?u64 {
+    const scan = try Scan.open(transaction, catalogReference);
+    if (property >= scan.propertyCount) return error.BadProperty;
+    const kind = scan.propertyKinds[property];
+    if (kind != .int and kind != .link) return error.UnsupportedAggregate;
+    if (scan.indexed[property]) {
+        // No residual liveness filtering needed here: rows.valueIndexRemove
+        // drops an outer key the moment its last live objectKey is removed
+        // (delete, or update moving off the old value), so the value index's
+        // outer key set already equals exactly the live values.
+        const valueIndexReference = scan.valueIndexReferences[property];
+        return switch (endpoint) {
+            .minimum => try index.minKey(transaction, valueIndexReference),
+            .maximum => try index.maxKey(transaction, valueIndexReference),
+        };
+    }
+    const aggregate = try aggregateInt(transaction, catalogReference, property, .{ .conjunction = &.{} }, allocator);
+    return switch (endpoint) {
+        .minimum => aggregate.min,
+        .maximum => aggregate.max,
+    };
+}
+
 /// Append the objectKeys whose property `property` lies in the inclusive range
 /// [low, high] to `out`. A conjunction of two bound comparisons, so it takes
 /// whichever path the planner picks for that tree.
@@ -246,4 +311,5 @@ test {
     _ = @import("queryDifferentialTests.zig");
     _ = @import("queryPaginationTests.zig");
     _ = @import("queryLazinessTests.zig");
+    _ = @import("queryEndpointTests.zig");
 }
