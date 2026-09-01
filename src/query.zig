@@ -241,4 +241,5 @@ test {
     _ = @import("queryTests.zig");
     _ = @import("queryDifferentialTests.zig");
     _ = @import("queryPaginationTests.zig");
+    _ = @import("queryLazinessTests.zig");
 }

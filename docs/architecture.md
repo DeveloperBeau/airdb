@@ -117,7 +117,9 @@ transaction threads catalog references exactly like tree roots.
 Secondary structures are maintained transactionally with the row:
 
 - **Value indexes** (per indexed property): value → set of objectKeys. The query
-  planner drives equality/range predicates off them.
+  planner drives equality/range predicates off them, and an ordered page over
+  an indexed property walks the same value index in key order, stopping as
+  soon as the page fills.
 - **Backlinks** (per link property): target objectKey → set of source objectKeys. They
   power `nullify`/`cascade`/`block` delete rules.
 

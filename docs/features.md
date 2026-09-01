@@ -61,13 +61,36 @@ Code pointers use `module.function` names under `src/`.
 
 - Per-property value indexes (`indexed = true`), maintained in the same
   transaction as every insert/update/delete; emptied entries are pruned.
-- `query.where` / `countWhere` / `aggregateInt` take one predicate tree built
-  from comparisons (`eq/ne/lt/le/gt/ge`) combined with and/or/not. An empty
-  conjunction matches every live row; an empty disjunction matches nothing.
-  The planner drives off an indexed equality or range term, unions a
-  disjunction's branches only when every branch is indexed, and falls back
-  to a streaming scan otherwise.
-- `query.rangeInclusive`, `query.sortByPropertyAscending`.
+- `query.where` takes a `Request` (predicate, ordering, page) and appends one
+  page of matching objectKeys, in the requested order; `countWhere` and
+  `aggregateInt` still take a bare predicate tree built from comparisons
+  (`eq/ne/lt/le/gt/ge`) combined with and/or/not. An empty conjunction matches
+  every live row; an empty disjunction matches nothing. The planner drives off
+  an indexed equality or range term, unions a disjunction's branches only when
+  every branch is indexed, and falls back to a streaming scan otherwise.
+- `query.rangeInclusive`, `query.sortByProperty` (ascending or descending, by
+  int or link property).
+- **Pagination and ordering**: `Request.page` takes either an `offset` or a
+  resumable `Cursor` (`query.cursorAfter`); `Request.ordering` orders by
+  objectKey or by an indexed/unindexed int or link property, ascending or
+  descending. `query.first` and `query.exists` are one-row terminals defined
+  in terms of a page of size 1.
+- **Laziness contract**: which delivery paths bound their work to the page
+  rather than the result.
+
+  | Ordering | Bounded to the page? |
+  |---|---|
+  | objectKey, either direction | Yes: streams the key→row index (or a materialized, sorted candidate list when a predicate drives an index), stopping as soon as the page fills. |
+  | indexed property, either direction | Yes: walks the property's value index in key order and stops as soon as the page fills. |
+  | unindexed property, either direction | No: collects every match, sorts, then takes the page — O(result) time and memory regardless of the limit. |
+
+- **Cursor limitation**: a cursor is a keyset position (the sort value plus the
+  objectKey that broke ties), not a row offset. Rows inserted before the
+  cursor's position are never seen by a page that resumes past them (working
+  as designed for keyset pagination), but if a row's sort property changes
+  between two page fetches, that row can cross the cursor and be skipped or
+  re-delivered. Cursors also require an indexed sort property; a cursor
+  against an unindexed property ordering is rejected by validation.
 
 ## Bulk operations
 
