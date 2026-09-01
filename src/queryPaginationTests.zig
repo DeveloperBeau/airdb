@@ -769,6 +769,20 @@ test "P28: a cursor with an unindexed sort property is error.CursorRequiresIndex
     try testing.expectEqual(@as(usize, 0), page.items.len);
 }
 
+// property1 = primaryKey % 7. Deliberately NOT a divisor of the page size (10)
+// used throughout this file's cursor-stability checks: with 30 seeded rows and
+// page size 10, a modulus of 10 would make every bucket's own value equal its
+// minimum member and every bucket hold exactly half a page, so a page boundary
+// always lands exactly on a bucket's first member and a resume bound wrongly
+// applied outside the resumed bucket happens to be a no-op (the M7 class of
+// bug). Modulus 7 does not divide the page size, so buckets have uneven sizes
+// (4 or 5 members among the first 30 rows) and page boundaries land mid-bucket,
+// which is what makes a wrongly-broadened resume bound observable. Checked by
+// hand-tracing the fixture: with modulus 10 a reintroduced M7-class bug (the
+// resume bound applied to every bucket instead of only the resumed one) leaves
+// every pre-existing row delivered exactly once by coincidence; with modulus 7
+// the same bug drops most of the pre-existing rows, which is what makes this
+// fixture, unlike the modulus-10 one it replaces, an actual test of the guard.
 fn createSeededDirectory(writeTransaction: *WriteTransaction, rowCount: u64) !Reference {
     var directoryReference = try typeDirectory.createTypes(writeTransaction, &.{
         &.{ .{ .kind = .int }, .{ .kind = .int, .indexed = true }, .{ .kind = .int } },
@@ -776,7 +790,7 @@ fn createSeededDirectory(writeTransaction: *WriteTransaction, rowCount: u64) !Re
     var primaryKey: u64 = 0;
     while (primaryKey < rowCount) : (primaryKey += 1) {
         directoryReference = (try typeRouting.insert(writeTransaction, directoryReference, 0, &.{
-            .{ .int = primaryKey }, .{ .int = primaryKey % 10 }, .{ .int = primaryKey },
+            .{ .int = primaryKey }, .{ .int = primaryKey % 7 }, .{ .int = primaryKey },
         })).directoryReference;
     }
     return directoryReference;
@@ -788,7 +802,7 @@ fn appendRowsToDirectory(writeTransaction: *WriteTransaction, directoryReference
     const end = startPrimaryKey + rowCount;
     while (primaryKey < end) : (primaryKey += 1) {
         result = (try typeRouting.insert(writeTransaction, result, 0, &.{
-            .{ .int = primaryKey }, .{ .int = primaryKey % 10 }, .{ .int = primaryKey },
+            .{ .int = primaryKey }, .{ .int = primaryKey % 7 }, .{ .int = primaryKey },
         })).directoryReference;
     }
     return result;
@@ -859,13 +873,15 @@ fn checkCursorStabilityUnderCommits(allocator: std.mem.Allocator, path: []const 
     try testing.expect(p29ExtraRowsCommitted);
 
     // Every one of the 30 pre-existing objectKeys (0..29, never deleted) must
-    // appear exactly once across every page fetched.
+    // appear exactly once across every page fetched, and none of the 20 rows
+    // committed between fetches (objectKeys 30..49) may appear more than once
+    // (they may legitimately appear zero or one times, depending on whether
+    // the scroll had already passed their sort position when they committed).
     try testing.expect(fetched.items.len > 0); // false-positive guard: nothing empty passes trivially
-    var seenCounts = [_]u8{0} ** 30;
-    for (fetched.items) |objectKey| {
-        if (objectKey < 30) seenCounts[objectKey] += 1;
-    }
-    for (seenCounts) |seenCount| try testing.expectEqual(@as(u8, 1), seenCount);
+    var seenCounts = [_]u8{0} ** 50;
+    for (fetched.items) |objectKey| seenCounts[objectKey] += 1;
+    for (seenCounts[0..30]) |seenCount| try testing.expectEqual(@as(u8, 1), seenCount);
+    for (seenCounts[30..50]) |seenCount| try testing.expect(seenCount <= 1);
 }
 
 test "P29: cursor stability under commits between page fetches, objectKey ascending" {
@@ -882,6 +898,58 @@ test "P29: cursor stability under commits between page fetches, indexed property
     const path = try qpTmpPath(testing.allocator, &tmp, "p29b.airdb");
     defer testing.allocator.free(path);
     try checkCursorStabilityUnderCommits(testing.allocator, path, .{ .sortKey = .{ .property = 1 } });
+}
+
+var p40BelowCursorObjectKey: ?u64 = null;
+
+// Commit one row whose sort value (0) sorts strictly before the value (1) the
+// cursor has already resumed past, using a primaryKey (1000) far outside the
+// seeded 0..29 range so it cannot collide. Because objectKey assignment is
+// strictly insertion-ordered (nextKey only ever increases, never reused), this
+// row's objectKey is necessarily higher than every already-emitted row's, even
+// though its sort position is lower: exactly the "inserted before the cursor's
+// position" case the spec names, which only arises under property ordering.
+fn commitRowBeforeCursorPosition(database: *Database) !void {
+    var writeTransaction = try database.beginWrite();
+    const result = try typeRouting.insert(&writeTransaction, writeTransaction.newRoot, 0, &.{
+        .{ .int = 1000 }, .{ .int = 0 }, .{ .int = 1000 },
+    });
+    writeTransaction.setRoot(result.directoryReference);
+    _ = try writeTransaction.commit();
+    p40BelowCursorObjectKey = result.objectKey;
+}
+
+test "P40: a row committed with a sort value before the cursor's resumed position is never seen" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try qpTmpPath(testing.allocator, &tmp, "p40.airdb");
+    defer testing.allocator.free(path);
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    {
+        var writeTransaction = try database.beginWrite();
+        const directoryReference = try createSeededDirectory(&writeTransaction, 30);
+        writeTransaction.setRoot(directoryReference);
+        _ = try writeTransaction.commit();
+    }
+
+    p40BelowCursorObjectKey = null;
+    const ordering = Ordering{ .sortKey = .{ .property = 1 } };
+    var fetched = try scrollToExhaustion(&database, ordering, 10, commitRowBeforeCursorPosition);
+    defer fetched.deinit(testing.allocator);
+    try testing.expect(p40BelowCursorObjectKey != null);
+
+    // The row committed with a below-cursor sort value must never surface,
+    // on any later page: keyset pagination working as designed, not a bug.
+    for (fetched.items) |objectKey| try testing.expect(objectKey != p40BelowCursorObjectKey.?);
+
+    // Every pre-existing row must still be delivered exactly once; this rules
+    // out a fix that hides the leak by dropping rows instead of excluding them.
+    var seenCounts = [_]u8{0} ** 30;
+    for (fetched.items) |objectKey| {
+        if (objectKey < 30) seenCounts[objectKey] += 1;
+    }
+    for (seenCounts) |seenCount| try testing.expectEqual(@as(u8, 1), seenCount);
 }
 
 test "P30: a pinned snapshot gives a fully consistent multi-page scroll" {
@@ -1102,6 +1170,7 @@ test "P36: fuzz, a random page equals the independently computed expected slice"
 
     var draw: u64 = 0;
     while (draw < 200) : (draw += 1) {
+        errdefer std.debug.print("P36 failed at draw {d}\n", .{draw});
         var prng = std.Random.DefaultPrng.init(draw);
         const random = prng.random();
         const sortKeyChoice = random.intRangeLessThan(u2, 0, 3);
@@ -1167,6 +1236,7 @@ test "P37: fuzz, random page sizes reconstruct the full ordered result exactly o
 
     var draw: u64 = 0;
     while (draw < 100) : (draw += 1) {
+        errdefer std.debug.print("P37 failed at draw {d}\n", .{draw});
         var prng = std.Random.DefaultPrng.init(draw + 1000);
         const random = prng.random();
         const pageSize = random.intRangeAtMost(u64, 1, 20);

@@ -73,6 +73,7 @@ test "D8: a collector appends to a list that already has items without disturbin
 test "D7: fuzz, the collected slice equals the reference slice" {
     var seed: u64 = 0;
     while (seed < 500) : (seed += 1) {
+        errdefer std.debug.print("D7 failed at seed {d}\n", .{seed});
         var prng = std.Random.DefaultPrng.init(seed);
         const random = prng.random();
         const offset = random.intRangeAtMost(u64, 0, 20);

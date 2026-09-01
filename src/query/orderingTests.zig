@@ -143,6 +143,7 @@ test "O11: a malformed predicate is still rejected through Request.validate" {
 test "O10: isOrderedBefore is a strict total order, fuzzed" {
     var seed: u64 = 0;
     while (seed < 5000) : (seed += 1) {
+        errdefer std.debug.print("O10 failed at seed {d}\n", .{seed});
         var prng = std.Random.DefaultPrng.init(seed);
         const random = prng.random();
         const domain = [_]u64{ 0, 1, std.math.maxInt(u64) };

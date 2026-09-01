@@ -1197,6 +1197,7 @@ test "T12: fuzz, descending equals ascending reversed for random ranges" {
 
     var trial: u64 = 0;
     while (trial < 200) : (trial += 1) {
+        errdefer std.debug.print("T12 failed at trial {d}\n", .{trial});
         var prng = std.Random.DefaultPrng.init(trial);
         const random = prng.random();
         const pick = random.intRangeLessThan(u32, 0, 6);
