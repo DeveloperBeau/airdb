@@ -252,7 +252,7 @@ test "predicate trees agree with a naive reference matcher, across a randomized 
 
             var hitsA = std.ArrayList(u64).empty;
             defer hitsA.deinit(testing.allocator);
-            query.where(&writeTransaction, catalogA, tree, &hitsA, testing.allocator) catch |err| {
+            query.where(&writeTransaction, catalogA, .{ .predicate = tree }, &hitsA, testing.allocator) catch |err| {
                 std.debug.print("seed {d} tree {d} (catalog A): where failed with {}\n", .{ seed, treeIndex, err });
                 return err;
             };
@@ -264,7 +264,7 @@ test "predicate trees agree with a naive reference matcher, across a randomized 
 
             var hitsB = std.ArrayList(u64).empty;
             defer hitsB.deinit(testing.allocator);
-            query.where(&writeTransaction, catalogB, tree, &hitsB, testing.allocator) catch |err| {
+            query.where(&writeTransaction, catalogB, .{ .predicate = tree }, &hitsB, testing.allocator) catch |err| {
                 std.debug.print("seed {d} tree {d} (catalog B): where failed with {}\n", .{ seed, treeIndex, err });
                 return err;
             };

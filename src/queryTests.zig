@@ -12,7 +12,7 @@ const where = query.where;
 const countWhere = query.countWhere;
 const aggregateInt = query.aggregateInt;
 const rangeInclusive = query.rangeInclusive;
-const sortByPropertyAscending = query.sortByPropertyAscending;
+const sortByProperty = query.sortByProperty;
 
 fn qTmpPath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const u8) ![]const u8 {
     var pathBuffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
@@ -82,13 +82,13 @@ test "where filters live rows by ANDed predicates" {
     // age == 30
     var hits1 = std.ArrayList(u64).empty;
     defer hits1.deinit(testing.allocator);
-    try where(&writeTransaction, catalogReference, intComparison(1, .eq, 30), &hits1, testing.allocator);
+    try where(&writeTransaction, catalogReference, .{ .predicate = intComparison(1, .eq, 30) }, &hits1, testing.allocator);
     try testing.expectEqual(@as(usize, 2), hits1.items.len);
     // age > 25 AND primaryKey < 4  -> primaryKey 2 (age30), primaryKey3 (age40) ; primaryKey4 excluded by primaryKey<4
     var hits2 = std.ArrayList(u64).empty;
     defer hits2.deinit(testing.allocator);
     const conjunction2 = [_]Predicate{ intComparison(1, .gt, 25), intComparison(0, .lt, 4) };
-    try where(&writeTransaction, catalogReference, .{ .conjunction = &conjunction2 }, &hits2, testing.allocator);
+    try where(&writeTransaction, catalogReference, .{ .predicate = .{ .conjunction = &conjunction2 } }, &hits2, testing.allocator);
     try testing.expectEqual(@as(usize, 2), hits2.items.len);
     // delete primaryKey 2, re-query age==30 -> only primaryKey4
     var out: [2]u64 = undefined;
@@ -96,7 +96,7 @@ test "where filters live rows by ANDed predicates" {
     catalogReference = (try rows.delete(&writeTransaction, catalogReference, 2, version2)).ok;
     var hits3 = std.ArrayList(u64).empty;
     defer hits3.deinit(testing.allocator);
-    try where(&writeTransaction, catalogReference, intComparison(1, .eq, 30), &hits3, testing.allocator);
+    try where(&writeTransaction, catalogReference, .{ .predicate = intComparison(1, .eq, 30) }, &hits3, testing.allocator);
     try testing.expectEqual(@as(usize, 1), hits3.items.len);
     writeTransaction.deinit();
 }
@@ -114,11 +114,11 @@ test "out-of-range property indices are rejected up front" {
     var hits = std.ArrayList(u64).empty;
     defer hits.deinit(testing.allocator);
     const bad = intComparison(2, .eq, 1);
-    try testing.expectError(error.BadProperty, where(&writeTransaction, catalogReference, bad, &hits, testing.allocator));
+    try testing.expectError(error.BadProperty, where(&writeTransaction, catalogReference, .{ .predicate = bad }, &hits, testing.allocator));
     try testing.expectError(error.BadProperty, countWhere(&writeTransaction, catalogReference, bad, testing.allocator));
     try testing.expectError(error.BadProperty, aggregateInt(&writeTransaction, catalogReference, 9, .{ .conjunction = &.{} }, testing.allocator));
     var objectKeys = [_]u64{};
-    try testing.expectError(error.BadProperty, sortByPropertyAscending(&writeTransaction, catalogReference, &objectKeys, 5, testing.allocator));
+    try testing.expectError(error.BadProperty, sortByProperty(&writeTransaction, catalogReference, &objectKeys, 5, .ascending, testing.allocator));
 }
 
 test "streamed full scan agrees with where on count and aggregate" {
@@ -139,7 +139,7 @@ test "streamed full scan agrees with where on count and aggregate" {
     const predicate = intComparison(1, .ge, 25);
     var objectKeys = std.ArrayList(u64).empty;
     defer objectKeys.deinit(testing.allocator);
-    try where(&writeTransaction, catalogReference, predicate, &objectKeys, testing.allocator);
+    try where(&writeTransaction, catalogReference, .{ .predicate = predicate }, &objectKeys, testing.allocator);
     try testing.expectEqual(@as(usize, 3), objectKeys.items.len); // primaryKeys 2, 3, 5
     try testing.expectEqual(@as(u64, objectKeys.items.len), try countWhere(&writeTransaction, catalogReference, predicate, testing.allocator));
     const agg = try aggregateInt(&writeTransaction, catalogReference, 1, predicate, testing.allocator);
@@ -171,7 +171,7 @@ test "countWhere and aggregateInt" {
     writeTransaction.deinit();
 }
 
-test "rangeInclusive and sortByPropertyAscending" {
+test "rangeInclusive and sortByProperty" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try qTmpPath(testing.allocator, &tmp, "q3.airdb");
@@ -186,7 +186,7 @@ test "rangeInclusive and sortByPropertyAscending" {
     try rangeInclusive(&writeTransaction, catalogReference, 0, 3, 7, &rng, testing.allocator);
     try testing.expectEqual(@as(usize, 3), rng.items.len); // primaryKeys 5,3,7
     // sort the matching objectKeys by primaryKey ascending, then verify the primaryKey order is 3,5,7
-    try sortByPropertyAscending(&writeTransaction, catalogReference, rng.items, 0, testing.allocator);
+    try sortByProperty(&writeTransaction, catalogReference, rng.items, 0, .ascending, testing.allocator);
     var out: [2]u64 = undefined;
     _ = try rows.getByObjectKey(&writeTransaction, catalogReference, rng.items[0], &out);
     try testing.expectEqual(@as(u64, 3), out[0]);
@@ -243,7 +243,7 @@ test "query returns stable object keys after relocation" {
     // that objectKey must resolve to the right values.
     var hits = std.ArrayList(u64).empty;
     defer hits.deinit(testing.allocator);
-    try where(&writeTransaction, catalogReference, intComparison(1, .eq, 30), &hits, testing.allocator);
+    try where(&writeTransaction, catalogReference, .{ .predicate = intComparison(1, .eq, 30) }, &hits, testing.allocator);
     try testing.expectEqual(@as(usize, 1), hits.items.len);
     try testing.expectEqual(targetObjectKey, hits.items[0]);
 
@@ -257,7 +257,7 @@ test "query returns stable object keys after relocation" {
 const relocation = @import("storage/relocation.zig");
 
 fn whereSorted(transaction: anytype, catalogReference: Reference, predicate: Predicate, out: *std.ArrayList(u64)) !void {
-    try where(transaction, catalogReference, predicate, out, testing.allocator);
+    try where(transaction, catalogReference, .{ .predicate = predicate }, out, testing.allocator);
     std.mem.sort(u64, out.items, {}, std.sort.asc(u64));
 }
 
@@ -470,7 +470,7 @@ test "an empty conjunction matches every live row" {
     const catalogReference = try seed(&writeTransaction, &.{ .{ 1, 20 }, .{ 2, 30 }, .{ 3, 40 } });
     var hits = std.ArrayList(u64).empty;
     defer hits.deinit(testing.allocator);
-    try where(&writeTransaction, catalogReference, .{ .conjunction = &.{} }, &hits, testing.allocator);
+    try where(&writeTransaction, catalogReference, .{ .predicate = .{ .conjunction = &.{} } }, &hits, testing.allocator);
     try testing.expectEqual(@as(usize, 3), hits.items.len);
 }
 
@@ -486,7 +486,7 @@ test "an empty disjunction matches nothing" {
     const catalogReference = try seed(&writeTransaction, &.{ .{ 1, 20 }, .{ 2, 30 } });
     var hits = std.ArrayList(u64).empty;
     defer hits.deinit(testing.allocator);
-    try where(&writeTransaction, catalogReference, .{ .disjunction = &.{} }, &hits, testing.allocator);
+    try where(&writeTransaction, catalogReference, .{ .predicate = .{ .disjunction = &.{} } }, &hits, testing.allocator);
     try testing.expectEqual(@as(usize, 0), hits.items.len);
 }
 
@@ -551,7 +551,7 @@ test "results ascend by objectKey on the candidate path for a drivable disjuncti
     const branches = [_]Predicate{ intComparison(1, .eq, 3), intComparison(2, .eq, 5) };
     var hits = std.ArrayList(u64).empty;
     defer hits.deinit(testing.allocator);
-    try where(&writeTransaction, catalogReference, .{ .disjunction = &branches }, &hits, testing.allocator);
+    try where(&writeTransaction, catalogReference, .{ .predicate = .{ .disjunction = &branches } }, &hits, testing.allocator);
     try testing.expect(hits.items.len > 0);
     try testing.expect(std.sort.isSorted(u64, hits.items, {}, std.sort.asc(u64)));
 }
@@ -678,7 +678,7 @@ test "out-of-range property anywhere in the tree is rejected before any emission
 
     var hits = std.ArrayList(u64).empty;
     defer hits.deinit(testing.allocator);
-    try testing.expectError(error.BadProperty, where(&writeTransaction, catalogReference, tree, &hits, testing.allocator));
+    try testing.expectError(error.BadProperty, where(&writeTransaction, catalogReference, .{ .predicate = tree }, &hits, testing.allocator));
     try testing.expectEqual(@as(usize, 0), hits.items.len);
     try testing.expectError(error.BadProperty, countWhere(&writeTransaction, catalogReference, tree, testing.allocator));
 }
@@ -703,7 +703,7 @@ test "a 33-deep tree is rejected with error.PredicateTooDeep" {
     }
     var hits = std.ArrayList(u64).empty;
     defer hits.deinit(testing.allocator);
-    try testing.expectError(error.PredicateTooDeep, where(&writeTransaction, catalogReference, current, &hits, testing.allocator));
+    try testing.expectError(error.PredicateTooDeep, where(&writeTransaction, catalogReference, .{ .predicate = current }, &hits, testing.allocator));
 }
 
 test "a bytes comparison against an int property is rejected with error.BadPredicate" {
@@ -719,7 +719,7 @@ test "a bytes comparison against an int property is rejected with error.BadPredi
     const predicate = Predicate{ .comparison = .{ .property = 1, .operator = .eq, .value = .{ .bytes = "x" } } };
     var hits = std.ArrayList(u64).empty;
     defer hits.deinit(testing.allocator);
-    try testing.expectError(error.BadPredicate, where(&writeTransaction, catalogReference, predicate, &hits, testing.allocator));
+    try testing.expectError(error.BadPredicate, where(&writeTransaction, catalogReference, .{ .predicate = predicate }, &hits, testing.allocator));
 }
 
 test "comparing a blob property with bytes is rejected with error.UnsupportedPredicate" {

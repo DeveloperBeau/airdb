@@ -365,8 +365,8 @@ test "collectCandidates: a drivable disjunction yields the union either branch m
 
     var expectedUnion = std.ArrayList(u64).empty;
     defer expectedUnion.deinit(testing.allocator);
-    try query.where(&writeTransaction, twoIndexedCatalog, branchA, &expectedUnion, testing.allocator);
-    try query.where(&writeTransaction, twoIndexedCatalog, branchB, &expectedUnion, testing.allocator);
+    try query.where(&writeTransaction, twoIndexedCatalog, .{ .predicate = branchA }, &expectedUnion, testing.allocator);
+    try query.where(&writeTransaction, twoIndexedCatalog, .{ .predicate = branchB }, &expectedUnion, testing.allocator);
     std.mem.sort(u64, expectedUnion.items, {}, std.sort.asc(u64));
 
     // collectCandidates is a superset (untrimmed, may repeat); every expected

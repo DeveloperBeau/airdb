@@ -18,6 +18,8 @@ const forEachKey = index.forEachKey;
 const forEachEntry = index.forEachEntry;
 const forEachEntryWhile = index.forEachEntryWhile;
 const forEachEntryInRange = index.forEachEntryInRange;
+const forEachEntryInRangeWhile = index.forEachEntryInRangeWhile;
+const forEachEntryInRangeDescendingWhile = index.forEachEntryInRangeDescendingWhile;
 const appendRun = index.appendRun;
 const makeInnerForTest = index.makeInnerForTest;
 
@@ -888,4 +890,362 @@ test "appendRun empty run is a no-op" {
     try testing.expectEqual(baseRoot, appended); // same reference, unchanged
     try testing.expectEqual(before, try count(&writeTransaction, appended));
     writeTransaction.deinit();
+}
+
+// ---------------------------------------------------------------------------
+// forEachEntryInRangeWhile / forEachEntryInRangeDescendingWhile
+// ---------------------------------------------------------------------------
+
+test "T1: forEachEntryInRangeWhile stops on the entry the callback rejects and reports false" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try idxTmpPath(testing.allocator, &tmp, "rw1.airdb");
+    defer testing.allocator.free(path);
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var writeTransaction = try database.beginWrite();
+    const root = try buildScrambled0to1000(&writeTransaction);
+    var keys = std.ArrayList(u64).empty;
+    defer keys.deinit(testing.allocator);
+    var vals = std.ArrayList(u64).empty;
+    defer vals.deinit(testing.allocator);
+    const visitedAll = try forEachEntryInRangeWhile(&writeTransaction, root, 200, 300, StoppingCollector{ .keys = &keys, .vals = &vals, .stopAfter = 3 }, StoppingCollector.onEntry);
+    try testing.expect(!visitedAll);
+    try testing.expectEqualSlices(u64, &.{ 200, 201, 202 }, keys.items);
+    writeTransaction.deinit();
+}
+
+test "T2: forEachEntryInRangeWhile visits exactly [low, high] and reports true when it completes" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try idxTmpPath(testing.allocator, &tmp, "rw2.airdb");
+    defer testing.allocator.free(path);
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var writeTransaction = try database.beginWrite();
+    const root = try buildScrambled0to1000(&writeTransaction);
+    var keys = std.ArrayList(u64).empty;
+    defer keys.deinit(testing.allocator);
+    var vals = std.ArrayList(u64).empty;
+    defer vals.deinit(testing.allocator);
+    const visitedAll = try forEachEntryInRangeWhile(&writeTransaction, root, 200, 300, StoppingCollector{ .keys = &keys, .vals = &vals, .stopAfter = std.math.maxInt(usize) }, StoppingCollector.onEntry);
+    try testing.expect(visitedAll);
+    try testing.expectEqual(@as(usize, 101), keys.items.len);
+    try testing.expectEqual(@as(u64, 200), keys.items[0]);
+    try testing.expectEqual(@as(u64, 300), keys.items[keys.items.len - 1]);
+    writeTransaction.deinit();
+}
+
+test "T3: forEachEntryInRange still visits the whole range over a multi-level tree" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try idxTmpPath(testing.allocator, &tmp, "rw3.airdb");
+    defer testing.allocator.free(path);
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var writeTransaction = try database.beginWrite();
+    const root = try buildScrambled0to1000(&writeTransaction);
+    var keys = std.ArrayList(u64).empty;
+    defer keys.deinit(testing.allocator);
+    var vals = std.ArrayList(u64).empty;
+    defer vals.deinit(testing.allocator);
+    try forEachEntryInRange(&writeTransaction, root, 50, 800, RangeCollector{ .keys = &keys, .vals = &vals }, RangeCollector.onEntry);
+    try testing.expectEqual(@as(usize, 751), keys.items.len);
+    try testing.expectEqual(@as(u64, 50), keys.items[0]);
+    try testing.expectEqual(@as(u64, 800), keys.items[keys.items.len - 1]);
+    writeTransaction.deinit();
+}
+
+test "T4: forEachEntryInRangeDescendingWhile visits [low, high] in descending order across several leaves" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try idxTmpPath(testing.allocator, &tmp, "rd4.airdb");
+    defer testing.allocator.free(path);
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var writeTransaction = try database.beginWrite();
+    var root = try create(&writeTransaction);
+    var inserted = std.ArrayList(u64).empty;
+    defer inserted.deinit(testing.allocator);
+    var position: u64 = 0;
+    while (position < 5000) : (position += 1) {
+        const key = (position *% 2654435761) % 1_000_003;
+        root = try insert(&writeTransaction, root, key, key * 10);
+        try inserted.append(testing.allocator, key);
+    }
+    std.mem.sort(u64, inserted.items, {}, std.sort.asc(u64));
+    const low: u64 = 12345;
+    const high: u64 = 54321;
+    var expectedAscending = std.ArrayList(u64).empty;
+    defer expectedAscending.deinit(testing.allocator);
+    for (inserted.items) |key| {
+        if (key >= low and key <= high) try expectedAscending.append(testing.allocator, key);
+    }
+    var expectedDescending = std.ArrayList(u64).empty;
+    defer expectedDescending.deinit(testing.allocator);
+    try expectedDescending.appendSlice(testing.allocator, expectedAscending.items);
+    std.mem.reverse(u64, expectedDescending.items);
+
+    var keys = std.ArrayList(u64).empty;
+    defer keys.deinit(testing.allocator);
+    var vals = std.ArrayList(u64).empty;
+    defer vals.deinit(testing.allocator);
+    const visitedAll = try forEachEntryInRangeDescendingWhile(&writeTransaction, root, low, high, StoppingCollector{ .keys = &keys, .vals = &vals, .stopAfter = std.math.maxInt(usize) }, StoppingCollector.onEntry);
+    try testing.expect(visitedAll);
+    try testing.expectEqualSlices(u64, expectedDescending.items, keys.items);
+    for (keys.items, vals.items) |key, val| try testing.expectEqual(key * 10, val);
+
+    // False positive: the ascending order must NOT also match (more than one key present).
+    try testing.expect(expectedAscending.items.len > 1);
+    try testing.expect(!std.mem.eql(u64, expectedAscending.items, keys.items));
+    writeTransaction.deinit();
+}
+
+test "T5: the descending walk over the full domain is the ascending walk reversed" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try idxTmpPath(testing.allocator, &tmp, "rd5.airdb");
+    defer testing.allocator.free(path);
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var writeTransaction = try database.beginWrite();
+    const root = try buildScrambled0to1000(&writeTransaction);
+
+    var ascendingKeys = std.ArrayList(u64).empty;
+    defer ascendingKeys.deinit(testing.allocator);
+    const AscendingCollector = struct {
+        keys: *std.ArrayList(u64),
+        fn onKey(self: @This(), key: u64) !void {
+            try self.keys.append(testing.allocator, key);
+        }
+    };
+    try forEachKey(&writeTransaction, root, AscendingCollector{ .keys = &ascendingKeys }, AscendingCollector.onKey);
+
+    var descendingKeys = std.ArrayList(u64).empty;
+    defer descendingKeys.deinit(testing.allocator);
+    var vals = std.ArrayList(u64).empty;
+    defer vals.deinit(testing.allocator);
+    _ = try forEachEntryInRangeDescendingWhile(&writeTransaction, root, 0, std.math.maxInt(u64), StoppingCollector{ .keys = &descendingKeys, .vals = &vals, .stopAfter = std.math.maxInt(usize) }, StoppingCollector.onEntry);
+
+    var reversedAscending = try testing.allocator.alloc(u64, ascendingKeys.items.len);
+    defer testing.allocator.free(reversedAscending);
+    for (ascendingKeys.items, 0..) |key, position| reversedAscending[ascendingKeys.items.len - 1 - position] = key;
+    try testing.expectEqualSlices(u64, reversedAscending, descendingKeys.items);
+    writeTransaction.deinit();
+}
+
+test "T6: the descending walk stops early and reports false" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try idxTmpPath(testing.allocator, &tmp, "rd6.airdb");
+    defer testing.allocator.free(path);
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var writeTransaction = try database.beginWrite();
+    const root = try buildScrambled0to1000(&writeTransaction);
+    var keys = std.ArrayList(u64).empty;
+    defer keys.deinit(testing.allocator);
+    var vals = std.ArrayList(u64).empty;
+    defer vals.deinit(testing.allocator);
+    const visitedAll = try forEachEntryInRangeDescendingWhile(&writeTransaction, root, 0, 1000, StoppingCollector{ .keys = &keys, .vals = &vals, .stopAfter = 4 }, StoppingCollector.onEntry);
+    try testing.expect(!visitedAll);
+    try testing.expectEqualSlices(u64, &.{ 1000, 999, 998, 997 }, keys.items);
+    writeTransaction.deinit();
+}
+
+test "T7: the descending walk skips an empty rightmost leaf" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try idxTmpPath(testing.allocator, &tmp, "rd7.airdb");
+    defer testing.allocator.free(path);
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var writeTransaction = try database.beginWrite();
+    defer writeTransaction.deinit();
+
+    var leftLeaf = try create(&writeTransaction);
+    var key: u64 = 1;
+    while (key <= 5) : (key += 1) leftLeaf = try insert(&writeTransaction, leftLeaf, key, key * 10);
+    const emptyLeaf = try create(&writeTransaction); // never inserted into: count == 0
+
+    const inner = try makeInnerForTest(&writeTransaction, &.{
+        .{ .reference = leftLeaf, .low = 1, .count = 5 },
+        .{ .reference = emptyLeaf, .low = 1_000_000, .count = 0 },
+    });
+
+    var keys = std.ArrayList(u64).empty;
+    defer keys.deinit(testing.allocator);
+    var vals = std.ArrayList(u64).empty;
+    defer vals.deinit(testing.allocator);
+    const visitedAll = try forEachEntryInRangeDescendingWhile(&writeTransaction, inner, 0, std.math.maxInt(u64), StoppingCollector{ .keys = &keys, .vals = &vals, .stopAfter = std.math.maxInt(usize) }, StoppingCollector.onEntry);
+    try testing.expect(visitedAll);
+    try testing.expectEqualSlices(u64, &.{ 5, 4, 3, 2, 1 }, keys.items);
+}
+
+test "T8: the descending walk over an empty tree visits nothing and reports true" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try idxTmpPath(testing.allocator, &tmp, "rd8.airdb");
+    defer testing.allocator.free(path);
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var writeTransaction = try database.beginWrite();
+    const root = try create(&writeTransaction);
+    var keys = std.ArrayList(u64).empty;
+    defer keys.deinit(testing.allocator);
+    var vals = std.ArrayList(u64).empty;
+    defer vals.deinit(testing.allocator);
+    const visitedAll = try forEachEntryInRangeDescendingWhile(&writeTransaction, root, 0, std.math.maxInt(u64), StoppingCollector{ .keys = &keys, .vals = &vals, .stopAfter = std.math.maxInt(usize) }, StoppingCollector.onEntry);
+    try testing.expect(visitedAll);
+    try testing.expectEqual(@as(usize, 0), keys.items.len);
+    writeTransaction.deinit();
+}
+
+test "T9: the descending walk with low greater than high visits nothing and reports true" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try idxTmpPath(testing.allocator, &tmp, "rd9.airdb");
+    defer testing.allocator.free(path);
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var writeTransaction = try database.beginWrite();
+    const root = try buildScrambled0to1000(&writeTransaction);
+    var keys = std.ArrayList(u64).empty;
+    defer keys.deinit(testing.allocator);
+    var vals = std.ArrayList(u64).empty;
+    defer vals.deinit(testing.allocator);
+    const visitedAll = try forEachEntryInRangeDescendingWhile(&writeTransaction, root, 300, 200, StoppingCollector{ .keys = &keys, .vals = &vals, .stopAfter = std.math.maxInt(usize) }, StoppingCollector.onEntry);
+    try testing.expect(visitedAll);
+    try testing.expectEqual(@as(usize, 0), keys.items.len);
+    writeTransaction.deinit();
+}
+
+test "T10: a single-key range delivers exactly that entry, in both directions" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try idxTmpPath(testing.allocator, &tmp, "rd10.airdb");
+    defer testing.allocator.free(path);
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var writeTransaction = try database.beginWrite();
+    const root = try buildScrambled0to1000(&writeTransaction);
+
+    var ascKeys = std.ArrayList(u64).empty;
+    defer ascKeys.deinit(testing.allocator);
+    var ascVals = std.ArrayList(u64).empty;
+    defer ascVals.deinit(testing.allocator);
+    const ascendedAll = try forEachEntryInRangeWhile(&writeTransaction, root, 500, 500, StoppingCollector{ .keys = &ascKeys, .vals = &ascVals, .stopAfter = std.math.maxInt(usize) }, StoppingCollector.onEntry);
+    try testing.expect(ascendedAll);
+    try testing.expectEqualSlices(u64, &.{500}, ascKeys.items);
+
+    var descKeys = std.ArrayList(u64).empty;
+    defer descKeys.deinit(testing.allocator);
+    var descVals = std.ArrayList(u64).empty;
+    defer descVals.deinit(testing.allocator);
+    const descendedAll = try forEachEntryInRangeDescendingWhile(&writeTransaction, root, 500, 500, StoppingCollector{ .keys = &descKeys, .vals = &descVals, .stopAfter = std.math.maxInt(usize) }, StoppingCollector.onEntry);
+    try testing.expect(descendedAll);
+    try testing.expectEqualSlices(u64, &.{500}, descKeys.items);
+    writeTransaction.deinit();
+}
+
+test "T11: a reference cycle in the descending walk is error.Corrupt" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try idxTmpPath(testing.allocator, &tmp, "rd11.airdb");
+    defer testing.allocator.free(path);
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var writeTransaction = try database.beginWrite();
+    defer writeTransaction.deinit();
+    const allocation = try writeTransaction.alloc(innerNodeSize);
+    _ = encodeInner(allocation.bytes, &.{allocation.reference}, &.{0}, &.{1});
+    const NopSink = struct {
+        fn onEntry(_: @This(), _: u64, _: u64) !bool {
+            return true;
+        }
+    };
+    try testing.expectError(error.Corrupt, forEachEntryInRangeDescendingWhile(&writeTransaction, allocation.reference, 0, std.math.maxInt(u64), NopSink{}, NopSink.onEntry));
+}
+
+test "T12: fuzz, descending equals ascending reversed for random ranges" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try idxTmpPath(testing.allocator, &tmp, "rd12.airdb");
+    defer testing.allocator.free(path);
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var writeTransaction = try database.beginWrite();
+    defer writeTransaction.deinit();
+
+    var root = try create(&writeTransaction);
+    var inserted = std.ArrayList(u64).empty;
+    defer inserted.deinit(testing.allocator);
+    var used = std.AutoHashMap(u64, void).init(testing.allocator);
+    defer used.deinit();
+    var prngSeed = std.Random.DefaultPrng.init(777);
+    const seedRandom = prngSeed.random();
+    var insertedCount: usize = 0;
+    while (insertedCount < 2000) {
+        const key = seedRandom.intRangeAtMost(u64, 0, 10_000_000);
+        if (used.contains(key)) continue;
+        try used.put(key, {});
+        try inserted.append(testing.allocator, key);
+        root = try insert(&writeTransaction, root, key, key);
+        insertedCount += 1;
+    }
+    std.mem.sort(u64, inserted.items, {}, std.sort.asc(u64));
+
+    var trial: u64 = 0;
+    while (trial < 200) : (trial += 1) {
+        var prng = std.Random.DefaultPrng.init(trial);
+        const random = prng.random();
+        const pick = random.intRangeLessThan(u32, 0, 6);
+        var low: u64 = undefined;
+        var high: u64 = undefined;
+        switch (pick) {
+            0 => {
+                low = 0;
+                high = std.math.maxInt(u64);
+            },
+            1 => {
+                low = random.intRangeAtMost(u64, 0, 10_000_000);
+                high = low; // low == high
+            },
+            2 => {
+                // inverted pair
+                low = random.intRangeAtMost(u64, 1, 10_000_000);
+                high = low - 1;
+            },
+            else => {
+                const a = random.intRangeAtMost(u64, 0, 10_000_000);
+                const b = random.intRangeAtMost(u64, 0, 10_000_000);
+                low = @min(a, b);
+                high = @max(a, b);
+            },
+        }
+
+        var expected = std.ArrayList(u64).empty;
+        defer expected.deinit(testing.allocator);
+        for (inserted.items) |key| {
+            if (key >= low and key <= high) try expected.append(testing.allocator, key);
+        }
+
+        var ascKeys = std.ArrayList(u64).empty;
+        defer ascKeys.deinit(testing.allocator);
+        var ascVals = std.ArrayList(u64).empty;
+        defer ascVals.deinit(testing.allocator);
+        _ = try forEachEntryInRangeWhile(&writeTransaction, root, low, high, StoppingCollector{ .keys = &ascKeys, .vals = &ascVals, .stopAfter = std.math.maxInt(usize) }, StoppingCollector.onEntry);
+        try testing.expectEqualSlices(u64, expected.items, ascKeys.items);
+
+        var descKeys = std.ArrayList(u64).empty;
+        defer descKeys.deinit(testing.allocator);
+        var descVals = std.ArrayList(u64).empty;
+        defer descVals.deinit(testing.allocator);
+        _ = try forEachEntryInRangeDescendingWhile(&writeTransaction, root, low, high, StoppingCollector{ .keys = &descKeys, .vals = &descVals, .stopAfter = std.math.maxInt(usize) }, StoppingCollector.onEntry);
+
+        var reversedExpected = try testing.allocator.alloc(u64, expected.items.len);
+        defer testing.allocator.free(reversedExpected);
+        for (expected.items, 0..) |key, position| reversedExpected[expected.items.len - 1 - position] = key;
+        try testing.expectEqualSlices(u64, reversedExpected, descKeys.items);
+    }
 }
