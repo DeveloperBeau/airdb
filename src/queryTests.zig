@@ -474,8 +474,16 @@ test "a disjunction returns the union, and a row matching both branches is retur
     defer database.deinit();
     var writeTransaction = try database.beginWrite();
     defer writeTransaction.deinit();
-    // property0 = primaryKey, property1 = a-branch value, property2 = b-branch value.
-    var catalogReference = try catalog.create(&writeTransaction, 3);
+    // property0 = primaryKey, property1 = a-branch value (indexed), property2 = b-branch
+    // value (indexed). Both indexed so the disjunction is drivable and this test forces
+    // the candidate path, where the dedupe guard lives, rather than the scan path (which
+    // cannot produce a duplicate regardless of whether the guard exists).
+    const definitions = [_]catalog.PropertyDefinition{
+        .{ .kind = .int },
+        .{ .kind = .int, .indexed = true },
+        .{ .kind = .int, .indexed = true },
+    };
+    var catalogReference = try catalog.createFromDefinitions(&writeTransaction, &definitions);
     // primaryKey 1: only a matches (property1==1, property2==0).
     const onlyA = try rows.insert(&writeTransaction, catalogReference, &.{ 1, 1, 0 });
     catalogReference = onlyA.catalogReference;

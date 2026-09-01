@@ -121,6 +121,37 @@ test "canDriveFromIndex: a tree nested 33 deep is not drivable" {
     try testing.expect(!planner.canDriveFromIndex(&scan, current));
 }
 
+test "canDriveFromIndex: a chain of single-child conjunctions reaching exactly depth 31 is drivable" {
+    // Conjunctions, not negations: negation's own `.negation => false` rule would
+    // shadow the depth check before it is ever reached.
+    const scan = makeScanForTest(&.{true});
+    var current = intComparison(0, .eq, 1);
+    var slots: [31][1]Predicate = undefined;
+    var level: usize = 0;
+    while (level < 31) : (level += 1) {
+        slots[level][0] = current;
+        current = .{ .conjunction = slots[level][0..] };
+    }
+    // 31 nested single-child conjunctions put the comparison at depth 31, one short of
+    // the 32 cap: it must still be drivable.
+    try testing.expect(planner.canDriveFromIndex(&scan, current));
+}
+
+test "canDriveFromIndex: a chain of single-child conjunctions reaching exactly depth 32 is not drivable" {
+    const scan = makeScanForTest(&.{true});
+    var current = intComparison(0, .eq, 1);
+    var slots: [32][1]Predicate = undefined;
+    var level: usize = 0;
+    while (level < 32) : (level += 1) {
+        slots[level][0] = current;
+        current = .{ .conjunction = slots[level][0..] };
+    }
+    // 32 nested single-child conjunctions put the comparison at exactly depth 32: the
+    // cap must fire there, not one level later as it would if this boundary were off by
+    // one.
+    try testing.expect(!planner.canDriveFromIndex(&scan, current));
+}
+
 test "isMoreSelective: exact counts order ascending, exact beats unbounded, unbounded beats nothing" {
     try testing.expect(planner.isMoreSelective(.{ .exact = 1 }, .{ .exact = 2 }));
     try testing.expect(!planner.isMoreSelective(.{ .exact = 2 }, .{ .exact = 1 }));

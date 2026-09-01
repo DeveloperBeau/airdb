@@ -154,3 +154,51 @@ test "evaluatePredicate rejects a 33-deep tree with error.PredicateTooDeep" {
     }
     try testing.expectError(error.PredicateTooDeep, evaluation.evaluatePredicate(&writeTransaction, &scan, 0, leaf));
 }
+
+test "evaluatePredicate succeeds on a tree with the comparison at exactly depth 31, the deepest depth the cap allows" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try evalTmpPath(testing.allocator, &tmp, "eval_deep_boundary_ok.airdb");
+    defer testing.allocator.free(path);
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var writeTransaction = try database.beginWrite();
+    defer writeTransaction.deinit();
+    const catalogReference = try seed(&writeTransaction, &.{.{ 1, 30 }});
+    const scan = try Scan.open(&writeTransaction, catalogReference);
+
+    var leaf = intComparison(1, .eq, 30);
+    var boxes: [31]Predicate = undefined;
+    var level: usize = 0;
+    while (level < 31) : (level += 1) {
+        boxes[level] = leaf;
+        leaf = .{ .negation = &boxes[level] };
+    }
+    // 31 negations put the comparison at depth 31, one short of the 32 cap: this must
+    // evaluate normally, not error. An odd number of negations flips a match to unmatched.
+    try testing.expectEqual(Match.unmatched, try evaluation.evaluatePredicate(&writeTransaction, &scan, 0, leaf));
+}
+
+test "evaluatePredicate rejects a tree with the comparison at exactly depth 32, one level past the cap" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try evalTmpPath(testing.allocator, &tmp, "eval_deep_boundary_fail.airdb");
+    defer testing.allocator.free(path);
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var writeTransaction = try database.beginWrite();
+    defer writeTransaction.deinit();
+    const catalogReference = try seed(&writeTransaction, &.{.{ 1, 30 }});
+    const scan = try Scan.open(&writeTransaction, catalogReference);
+
+    var leaf = intComparison(1, .eq, 30);
+    var boxes: [32]Predicate = undefined;
+    var level: usize = 0;
+    while (level < 32) : (level += 1) {
+        boxes[level] = leaf;
+        leaf = .{ .negation = &boxes[level] };
+    }
+    // 32 negations put the comparison at exactly depth 32: the cap must fire there, not
+    // one level later as it would if this boundary were off by one.
+    try testing.expectError(error.PredicateTooDeep, evaluation.evaluatePredicate(&writeTransaction, &scan, 0, leaf));
+}
