@@ -21,10 +21,17 @@ const predicateLanguage = @import("query/predicate.zig");
 
 /// A filter tree over a type's properties.
 pub const Predicate = predicateLanguage.Predicate;
+/// Comparison a predicate applies to one property's value.
 pub const Operator = predicateLanguage.Operator;
+/// The right-hand side of a comparison: a raw u64 for int and link properties,
+/// or bytes for blob properties.
 pub const ComparisonValue = predicateLanguage.ComparisonValue;
+/// One filter clause: property `property` compared against `value` with `operator`.
 pub const Comparison = predicateLanguage.Comparison;
+/// Three-valued outcome of evaluating a predicate against one row.
 pub const Match = predicateLanguage.Match;
+/// Deepest predicate nesting accepted. Predicates are caller-supplied and will
+/// eventually arrive across the C ABI, which is an untrusted boundary.
 pub const maxPredicateDepth = predicateLanguage.maxPredicateDepth;
 
 /// Run a query: stream every live matching (objectKey, row) pair into

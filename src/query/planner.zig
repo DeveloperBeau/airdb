@@ -50,19 +50,21 @@ fn canDriveFromIndexAt(scan: *const Scan, predicate: Predicate, depth: usize) bo
     };
 }
 
-/// Translate a range operator + value into an inclusive [lo, hi] over u64.
+/// An inclusive [low, high] key range over a value index.
+pub const Bounds = struct { low: u64, high: u64 };
+
+/// Translate a range operator + value into an inclusive [low, high] over u64.
 /// Returns null when the range is provably empty (gt maxInt, lt 0), so the
 /// caller emits zero candidates.
 ///   ge v -> [v, max]      gt v -> [v+1, max]  (empty if v == max)
 ///   le v -> [0, v]        lt v -> [0, v-1]    (empty if v == 0)
-pub const Bounds = struct { lo: u64, hi: u64 };
 pub fn rangeBounds(operator: Operator, value: u64) ?Bounds {
     const max = std.math.maxInt(u64);
     return switch (operator) {
-        .ge => Bounds{ .lo = value, .hi = max },
-        .gt => if (value == max) null else Bounds{ .lo = value + 1, .hi = max },
-        .le => Bounds{ .lo = 0, .hi = value },
-        .lt => if (value == 0) null else Bounds{ .lo = 0, .hi = value - 1 },
+        .ge => Bounds{ .low = value, .high = max },
+        .gt => if (value == max) null else Bounds{ .low = value + 1, .high = max },
+        .le => Bounds{ .low = 0, .high = value },
+        .lt => if (value == 0) null else Bounds{ .low = 0, .high = value - 1 },
         else => unreachable,
     };
 }
@@ -180,7 +182,7 @@ pub fn collectCandidates(
             const bounds = rangeBounds(comparison.operator, probeValue) orelse return; // empty range
             var innerRoots = std.ArrayList(u64).empty;
             defer innerRoots.deinit(allocator);
-            try index.forEachEntryInRange(transaction, valueIndexReference, bounds.lo, bounds.hi, InnerRootCollector{ .list = &innerRoots, .allocator = allocator }, InnerRootCollector.onEntry);
+            try index.forEachEntryInRange(transaction, valueIndexReference, bounds.low, bounds.high, InnerRootCollector{ .list = &innerRoots, .allocator = allocator }, InnerRootCollector.onEntry);
             for (innerRoots.items) |innerRoot| {
                 if (innerRoot == 0) continue;
                 try index.forEachKey(transaction, innerRoot, ObjectKeyCollector{ .list = candidates, .allocator = allocator }, ObjectKeyCollector.onKey);

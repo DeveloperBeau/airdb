@@ -38,6 +38,31 @@ fn seedPlannerCatalog(writeTransaction: *@import("database.zig").WriteTransactio
     return catalogReference;
 }
 
+// Same seeding as seedPlannerCatalog, but also returns the objectKey rows.insert
+// actually assigned to row `targetRowIndex`, so a caller that needs to reference
+// one seeded row does not have to assume objectKey equals the insertion ordinal.
+fn seedPlannerCatalogCapturingObjectKey(
+    writeTransaction: *@import("database.zig").WriteTransaction,
+    indexed: bool,
+    rowCount: u64,
+    targetRowIndex: u64,
+) !struct { catalogReference: Reference, objectKey: u64 } {
+    const definitions = [_]catalog.PropertyDefinition{
+        .{ .kind = .int },
+        .{ .kind = .int, .indexed = indexed },
+        .{ .kind = .int },
+    };
+    var catalogReference = try catalog.createFromDefinitions(writeTransaction, &definitions);
+    var targetObjectKey: ?u64 = null;
+    var rowIndex: u64 = 0;
+    while (rowIndex < rowCount) : (rowIndex += 1) {
+        const inserted = try rows.insert(writeTransaction, catalogReference, &.{ rowIndex, rowIndex % 100, rowIndex });
+        catalogReference = inserted.catalogReference;
+        if (rowIndex == targetRowIndex) targetObjectKey = inserted.objectKey;
+    }
+    return .{ .catalogReference = catalogReference, .objectKey = targetObjectKey.? };
+}
+
 // Build a type with primaryKey(int) + age(int) and insert (primaryKey, age) rows.
 fn seed(writeTransaction: anytype, pairs: []const [2]u64) !Reference {
     var catalogReference = try catalog.create(writeTransaction, 2);
@@ -836,9 +861,10 @@ test "the disjunction regression: a row matching only the unindexed branch is no
     // property1 indexed in catalog A, not in catalog B; property2 indexed in
     // neither. Rows are {i, i % 100, i}, so at i == 7: property1 == 7 (not 42)
     // and property2 == 7, meaning the row matches only the property2 branch.
-    const catalogA = try seedPlannerCatalog(&writeTransaction, true, 100);
+    const seededA = try seedPlannerCatalogCapturingObjectKey(&writeTransaction, true, 100, 7);
+    const catalogA = seededA.catalogReference;
     const catalogB = try seedPlannerCatalog(&writeTransaction, false, 100);
-    const regressionRowObjectKey = 7;
+    const regressionRowObjectKey = seededA.objectKey;
 
     const branches = [_]Predicate{ intComparison(1, .eq, 42), intComparison(2, .eq, 7) };
     const tree = Predicate{ .disjunction = &branches };

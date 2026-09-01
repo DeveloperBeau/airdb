@@ -57,6 +57,24 @@ fn referenceMatches(row: ReferenceRow, predicate: Predicate) bool {
     }
 }
 
+const ReferenceAggregate = struct { count: u64, sum: u64, min: ?u64, max: ?u64 };
+
+// A from-scratch aggregate over the same rows and matcher as the rest of this
+// file. Must not call query.aggregateInt, or the comparison below would agree
+// with the engine by construction and prove nothing.
+fn referenceAggregate(referenceRows: []const ReferenceRow, predicate: Predicate, property: usize) ReferenceAggregate {
+    var result = ReferenceAggregate{ .count = 0, .sum = 0, .min = null, .max = null };
+    for (referenceRows) |row| {
+        if (!row.isLive or !referenceMatches(row, predicate)) continue;
+        const value = row.values[property];
+        result.count += 1;
+        result.sum +%= value;
+        if (result.min == null or value < result.min.?) result.min = value;
+        if (result.max == null or value > result.max.?) result.max = value;
+    }
+    return result;
+}
+
 fn treeContainsNegation(predicate: Predicate) bool {
     switch (predicate) {
         .comparison => return false,
@@ -260,6 +278,25 @@ test "predicate trees agree with a naive reference matcher, across a randomized 
             try testing.expectEqual(@as(u64, hitsA.items.len), countA);
             const countB = try query.countWhere(&writeTransaction, catalogB, tree, testing.allocator);
             try testing.expectEqual(@as(u64, hitsB.items.len), countB);
+
+            // aggregateInt shares runQuery/the planner/isLiveMatch with where and
+            // countWhere (already checked above); this is the only line that
+            // exercises the Sink's own count/sum/min/max arithmetic against an
+            // independent reference.
+            const aggregateProperty = 0;
+            const expectedAggregateA = referenceAggregate(referenceRowsA.items, tree, aggregateProperty);
+            const actualAggregateA = try query.aggregateInt(&writeTransaction, catalogA, aggregateProperty, tree, testing.allocator);
+            try testing.expectEqual(expectedAggregateA.count, actualAggregateA.count);
+            try testing.expectEqual(expectedAggregateA.sum, actualAggregateA.sum);
+            try testing.expectEqual(expectedAggregateA.min, actualAggregateA.min);
+            try testing.expectEqual(expectedAggregateA.max, actualAggregateA.max);
+
+            const expectedAggregateB = referenceAggregate(referenceRowsB.items, tree, aggregateProperty);
+            const actualAggregateB = try query.aggregateInt(&writeTransaction, catalogB, aggregateProperty, tree, testing.allocator);
+            try testing.expectEqual(expectedAggregateB.count, actualAggregateB.count);
+            try testing.expectEqual(expectedAggregateB.sum, actualAggregateB.sum);
+            try testing.expectEqual(expectedAggregateB.min, actualAggregateB.min);
+            try testing.expectEqual(expectedAggregateB.max, actualAggregateB.max);
 
             // Every returned objectKey is live in the reference and appears at
             // most once (guaranteed here by matching the deduplicated,

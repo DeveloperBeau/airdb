@@ -48,7 +48,10 @@ fn validateAt(self: Predicate, propertyKinds: []const catalog.PropertyKind, dept
             if (comparison.property >= propertyKinds.len) return error.BadProperty;
             const kind = propertyKinds[comparison.property];
             switch (comparison.value) {
-                .int => if (kind == .blob) return error.BadPredicate,
+                // int and link properties store a raw scalar u64 (link stores target
+                // objectKey + 1); every other kind's column holds a tree root, so
+                // comparing it as an int would return a confidently wrong answer.
+                .int => if (kind != .int and kind != .link) return error.BadPredicate,
                 .bytes => {
                     if (kind != .blob) return error.BadPredicate;
                     return error.UnsupportedPredicate;

@@ -64,6 +64,11 @@ fn bytesComparison(property: usize, operator: predicate.Operator, value: []const
 
 const intKinds = [_]catalog.PropertyKind{ .int, .int, .blob };
 
+// property0 = int, property1 = list, property2 = set, property3 = link,
+// property4 = linkSet, property5 = dict. Used to check every non-scalar kind
+// rejects an int comparison, and that link (a scalar-shaped reference) does not.
+const everyKind = [_]catalog.PropertyKind{ .int, .list, .set, .link, .linkSet, .dict };
+
 test "validate accepts well-formed trees" {
     // A bare int comparison on an int property.
     try (intComparison(0, .eq, 1)).validate(&intKinds);
@@ -122,6 +127,30 @@ test "validate rejects an out-of-range property nested inside negation inside co
 
 test "validate rejects an int value against a blob property" {
     try testing.expectError(error.BadPredicate, (intComparison(2, .eq, 1)).validate(&intKinds));
+}
+
+test "validate rejects an int value against a list property" {
+    try testing.expectError(error.BadPredicate, (intComparison(1, .eq, 1)).validate(&everyKind));
+}
+
+test "validate rejects an int value against a set property" {
+    try testing.expectError(error.BadPredicate, (intComparison(2, .eq, 1)).validate(&everyKind));
+}
+
+test "validate rejects an int value against a linkSet property" {
+    try testing.expectError(error.BadPredicate, (intComparison(4, .eq, 1)).validate(&everyKind));
+}
+
+test "validate rejects an int value against a dict property" {
+    try testing.expectError(error.BadPredicate, (intComparison(5, .eq, 1)).validate(&everyKind));
+}
+
+test "validate accepts an int value against a link property, the one non-int scalar kind" {
+    // False-positive control for the four rejections above: link is the kind
+    // that must stay accepted (module doc: link properties compare as target
+    // objectKey + 1), so the check must be a scalar allow-list, not a blanket
+    // non-int rejection.
+    try (intComparison(3, .eq, 1)).validate(&everyKind);
 }
 
 test "validate rejects a bytes value against an int property" {

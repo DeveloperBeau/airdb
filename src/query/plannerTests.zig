@@ -162,10 +162,10 @@ test "isMoreSelective: exact counts order ascending, exact beats unbounded, unbo
 }
 
 test "rangeBounds translates each operator into an inclusive range, with the two empty-range guards" {
-    try testing.expectEqual(planner.Bounds{ .lo = 5, .hi = std.math.maxInt(u64) }, planner.rangeBounds(.ge, 5).?);
-    try testing.expectEqual(planner.Bounds{ .lo = 6, .hi = std.math.maxInt(u64) }, planner.rangeBounds(.gt, 5).?);
-    try testing.expectEqual(planner.Bounds{ .lo = 0, .hi = 5 }, planner.rangeBounds(.le, 5).?);
-    try testing.expectEqual(planner.Bounds{ .lo = 0, .hi = 4 }, planner.rangeBounds(.lt, 5).?);
+    try testing.expectEqual(planner.Bounds{ .low = 5, .high = std.math.maxInt(u64) }, planner.rangeBounds(.ge, 5).?);
+    try testing.expectEqual(planner.Bounds{ .low = 6, .high = std.math.maxInt(u64) }, planner.rangeBounds(.gt, 5).?);
+    try testing.expectEqual(planner.Bounds{ .low = 0, .high = 5 }, planner.rangeBounds(.le, 5).?);
+    try testing.expectEqual(planner.Bounds{ .low = 0, .high = 4 }, planner.rangeBounds(.lt, 5).?);
     try testing.expectEqual(@as(?planner.Bounds, null), planner.rangeBounds(.gt, std.math.maxInt(u64)));
     try testing.expectEqual(@as(?planner.Bounds, null), planner.rangeBounds(.lt, 0));
 }
