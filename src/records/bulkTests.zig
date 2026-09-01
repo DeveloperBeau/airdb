@@ -435,8 +435,8 @@ test "bulkImport equals row-by-row for a scalar indexed type" {
         defer setA.deinit(testing.allocator);
         var setB = std.ArrayList(u64).empty;
         defer setB.deinit(testing.allocator);
-        try query.where(&readTransactionA, catalogA, &.{}, &setA, testing.allocator);
-        try query.where(&readTransactionB, catalogB, &.{}, &setB, testing.allocator);
+        try query.where(&readTransactionA, catalogA, .{ .conjunction = &.{} }, &setA, testing.allocator);
+        try query.where(&readTransactionB, catalogB, .{ .conjunction = &.{} }, &setB, testing.allocator);
         try testing.expectEqualSlices(u64, setB.items, setA.items);
     }
 
@@ -446,8 +446,8 @@ test "bulkImport equals row-by-row for a scalar indexed type" {
         defer setA.deinit(testing.allocator);
         var setB = std.ArrayList(u64).empty;
         defer setB.deinit(testing.allocator);
-        try query.where(&readTransactionA, catalogA, &.{.{ .property = 2, .operator = .eq, .value = 7 }}, &setA, testing.allocator);
-        try query.where(&readTransactionB, catalogB, &.{.{ .property = 2, .operator = .eq, .value = 7 }}, &setB, testing.allocator);
+        try query.where(&readTransactionA, catalogA, .{ .comparison = .{ .property = 2, .operator = .eq, .value = .{ .int = 7 } } }, &setA, testing.allocator);
+        try query.where(&readTransactionB, catalogB, .{ .comparison = .{ .property = 2, .operator = .eq, .value = .{ .int = 7 } } }, &setB, testing.allocator);
         std.mem.sort(u64, setA.items, {}, std.sort.asc(u64));
         std.mem.sort(u64, setB.items, {}, std.sort.asc(u64));
         try testing.expectEqualSlices(u64, setB.items, setA.items);
@@ -661,8 +661,8 @@ test "bulkAppend equals row-by-row for a contiguous monotonic batch" {
         defer setA.deinit(testing.allocator);
         var setB = std.ArrayList(u64).empty;
         defer setB.deinit(testing.allocator);
-        try query.where(&readTransactionA, catalogA, &.{}, &setA, testing.allocator);
-        try query.where(&readTransactionB, catalogB, &.{}, &setB, testing.allocator);
+        try query.where(&readTransactionA, catalogA, .{ .conjunction = &.{} }, &setA, testing.allocator);
+        try query.where(&readTransactionB, catalogB, .{ .conjunction = &.{} }, &setB, testing.allocator);
         try testing.expectEqualSlices(u64, setB.items, setA.items);
     }
 }
@@ -836,8 +836,8 @@ test "bulkAppendOrInsert falls back and equals row-by-row for a scattered batch"
         defer setA.deinit(testing.allocator);
         var setB = std.ArrayList(u64).empty;
         defer setB.deinit(testing.allocator);
-        try query.where(&readTransactionA, catalogA, &.{}, &setA, testing.allocator);
-        try query.where(&readTransactionB, catalogB, &.{}, &setB, testing.allocator);
+        try query.where(&readTransactionA, catalogA, .{ .conjunction = &.{} }, &setA, testing.allocator);
+        try query.where(&readTransactionB, catalogB, .{ .conjunction = &.{} }, &setB, testing.allocator);
         try testing.expectEqualSlices(u64, setB.items, setA.items);
     }
 }

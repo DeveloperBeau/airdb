@@ -88,6 +88,10 @@ pub const forEachKey = Tree.forEachKey;
 /// surfaces the value stored alongside each key in the leaf.
 pub const forEachEntry = Tree.forEachEntry;
 
+/// Visit every key/value pair in ascending key order until onEntry returns
+/// false. Returns whether the walk reached the end of the tree.
+pub const forEachEntryWhile = Tree.forEachEntryWhile;
+
 /// Return the largest key in the tree rooted at root, or null if the tree is
 /// empty. Read-only, O(height). Descends the LAST NON-EMPTY child at each
 /// level: removals never merge or drop leaves, so the rightmost leaf can be

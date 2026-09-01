@@ -488,39 +488,62 @@ pub fn BTreeCore(comptime Keying: type) type {
             }
         }
 
-        /// Visit every (storedKey, value) pair in ascending key order,
-        /// calling onEntry(context, storedKey, value) for each. Same
-        /// traversal as forEachKey, but also surfaces the value stored
-        /// alongside each key in the leaf. O(nodes) with I/O.
+        /// Visit (storedKey, value) pairs in ascending key order until
+        /// `onEntry` returns false. Returns false if a callback stopped the
+        /// walk, true if every entry was visited and every callback returned
+        /// true (so an empty tree returns true, and a callback returning false
+        /// on the very last entry still returns false). O(nodes) with I/O.
+        pub fn forEachEntryWhile(
+            transaction: anytype,
+            root: Reference,
+            context: anytype,
+            comptime onEntry: fn (@TypeOf(context), u64, u64) anyerror!bool,
+        ) !bool {
+            return forEachEntryWhileAt(transaction, root, context, onEntry, 0);
+        }
+
+        fn forEachEntryWhileAt(
+            transaction: anytype,
+            root: Reference,
+            context: anytype,
+            comptime onEntry: fn (@TypeOf(context), u64, u64) anyerror!bool,
+            depth: usize,
+        ) !bool {
+            if (depth >= maxDepth) return error.Corrupt;
+            const bytes = try dereferenceNode(transaction, root);
+            if (bytes[0] == kindLeaf) {
+                const leaf = try parseLeaf(bytes);
+                var slot: usize = 0;
+                while (slot < leaf.count) : (slot += 1) {
+                    if (!try onEntry(context, leaf.key(slot), leaf.value(slot))) return false;
+                }
+                return true;
+            }
+            const inner = try parseInner(bytes);
+            var childIndex: usize = 0;
+            while (childIndex < inner.childCount) : (childIndex += 1) {
+                if (!try forEachEntryWhileAt(transaction, inner.childReference(childIndex), context, onEntry, depth + 1)) return false;
+            }
+            return true;
+        }
+
+        /// Visit every (storedKey, value) pair in ascending key order, calling
+        /// onEntry(context, storedKey, value) for each. The always-continuing
+        /// case of forEachEntryWhile. O(nodes) with I/O.
         pub fn forEachEntry(
             transaction: anytype,
             root: Reference,
             context: anytype,
             comptime onEntry: fn (@TypeOf(context), u64, u64) anyerror!void,
         ) !void {
-            return forEachEntryAt(transaction, root, context, onEntry, 0);
-        }
-
-        fn forEachEntryAt(
-            transaction: anytype,
-            root: Reference,
-            context: anytype,
-            comptime onEntry: fn (@TypeOf(context), u64, u64) anyerror!void,
-            depth: usize,
-        ) !void {
-            if (depth >= maxDepth) return error.Corrupt;
-            const bytes = try dereferenceNode(transaction, root);
-            if (bytes[0] == kindLeaf) {
-                const leaf = try parseLeaf(bytes);
-                var slot: usize = 0;
-                while (slot < leaf.count) : (slot += 1) try onEntry(context, leaf.key(slot), leaf.value(slot));
-                return;
-            }
-            const inner = try parseInner(bytes);
-            var childIndex: usize = 0;
-            while (childIndex < inner.childCount) : (childIndex += 1) {
-                try forEachEntryAt(transaction, inner.childReference(childIndex), context, onEntry, depth + 1);
-            }
+            const Continuing = struct {
+                inner: @TypeOf(context),
+                fn onEntryContinuing(self: @This(), key: u64, value: u64) anyerror!bool {
+                    try onEntry(self.inner, key, value);
+                    return true;
+                }
+            };
+            _ = try forEachEntryWhile(transaction, root, Continuing{ .inner = context }, Continuing.onEntryContinuing);
         }
     };
 }
