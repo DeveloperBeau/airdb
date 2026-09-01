@@ -100,7 +100,10 @@ pub const Aggregate = struct { count: u64, sum: u64, min: ?u64, max: ?u64 };
 
 /// Aggregate int property `property` over the live rows satisfying `predicate`.
 /// `sum` wraps on overflow; min/max are null when no row matches. O(n) over the
-/// live set without a usable value index.
+/// live set without a usable value index. `property`'s kind is not yet
+/// checked, unlike `sortByProperty` and `Request.validate`: a blob or
+/// collection property aggregates its raw tree-root u64 rather than being
+/// rejected. That check arrives with collection predicates.
 pub fn aggregateInt(
     transaction: anytype,
     catalogReference: Reference,
@@ -183,8 +186,9 @@ pub fn exists(
 /// Call it on the transaction that produced the page: it reads the row's
 /// current sort value, so a value that changed since the page was fetched
 /// yields a cursor for the new position. `error.NotFound` when `objectKey` no
-/// longer resolves. O(1) and no I/O for `.objectKey`; one index descent plus
-/// one column read for `.property`.
+/// longer resolves, `error.BadProperty` when `ordering`'s property is outside
+/// the type. O(1) and no I/O for `.objectKey`; one index descent plus one
+/// column read for `.property`.
 pub fn cursorAfter(
     transaction: anytype,
     catalogReference: Reference,

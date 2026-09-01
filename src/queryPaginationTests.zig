@@ -610,10 +610,19 @@ test "P22: cursorAfter on an objectKey that does not resolve is error.NotFound" 
     try testing.expectError(error.NotFound, cursorAfter(&writeTransaction, catalogReference, .{ .sortKey = .{ .property = 1 } }, 999));
 }
 
-fn assertCursorPagesEqualOffsetPages(writeTransaction: *WriteTransaction, catalogReference: Reference, ordering: Ordering, pageSize: u64) !void {
+// Maximum pages either loop below will fetch before concluding the cursor is
+// stuck in a cycle rather than genuinely converging. No correct scroll in this
+// file comes near this: the largest is 50 rows at page size 5 (10 pages). A
+// cap, not more cursor history, closes the case where a resume-bound
+// regression makes the cursor revisit an earlier bucket on a period greater
+// than one, which the immediately-preceding-cursor comparison below does not
+// catch (see the Reviewer's period-2 trace against the modulus-7 fixture).
+const maxFetchesBeforeStuckCursor: u64 = 1000;
+
+fn assertCursorPagesEqualOffsetPages(writeTransaction: *WriteTransaction, catalogReference: Reference, ordering: Ordering, predicate: Predicate, pageSize: u64) !void {
     var unpaged = std.ArrayList(u64).empty;
     defer unpaged.deinit(testing.allocator);
-    try where(writeTransaction, catalogReference, .{ .ordering = ordering }, &unpaged, testing.allocator);
+    try where(writeTransaction, catalogReference, .{ .predicate = predicate, .ordering = ordering }, &unpaged, testing.allocator);
 
     var offsetResult = std.ArrayList(u64).empty;
     defer offsetResult.deinit(testing.allocator);
@@ -621,7 +630,7 @@ fn assertCursorPagesEqualOffsetPages(writeTransaction: *WriteTransaction, catalo
     while (true) {
         var page = std.ArrayList(u64).empty;
         defer page.deinit(testing.allocator);
-        try where(writeTransaction, catalogReference, .{ .ordering = ordering, .page = .{ .start = .{ .offset = offset }, .limit = pageSize } }, &page, testing.allocator);
+        try where(writeTransaction, catalogReference, .{ .predicate = predicate, .ordering = ordering, .page = .{ .start = .{ .offset = offset }, .limit = pageSize } }, &page, testing.allocator);
         if (page.items.len == 0) break;
         try offsetResult.appendSlice(testing.allocator, page.items);
         offset += pageSize;
@@ -630,11 +639,14 @@ fn assertCursorPagesEqualOffsetPages(writeTransaction: *WriteTransaction, catalo
     var cursorResult = std.ArrayList(u64).empty;
     defer cursorResult.deinit(testing.allocator);
     var cursor: ?query.Cursor = null;
+    var fetchCount: u64 = 0;
     while (true) {
+        fetchCount += 1;
+        try testing.expect(fetchCount < maxFetchesBeforeStuckCursor);
         var page = std.ArrayList(u64).empty;
         defer page.deinit(testing.allocator);
         const start: query.PageStart = if (cursor) |resumeCursor| .{ .after = resumeCursor } else .{ .offset = 0 };
-        try where(writeTransaction, catalogReference, .{ .ordering = ordering, .page = .{ .start = start, .limit = pageSize } }, &page, testing.allocator);
+        try where(writeTransaction, catalogReference, .{ .predicate = predicate, .ordering = ordering, .page = .{ .start = start, .limit = pageSize } }, &page, testing.allocator);
         if (page.items.len == 0) break;
         try cursorResult.appendSlice(testing.allocator, page.items);
         const nextCursor = try cursorAfter(writeTransaction, catalogReference, ordering, page.items[page.items.len - 1]);
@@ -658,8 +670,9 @@ test "P23: cursor pages equal offset pages, objectKey ordering, both directions"
     var writeTransaction = try database.beginWrite();
     defer writeTransaction.deinit();
     const catalogReference = try seedThreeProperty(&writeTransaction, false, 37);
-    try assertCursorPagesEqualOffsetPages(&writeTransaction, catalogReference, .{}, 5);
-    try assertCursorPagesEqualOffsetPages(&writeTransaction, catalogReference, .{ .order = .descending }, 5);
+    const emptyPredicate: Predicate = .{ .conjunction = &.{} };
+    try assertCursorPagesEqualOffsetPages(&writeTransaction, catalogReference, .{}, emptyPredicate, 5);
+    try assertCursorPagesEqualOffsetPages(&writeTransaction, catalogReference, .{ .order = .descending }, emptyPredicate, 5);
 }
 
 test "P24: cursor pages equal offset pages, indexed property ordering, both directions" {
@@ -677,8 +690,32 @@ test "P24: cursor pages equal offset pages, indexed property ordering, both dire
     // so a resume bound wrongly applied outside the resumed value bucket would
     // not be a no-op against this data.
     const catalogReference = try seedWithValues(&writeTransaction, true, &p10Values);
-    try assertCursorPagesEqualOffsetPages(&writeTransaction, catalogReference, .{ .sortKey = .{ .property = 1 } }, 5);
-    try assertCursorPagesEqualOffsetPages(&writeTransaction, catalogReference, .{ .sortKey = .{ .property = 1 }, .order = .descending }, 5);
+    const emptyPredicate: Predicate = .{ .conjunction = &.{} };
+    try assertCursorPagesEqualOffsetPages(&writeTransaction, catalogReference, .{ .sortKey = .{ .property = 1 } }, emptyPredicate, 5);
+    try assertCursorPagesEqualOffsetPages(&writeTransaction, catalogReference, .{ .sortKey = .{ .property = 1 }, .order = .descending }, emptyPredicate, 5);
+}
+
+test "P41: cursor pages equal offset pages when an index-driving predicate restricts the candidate path, both directions" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try qpTmpPath(testing.allocator, &tmp, "p41.airdb");
+    defer testing.allocator.free(path);
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var writeTransaction = try database.beginWrite();
+    defer writeTransaction.deinit();
+    // 250 rows, property1 = objectKey % 100: an indexed range comparison
+    // (property1 >= 90) is a term canDriveFromIndex can drive, so `runQuery`
+    // takes the candidate path (src/query/execution.zig:40-78), materializing
+    // and sorting candidates before applying execution.zig's `bounds` filter.
+    // Every other `.after` cursor test in this file either carries the default
+    // empty conjunction (which the candidate path cannot drive) or uses
+    // property ordering (which never enters runQuery at all), so this is the
+    // only test that exercises a cursor against that filter.
+    const catalogReference = try seedThreeProperty(&writeTransaction, true, 250);
+    const drivingPredicate = intComparison(1, .ge, 90);
+    try assertCursorPagesEqualOffsetPages(&writeTransaction, catalogReference, .{}, drivingPredicate, 5);
+    try assertCursorPagesEqualOffsetPages(&writeTransaction, catalogReference, .{ .order = .descending }, drivingPredicate, 5);
 }
 
 test "P25: a cursor inside a run of duplicate sort values resumes within the run" {
@@ -821,7 +858,10 @@ fn scrollToExhaustion(
     var allFetched = std.ArrayList(u64).empty;
     var cursor: ?query.Cursor = null;
     var isFirstFetch = true;
+    var fetchCount: u64 = 0;
     while (true) {
+        fetchCount += 1;
+        try testing.expect(fetchCount < maxFetchesBeforeStuckCursor);
         var readTransaction = try database.beginRead();
         const catalogReference = try typeDirectory.catalogReference(&readTransaction, readTransaction.root(), 0);
         var page = std.ArrayList(u64).empty;
@@ -1139,7 +1179,7 @@ fn p36ExpectedSlice(
 
     var result = std.ArrayList(u64).empty;
     const start = @min(offset, matching.items.len);
-    const end = if (limit) |l| @min(start +| l, matching.items.len) else matching.items.len;
+    const end = if (limit) |pageLimit| @min(start +| pageLimit, matching.items.len) else matching.items.len;
     for (matching.items[start..end]) |entry| try result.append(allocator, entry.objectKey);
     return result;
 }
@@ -1208,14 +1248,14 @@ test "P36: fuzz, a random page equals the independently computed expected slice"
             }
             if (order == .descending) std.mem.reverse(u64, matching.items);
             const start = @min(offset, matching.items.len);
-            const end = if (limit) |l| @min(start +| l, matching.items.len) else matching.items.len;
+            const end = if (limit) |pageLimit| @min(start +| pageLimit, matching.items.len) else matching.items.len;
             try testing.expectEqualSlices(u64, matching.items[start..end], page.items);
         } else {
             var expected = try p36ExpectedSlice(testing.allocator, &property1Values, sortKeyChoice, order, offset, limit);
             defer expected.deinit(testing.allocator);
             try testing.expectEqualSlices(u64, expected.items, page.items);
         }
-        if (limit) |l| try testing.expect(page.items.len <= l);
+        if (limit) |pageLimit| try testing.expect(page.items.len <= pageLimit);
     }
 }
 
@@ -1228,11 +1268,23 @@ test "P37: fuzz, random page sizes reconstruct the full ordered result exactly o
     defer database.deinit();
     var writeTransaction = try database.beginWrite();
     defer writeTransaction.deinit();
-    const catalogReference = try seedThreeProperty(&writeTransaction, true, 80);
+    // Decorrelated from objectKey (unlike seedThreeProperty's property1 == objectKey
+    // identity mapping for rowCount < 100): value order and objectKey order disagree,
+    // e.g. ascending visits objectKey 0, 7, 14, ... before objectKey 1, 8, 15, ....
+    // Per the spec's section 7 table, the expected sequence below is computed by
+    // sorting a copy of this array with p36LessThan, a comparator written in this
+    // file, never by calling `where` and comparing the engine's paged output against
+    // its own unpaged output.
+    const rowCount: usize = 80;
+    var values: [rowCount]u64 = undefined;
+    for (0..rowCount) |index| values[index] = index % 7;
+    const catalogReference = try seedWithValues(&writeTransaction, true, &values);
 
-    var unpaged = std.ArrayList(u64).empty;
-    defer unpaged.deinit(testing.allocator);
-    try where(&writeTransaction, catalogReference, .{ .ordering = .{ .sortKey = .{ .property = 1 } } }, &unpaged, testing.allocator);
+    var expectedEntries: [rowCount]P36Entry = undefined;
+    for (0..rowCount) |index| expectedEntries[index] = .{ .value = values[index], .objectKey = index };
+    std.mem.sort(P36Entry, &expectedEntries, SortOrder.ascending, p36LessThan);
+    var expected: [rowCount]u64 = undefined;
+    for (expectedEntries, 0..) |entry, index| expected[index] = entry.objectKey;
 
     var draw: u64 = 0;
     while (draw < 100) : (draw += 1) {
@@ -1255,6 +1307,6 @@ test "P37: fuzz, random page sizes reconstruct the full ordered result exactly o
             try reconstructed.appendSlice(testing.allocator, page.items);
             offset += pageSize;
         }
-        try testing.expectEqualSlices(u64, unpaged.items, reconstructed.items);
+        try testing.expectEqualSlices(u64, &expected, reconstructed.items);
     }
 }

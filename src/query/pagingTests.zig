@@ -89,7 +89,7 @@ test "D7: fuzz, the collected slice equals the reference slice" {
 
         // Reference: slice the sequence with plain arithmetic.
         const start = @min(offset, sequence.items.len);
-        const end = if (limit) |l| @min(start +| l, sequence.items.len) else sequence.items.len;
+        const end = if (limit) |pageLimit| @min(start +| pageLimit, sequence.items.len) else sequence.items.len;
         const expected = sequence.items[start..end];
 
         var out = std.ArrayList(u64).empty;
@@ -99,6 +99,6 @@ test "D7: fuzz, the collected slice equals the reference slice" {
             if (!(try collector.collect(key))) break;
         }
         try testing.expectEqualSlices(u64, expected, out.items);
-        if (limit) |l| try testing.expect(out.items.len <= l);
+        if (limit) |pageLimit| try testing.expect(out.items.len <= pageLimit);
     }
 }
