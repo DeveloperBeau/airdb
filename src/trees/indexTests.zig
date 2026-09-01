@@ -300,10 +300,25 @@ test "minKey on empty and single-key trees" {
 }
 
 test "minKey and maxKey track a model set under churn" {
-    // Fuzz: the model is the only source of expected values. Domain is small
-    // relative to operation count so leaves fill, split and empty repeatedly,
-    // including at both edges -- catching an empty boundary leaf arising at a
-    // depth or position the hand-written boundary tests above do not construct.
+    // Fuzz: the model is the only source of expected values. A single flat
+    // domain almost never empties a boundary leaf by chance -- every one of
+    // leafCap keys in that leaf would need to be independently absent at the
+    // same sampled checkpoint, and WHICH keys a real boundary leaf holds
+    // depends on split history a black-box model cannot predict, so a zone
+    // sized purely by guesswork can miss the actual leaf entirely.
+    //
+    // Instead, the low and high edges are pre-built with the exact ascending
+    // fill "minKey survives an emptied leftmost leaf" and "maxKey survives an
+    // emptied rightmost leaf" use: inserting edgeFillCount keys in order
+    // forces exactly one split there, so the resulting leftmost and rightmost
+    // leaves' key ranges are known, not guessed (lowSplitBoundary,
+    // highSplitBoundary). Because no key outside an edge's own fill range is
+    // ever inserted into it afterward, that split boundary cannot move: only
+    // churn confined to the edge's own keys can affect it. Random churn then
+    // hammers removal at both edges, concentrating on that fixed pair of
+    // leaves, while a wide middle zone stays biased toward insertion to keep
+    // the tree alive elsewhere. The self-check after the loop fails loudly if
+    // this seed and these parameters stop reaching the emptied state.
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try idxTmpPath(testing.allocator, &tmp, "idx_minmax_fuzz.airdb");
@@ -314,19 +329,50 @@ test "minKey and maxKey track a model set under churn" {
     defer writeTransaction.deinit();
 
     var root = try create(&writeTransaction);
-    const domain: u64 = 500;
+    const domain: u64 = 300;
+    const edgeFillCount: u64 = 65; // matches the 0..=64 fill in the hand-written boundary tests
+    const lowSplitBoundary: u64 = edgeFillCount / 2; // keys below this are the known emptied-in-T1 leftmost leaf
+    const highEdgeStart: u64 = domain - edgeFillCount;
+    const highSplitBoundary: u64 = highEdgeStart + lowSplitBoundary; // keys from here up are the mirrored rightmost leaf
     var present = [_]bool{false} ** domain;
+
+    // Ascending pre-fill at each edge, matching the boundary tests exactly so
+    // the split point is known rather than inferred.
+    var fillKey: u64 = 0;
+    while (fillKey < edgeFillCount) : (fillKey += 1) {
+        root = try insert(&writeTransaction, root, fillKey, fillKey);
+        present[fillKey] = true;
+    }
+    fillKey = highEdgeStart;
+    while (fillKey < domain) : (fillKey += 1) {
+        root = try insert(&writeTransaction, root, fillKey, fillKey);
+        present[fillKey] = true;
+    }
 
     var prng = std.Random.DefaultPrng.init(0xA17D8);
     const random = prng.random();
+    var lowLeafEmptiedWithLiveKeys: u64 = 0;
+    var highLeafEmptiedWithLiveKeys: u64 = 0;
     var operation: usize = 0;
-    while (operation < 2000) : (operation += 1) {
-        if (random.float(f32) < 0.6) {
-            const key = random.intRangeLessThan(u64, 0, domain);
+    while (operation < 4000) : (operation += 1) {
+        const zoneRoll = random.float(f32);
+        var key: u64 = undefined;
+        var insertProbability: f32 = undefined;
+        if (zoneRoll < 0.25) {
+            key = random.intRangeLessThan(u64, 0, edgeFillCount);
+            insertProbability = 0.08; // mostly emptied, rarely repopulated
+        } else if (zoneRoll < 0.5) {
+            key = random.intRangeLessThan(u64, highEdgeStart, domain);
+            insertProbability = 0.08;
+        } else {
+            key = random.intRangeLessThan(u64, edgeFillCount, highEdgeStart);
+            insertProbability = 0.65; // keeps the middle populated enough to force splits
+        }
+
+        if (random.float(f32) < insertProbability) {
             root = try insert(&writeTransaction, root, key, key);
             present[key] = true;
         } else {
-            const key = random.intRangeLessThan(u64, 0, domain);
             root = try remove(&writeTransaction, root, key);
             present[key] = false;
         }
@@ -346,8 +392,36 @@ test "minKey and maxKey track a model set under churn" {
             try testing.expectEqual(expectedCount, try count(&writeTransaction, root));
             try testing.expectEqual(expectedCount == 0, (try minKey(&writeTransaction, root)) == null);
             if (expectedMin != null and expectedMax != null) try testing.expect(expectedMin.? <= expectedMax.?);
+
+            if (expectedCount > 0) {
+                var lowLeafEmpty = true;
+                for (present[0..lowSplitBoundary]) |isPresent| {
+                    if (isPresent) {
+                        lowLeafEmpty = false;
+                        break;
+                    }
+                }
+                if (lowLeafEmpty) lowLeafEmptiedWithLiveKeys += 1;
+
+                var highLeafEmpty = true;
+                for (present[highSplitBoundary..]) |isPresent| {
+                    if (isPresent) {
+                        highLeafEmpty = false;
+                        break;
+                    }
+                }
+                if (highLeafEmpty) highLeafEmptiedWithLiveKeys += 1;
+            }
         }
     }
+
+    // If either count is zero, this seed and these parameters stopped
+    // reaching the boundary-empty-leaf state this test exists to check, and
+    // the invariant assertions above ran only against the easy,
+    // never-emptied shape. See "minKey survives an emptied leftmost leaf" for
+    // the hand-constructed version of the same state.
+    try testing.expect(lowLeafEmptiedWithLiveKeys > 0);
+    try testing.expect(highLeafEmptiedWithLiveKeys > 0);
 }
 
 test "stored subtree counts match a full iteration under churn" {
