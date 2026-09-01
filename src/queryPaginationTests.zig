@@ -637,7 +637,11 @@ fn assertCursorPagesEqualOffsetPages(writeTransaction: *WriteTransaction, catalo
         try where(writeTransaction, catalogReference, .{ .ordering = ordering, .page = .{ .start = start, .limit = pageSize } }, &page, testing.allocator);
         if (page.items.len == 0) break;
         try cursorResult.appendSlice(testing.allocator, page.items);
-        cursor = try cursorAfter(writeTransaction, catalogReference, ordering, page.items[page.items.len - 1]);
+        const nextCursor = try cursorAfter(writeTransaction, catalogReference, ordering, page.items[page.items.len - 1]);
+        // Fail fast rather than hang: a cursor that fails to advance past its
+        // predecessor would otherwise re-fetch the same trailing row forever.
+        if (cursor) |previousCursor| try testing.expect(!std.meta.eql(previousCursor, nextCursor));
+        cursor = nextCursor;
     }
 
     try testing.expectEqualSlices(u64, unpaged.items, offsetResult.items);
@@ -667,7 +671,12 @@ test "P24: cursor pages equal offset pages, indexed property ordering, both dire
     defer database.deinit();
     var writeTransaction = try database.beginWrite();
     defer writeTransaction.deinit();
-    const catalogReference = try seedThreeProperty(&writeTransaction, true, 37);
+    // Uses the already-decorrelated p10Values dataset (value order deliberately
+    // disagrees with objectKey order, e.g. ascending visits objectKey 8 before 6)
+    // rather than seedThreeProperty's identity mapping (property1 == objectKey),
+    // so a resume bound wrongly applied outside the resumed value bucket would
+    // not be a no-op against this data.
+    const catalogReference = try seedWithValues(&writeTransaction, true, &p10Values);
     try assertCursorPagesEqualOffsetPages(&writeTransaction, catalogReference, .{ .sortKey = .{ .property = 1 } }, 5);
     try assertCursorPagesEqualOffsetPages(&writeTransaction, catalogReference, .{ .sortKey = .{ .property = 1 }, .order = .descending }, 5);
 }
@@ -681,23 +690,29 @@ test "P25: a cursor inside a run of duplicate sort values resumes within the run
     defer database.deinit();
     var writeTransaction = try database.beginWrite();
     defer writeTransaction.deinit();
-    // 5 rows sharing value 7 (objectKeys 0..4), then one row with value 8 (objectKey 5).
-    const values = [_]u64{ 7, 7, 7, 7, 7, 8 };
+    // Row with value 8 inserted FIRST (objectKey 0), then 5 rows sharing value 7
+    // (objectKeys 1..5): the run's objectKeys deliberately sort below the
+    // value-8 row's objectKey, disagreeing with sort-property order, so a
+    // resume bound wrongly applied to the later value-8 bucket (instead of
+    // only the resumed value-7 bucket) would exclude it.
+    const values = [_]u64{ 8, 7, 7, 7, 7, 7 };
     const catalogReference = try seedWithValues(&writeTransaction, true, &values);
     const ordering = Ordering{ .sortKey = .{ .property = 1 } };
-    // Cursor placed at the third row of the run (objectKey 2).
-    const cursor = try cursorAfter(&writeTransaction, catalogReference, ordering, 2);
+    // Ascending order: the run 1,2,3,4,5 (value 7), then 0 (value 8).
+    // Cursor placed at the third row of the run (objectKey 3).
+    const cursor = try cursorAfter(&writeTransaction, catalogReference, ordering, 3);
     var page = std.ArrayList(u64).empty;
     defer page.deinit(testing.allocator);
     try where(&writeTransaction, catalogReference, .{ .ordering = ordering, .page = .{ .start = .{ .after = cursor } } }, &page, testing.allocator);
-    try expectSlice(&.{ 3, 4, 5 }, &page);
+    try expectSlice(&.{ 4, 5, 0 }, &page);
 
-    // Must NOT fire for a cursor at the end of a run: the next value's rows follow.
-    const endOfRunCursor = try cursorAfter(&writeTransaction, catalogReference, ordering, 4);
+    // Must NOT fire for a cursor at the end of a run: the next value's bucket
+    // follows in full, including its lower objectKey.
+    const endOfRunCursor = try cursorAfter(&writeTransaction, catalogReference, ordering, 5);
     var afterEndOfRun = std.ArrayList(u64).empty;
     defer afterEndOfRun.deinit(testing.allocator);
     try where(&writeTransaction, catalogReference, .{ .ordering = ordering, .page = .{ .start = .{ .after = endOfRunCursor } } }, &afterEndOfRun, testing.allocator);
-    try expectSlice(&.{5}, &afterEndOfRun);
+    try expectSlice(&.{0}, &afterEndOfRun);
 }
 
 test "P26: an ascending cursor at maxInt returns an empty page" {
