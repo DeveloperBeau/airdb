@@ -130,7 +130,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
         rowsEq = try query.countWhere(
             &readTransaction,
             catalogReference,
-            &.{.{ .property = 1, .operator = .eq, .value = eqCategory }},
+            .{ .comparison = .{ .property = 1, .operator = .eq, .value = .{ .int = eqCategory } } },
             alloc,
         );
     }
@@ -139,7 +139,7 @@ pub fn run(ctx: *harness.Ctx) !harness.Result {
 
     // Full scan: no predicate matches every live row.
     const fullStart = nowNs(io);
-    _ = try query.countWhere(&readTransaction, catalogReference, &.{}, alloc);
+    _ = try query.countWhere(&readTransaction, catalogReference, .{ .conjunction = &.{} }, alloc);
     const fullNs: u64 = @intCast(nowNs(io) - fullStart);
 
     readTransaction.end();

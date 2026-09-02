@@ -16,6 +16,7 @@ const count = index.count;
 const maxKey = index.maxKey;
 const forEachKey = index.forEachKey;
 const forEachEntry = index.forEachEntry;
+const forEachEntryWhile = index.forEachEntryWhile;
 const forEachEntryInRange = index.forEachEntryInRange;
 const appendRun = index.appendRun;
 const makeInnerForTest = index.makeInnerForTest;
@@ -333,6 +334,223 @@ test "forEachEntry visits key/value pairs in ascending key order" {
         first = false;
     }
     writeTransaction.deinit();
+}
+
+const StoppingCollector = struct {
+    keys: *std.ArrayList(u64),
+    vals: *std.ArrayList(u64),
+    stopAfter: usize,
+    fn onEntry(self: @This(), key: u64, val: u64) !bool {
+        try self.keys.append(testing.allocator, key);
+        try self.vals.append(testing.allocator, val);
+        return self.keys.items.len < self.stopAfter;
+    }
+};
+
+// Like StoppingCollector, but a stop position at the tree's true key count is
+// not a deliberate early stop: it lets the walk run to its natural end, so
+// the return value reflects "did we reach the end" rather than "did the
+// collector ask to keep going on the last entry too". Used only by the fuzz
+// invariant below, which asserts the return value equals `k == keyCount`.
+const FuzzStoppingCollector = struct {
+    keys: *std.ArrayList(u64),
+    vals: *std.ArrayList(u64),
+    stopAfter: usize,
+    keyCount: usize,
+    fn onEntry(self: @This(), key: u64, val: u64) !bool {
+        try self.keys.append(testing.allocator, key);
+        try self.vals.append(testing.allocator, val);
+        return self.keys.items.len < self.stopAfter or self.stopAfter == self.keyCount;
+    }
+};
+
+test "forEachEntryWhile: an always-true callback visits every entry in ascending order and returns true" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try idxTmpPath(testing.allocator, &tmp, "while_all.airdb");
+    defer testing.allocator.free(path);
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var writeTransaction = try database.beginWrite();
+    var root = try create(&writeTransaction);
+    var position: u64 = 0;
+    while (position < 200) : (position += 1) {
+        const key = (position *% 2654435761) % 100_003;
+        root = try insert(&writeTransaction, root, key, key * 7 + 1);
+    }
+    var keys = std.ArrayList(u64).empty;
+    defer keys.deinit(testing.allocator);
+    var vals = std.ArrayList(u64).empty;
+    defer vals.deinit(testing.allocator);
+    const visitedEveryEntry = try forEachEntryWhile(&writeTransaction, root, StoppingCollector{ .keys = &keys, .vals = &vals, .stopAfter = std.math.maxInt(usize) }, StoppingCollector.onEntry);
+    try testing.expect(visitedEveryEntry);
+    try testing.expectEqual(try count(&writeTransaction, root), @as(u64, keys.items.len));
+    var prev: u64 = 0;
+    var first = true;
+    for (keys.items, vals.items) |key, val| {
+        if (!first) try testing.expect(key > prev);
+        try testing.expectEqual(key * 7 + 1, val);
+        prev = key;
+        first = false;
+    }
+    writeTransaction.deinit();
+}
+
+test "forEachEntryWhile: a callback returning false after the 3rd entry visits exactly 3 and returns false" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try idxTmpPath(testing.allocator, &tmp, "while_stop3.airdb");
+    defer testing.allocator.free(path);
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var writeTransaction = try database.beginWrite();
+    var root = try create(&writeTransaction);
+    var position: u64 = 0;
+    while (position < 50) : (position += 1) root = try insert(&writeTransaction, root, position, position);
+    var keys = std.ArrayList(u64).empty;
+    defer keys.deinit(testing.allocator);
+    var vals = std.ArrayList(u64).empty;
+    defer vals.deinit(testing.allocator);
+    const visitedEveryEntry = try forEachEntryWhile(&writeTransaction, root, StoppingCollector{ .keys = &keys, .vals = &vals, .stopAfter = 3 }, StoppingCollector.onEntry);
+    try testing.expect(!visitedEveryEntry);
+    try testing.expectEqual(@as(usize, 3), keys.items.len);
+    try testing.expectEqualSlices(u64, &.{ 0, 1, 2 }, keys.items);
+    writeTransaction.deinit();
+}
+
+test "forEachEntryWhile: stopping mid-walk across a leaf boundary visits only the expected prefix" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try idxTmpPath(testing.allocator, &tmp, "while_leaf_boundary.airdb");
+    defer testing.allocator.free(path);
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var writeTransaction = try database.beginWrite();
+    var root = try create(&writeTransaction);
+    // Insert well more than one leaf's worth (leafCap == 64) in ascending order
+    // so key order is predictable across the leaf boundary.
+    const keyCount: u64 = 200;
+    var position: u64 = 0;
+    while (position < keyCount) : (position += 1) root = try insert(&writeTransaction, root, position, position);
+    // Stop partway into the second leaf.
+    const stopAfter: usize = 70;
+    var keys = std.ArrayList(u64).empty;
+    defer keys.deinit(testing.allocator);
+    var vals = std.ArrayList(u64).empty;
+    defer vals.deinit(testing.allocator);
+    const visitedEveryEntry = try forEachEntryWhile(&writeTransaction, root, StoppingCollector{ .keys = &keys, .vals = &vals, .stopAfter = stopAfter }, StoppingCollector.onEntry);
+    try testing.expect(!visitedEveryEntry);
+    try testing.expectEqual(stopAfter, keys.items.len);
+    for (keys.items, 0..) |key, position2| try testing.expectEqual(@as(u64, position2), key);
+    writeTransaction.deinit();
+}
+
+test "forEachEntryWhile: stopping on the very last entry still returns false" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try idxTmpPath(testing.allocator, &tmp, "while_last.airdb");
+    defer testing.allocator.free(path);
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var writeTransaction = try database.beginWrite();
+    var root = try create(&writeTransaction);
+    var position: u64 = 0;
+    while (position < 10) : (position += 1) root = try insert(&writeTransaction, root, position, position);
+    var keys = std.ArrayList(u64).empty;
+    defer keys.deinit(testing.allocator);
+    var vals = std.ArrayList(u64).empty;
+    defer vals.deinit(testing.allocator);
+    const visitedEveryEntry = try forEachEntryWhile(&writeTransaction, root, StoppingCollector{ .keys = &keys, .vals = &vals, .stopAfter = 10 }, StoppingCollector.onEntry);
+    try testing.expect(!visitedEveryEntry);
+    try testing.expectEqual(@as(usize, 10), keys.items.len);
+    writeTransaction.deinit();
+}
+
+test "forEachEntryWhile: an empty tree returns true and visits nothing" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try idxTmpPath(testing.allocator, &tmp, "while_empty.airdb");
+    defer testing.allocator.free(path);
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var writeTransaction = try database.beginWrite();
+    const root = try create(&writeTransaction);
+    var keys = std.ArrayList(u64).empty;
+    defer keys.deinit(testing.allocator);
+    var vals = std.ArrayList(u64).empty;
+    defer vals.deinit(testing.allocator);
+    const visitedEveryEntry = try forEachEntryWhile(&writeTransaction, root, StoppingCollector{ .keys = &keys, .vals = &vals, .stopAfter = std.math.maxInt(usize) }, StoppingCollector.onEntry);
+    try testing.expect(visitedEveryEntry);
+    try testing.expectEqual(@as(usize, 0), keys.items.len);
+    writeTransaction.deinit();
+}
+
+test "forEachEntryWhile: a callback error propagates and stops the walk" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try idxTmpPath(testing.allocator, &tmp, "while_error.airdb");
+    defer testing.allocator.free(path);
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var writeTransaction = try database.beginWrite();
+    var root = try create(&writeTransaction);
+    var position: u64 = 0;
+    while (position < 50) : (position += 1) root = try insert(&writeTransaction, root, position, position);
+    const ErroringCollector = struct {
+        visited: *usize,
+        errorAfter: usize,
+        fn onEntry(self: @This(), _: u64, _: u64) anyerror!bool {
+            self.visited.* += 1;
+            if (self.visited.* == self.errorAfter) return error.TestInduced;
+            return true;
+        }
+    };
+    var visited: usize = 0;
+    try testing.expectError(error.TestInduced, forEachEntryWhile(&writeTransaction, root, ErroringCollector{ .visited = &visited, .errorAfter = 5 }, ErroringCollector.onEntry));
+    try testing.expectEqual(@as(usize, 5), visited);
+    writeTransaction.deinit();
+}
+
+test "forEachEntryWhile fuzz: the visited prefix equals the first k sorted keys, and the return value matches k == keyCount" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try idxTmpPath(testing.allocator, &tmp, "while_fuzz.airdb");
+    defer testing.allocator.free(path);
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var writeTransaction = try database.beginWrite();
+    defer writeTransaction.deinit();
+
+    var seed: u64 = 0;
+    while (seed < 100) : (seed += 1) {
+        var prng = std.Random.DefaultPrng.init(seed);
+        const random = prng.random();
+        const keyCount = random.intRangeAtMost(usize, 1, 500);
+        var root = try create(&writeTransaction);
+        var inserted = std.ArrayList(u64).empty;
+        defer inserted.deinit(testing.allocator);
+        var used = std.AutoHashMap(u64, void).init(testing.allocator);
+        defer used.deinit();
+        var insertedCount: usize = 0;
+        while (insertedCount < keyCount) {
+            const key = random.intRangeAtMost(u64, 0, 1_000_000);
+            if (used.contains(key)) continue;
+            try used.put(key, {});
+            try inserted.append(testing.allocator, key);
+            root = try insert(&writeTransaction, root, key, key);
+            insertedCount += 1;
+        }
+        std.mem.sort(u64, inserted.items, {}, std.sort.asc(u64));
+        const stopPosition = random.intRangeAtMost(usize, 1, keyCount);
+
+        var keys = std.ArrayList(u64).empty;
+        defer keys.deinit(testing.allocator);
+        var vals = std.ArrayList(u64).empty;
+        defer vals.deinit(testing.allocator);
+        const visitedEveryEntry = try forEachEntryWhile(&writeTransaction, root, FuzzStoppingCollector{ .keys = &keys, .vals = &vals, .stopAfter = stopPosition, .keyCount = keyCount }, FuzzStoppingCollector.onEntry);
+        try testing.expectEqualSlices(u64, inserted.items[0..stopPosition], keys.items);
+        try testing.expectEqual(stopPosition == keyCount, visitedEveryEntry);
+    }
 }
 
 // Build a tree holding keys 0..=1000 (each once) inserted in scrambled order,

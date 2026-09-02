@@ -61,10 +61,12 @@ Code pointers use `module.function` names under `src/`.
 
 - Per-property value indexes (`indexed = true`), maintained in the same
   transaction as every insert/update/delete; emptied entries are pruned.
-- `query.where` / `countWhere` / `aggregateInt` with `eq/ne/lt/le/gt/ge`
-  predicates (logical AND). The planner drives off an indexed equality or
-  range predicate when one exists; otherwise the scan streams the key→row
-  index without materializing the table.
+- `query.where` / `countWhere` / `aggregateInt` take one predicate tree built
+  from comparisons (`eq/ne/lt/le/gt/ge`) combined with and/or/not. An empty
+  conjunction matches every live row; an empty disjunction matches nothing.
+  The planner drives off an indexed equality or range term, unions a
+  disjunction's branches only when every branch is indexed, and falls back
+  to a streaming scan otherwise.
 - `query.rangeInclusive`, `query.sortByPropertyAscending`.
 
 ## Bulk operations
