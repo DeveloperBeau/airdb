@@ -93,6 +93,14 @@ Code pointers use `module.function` names under `src/`.
   an int or link property over the live rows, reading the value index's first
   or last key when the property is indexed (O(log n)) and scanning otherwise.
   They take no predicate; `aggregateInt` covers the filtered case.
+- `query.distinct` and `query.groupBy` partition the live rows satisfying a
+  predicate by one int or link property's value: `distinct` appends one
+  representative objectKey per value (paged, lazy when the property is
+  indexed); `groupBy` appends one `Group` per value carrying the `Aggregate`
+  of a second property over that value's rows (never lazy, since a group is
+  only correct once complete; takes no page). Both reject a `.blob` property
+  even when it is indexed, because its value index is keyed by bytes
+  truncated to 256 bytes, so one outer key can cover two distinct values.
 - **Laziness contract**: which delivery paths bound their work to the page
   rather than the result.
 

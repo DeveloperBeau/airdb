@@ -31,6 +31,7 @@ const predicateLanguage = @import("query/predicate.zig");
 const orderingLanguage = @import("query/ordering.zig");
 const paging = @import("query/paging.zig");
 const aggregateModule = @import("query/aggregate.zig");
+const groupingModule = @import("query/grouping.zig");
 
 /// Direction an ordered query emits in.
 pub const SortOrder = orderingLanguage.SortOrder;
@@ -110,6 +111,12 @@ pub fn countWhere(
 /// contributed).
 pub const Aggregate = aggregateModule.Aggregate;
 
+/// One distinct value of a grouping property, with the aggregate of the
+/// aggregated property over the rows carrying it.
+pub const Group = groupingModule.Group;
+/// Which property `groupBy` partitions by and which one it aggregates.
+pub const Grouping = groupingModule.Grouping;
+
 /// Aggregate int property `property` over the live rows satisfying `predicate`.
 /// `sum` wraps on overflow; min/max are null when no row matches. O(n) over the
 /// live set without a usable value index. `property`'s kind is not yet
@@ -140,6 +147,83 @@ pub fn aggregateInt(
     };
     try execution.runQuery(transaction, &scan, predicate, .ascending, null, allocator, Sink{ .transaction = transaction, .scan = &scan, .property = property, .aggregate = &aggregate }, Sink.onMatch);
     return aggregate;
+}
+
+/// Append one page of representative objectKeys, one per distinct value of int
+/// or link property `property` among the live rows satisfying `predicate`, to
+/// `out`. Values arrive ascending, and each value's representative is the
+/// SMALLEST matching objectKey carrying it, so the indexed and unindexed paths
+/// return the identical sequence. `out` grows with `allocator`, the caller
+/// owns it, and existing items are left in place.
+///
+/// `error.BadProperty` when `property` is outside the type,
+/// `error.UnsupportedGrouping` when its kind is neither int nor link (a `.blob`
+/// property is rejected even when indexed: its value index is keyed by
+/// TRUNCATED bytes, so one outer key can cover two distinct values),
+/// `error.UnsupportedPageStart` when `page` resumes from a cursor, which this
+/// terminal does not yet produce.
+///
+/// Only one of the two paths is lazy:
+///   - `property` indexed: walks its value index in key order and stops at the
+///     first matching row of each value, then stops entirely when the page
+///     fills, so the work tracks the page. O(values visited + rows examined)
+///     with I/O, and no memory beyond `out`.
+///   - `property` unindexed: NOT lazy. A hash set must see every matching row
+///     before it knows which values are distinct, so `page.limit` bounds what
+///     is delivered and not what is read. O(matching rows) time with I/O and
+///     O(distinct values) memory whatever the limit.
+pub fn distinct(
+    transaction: anytype,
+    catalogReference: Reference,
+    property: usize,
+    predicate: Predicate,
+    page: Page,
+    out: *std.ArrayList(u64),
+    allocator: std.mem.Allocator,
+) !void {
+    const scan = try Scan.open(transaction, catalogReference);
+    try predicate.validate(scan.propertyKinds[0..scan.propertyCount]);
+    try groupingModule.validateGroupableProperty(&scan, property);
+    switch (page.start) {
+        .offset => {},
+        .after => return error.UnsupportedPageStart,
+    }
+    try groupingModule.collectDistinct(transaction, &scan, property, predicate, page, out, allocator);
+}
+
+/// Append one `Group` per distinct value of `grouping.groupProperty` among the
+/// live rows satisfying `predicate` to `out`, each carrying the `Aggregate` of
+/// `grouping.aggregateProperty` over that value's matching rows. Groups arrive
+/// ascending by value; a value whose every row is dead or filtered out
+/// produces no group. `Group` holds no pointers, so `out.deinit(allocator)` is
+/// the whole free, and existing items are left in place.
+///
+/// `error.BadProperty` when either property is outside the type,
+/// `error.UnsupportedGrouping` when either property's kind is neither int nor
+/// link. Unlike `aggregateInt`, this terminal does NOT inherit the deferred
+/// kind check: a blob or collection property is rejected here rather than
+/// aggregated as its raw tree-root u64.
+///
+/// Neither path is lazy, because a group is only correct once it is complete.
+/// They differ in memory:
+///   - `grouping.groupProperty` indexed: the value index yields each group's
+///     rows contiguously, so groups stream out with one `Aggregate` live at a
+///     time. O(matching rows) time with I/O, no working memory beyond `out`.
+///   - unindexed: one scan pass into an `AutoHashMap(u64, Aggregate)`, then a
+///     sort by value. O(matching rows) time with I/O, O(distinct values)
+///     memory.
+pub fn groupBy(
+    transaction: anytype,
+    catalogReference: Reference,
+    grouping: Grouping,
+    predicate: Predicate,
+    out: *std.ArrayList(Group),
+    allocator: std.mem.Allocator,
+) !void {
+    const scan = try Scan.open(transaction, catalogReference);
+    try predicate.validate(scan.propertyKinds[0..scan.propertyCount]);
+    try grouping.validate(&scan);
+    try groupingModule.collectGroups(transaction, &scan, grouping, predicate, out, allocator);
 }
 
 /// Which end of a property's value range an endpoint terminal wants.
@@ -320,4 +404,5 @@ test {
     _ = @import("queryEndpointTests.zig");
     _ = @import("queryStringTests.zig");
     _ = @import("queryIndexedStringTests.zig");
+    _ = @import("queryGroupingTests.zig");
 }
