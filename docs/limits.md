@@ -79,6 +79,12 @@ newer one. Ship a matched engine with your app.
 - A single arena allocation caps at one section (16 MiB); larger blobs chunk
   transparently, but list/set/dict *elements* are u64s (blob elements are references
   and follow blob rules).
+- An indexed `.blob` property's value-index key is its stored bytes truncated
+  to 256 bytes; two values sharing a 256-byte prefix share one index key
+  (the query engine still returns the exact answer, re-checking every
+  candidate against its full bytes).
+- `bulkImport` refuses a type with an indexed `.blob` property
+  (`error.UnsupportedForBulk`); an unindexed `.blob` property is unaffected.
 - `Database.create`/`open` require absolute paths.
 
 ## Failed commits

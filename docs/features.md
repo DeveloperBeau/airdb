@@ -60,7 +60,16 @@ Code pointers use `module.function` names under `src/`.
 ## Secondary indexes and queries
 
 - Per-property value indexes (`indexed = true`), maintained in the same
-  transaction as every insert/update/delete; emptied entries are pruned.
+  transaction as every insert/update/delete; emptied entries are pruned. An
+  indexed `.blob` property is keyed by its stored bytes truncated to 256
+  bytes, not by a reference, so `eq`, `beginsWith`, and the four range
+  operators (`lt/le/gt/ge`) are served from the index; `ne` never is, for any
+  kind. Because the key is truncated, the index is a candidate index, not a
+  covering one: results are exact because every candidate is re-checked
+  against its full bytes, but `countWhere` over a blob predicate still reads
+  every candidate row even when the index drives the plan. Ordering and
+  `query.minimum`/`query.maximum` remain int and link only; a blob property's
+  index cannot serve either.
 - `query.where` takes a `Request` (predicate, ordering, page) and appends one
   page of matching objectKeys, in the requested order; `countWhere` and
   `aggregateInt` still take a bare predicate tree built from comparisons
@@ -70,8 +79,9 @@ Code pointers use `module.function` names under `src/`.
   disjunction's branches only when every branch is indexed, and falls back to
   a streaming scan otherwise. A comparison over a blob property accepts all
   seven operators, comparing the stored bytes unsigned and byte-wise (no case
-  folding or normalization); a value index cannot serve the bytes, so a blob
-  predicate always costs a full scan.
+  folding or normalization); an indexed blob property drives eq/range/
+  beginsWith terms from its truncated-key index as above, and an unindexed
+  one always costs a full scan.
 - `query.rangeInclusive`, `query.sortByProperty` (ascending or descending, by
   int or link property).
 - **Pagination and ordering**: `Request.page` takes either an `offset` or a
