@@ -14,6 +14,8 @@ const typeRouting = @import("schema/typeRouting.zig");
 const compaction = @import("storage/compaction.zig");
 const catalog = @import("schema/catalog.zig");
 const Index = @import("trees/index.zig");
+const byteKeyIndex = @import("trees/byteKeyIndex.zig");
+const WriteTransaction = databaseModule.WriteTransaction;
 
 fn tmpFilePath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const u8) ![]const u8 {
     var pathBuffer: [Io.Dir.max_path_bytes]u8 = undefined;
@@ -296,6 +298,183 @@ test "verifyIntegrity detects a corrupted value index" {
         const newVi = try Index.insert(&writeTransaction, view.valueIndexReference(propertyIndex), bogusValue, setRoot);
         const newCatalog = try catalog.setValueIndexReference(&writeTransaction, catalogReference, propertyIndex, newVi);
         const newDirectoryReference = try typeDirectory.setCatalogReference(&writeTransaction, directoryReference, tid, newCatalog);
+        writeTransaction.setRoot(newDirectoryReference);
+        _ = try writeTransaction.commit();
+    }
+
+    try testing.expectError(error.ValueIndexStaleEntry, verification.verifyIntegrity(&database));
+}
+
+// Fixture shared by the blob value-index audit tests below: property0 =
+// primaryKey(int), property1 = blob (indexed). 30 rows, values distinct per
+// row via "row-{d}", except row 7 gets a 300-byte value and rows 20/21 share a
+// 256-byte prefix -- the false-negative boundary the backward audit must not
+// misreport as corruption.
+const blobAuditRowCount: u64 = 30;
+
+fn seedBlobAuditDirectory(writeTransaction: *WriteTransaction) !struct { directoryReference: Reference, objectKeys: [blobAuditRowCount]u64 } {
+    var directoryReference = try typeDirectory.createTypes(writeTransaction, &.{
+        &.{ .{ .kind = .int }, .{ .kind = .blob, .indexed = true } },
+    }, &.{false});
+    var objectKeys: [blobAuditRowCount]u64 = undefined;
+    var buffer: [16]u8 = undefined;
+    var primaryKey: u64 = 0;
+    while (primaryKey < blobAuditRowCount) : (primaryKey += 1) {
+        const value: []const u8 = if (primaryKey == 7) blk: {
+            const bytes = try writeTransaction.database.store.allocator.alloc(u8, 300);
+            @memset(bytes, 'z');
+            break :blk bytes;
+        } else if (primaryKey == 20 or primaryKey == 21) blk: {
+            const bytes = try writeTransaction.database.store.allocator.alloc(u8, 256);
+            @memset(bytes, 'w');
+            break :blk bytes;
+        } else try std.fmt.bufPrint(&buffer, "row-{d}", .{primaryKey});
+        defer if (primaryKey == 7 or primaryKey == 20 or primaryKey == 21) writeTransaction.database.store.allocator.free(@constCast(value));
+        const inserted = try typeRouting.insert(writeTransaction, directoryReference, 0, &.{ .{ .int = primaryKey }, .{ .bytes = value } });
+        directoryReference = inserted.directoryReference;
+        objectKeys[primaryKey] = inserted.objectKey;
+    }
+    return .{ .directoryReference = directoryReference, .objectKeys = objectKeys };
+}
+
+test "verifyIntegrity: clean after blob value-index churn (30 inserted, 10 updated, 5 deleted)" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "vi_blob_churn.airdb");
+    defer testing.allocator.free(path);
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+
+    var writeTransaction = try database.beginWrite();
+    var seeded = try seedBlobAuditDirectory(&writeTransaction);
+    var propertyBuffer: [2]catalog.Value = undefined;
+    var primaryKey: u64 = 0;
+    while (primaryKey < 10) : (primaryKey += 1) {
+        const version = (try typeRouting.get(&writeTransaction, seeded.directoryReference, 0, primaryKey, &propertyBuffer)).?;
+        seeded.directoryReference = (try typeRouting.update(&writeTransaction, seeded.directoryReference, 0, primaryKey, &.{ .{ .int = primaryKey }, .{ .bytes = "updated" } }, version)).ok.directoryReference;
+    }
+    primaryKey = 10;
+    while (primaryKey < 15) : (primaryKey += 1) {
+        const version = (try typeRouting.get(&writeTransaction, seeded.directoryReference, 0, primaryKey, &propertyBuffer)).?;
+        seeded.directoryReference = (try typeRouting.delete(&writeTransaction, seeded.directoryReference, 0, primaryKey, version)).ok;
+    }
+    writeTransaction.setRoot(seeded.directoryReference);
+    _ = try writeTransaction.commit();
+
+    // False negative: the 300-byte value and the shared-256-byte-prefix pair
+    // must not be reported as corruption. If the backward audit compared full
+    // bytes instead of truncated keys, this call fails.
+    try verification.verifyIntegrity(&database);
+}
+
+test "verifyIntegrity detects a corrupted blob value index, backward direction (bogus outer key)" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "vi_blob_backward.airdb");
+    defer testing.allocator.free(path);
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+
+    var liveObjectKey: u64 = undefined;
+    {
+        var writeTransaction = try database.beginWrite();
+        const seeded = try seedBlobAuditDirectory(&writeTransaction);
+        liveObjectKey = seeded.objectKeys[0];
+        writeTransaction.setRoot(seeded.directoryReference);
+        _ = try writeTransaction.commit();
+    }
+    try verification.verifyIntegrity(&database); // clean before corruption
+
+    {
+        var writeTransaction = try database.beginWrite();
+        const directoryReference = database.activeRoot;
+        const catalogReference = try typeDirectory.catalogReference(&writeTransaction, directoryReference, 0);
+        const view = try catalog.loadCatalog(&writeTransaction, catalogReference);
+        var setRoot = try Index.create(&writeTransaction);
+        setRoot = try Index.insert(&writeTransaction, setRoot, liveObjectKey, 1);
+        const newVi = try byteKeyIndex.insert(&writeTransaction, view.valueIndexReference(1), "no row carries this", setRoot);
+        const newCatalog = try catalog.setValueIndexReference(&writeTransaction, catalogReference, 1, newVi);
+        const newDirectoryReference = try typeDirectory.setCatalogReference(&writeTransaction, directoryReference, 0, newCatalog);
+        writeTransaction.setRoot(newDirectoryReference);
+        _ = try writeTransaction.commit();
+    }
+
+    try testing.expectError(error.ValueIndexStaleEntry, verification.verifyIntegrity(&database));
+}
+
+test "verifyIntegrity detects a corrupted blob value index, forward direction (missing outer key)" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "vi_blob_forward.airdb");
+    defer testing.allocator.free(path);
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+
+    {
+        var writeTransaction = try database.beginWrite();
+        const seeded = try seedBlobAuditDirectory(&writeTransaction);
+        writeTransaction.setRoot(seeded.directoryReference);
+        _ = try writeTransaction.commit();
+    }
+    try verification.verifyIntegrity(&database); // clean before corruption
+
+    {
+        var writeTransaction = try database.beginWrite();
+        const directoryReference = database.activeRoot;
+        const catalogReference = try typeDirectory.catalogReference(&writeTransaction, directoryReference, 0);
+        const view = try catalog.loadCatalog(&writeTransaction, catalogReference);
+        // Row 0's key is "row-0"; remove its outer entry entirely.
+        const newVi = try byteKeyIndex.remove(&writeTransaction, view.valueIndexReference(1), "row-0");
+        const newCatalog = try catalog.setValueIndexReference(&writeTransaction, catalogReference, 1, newVi);
+        const newDirectoryReference = try typeDirectory.setCatalogReference(&writeTransaction, directoryReference, 0, newCatalog);
+        writeTransaction.setRoot(newDirectoryReference);
+        _ = try writeTransaction.commit();
+    }
+
+    try testing.expectError(error.ValueIndexMissingEntry, verification.verifyIntegrity(&database));
+}
+
+test "verifyIntegrity detects a corrupted blob value index, backward value-mismatch direction" {
+    // The direction that catches a WRONG key rather than a missing one: row
+    // 0's objectKey is left in its true key's inner set ("row-0"), so the
+    // forward invariant still holds and does not mask this check, and is
+    // additionally inserted into a DIFFERENT existing key's inner set
+    // ("row-1", which belongs to a different live row). The backward audit
+    // finds rowZeroObjectKey under outer key "row-1" and compares it against
+    // row 0's own truncated key ("row-0"), which disagrees.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(testing.allocator, &tmp, "vi_blob_mismatch.airdb");
+    defer testing.allocator.free(path);
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+
+    var rowZeroObjectKey: u64 = undefined;
+    {
+        var writeTransaction = try database.beginWrite();
+        const seeded = try seedBlobAuditDirectory(&writeTransaction);
+        rowZeroObjectKey = seeded.objectKeys[0];
+        writeTransaction.setRoot(seeded.directoryReference);
+        _ = try writeTransaction.commit();
+    }
+    try verification.verifyIntegrity(&database); // clean before corruption
+
+    {
+        var writeTransaction = try database.beginWrite();
+        const directoryReference = database.activeRoot;
+        const catalogReference = try typeDirectory.catalogReference(&writeTransaction, directoryReference, 0);
+        const view = try catalog.loadCatalog(&writeTransaction, catalogReference);
+        const valueIndexReference = view.valueIndexReference(1);
+        // Row 0's TRUE association ("row-0" -> {rowZeroObjectKey, ...}) is left
+        // untouched, so the forward direction still holds. Additionally insert
+        // rowZeroObjectKey into "row-1"'s inner set, an EXISTING key belonging
+        // to a different live row.
+        const otherInnerRoot = (try byteKeyIndex.get(&writeTransaction, valueIndexReference, "row-1")).?;
+        const newOtherInner = try Index.insert(&writeTransaction, otherInnerRoot, rowZeroObjectKey, 1);
+        const newVi = try byteKeyIndex.insert(&writeTransaction, valueIndexReference, "row-1", newOtherInner);
+
+        const newCatalog = try catalog.setValueIndexReference(&writeTransaction, catalogReference, 1, newVi);
+        const newDirectoryReference = try typeDirectory.setCatalogReference(&writeTransaction, directoryReference, 0, newCatalog);
         writeTransaction.setRoot(newDirectoryReference);
         _ = try writeTransaction.commit();
     }
