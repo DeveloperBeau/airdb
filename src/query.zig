@@ -35,6 +35,7 @@ const orderingLanguage = @import("query/ordering.zig");
 const paging = @import("query/paging.zig");
 const aggregateModule = @import("query/aggregate.zig");
 const groupingModule = @import("query/grouping.zig");
+const materialized = @import("query/materialized.zig");
 
 /// Direction an ordered query emits in.
 pub const SortOrder = orderingLanguage.SortOrder;
@@ -416,4 +417,9 @@ test {
     _ = @import("queryStringTests.zig");
     _ = @import("queryIndexedStringTests.zig");
     _ = @import("queryGroupingTests.zig");
+    // Pulled in directly, ahead of the facade re-exports added later in this
+    // branch, so materializedTests.zig and batchTests.zig run as soon as their
+    // production files exist.
+    _ = @import("query/materialized.zig");
+    _ = @import("query/batch.zig");
 }
