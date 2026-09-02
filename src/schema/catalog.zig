@@ -160,11 +160,24 @@ pub fn writeCatalog(
 /// column per property, backlink indexes for link properties, value indexes
 /// for indexed properties, version/live columns, the primaryKey and key->row
 /// indexes, and the catalog node itself. definitions[0].kind must be .int
-/// (the primary key). O(propertyCount) node allocations.
+/// (the primary key). Indexing a collection kind is error.Unsupported.
+/// O(propertyCount) node allocations.
 pub fn createFromDefinitions(transaction: *WriteTransaction, definitions: []const PropertyDefinition) !Reference {
     std.debug.assert(definitions.len >= 1 and definitions[0].kind == .int);
     const propertyCount: PropertyCount = @intCast(definitions.len);
     std.debug.assert(propertyCount <= maxPropertyCount);
+    // Indexing a collection property would index its per-row root reference --
+    // a storage address that changes on every mutation and every compaction,
+    // not a value. migrations.addProperty has rejected this since it was
+    // written; accepting it here let a caller build a type whose "index" was
+    // meaningless and whose collection writers had no index to maintain.
+    for (definitions) |definition| {
+        const isCollection = switch (definition.kind) {
+            .list, .set, .dict, .linkSet => true,
+            .int, .blob, .link => false,
+        };
+        if (definition.indexed and isCollection) return error.Unsupported;
+    }
     var propertyColumnReferences: [maxPropertyCount]Reference = undefined;
     var kinds: [maxPropertyCount]PropertyKind = undefined;
     var elements: [maxPropertyCount]ElementKind = undefined;
