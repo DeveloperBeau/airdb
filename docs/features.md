@@ -75,6 +75,10 @@ Code pointers use `module.function` names under `src/`.
   objectKey or by an indexed/unindexed int or link property, ascending or
   descending. `query.first` and `query.exists` are one-row terminals defined
   in terms of a page of size 1.
+- `query.minimum` and `query.maximum` return the smallest and largest value of
+  an int or link property over the live rows, reading the value index's first
+  or last key when the property is indexed (O(log n)) and scanning otherwise.
+  They take no predicate; `aggregateInt` covers the filtered case.
 - **Laziness contract**: which delivery paths bound their work to the page
   rather than the result.
 

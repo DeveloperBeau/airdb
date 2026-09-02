@@ -14,6 +14,7 @@ const get = index.get;
 const remove = index.remove;
 const count = index.count;
 const maxKey = index.maxKey;
+const minKey = index.minKey;
 const forEachKey = index.forEachKey;
 const forEachEntry = index.forEachEntry;
 const forEachEntryWhile = index.forEachEntryWhile;
@@ -51,6 +52,7 @@ test "a reference cycle or unknown kind byte fails with error.Corrupt" {
     _ = encodeInner(allocation.bytes, &.{allocation.reference}, &.{0}, &.{1});
     try testing.expectError(error.Corrupt, get(&writeTransaction, allocation.reference, 5));
     try testing.expectError(error.Corrupt, maxKey(&writeTransaction, allocation.reference));
+    try testing.expectError(error.Corrupt, minKey(&writeTransaction, allocation.reference));
     try testing.expectError(error.Corrupt, insert(&writeTransaction, allocation.reference, 1, 1));
     try testing.expectError(error.Corrupt, remove(&writeTransaction, allocation.reference, 1));
     const NopSink = struct {
@@ -218,6 +220,208 @@ test "maxKey survives an emptied rightmost leaf" {
     key = 0;
     while (key < 32) : (key += 1) root = try remove(&writeTransaction, root, key);
     try testing.expectEqual(@as(?u64, null), try maxKey(&writeTransaction, root));
+}
+
+test "minKey survives an emptied leftmost leaf" {
+    // The mirror of "maxKey survives an emptied rightmost leaf", exercised at
+    // the low end: deleting the lowest range of an indexed property's values
+    // (rows.valueIndexRemove, run once per delete) empties the value index's
+    // leftmost leaf without merging or dropping it. minKey must skip that
+    // empty leaf and keep descending rather than reporting the tree empty or
+    // returning a stale key out of it.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try idxTmpPath(testing.allocator, &tmp, "idx_minkey.airdb");
+    defer testing.allocator.free(path);
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var writeTransaction = try database.beginWrite();
+    defer writeTransaction.deinit();
+
+    var root = try create(&writeTransaction);
+    var key: u64 = 0;
+    while (key <= 64) : (key += 1) root = try insert(&writeTransaction, root, key, key); // forces a leaf split
+    try testing.expectEqual(@as(?u64, 0), try minKey(&writeTransaction, root));
+    try testing.expectEqual(@as(?u64, 64), try maxKey(&writeTransaction, root));
+    // Empty the leftmost leaf by removing the lower half.
+    key = 0;
+    while (key <= 31) : (key += 1) root = try remove(&writeTransaction, root, key);
+    // False-negative role: a "descend child 0 unconditionally" implementation
+    // returns null here (it lands on the now-empty leftmost leaf and stops); a
+    // "descend child 0 then take slot 0" implementation traps or returns a
+    // stale key out of the empty leaf. This input MUST trigger the assertion.
+    try testing.expectEqual(@as(?u64, 32), try minKey(&writeTransaction, root));
+    // Fully emptied tree reports null.
+    key = 32;
+    while (key <= 64) : (key += 1) root = try remove(&writeTransaction, root, key);
+    try testing.expectEqual(@as(?u64, null), try minKey(&writeTransaction, root));
+}
+
+test "minKey and maxKey agree on a tree with no emptied boundary" {
+    // False-positive validation for "minKey survives an emptied leftmost
+    // leaf": a naive leftmost-descent implementation of minKey passes THIS
+    // test (nothing is emptied, so descending child 0 unconditionally happens
+    // to be correct). Its passing under that same broken implementation is
+    // what proves the emptied-leaf test above is the one actually doing the
+    // work; keep the two tests together.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try idxTmpPath(testing.allocator, &tmp, "idx_minkey_noboundary.airdb");
+    defer testing.allocator.free(path);
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var writeTransaction = try database.beginWrite();
+    defer writeTransaction.deinit();
+
+    var root = try create(&writeTransaction);
+    var key: u64 = 0;
+    while (key <= 64) : (key += 1) root = try insert(&writeTransaction, root, key, key);
+    try testing.expectEqual(@as(?u64, 0), try minKey(&writeTransaction, root));
+}
+
+test "minKey on empty and single-key trees" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try idxTmpPath(testing.allocator, &tmp, "idx_minkey_edge.airdb");
+    defer testing.allocator.free(path);
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var writeTransaction = try database.beginWrite();
+    defer writeTransaction.deinit();
+
+    var root = try create(&writeTransaction);
+    try testing.expectEqual(@as(?u64, null), try minKey(&writeTransaction, root));
+    root = try insert(&writeTransaction, root, 7, 70);
+    try testing.expectEqual(@as(?u64, 7), try minKey(&writeTransaction, root));
+    try testing.expectEqual(@as(?u64, 7), try maxKey(&writeTransaction, root));
+    root = try remove(&writeTransaction, root, 7);
+    try testing.expectEqual(@as(?u64, null), try minKey(&writeTransaction, root));
+    try testing.expectEqual(@as(?u64, null), try maxKey(&writeTransaction, root));
+}
+
+test "minKey and maxKey track a model set under churn" {
+    // Fuzz: the model is the only source of expected values. A single flat
+    // domain almost never empties a boundary leaf by chance -- every one of
+    // leafCap keys in that leaf would need to be independently absent at the
+    // same sampled checkpoint, and WHICH keys a real boundary leaf holds
+    // depends on split history a black-box model cannot predict, so a zone
+    // sized purely by guesswork can miss the actual leaf entirely.
+    //
+    // Instead, the low and high edges are pre-built with the exact ascending
+    // fill "minKey survives an emptied leftmost leaf" and "maxKey survives an
+    // emptied rightmost leaf" use: inserting edgeFillCount keys in order
+    // forces exactly one split there, so the resulting leftmost and rightmost
+    // leaves' key ranges are known, not guessed (lowSplitBoundary,
+    // highSplitBoundary). Because no key outside an edge's own fill range is
+    // ever inserted into it afterward, that split boundary cannot move: only
+    // churn confined to the edge's own keys can affect it. Random churn then
+    // hammers removal at both edges, concentrating on that fixed pair of
+    // leaves, while a wide middle zone stays biased toward insertion to keep
+    // the tree alive elsewhere. The self-check after the loop fails loudly if
+    // this seed and these parameters stop reaching the emptied state.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try idxTmpPath(testing.allocator, &tmp, "idx_minmax_fuzz.airdb");
+    defer testing.allocator.free(path);
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var writeTransaction = try database.beginWrite();
+    defer writeTransaction.deinit();
+
+    var root = try create(&writeTransaction);
+    const domain: u64 = 300;
+    const edgeFillCount: u64 = @as(u64, node.leafCap) + 1; // one past a full leaf, so the edge splits exactly once
+    const lowSplitBoundary: u64 = edgeFillCount / 2; // keys below this are the known emptied-in-T1 leftmost leaf
+    const highEdgeStart: u64 = domain - edgeFillCount;
+    const highSplitBoundary: u64 = highEdgeStart + lowSplitBoundary; // keys from here up are the mirrored rightmost leaf
+    var present = [_]bool{false} ** domain;
+
+    // Ascending pre-fill at each edge, matching the boundary tests exactly so
+    // the split point is known rather than inferred.
+    var fillKey: u64 = 0;
+    while (fillKey < edgeFillCount) : (fillKey += 1) {
+        root = try insert(&writeTransaction, root, fillKey, fillKey);
+        present[fillKey] = true;
+    }
+    fillKey = highEdgeStart;
+    while (fillKey < domain) : (fillKey += 1) {
+        root = try insert(&writeTransaction, root, fillKey, fillKey);
+        present[fillKey] = true;
+    }
+
+    var prng = std.Random.DefaultPrng.init(0xA17D8);
+    const random = prng.random();
+    var lowLeafEmptiedWithLiveKeys: u64 = 0;
+    var highLeafEmptiedWithLiveKeys: u64 = 0;
+    var operation: usize = 0;
+    while (operation < 4000) : (operation += 1) {
+        const zoneRoll = random.float(f32);
+        var key: u64 = undefined;
+        var insertProbability: f32 = undefined;
+        if (zoneRoll < 0.25) {
+            key = random.intRangeLessThan(u64, 0, edgeFillCount);
+            insertProbability = 0.08; // mostly emptied, rarely repopulated
+        } else if (zoneRoll < 0.5) {
+            key = random.intRangeLessThan(u64, highEdgeStart, domain);
+            insertProbability = 0.08;
+        } else {
+            key = random.intRangeLessThan(u64, edgeFillCount, highEdgeStart);
+            insertProbability = 0.65; // keeps the middle populated enough to force splits
+        }
+
+        if (random.float(f32) < insertProbability) {
+            root = try insert(&writeTransaction, root, key, key);
+            present[key] = true;
+        } else {
+            root = try remove(&writeTransaction, root, key);
+            present[key] = false;
+        }
+
+        if (operation % 25 == 0) {
+            var expectedMin: ?u64 = null;
+            var expectedMax: ?u64 = null;
+            var expectedCount: u64 = 0;
+            for (present, 0..) |isPresent, value| {
+                if (!isPresent) continue;
+                expectedCount += 1;
+                if (expectedMin == null) expectedMin = value;
+                expectedMax = value;
+            }
+            try testing.expectEqual(expectedMin, try minKey(&writeTransaction, root));
+            try testing.expectEqual(expectedMax, try maxKey(&writeTransaction, root));
+            try testing.expectEqual(expectedCount, try count(&writeTransaction, root));
+            try testing.expectEqual(expectedCount == 0, (try minKey(&writeTransaction, root)) == null);
+            if (expectedMin != null and expectedMax != null) try testing.expect(expectedMin.? <= expectedMax.?);
+
+            if (expectedCount > 0) {
+                var lowLeafEmpty = true;
+                for (present[0..lowSplitBoundary]) |isPresent| {
+                    if (isPresent) {
+                        lowLeafEmpty = false;
+                        break;
+                    }
+                }
+                if (lowLeafEmpty) lowLeafEmptiedWithLiveKeys += 1;
+
+                var highLeafEmpty = true;
+                for (present[highSplitBoundary..]) |isPresent| {
+                    if (isPresent) {
+                        highLeafEmpty = false;
+                        break;
+                    }
+                }
+                if (highLeafEmpty) highLeafEmptiedWithLiveKeys += 1;
+            }
+        }
+    }
+
+    // If either count is zero, this seed and these parameters stopped
+    // reaching the boundary-empty-leaf state this test exists to check, and
+    // the invariant assertions above ran only against the easy,
+    // never-emptied shape. See "minKey survives an emptied leftmost leaf" for
+    // the hand-constructed version of the same state.
+    try testing.expect(lowLeafEmptiedWithLiveKeys > 0);
+    try testing.expect(highLeafEmptiedWithLiveKeys > 0);
 }
 
 test "stored subtree counts match a full iteration under churn" {

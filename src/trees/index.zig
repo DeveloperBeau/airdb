@@ -11,7 +11,7 @@ const node = @import("indexNode.zig");
 const bTreeCore = @import("bTreeCore.zig");
 
 // Local aliases for the on-disk node format, used by the numeric-only extras
-// below (maxKey, range iteration, test helpers).
+// below (minKey, maxKey, range iteration, test helpers).
 const fanout = node.fanout;
 const kindLeaf = node.kindLeaf;
 const leafNodeSize = node.leafNodeSize;
@@ -114,6 +114,35 @@ pub fn maxKey(transaction: anytype, root: Reference) !?u64 {
         currentReference = blk: {
             while (childIndex > 0) {
                 childIndex -= 1;
+                if (view.subtreeCount(childIndex) > 0) break :blk view.childReference(childIndex);
+            }
+            return null; // every subtree is empty
+        };
+    }
+    return error.Corrupt;
+}
+
+/// Return the smallest key in the tree rooted at root, or null if the tree is
+/// empty. Read-only, O(height) with I/O. The mirror of maxKey, and it needs
+/// the same care for the same reason: removals never merge or drop leaves
+/// (see bTreeCore.removeInto), so the LEFTMOST leaf can be empty while the
+/// tree still holds keys. Descends the FIRST NON-EMPTY child at each level;
+/// blindly following the leftmost path would report a non-empty tree as empty
+/// or, worse for a value index, skip the true minimum.
+pub fn minKey(transaction: anytype, root: Reference) !?u64 {
+    var currentReference: Reference = root;
+    var depth: usize = 0;
+    while (depth < maxDepth) : (depth += 1) {
+        const bytes = try dereferenceNode(transaction, currentReference);
+        if (bytes[0] == kindLeaf) {
+            const view = try parseLeaf(bytes);
+            if (view.count == 0) return null; // only the empty root reaches here
+            return view.key(0);
+        }
+        const view = try parseInner(bytes);
+        var childIndex: usize = 0;
+        currentReference = blk: {
+            while (childIndex < view.childCount) : (childIndex += 1) {
                 if (view.subtreeCount(childIndex) > 0) break :blk view.childReference(childIndex);
             }
             return null; // every subtree is empty
