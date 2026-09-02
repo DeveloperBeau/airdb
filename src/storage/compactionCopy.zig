@@ -15,6 +15,8 @@ const catalog = @import("../schema/catalog.zig");
 const blob = @import("../records/blob.zig");
 const links = @import("../records/links.zig");
 const byteKeyIndex = @import("../trees/byteKeyIndex.zig");
+const rows = @import("../records/rows.zig");
+const blobIndexKey = @import("../records/blobIndexKey.zig");
 
 /// One key->row index entry: a stable object key and its physical row.
 pub const Pair = struct { objectKey: u64, row: u64 };
@@ -99,14 +101,24 @@ fn copyBindex(source: anytype, destination: *WriteTransaction, srcRoot: u64) !u6
     return newr;
 }
 
-// Add objectKey under `value` in a value index (value -> {objectKey -> 1}), mirroring the
-// shape the object layer's maintenance keeps. Local to the copy path, which
-// must rebuild value indexes in the destination database.
-fn viAddInto(destination: *WriteTransaction, valueIndexReference: Reference, value: u64, objectKey: u64) !Reference {
-    const existing = try Index.get(destination, valueIndexReference, value);
-    var setRoot = existing orelse try Index.create(destination);
-    setRoot = try Index.insert(destination, setRoot, objectKey, 1);
-    return try Index.insert(destination, valueIndexReference, value, setRoot);
+// Add objectKey under `raw`'s key in a DESTINATION value index, keyed the same
+// way the write path keys it (rows.zig): the column word for an int or link
+// property, the stored bytes truncated to blobIndexKey.maxLength for a blob.
+// `raw` is already the destination-local reference produced by copyValue, so
+// the blob arm reads the key from the destination's own copy and holds no
+// source dereference across the insert. This is also where "byte keys survive
+// compaction naturally" is actually true: the destination index is built from
+// the destination's own copied bytes, and the key IS the bytes, so unlike a
+// reference-keyed index it carries no source-address dependency.
+fn addToDestinationValueIndex(destination: *WriteTransaction, valueIndexReference: Reference, kind: catalog.PropertyKind, raw: u64, objectKey: u64) !Reference {
+    return switch (kind) {
+        .blob => blk: {
+            var keyBuffer: [blobIndexKey.maxLength]u8 = undefined;
+            const key = try blobIndexKey.read(destination, raw, &keyBuffer);
+            break :blk try rows.blobValueIndexAdd(destination, valueIndexReference, key, objectKey);
+        },
+        else => try rows.intValueIndexAdd(destination, valueIndexReference, raw, objectKey),
+    };
 }
 
 // Re-point every reference field of the snapshot at fresh structures created in the
@@ -118,6 +130,12 @@ fn createDestinationStructures(destination: *WriteTransaction, snapshot: *catalo
     while (propertyIndex < snapshot.propertyCount) : (propertyIndex += 1) {
         snapshot.properties[propertyIndex].column = try Column.create(destination);
         snapshot.properties[propertyIndex].backlink = if (snapshot.properties[propertyIndex].kind == .link or snapshot.properties[propertyIndex].kind == .linkSet) try Index.create(destination) else 0;
+        // Index.create even for an indexed .blob property: Index and
+        // byteKeyIndex are both bTreeCore.BTreeCore(...).create producing a
+        // byte-identical empty leaf (catalog.zig, blobIndexKey.zig's node
+        // -shape coupling test), so this needs no kind branch. The blob
+        // property's index is walked as byteKeyIndex from its first insert
+        // below (addToDestinationValueIndex), which is what decides its keying.
         snapshot.properties[propertyIndex].valueIndex = if (snapshot.properties[propertyIndex].indexed) try Index.create(destination) else 0;
     }
     snapshot.versionColumnReference = try Column.create(destination);
@@ -166,7 +184,7 @@ pub fn copyTypeRows(source: anytype, sourceCatalog: Reference, destination: *Wri
             // empties every indexed query after a full-file compaction (the
             // planner trusts the flag) and fails the value-index audit.
             if (snapshot.properties[propertyIndex].indexed) {
-                snapshot.properties[propertyIndex].valueIndex = try viAddInto(destination, snapshot.properties[propertyIndex].valueIndex, draw, pair.objectKey);
+                snapshot.properties[propertyIndex].valueIndex = try addToDestinationValueIndex(destination, snapshot.properties[propertyIndex].valueIndex, snapshot.properties[propertyIndex].kind, draw, pair.objectKey);
             }
         }
         const version = try Column.get(source, sourceVersionColumn, pair.row);

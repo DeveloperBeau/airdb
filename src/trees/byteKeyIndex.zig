@@ -105,6 +105,44 @@ pub fn forEachEntry(
     );
 }
 
+/// Visit every (key, value) entry whose key is byte-ordered >= `startKey`, in
+/// ascending byte order, until `onEntry` returns false. Returns whether the
+/// walk ran to completion. An empty `startKey` starts at the first entry,
+/// since the empty string precedes every key. The key slice points into
+/// mapped storage and is valid only for the duration of the callback; copy it
+/// if it must outlive the call.
+///
+/// There is no upper bound: `onEntry` returns false at the caller's bound (a
+/// prefix that no longer matches, or a key past a byte-order high). Because
+/// keys are visited in ascending order, a caller whose bound is contiguous in
+/// byte order may stop at the first entry outside it.
+/// O(log n + visited) with I/O, plus one blob dereference per key compared.
+pub fn forEachEntryFromWhile(
+    transaction: anytype,
+    root: Reference,
+    startKey: []const u8,
+    ctx: anytype,
+    comptime onEntry: fn (@TypeOf(ctx), key: []const u8, value: u64) anyerror!bool,
+) !bool {
+    // Adapt the core's raw (storedKey, value) walker: each stored key is a
+    // blob reference, dereferenced here before reaching the caller's callback.
+    const KeyDereferencing = struct {
+        transaction: @TypeOf(transaction),
+        context: @TypeOf(ctx),
+        fn visit(self: @This(), storedKeyReference: u64, value: u64) anyerror!bool {
+            const keyBytes = try blob.get(self.transaction, storedKeyReference);
+            return onEntry(self.context, keyBytes, value);
+        }
+    };
+    return Tree.forEachEntryFromWhile(
+        transaction,
+        root,
+        startKey,
+        KeyDereferencing{ .transaction = transaction, .context = ctx },
+        KeyDereferencing.visit,
+    );
+}
+
 test {
     _ = @import("byteKeyIndexTests.zig");
 }

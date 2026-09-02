@@ -148,11 +148,11 @@ test "T-Q2: the empty row's membership in each of the seven results, keyed to th
     }
 }
 
-test "T-Q3: an indexed blob property is not driven from the index (C4 regression); identical results to T-Q1" {
-    // Before the C4 fix, isIndexFriendly did not consult the comparison's value
-    // kind, so an eq on this indexed blob property took the index path and
-    // collectCandidates's .bytes arm failed the whole query with
-    // error.NoIndexPlan. This test would fail with that error pre-fix.
+test "T-Q3: an indexed blob property returns the same seven operator results as the unindexed one" {
+    // Property 2 is indexed and now takes the index path (planner.zig); property 1
+    // (T-Q1) is unindexed and takes the scan path. T-Q1 and T-Q3 asserting the
+    // same hand-built expected sets over the same seed values IS the
+    // indexed-vs-scan equivalence -- the smallest such test in the suite.
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try qsTmpPath(testing.allocator, &tmp, "q3.airdb");

@@ -14,6 +14,7 @@ const remove = byteKeyIndex.remove;
 const count = byteKeyIndex.count;
 const freeTree = byteKeyIndex.freeTree;
 const forEachEntry = byteKeyIndex.forEachEntry;
+const forEachEntryFromWhile = byteKeyIndex.forEachEntryFromWhile;
 
 const innerNodeSize = node.innerNodeSize;
 const encodeInner = node.encodeInner;
@@ -304,4 +305,362 @@ test "many keys across splits" {
         try testing.expectEqual(num +% 7, val);
     }
     writeTransaction.deinit();
+}
+
+// ---------------------------------------------------------------------------
+// forEachEntryFromWhile
+// ---------------------------------------------------------------------------
+
+const RecordingWalk = struct {
+    keys: *std.ArrayList([]u8),
+    vals: *std.ArrayList(u64),
+    stopAfter: ?usize = null,
+    fn onEntry(self: @This(), key: []const u8, val: u64) anyerror!bool {
+        try self.keys.append(testing.allocator, try testing.allocator.dupe(u8, key));
+        try self.vals.append(testing.allocator, val);
+        if (self.stopAfter) |limit| return self.keys.items.len < limit;
+        return true;
+    }
+};
+
+fn freeRecordedKeys(keys: *std.ArrayList([]u8)) void {
+    for (keys.items) |key| testing.allocator.free(key);
+    keys.deinit(testing.allocator);
+}
+
+test "forEachEntryFromWhile: a start key equal to an existing key visits that key first" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try bidxTmpPath(testing.allocator, &tmp, "bidx_from_eq.airdb");
+    defer testing.allocator.free(path);
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var writeTransaction = try database.beginWrite();
+    defer writeTransaction.deinit();
+
+    var root = try create(&writeTransaction);
+    root = try insert(&writeTransaction, root, "apple", 1);
+    root = try insert(&writeTransaction, root, "banana", 2);
+    root = try insert(&writeTransaction, root, "cherry", 3);
+
+    var keys = std.ArrayList([]u8).empty;
+    defer freeRecordedKeys(&keys);
+    var vals = std.ArrayList(u64).empty;
+    defer vals.deinit(testing.allocator);
+    const completed = try forEachEntryFromWhile(&writeTransaction, root, "banana", RecordingWalk{ .keys = &keys, .vals = &vals }, RecordingWalk.onEntry);
+    try testing.expect(completed);
+    try testing.expectEqualSlices(u64, &.{ 2, 3 }, vals.items);
+    try testing.expectEqualStrings("banana", keys.items[0]);
+}
+
+test "forEachEntryFromWhile: a start key strictly between two keys starts at the next key up" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try bidxTmpPath(testing.allocator, &tmp, "bidx_from_between.airdb");
+    defer testing.allocator.free(path);
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var writeTransaction = try database.beginWrite();
+    defer writeTransaction.deinit();
+
+    var root = try create(&writeTransaction);
+    root = try insert(&writeTransaction, root, "apple", 1);
+    root = try insert(&writeTransaction, root, "cherry", 3);
+
+    var keys = std.ArrayList([]u8).empty;
+    defer freeRecordedKeys(&keys);
+    var vals = std.ArrayList(u64).empty;
+    defer vals.deinit(testing.allocator);
+    _ = try forEachEntryFromWhile(&writeTransaction, root, "banana", RecordingWalk{ .keys = &keys, .vals = &vals }, RecordingWalk.onEntry);
+    try testing.expectEqualSlices(u64, &.{3}, vals.items);
+    try testing.expectEqualStrings("cherry", keys.items[0]);
+}
+
+test "forEachEntryFromWhile: a start key before every key, and the empty start key, visit every entry" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try bidxTmpPath(testing.allocator, &tmp, "bidx_from_before.airdb");
+    defer testing.allocator.free(path);
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var writeTransaction = try database.beginWrite();
+    defer writeTransaction.deinit();
+
+    var root = try create(&writeTransaction);
+    root = try insert(&writeTransaction, root, "banana", 2);
+    root = try insert(&writeTransaction, root, "apple", 1);
+    root = try insert(&writeTransaction, root, "cherry", 3);
+
+    const expected = [_][]const u8{ "apple", "banana", "cherry" };
+
+    for ([_][]const u8{ "0", "" }) |startKey| {
+        var keys = std.ArrayList([]u8).empty;
+        defer freeRecordedKeys(&keys);
+        var vals = std.ArrayList(u64).empty;
+        defer vals.deinit(testing.allocator);
+        const completed = try forEachEntryFromWhile(&writeTransaction, root, startKey, RecordingWalk{ .keys = &keys, .vals = &vals }, RecordingWalk.onEntry);
+        try testing.expect(completed);
+        try testing.expectEqual(expected.len, keys.items.len);
+        for (expected, keys.items) |expectedKey, actualKey| try testing.expectEqualStrings(expectedKey, actualKey);
+    }
+}
+
+test "forEachEntryFromWhile: a start key after every key visits nothing and returns true" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try bidxTmpPath(testing.allocator, &tmp, "bidx_from_after.airdb");
+    defer testing.allocator.free(path);
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var writeTransaction = try database.beginWrite();
+    defer writeTransaction.deinit();
+
+    var root = try create(&writeTransaction);
+    root = try insert(&writeTransaction, root, "apple", 1);
+    root = try insert(&writeTransaction, root, "banana", 2);
+
+    var keys = std.ArrayList([]u8).empty;
+    defer freeRecordedKeys(&keys);
+    var vals = std.ArrayList(u64).empty;
+    defer vals.deinit(testing.allocator);
+    const completed = try forEachEntryFromWhile(&writeTransaction, root, "zzz", RecordingWalk{ .keys = &keys, .vals = &vals }, RecordingWalk.onEntry);
+    try testing.expect(completed);
+    try testing.expectEqual(@as(usize, 0), keys.items.len);
+}
+
+test "forEachEntryFromWhile: an early stop visits exactly that many entries and returns false" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try bidxTmpPath(testing.allocator, &tmp, "bidx_from_stop.airdb");
+    defer testing.allocator.free(path);
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var writeTransaction = try database.beginWrite();
+    defer writeTransaction.deinit();
+
+    var root = try create(&writeTransaction);
+    root = try insert(&writeTransaction, root, "a", 1);
+    root = try insert(&writeTransaction, root, "b", 2);
+    root = try insert(&writeTransaction, root, "c", 3);
+    root = try insert(&writeTransaction, root, "d", 4);
+    root = try insert(&writeTransaction, root, "e", 5);
+
+    var keys = std.ArrayList([]u8).empty;
+    defer freeRecordedKeys(&keys);
+    var vals = std.ArrayList(u64).empty;
+    defer vals.deinit(testing.allocator);
+    const completed = try forEachEntryFromWhile(&writeTransaction, root, "", RecordingWalk{ .keys = &keys, .vals = &vals, .stopAfter = 3 }, RecordingWalk.onEntry);
+    try testing.expect(!completed);
+    try testing.expectEqual(@as(usize, 3), keys.items.len);
+}
+
+test "forEachEntryFromWhile: an empty tree visits nothing and returns true" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try bidxTmpPath(testing.allocator, &tmp, "bidx_from_empty.airdb");
+    defer testing.allocator.free(path);
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var writeTransaction = try database.beginWrite();
+    defer writeTransaction.deinit();
+
+    const root = try create(&writeTransaction);
+    var keys = std.ArrayList([]u8).empty;
+    defer freeRecordedKeys(&keys);
+    var vals = std.ArrayList(u64).empty;
+    defer vals.deinit(testing.allocator);
+    const completed = try forEachEntryFromWhile(&writeTransaction, root, "", RecordingWalk{ .keys = &keys, .vals = &vals }, RecordingWalk.onEntry);
+    try testing.expect(completed);
+    try testing.expectEqual(@as(usize, 0), keys.items.len);
+}
+
+test "forEachEntryFromWhile: the empty key is a legitimate stored key, visited first from an empty start" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try bidxTmpPath(testing.allocator, &tmp, "bidx_from_emptykey.airdb");
+    defer testing.allocator.free(path);
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var writeTransaction = try database.beginWrite();
+    defer writeTransaction.deinit();
+
+    var root = try create(&writeTransaction);
+    root = try insert(&writeTransaction, root, "apple", 1);
+    root = try insert(&writeTransaction, root, "", 99);
+
+    var keys = std.ArrayList([]u8).empty;
+    defer freeRecordedKeys(&keys);
+    var vals = std.ArrayList(u64).empty;
+    defer vals.deinit(testing.allocator);
+    _ = try forEachEntryFromWhile(&writeTransaction, root, "", RecordingWalk{ .keys = &keys, .vals = &vals }, RecordingWalk.onEntry);
+    try testing.expectEqual(@as(u64, 99), vals.items[0]);
+    try testing.expectEqualStrings("", keys.items[0]);
+}
+
+test "forEachEntryFromWhile: across splits, walking from a middle key matches std's sort of the tail" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try bidxTmpPath(testing.allocator, &tmp, "bidx_from_splits.airdb");
+    defer testing.allocator.free(path);
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var writeTransaction = try database.beginWrite();
+    defer writeTransaction.deinit();
+
+    var root = try create(&writeTransaction);
+    const N: u64 = 1000;
+    var buffer: [64]u8 = undefined;
+    var inserted = std.ArrayList([]u8).empty;
+    defer {
+        for (inserted.items) |key| testing.allocator.free(key);
+        inserted.deinit(testing.allocator);
+    }
+    var round: u64 = 0;
+    while (round < N) : (round += 1) {
+        const keyNumber = (round *% 2654435761) % N;
+        const key = try std.fmt.bufPrint(&buffer, "key-{d:0>5}", .{keyNumber});
+        root = try insert(&writeTransaction, root, key, keyNumber);
+        try inserted.append(testing.allocator, try testing.allocator.dupe(u8, key));
+    }
+
+    // Expected order and tail come purely from std, over the RAM strings, not
+    // from forEachEntry.
+    const sortableKeys = try testing.allocator.alloc([]const u8, inserted.items.len);
+    defer testing.allocator.free(sortableKeys);
+    for (inserted.items, 0..) |key, index| sortableKeys[index] = key;
+    std.mem.sort([]const u8, sortableKeys, {}, struct {
+        fn lessThan(_: void, left: []const u8, right: []const u8) bool {
+            return std.mem.lessThan(u8, left, right);
+        }
+    }.lessThan);
+
+    const startKey = "key-00500";
+    var expectedStart: usize = 0;
+    while (expectedStart < sortableKeys.len and std.mem.order(u8, sortableKeys[expectedStart], startKey) == .lt) : (expectedStart += 1) {}
+    const expectedTail = sortableKeys[expectedStart..];
+
+    var keys = std.ArrayList([]u8).empty;
+    defer freeRecordedKeys(&keys);
+    var vals = std.ArrayList(u64).empty;
+    defer vals.deinit(testing.allocator);
+    const completed = try forEachEntryFromWhile(&writeTransaction, root, startKey, RecordingWalk{ .keys = &keys, .vals = &vals }, RecordingWalk.onEntry);
+    try testing.expect(completed);
+    try testing.expectEqual(expectedTail.len, keys.items.len);
+    for (expectedTail, keys.items) |expectedKey, actualKey| try testing.expectEqualStrings(expectedKey, actualKey);
+}
+
+test "forEachEntryFromWhile: a byteKeyIndex reference cycle fails with error.Corrupt" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try bidxTmpPath(testing.allocator, &tmp, "bidx_from_cycle.airdb");
+    defer testing.allocator.free(path);
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var writeTransaction = try database.beginWrite();
+    defer writeTransaction.deinit();
+
+    const keyReference = try blob.put(&writeTransaction, "k");
+    const allocation = try writeTransaction.alloc(innerNodeSize);
+    _ = encodeInner(allocation.bytes, &.{allocation.reference}, &.{keyReference}, &.{1});
+    const NopSink = struct {
+        fn onEntry(_: @This(), _: []const u8, _: u64) anyerror!bool {
+            return true;
+        }
+    };
+    try testing.expectError(error.Corrupt, forEachEntryFromWhile(&writeTransaction, allocation.reference, "k", NopSink{}, NopSink.onEntry));
+}
+
+test "forEachEntryFromWhile: MUST exclude a key below the start, MUST include the start key itself" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try bidxTmpPath(testing.allocator, &tmp, "bidx_from_inclusive.airdb");
+    defer testing.allocator.free(path);
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var writeTransaction = try database.beginWrite();
+    defer writeTransaction.deinit();
+
+    var root = try create(&writeTransaction);
+    root = try insert(&writeTransaction, root, "a", 1);
+    root = try insert(&writeTransaction, root, "b", 2);
+    root = try insert(&writeTransaction, root, "c", 3);
+
+    var keys = std.ArrayList([]u8).empty;
+    defer freeRecordedKeys(&keys);
+    var vals = std.ArrayList(u64).empty;
+    defer vals.deinit(testing.allocator);
+    _ = try forEachEntryFromWhile(&writeTransaction, root, "b", RecordingWalk{ .keys = &keys, .vals = &vals }, RecordingWalk.onEntry);
+    // MUST be excluded: "a" is not visited.
+    try testing.expect(std.mem.indexOfScalar(u64, vals.items, 1) == null);
+    // MUST be included: "b" itself IS visited. Dies if the descent used a
+    // strict lower bound.
+    try testing.expect(std.mem.indexOfScalar(u64, vals.items, 2) != null);
+}
+
+// Wraps a transaction and counts every dereference() call, so a test can
+// measure node-visit cost directly rather than trusting that an optimization
+// ran. Mirrors queryLazinessTests.zig's CountingTransaction.
+const CountingTransaction = struct {
+    inner: *@import("../transactions/writeTransaction.zig").WriteTransaction,
+    dereferenceCount: u64 = 0,
+
+    pub fn dereference(self: *CountingTransaction, reference: u64, length: usize) ![]const u8 {
+        self.dereferenceCount += 1;
+        return self.inner.dereference(reference, length);
+    }
+};
+
+// Stops after the first entry, so the walk's own output cost (one
+// blob.get) is the same constant regardless of where the start key lands;
+// whatever varies with the start key's position is the cost of REACHING it.
+const StopAfterFirst = struct {
+    fn onEntry(_: @This(), _: []const u8, _: u64) anyerror!bool {
+        return false;
+    }
+};
+
+test "forEachEntryFromWhile: reaching a start key near the end of the range costs under 200 dereferences, so the descent shortcut is not silently lost (M15 guard)" {
+    // childIndexForKey's descent is a traversal shortcut: forcing it to
+    // always start at child 0 (M15 in the mutation table) is correctness
+    // -equivalent (leafLowerBound filters every leaf regardless of how it was
+    // reached) but touches every node between the first child and the start
+    // key instead of descending straight to it. A pure key-sequence assertion
+    // cannot see that difference; a dereference count can. Stopping the walk
+    // after its first entry isolates the cost of REACHING the start key from
+    // the cost of the entries it then reports, so a start key near the END of
+    // the 1000-key range (which the shortcut reaches in O(height)) is
+    // compared against one where the lost shortcut would instead cost
+    // O(number of leaves before it).
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try bidxTmpPath(testing.allocator, &tmp, "bidx_from_derefcount.airdb");
+    defer testing.allocator.free(path);
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var writeTransaction = try database.beginWrite();
+    defer writeTransaction.deinit();
+
+    var root = try create(&writeTransaction);
+    const N: u64 = 1000;
+    var buffer: [64]u8 = undefined;
+    var round: u64 = 0;
+    while (round < N) : (round += 1) {
+        const keyNumber = (round *% 2654435761) % N;
+        const key = try std.fmt.bufPrint(&buffer, "key-{d:0>5}", .{keyNumber});
+        root = try insert(&writeTransaction, root, key, keyNumber);
+    }
+
+    var nearEnd = CountingTransaction{ .inner = &writeTransaction };
+    _ = try forEachEntryFromWhile(&nearEnd, root, "key-00990", StopAfterFirst{}, StopAfterFirst.onEntry);
+
+    // An absolute bound, hand-measured rather than pinned to a ratio: with the
+    // shortcut intact, reaching this start key measures 82 dereferences
+    // (childIndexForKey's own per-level linear scan of low keys dominates,
+    // not the descent depth); with the shortcut lost (childIndex forced to 0,
+    // M15's mutation), the same walk measures 403, because every level then
+    // recurses into every child from the first one instead of only from the
+    // correct starting child onward. 200 sits comfortably above measurement
+    // noise on the correct path and comfortably below the mutated path's
+    // result.
+    try testing.expect(nearEnd.dereferenceCount < 200);
 }

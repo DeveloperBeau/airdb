@@ -101,17 +101,25 @@ test "canDriveFromIndex: ne and beginsWith on an indexed property are not drivab
     try testing.expect(!planner.canDriveFromIndex(&scan, intComparison(0, .beginsWith, 5)));
 }
 
-test "T-N1: a bytes comparison on an indexed blob property is never drivable from the index (C4)" {
+test "T-N1: a bytes comparison on an indexed blob property is drivable for every operator but ne" {
     const kinds = [_]catalog.PropertyKind{ .int, .blob, .int };
     const indexedFlags = [_]bool{ false, true, true };
     const scan = makeScanForTestWithKinds(&kinds, &indexedFlags);
-    const operators = [_]Operator{ .eq, .lt, .le, .gt, .ge, .ne, .beginsWith };
-    for (operators) |operator| {
-        try testing.expect(!planner.canDriveFromIndex(&scan, bytesComparison(1, operator, "x")));
+    const drivable = [_]Operator{ .eq, .lt, .le, .gt, .ge, .beginsWith };
+    for (drivable) |operator| {
+        try testing.expect(planner.canDriveFromIndex(&scan, bytesComparison(1, operator, "x")));
     }
-    // False-positive guard: without it, an isIndexFriendly that returned false
+    try testing.expect(!planner.canDriveFromIndex(&scan, bytesComparison(1, .ne, "x")));
+    // False-positive guard: without it, an isIndexFriendly that returned true
     // unconditionally would pass. An eq int comparison on property 2 IS drivable.
     try testing.expect(planner.canDriveFromIndex(&scan, intComparison(2, .eq, 5)));
+    // Mirror: a bytes comparison on an UNINDEXED blob property is not drivable,
+    // regardless of operator.
+    const unindexedFlags = [_]bool{ false, false, true };
+    const unindexedScan = makeScanForTestWithKinds(&kinds, &unindexedFlags);
+    for (drivable) |operator| {
+        try testing.expect(!planner.canDriveFromIndex(&unindexedScan, bytesComparison(1, operator, "x")));
+    }
 }
 
 test "canDriveFromIndex: eq on an unindexed property is not drivable" {
@@ -187,12 +195,12 @@ test "canDriveFromIndex: a chain of single-child conjunctions reaching exactly d
     try testing.expect(!planner.canDriveFromIndex(&scan, current));
 }
 
-test "isMoreSelective: exact counts order ascending, exact beats unbounded, unbounded beats nothing" {
-    try testing.expect(planner.isMoreSelective(.{ .exact = 1 }, .{ .exact = 2 }));
-    try testing.expect(!planner.isMoreSelective(.{ .exact = 2 }, .{ .exact = 1 }));
-    try testing.expect(planner.isMoreSelective(.{ .exact = 0 }, .{ .exact = 1 }));
-    try testing.expect(planner.isMoreSelective(.{ .exact = 1_000_000 }, .unbounded));
-    try testing.expect(!planner.isMoreSelective(.unbounded, .{ .exact = 1 }));
+test "isMoreSelective: atMost counts order ascending, atMost beats unbounded, unbounded beats nothing" {
+    try testing.expect(planner.isMoreSelective(.{ .atMost = 1 }, .{ .atMost = 2 }));
+    try testing.expect(!planner.isMoreSelective(.{ .atMost = 2 }, .{ .atMost = 1 }));
+    try testing.expect(planner.isMoreSelective(.{ .atMost = 0 }, .{ .atMost = 1 }));
+    try testing.expect(planner.isMoreSelective(.{ .atMost = 1_000_000 }, .unbounded));
+    try testing.expect(!planner.isMoreSelective(.unbounded, .{ .atMost = 1 }));
     try testing.expect(!planner.isMoreSelective(.unbounded, .unbounded));
 }
 
@@ -310,10 +318,10 @@ test "selectivityOf: an eq on an indexed property returns the exact match count"
 
     const selectivity = try planner.selectivityOf(&writeTransaction, &scan, predicate, 0);
     // Expected value from the seed arithmetic itself, not from the index.
-    try testing.expectEqual(Selectivity{ .exact = rowCount / 100 }, selectivity);
+    try testing.expectEqual(Selectivity{ .atMost = rowCount / 100 }, selectivity);
     // Cross-check against the scan path over the unindexed twin.
     const scanCount = try query.countWhere(&writeTransaction, scanCatalog, predicate, testing.allocator);
-    try testing.expectEqual(scanCount, selectivity.exact);
+    try testing.expectEqual(scanCount, selectivity.atMost);
 }
 
 test "selectivityOf: an eq whose value no row holds returns exact 0" {
@@ -329,7 +337,7 @@ test "selectivityOf: an eq whose value no row holds returns exact 0" {
     const scan = try Scan.open(&writeTransaction, indexedCatalog);
     // Values are i % 100, so 100 never appears.
     const selectivity = try planner.selectivityOf(&writeTransaction, &scan, intComparison(1, .eq, 100), 0);
-    try testing.expectEqual(Selectivity{ .exact = 0 }, selectivity);
+    try testing.expectEqual(Selectivity{ .atMost = 0 }, selectivity);
 }
 
 test "selectivityOf: a range comparison returns unbounded" {
@@ -362,7 +370,7 @@ test "selectivityOf: a conjunction of two indexed eq terms returns the smaller e
     // property1 == 7 matches 50 rows; property2 == 0 matches exactly 1 row.
     const children = [_]Predicate{ intComparison(1, .eq, 7), intComparison(2, .eq, 0) };
     const selectivity = try planner.selectivityOf(&writeTransaction, &scan, .{ .conjunction = &children }, 0);
-    try testing.expectEqual(Selectivity{ .exact = 1 }, selectivity);
+    try testing.expectEqual(Selectivity{ .atMost = 1 }, selectivity);
 }
 
 test "selectivityOf: a disjunction of two eq terms returns the sum of their counts" {
@@ -379,7 +387,7 @@ test "selectivityOf: a disjunction of two eq terms returns the sum of their coun
     const scan = try Scan.open(&writeTransaction, twoIndexedCatalog);
     const children = [_]Predicate{ intComparison(1, .eq, 7), intComparison(2, .eq, 0) };
     const selectivity = try planner.selectivityOf(&writeTransaction, &scan, .{ .disjunction = &children }, 0);
-    try testing.expectEqual(Selectivity{ .exact = 50 + 1 }, selectivity);
+    try testing.expectEqual(Selectivity{ .atMost = 50 + 1 }, selectivity);
 }
 
 test "collectCandidates: a drivable disjunction yields the union either branch matches" {
@@ -554,7 +562,7 @@ fn seedBlobPlusIntCatalog(writeTransaction: *WriteTransaction, rowCount: u64, ob
     return catalogReference;
 }
 
-test "T-N2: collectCandidates on the property-1 bytes comparison still returns error.NoIndexPlan" {
+test "T-N2: collectCandidates on the property-1 bytes comparison returns every row carrying that value" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try plannerTmpPath(testing.allocator, &tmp, "planner_n2.airdb");
@@ -563,18 +571,27 @@ test "T-N2: collectCandidates on the property-1 bytes comparison still returns e
     defer database.deinit();
     var writeTransaction = try database.beginWrite();
     defer writeTransaction.deinit();
-    const catalogReference = try seedBlobPlusIntCatalog(&writeTransaction, 10, null);
+    var objectKeys: [500]u64 = undefined;
+    const catalogReference = try seedBlobPlusIntCatalog(&writeTransaction, 500, &objectKeys);
     const scan = try Scan.open(&writeTransaction, catalogReference);
 
+    // Every one of the 500 rows carries the blob value "x" (seedBlobPlusIntCatalog).
     var candidates = std.ArrayList(u64).empty;
     defer candidates.deinit(testing.allocator);
-    // Pins the defensive guard in collectCandidates's .bytes arm, which
-    // isIndexFriendly now normally forecloses from ever being reached through
-    // runQuery.
-    try testing.expectError(error.NoIndexPlan, planner.collectCandidates(&writeTransaction, &scan, bytesComparison(1, .eq, "x"), &candidates, testing.allocator, 0));
+    try planner.collectCandidates(&writeTransaction, &scan, bytesComparison(1, .eq, "x"), &candidates, testing.allocator, 0);
+    std.mem.sort(u64, candidates.items, {}, std.sort.asc(u64));
+    var expected: [500]u64 = objectKeys;
+    std.mem.sort(u64, &expected, {}, std.sort.asc(u64));
+    try testing.expectEqualSlices(u64, &expected, candidates.items);
+
+    // No row carries "y".
+    var missCandidates = std.ArrayList(u64).empty;
+    defer missCandidates.deinit(testing.allocator);
+    try planner.collectCandidates(&writeTransaction, &scan, bytesComparison(1, .eq, "y"), &missCandidates, testing.allocator, 0);
+    try testing.expectEqual(@as(usize, 0), missCandidates.items.len);
 }
 
-test "selectivityOf: a bytes eq comparison on an indexed blob property returns unbounded (defensive guard)" {
+test "selectivityOf: a bytes eq comparison on an indexed blob property counts the inner set" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try plannerTmpPath(testing.allocator, &tmp, "planner_sel_bytes.airdb");
@@ -583,17 +600,64 @@ test "selectivityOf: a bytes eq comparison on an indexed blob property returns u
     defer database.deinit();
     var writeTransaction = try database.beginWrite();
     defer writeTransaction.deinit();
-    const catalogReference = try seedBlobPlusIntCatalog(&writeTransaction, 10, null);
+    const catalogReference = try seedBlobPlusIntCatalog(&writeTransaction, 500, null);
     const scan = try Scan.open(&writeTransaction, catalogReference);
 
-    // Pins selectivityOf's own defensive guard, the twin of T-N2's guard in
-    // collectCandidates, which isIndexFriendly now normally forecloses from
-    // ever being reached through runQuery. The operator must be .eq:
-    // selectivityOf's `comparison.operator != .eq` check returns .unbounded
-    // first for any other operator, so a non-eq probe would pass without
-    // reaching the .bytes arm under test.
+    // Every one of the 500 rows carries the blob value "x": hand-known fixture size.
     const selectivity = try planner.selectivityOf(&writeTransaction, &scan, bytesComparison(1, .eq, "x"), 0);
-    try testing.expectEqual(Selectivity.unbounded, selectivity);
+    try testing.expectEqual(Selectivity{ .atMost = 500 }, selectivity);
+
+    // Defensive-guard shape that IS still unsupported: a .bytes comparison
+    // against an .int property returns .unbounded rather than probing.
+    const mismatchedKindScan = makeScanForTestWithKinds(&.{ .int, .int }, &.{ true, true });
+    const mismatched = try planner.selectivityOf(&writeTransaction, &mismatchedKindScan, bytesComparison(0, .eq, "x"), 0);
+    try testing.expectEqual(Selectivity.unbounded, mismatched);
+}
+
+test "selectivityOf: two values sharing a 256-byte prefix but differing after it overestimate to atMost 2, true match count 1" {
+    // Pins that Selectivity is now an upper bound, not an exact count: the
+    // truncated key cannot distinguish the two rows, so the outer key's inner
+    // set holds both, even though eq only truly matches one.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try plannerTmpPath(testing.allocator, &tmp, "planner_sel_shared_prefix.airdb");
+    defer testing.allocator.free(path);
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var writeTransaction = try database.beginWrite();
+    defer writeTransaction.deinit();
+
+    var sharedPrefix: [260]u8 = undefined;
+    @memset(&sharedPrefix, 'x');
+    var valueA: [263]u8 = undefined;
+    @memcpy(valueA[0..260], &sharedPrefix);
+    @memcpy(valueA[260..263], "AAA");
+    var valueB: [263]u8 = undefined;
+    @memcpy(valueB[0..260], &sharedPrefix);
+    @memcpy(valueB[260..263], "BBB");
+
+    const definitions = [_]catalog.PropertyDefinition{ .{ .kind = .int }, .{ .kind = .blob, .indexed = true } };
+    var catalogReference = try catalog.createFromDefinitions(&writeTransaction, &definitions);
+    const referenceA = try blob.put(&writeTransaction, &valueA);
+    const referenceB = try blob.put(&writeTransaction, &valueB);
+    catalogReference = (try rows.insert(&writeTransaction, catalogReference, &.{ 0, referenceA })).catalogReference;
+    catalogReference = (try rows.insert(&writeTransaction, catalogReference, &.{ 1, referenceB })).catalogReference;
+    const scan = try Scan.open(&writeTransaction, catalogReference);
+
+    const selectivityForA = try planner.selectivityOf(&writeTransaction, &scan, bytesComparison(1, .eq, &valueA), 0);
+    try testing.expectEqual(Selectivity{ .atMost = 2 }, selectivityForA);
+    const selectivityForB = try planner.selectivityOf(&writeTransaction, &scan, bytesComparison(1, .eq, &valueB), 0);
+    try testing.expectEqual(Selectivity{ .atMost = 2 }, selectivityForB);
+}
+
+test "canDriveFromIndex: a bytes comparison on an indexed .int property is never drivable" {
+    const kinds = [_]catalog.PropertyKind{.int};
+    const indexedFlags = [_]bool{true};
+    const scan = makeScanForTestWithKinds(&kinds, &indexedFlags);
+    const operators = [_]Operator{ .eq, .lt, .le, .gt, .ge, .ne, .beginsWith };
+    for (operators) |operator| {
+        try testing.expect(!planner.canDriveFromIndex(&scan, bytesComparison(0, operator, "x")));
+    }
 }
 
 test "T-N3: a conjunction with one bytes child and one drivable int child is drivable, and drives off the int child" {
@@ -614,7 +678,11 @@ test "T-N3: a conjunction with one bytes child and one drivable int child is dri
 
     const children = [_]Predicate{ bytesComparison(1, .eq, "x"), intComparison(2, .eq, 7) };
     const tree = Predicate{ .conjunction = &children };
-    // One drivable child (property 2) is enough.
+    // Both children are now drivable (the blob comparison is index-friendly
+    // since section 5.1): blob eq "x" is .atMost = 200 (every row) while int
+    // eq 7 is .atMost = 2, so mostSelectiveChild picks the int child. This
+    // test is therefore the proof that ranking works correctly ACROSS
+    // keyings, not merely that one drivable child suffices.
     try testing.expect(planner.canDriveFromIndex(&scan, tree));
 
     var candidates = std.ArrayList(u64).empty;

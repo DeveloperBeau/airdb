@@ -1,7 +1,9 @@
 # On-disk format
 
 Pre-1.0: this layout changes without migration support. All integers are
-little-endian; the store refuses to open big-endian-tagged files.
+little-endian; the store refuses to open big-endian-tagged files. Current
+magic: `airdb_0003`; a file written with an older magic refuses to open with
+`error.BadMagic` rather than being read or migrated.
 
 ## File layout
 
@@ -71,6 +73,14 @@ then per-property parallel arrays in this order: column references (u64), kinds
 (u8), element kinds (u8), backlink references (u64), link targets (u16), delete
 rules (u8), value-index references (u64), indexed flags (u8). New arrays append at
 the end so earlier offsets never move.
+
+An indexed property's `value_index_reference` names a u64-keyed tree
+(`trees/index.zig`) mapping the property's raw column word to an inner
+objectKey set, except for an indexed `.blob` property, whose
+`value_index_reference` instead names a byte-keyed tree
+(`trees/byteKeyIndex.zig`) mapping the value's first 256 bytes to an
+objectKey set. The two trees share the same on-disk node layout; only the
+comparator differs.
 
 The type directory node is `type_count u16`, `type_count × catalog_reference u64`,
 `type_count × embedded_flag u8`.

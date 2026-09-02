@@ -1013,3 +1013,186 @@ test "compactInPlace shrinks and preserves data" {
     var valuesB2: [2]catalog.Value = undefined;
     try testing.expectEqual(@as(?u64, null), try typeRouting.get(&readTransaction, directoryReference, 1, 42, &valuesB2));
 }
+
+// Seven distinct blob values, the last two sharing a 256-byte prefix (their
+// index keys collide before residual filtering separates them), cycled over
+// 50 rows by primaryKey % 7. Every third row (primaryKey % 3 == 0) is deleted
+// before compaction, leaving a gap the copy path must not disturb.
+var compactionSharedPrefix: [260]u8 = undefined;
+var compactionSharedA: [263]u8 = undefined;
+var compactionSharedB: [263]u8 = undefined;
+
+fn compactionBlobValues() [7][]const u8 {
+    @memset(&compactionSharedPrefix, 'x');
+    @memcpy(compactionSharedA[0..260], &compactionSharedPrefix);
+    @memcpy(compactionSharedA[260..263], "AAA");
+    @memcpy(compactionSharedB[0..260], &compactionSharedPrefix);
+    @memcpy(compactionSharedB[260..263], "BBB");
+    return .{ "alpha", "beta", "gamma", "delta", "epsilon", &compactionSharedA, &compactionSharedB };
+}
+
+// Every surviving objectKey whose row's value equals `distinctValues[valueIndex]`,
+// hand-computed from the primaryKey%7/primaryKey%3 seeding rule, never read back
+// from any index.
+fn compactionSurvivingObjectKeys(objectKeys: []const u64, rowCount: u64, valueIndex: usize, allocator: std.mem.Allocator) ![]u64 {
+    var list = std.ArrayList(u64).empty;
+    errdefer list.deinit(allocator);
+    var primaryKey: u64 = 0;
+    while (primaryKey < rowCount) : (primaryKey += 1) {
+        if (primaryKey % 3 == 0) continue; // deleted
+        if (primaryKey % 7 != valueIndex) continue;
+        try list.append(allocator, objectKeys[primaryKey]);
+    }
+    std.mem.sort(u64, list.items, {}, std.sort.asc(u64));
+    return list.toOwnedSlice(allocator);
+}
+
+test "compactInPlace preserves blob value indexes and passes verifyIntegrity" {
+    const query = @import("../query.zig");
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try cmpTmpPath(testing.allocator, &tmp, "inplace_blob_vidx.airdb");
+    defer testing.allocator.free(path);
+
+    const distinctValues = compactionBlobValues();
+    const rowCount: u64 = 50;
+    var objectKeys: [rowCount]u64 = undefined;
+
+    {
+        var database = try Database.create(testing.allocator, path);
+        var writeTransaction = try database.beginWrite();
+        var directoryReference = try typeDirectory.createTypes(&writeTransaction, &.{
+            &.{ .{ .kind = .int }, .{ .kind = .blob, .indexed = true } },
+        }, &.{false});
+        var primaryKey: u64 = 0;
+        while (primaryKey < rowCount) : (primaryKey += 1) {
+            const value = distinctValues[primaryKey % 7];
+            const inserted = try typeRouting.insert(&writeTransaction, directoryReference, 0, &.{ .{ .int = primaryKey }, .{ .bytes = value } });
+            directoryReference = inserted.directoryReference;
+            objectKeys[primaryKey] = inserted.objectKey;
+        }
+        primaryKey = 0;
+        while (primaryKey < rowCount) : (primaryKey += 1) {
+            if (primaryKey % 3 != 0) continue;
+            var out: [2]catalog.Value = undefined;
+            const version = (try typeRouting.get(&writeTransaction, directoryReference, 0, primaryKey, &out)).?;
+            directoryReference = (try typeRouting.delete(&writeTransaction, directoryReference, 0, primaryKey, version)).ok;
+        }
+        writeTransaction.setRoot(directoryReference);
+        _ = try writeTransaction.commit();
+        database.deinit();
+    }
+
+    try compactInPlace(testing.allocator, path);
+
+    var database = try Database.open(testing.allocator, path);
+    defer database.deinit();
+    try verification.verifyIntegrity(&database);
+    var readTransaction = try database.beginRead();
+    defer readTransaction.end();
+    const catalogReference = try typeDirectory.catalogReference(&readTransaction, readTransaction.root(), 0);
+
+    for (distinctValues, 0..) |value, valueIndex| {
+        const expected = try compactionSurvivingObjectKeys(&objectKeys, rowCount, valueIndex, testing.allocator);
+        defer testing.allocator.free(expected);
+
+        var eqHits = std.ArrayList(u64).empty;
+        defer eqHits.deinit(testing.allocator);
+        try query.where(&readTransaction, catalogReference, .{ .predicate = .{ .comparison = .{ .property = 1, .operator = .eq, .value = .{ .bytes = value } } } }, &eqHits, testing.allocator);
+        std.mem.sort(u64, eqHits.items, {}, std.sort.asc(u64));
+        try testing.expectEqualSlices(u64, expected, eqHits.items);
+    }
+
+    // A beginsWith query over the shared 256-byte prefix returns both surviving
+    // shared-prefix rows (indices 5 and 6), never read back from the index.
+    var expectedBegins = std.ArrayList(u64).empty;
+    defer expectedBegins.deinit(testing.allocator);
+    for ([_]usize{ 5, 6 }) |valueIndex| {
+        const rowsForValue = try compactionSurvivingObjectKeys(&objectKeys, rowCount, valueIndex, testing.allocator);
+        defer testing.allocator.free(rowsForValue);
+        try expectedBegins.appendSlice(testing.allocator, rowsForValue);
+    }
+    std.mem.sort(u64, expectedBegins.items, {}, std.sort.asc(u64));
+    var beginsHits = std.ArrayList(u64).empty;
+    defer beginsHits.deinit(testing.allocator);
+    try query.where(&readTransaction, catalogReference, .{ .predicate = .{ .comparison = .{ .property = 1, .operator = .beginsWith, .value = .{ .bytes = &compactionSharedPrefix } } } }, &beginsHits, testing.allocator);
+    std.mem.sort(u64, beginsHits.items, {}, std.sort.asc(u64));
+    try testing.expectEqualSlices(u64, expectedBegins.items, beginsHits.items);
+}
+
+test "compactToNewFile preserves blob value indexes" {
+    // Without section 8's checkRowProperties blob arm, this fails with
+    // error.CompactionMismatch during compactToNewFile itself, not at any
+    // later assertion: a byte-keyed root descended as a numeric tree resolves
+    // to nothing, so the per-row indexed-property check aborts the compaction.
+    const query = @import("../query.zig");
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const srcPath = try cmpTmpPath(testing.allocator, &tmp, "tonew_blob_vidx_src.airdb");
+    defer testing.allocator.free(srcPath);
+    const dstPath = try cmpTmpPath(testing.allocator, &tmp, "tonew_blob_vidx_dst.airdb");
+    defer testing.allocator.free(dstPath);
+
+    const distinctValues = compactionBlobValues();
+    const rowCount: u64 = 50;
+    var objectKeys: [rowCount]u64 = undefined;
+
+    {
+        var database = try Database.create(testing.allocator, srcPath);
+        defer database.deinit();
+        var writeTransaction = try database.beginWrite();
+        var directoryReference = try typeDirectory.createTypes(&writeTransaction, &.{
+            &.{ .{ .kind = .int }, .{ .kind = .blob, .indexed = true } },
+        }, &.{false});
+        var primaryKey: u64 = 0;
+        while (primaryKey < rowCount) : (primaryKey += 1) {
+            const value = distinctValues[primaryKey % 7];
+            const inserted = try typeRouting.insert(&writeTransaction, directoryReference, 0, &.{ .{ .int = primaryKey }, .{ .bytes = value } });
+            directoryReference = inserted.directoryReference;
+            objectKeys[primaryKey] = inserted.objectKey;
+        }
+        primaryKey = 0;
+        while (primaryKey < rowCount) : (primaryKey += 1) {
+            if (primaryKey % 3 != 0) continue;
+            var out: [2]catalog.Value = undefined;
+            const version = (try typeRouting.get(&writeTransaction, directoryReference, 0, primaryKey, &out)).?;
+            directoryReference = (try typeRouting.delete(&writeTransaction, directoryReference, 0, primaryKey, version)).ok;
+        }
+        writeTransaction.setRoot(directoryReference);
+        _ = try writeTransaction.commit();
+    }
+
+    try compactToNewFile(testing.allocator, srcPath, dstPath);
+
+    var reopenedDestination = try Database.open(testing.allocator, dstPath);
+    defer reopenedDestination.deinit();
+    try verification.verifyIntegrity(&reopenedDestination);
+    var readTransaction = try reopenedDestination.beginRead();
+    defer readTransaction.end();
+    const catalogReference = try typeDirectory.catalogReference(&readTransaction, readTransaction.root(), 0);
+
+    for (distinctValues, 0..) |value, valueIndex| {
+        const expected = try compactionSurvivingObjectKeys(&objectKeys, rowCount, valueIndex, testing.allocator);
+        defer testing.allocator.free(expected);
+
+        var eqHits = std.ArrayList(u64).empty;
+        defer eqHits.deinit(testing.allocator);
+        try query.where(&readTransaction, catalogReference, .{ .predicate = .{ .comparison = .{ .property = 1, .operator = .eq, .value = .{ .bytes = value } } } }, &eqHits, testing.allocator);
+        std.mem.sort(u64, eqHits.items, {}, std.sort.asc(u64));
+        try testing.expectEqualSlices(u64, expected, eqHits.items);
+    }
+
+    var expectedBegins = std.ArrayList(u64).empty;
+    defer expectedBegins.deinit(testing.allocator);
+    for ([_]usize{ 5, 6 }) |valueIndex| {
+        const rowsForValue = try compactionSurvivingObjectKeys(&objectKeys, rowCount, valueIndex, testing.allocator);
+        defer testing.allocator.free(rowsForValue);
+        try expectedBegins.appendSlice(testing.allocator, rowsForValue);
+    }
+    std.mem.sort(u64, expectedBegins.items, {}, std.sort.asc(u64));
+    var beginsHits = std.ArrayList(u64).empty;
+    defer beginsHits.deinit(testing.allocator);
+    try query.where(&readTransaction, catalogReference, .{ .predicate = .{ .comparison = .{ .property = 1, .operator = .beginsWith, .value = .{ .bytes = &compactionSharedPrefix } } } }, &beginsHits, testing.allocator);
+    std.mem.sort(u64, beginsHits.items, {}, std.sort.asc(u64));
+    try testing.expectEqualSlices(u64, expectedBegins.items, beginsHits.items);
+}

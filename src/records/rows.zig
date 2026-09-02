@@ -13,6 +13,7 @@ const Column = @import("../trees/column.zig");
 const Index = @import("../trees/index.zig");
 const byteKeyIndex = @import("../trees/byteKeyIndex.zig");
 const blob = @import("blob.zig");
+const blobIndexKey = @import("blobIndexKey.zig");
 const catalog = @import("../schema/catalog.zig");
 
 const PropertyKind = catalog.PropertyKind;
@@ -31,20 +32,32 @@ const loadCatalog = catalog.loadCatalog;
 // rows. These helpers mirror the backlink add/remove path in links.zig.
 // ---------------------------------------------------------------------------
 
-/// Add `objectKey` to the value-index inner set for `value`, returning the new index reference.
+/// Add `objectKey` to the int-keyed value-index inner set for `value`,
+/// returning the new index reference.
 /// Pub: the migration backfill reuses it to index pre-migration rows.
-pub fn valueIndexAdd(transaction: *WriteTransaction, valueIndexReference: Reference, value: u64, objectKey: u64) !Reference {
+pub fn intValueIndexAdd(transaction: *WriteTransaction, valueIndexReference: Reference, value: u64, objectKey: u64) !Reference {
     const existing = try Index.get(transaction, valueIndexReference, value);
     var setRoot = existing orelse try Index.create(transaction);
     setRoot = try Index.insert(transaction, setRoot, objectKey, 1);
     return try Index.insert(transaction, valueIndexReference, value, setRoot);
 }
 
-// Remove `objectKey` from the value-index inner set for `value`. No-op if absent.
+/// Add `objectKey` to the byte-keyed value-index inner set for `key`,
+/// returning the new index reference. `key` is already truncated by
+/// `blobIndexKey`; this function does not truncate.
+/// Pub: the migration backfill and the compaction copy reuse it.
+pub fn blobValueIndexAdd(transaction: *WriteTransaction, valueIndexReference: Reference, key: []const u8, objectKey: u64) !Reference {
+    const existing = try byteKeyIndex.get(transaction, valueIndexReference, key);
+    var setRoot = existing orelse try Index.create(transaction);
+    setRoot = try Index.insert(transaction, setRoot, objectKey, 1);
+    return try byteKeyIndex.insert(transaction, valueIndexReference, key, setRoot);
+}
+
+// Remove `objectKey` from the int-keyed value-index inner set for `value`. No-op if absent.
 // When the inner set empties, its outer entry is removed and the set's nodes
 // freed: high-churn workloads would otherwise accumulate one empty set per
 // distinct value ever indexed, reclaimable only by a full file copy.
-fn valueIndexRemove(transaction: *WriteTransaction, valueIndexReference: Reference, value: u64, objectKey: u64) !Reference {
+fn intValueIndexRemove(transaction: *WriteTransaction, valueIndexReference: Reference, value: u64, objectKey: u64) !Reference {
     const existing = try Index.get(transaction, valueIndexReference, value);
     const setRoot = existing orelse return valueIndexReference;
     const newSet = try Index.remove(transaction, setRoot, objectKey);
@@ -56,18 +69,57 @@ fn valueIndexRemove(transaction: *WriteTransaction, valueIndexReference: Referen
     return try Index.insert(transaction, valueIndexReference, value, newSet);
 }
 
-// Add objectKey->value to indexed property p's value index. Returns the new catalog.
-fn addValueIndex(transaction: *WriteTransaction, catalogReference: Reference, propertyIndex: usize, value: u64, objectKey: u64) !Reference {
-    const view = try loadCatalog(transaction, catalogReference);
-    const newVi = try valueIndexAdd(transaction, view.valueIndexReference(propertyIndex), value, objectKey);
-    return try catalog.setValueIndexReference(transaction, catalogReference, propertyIndex, newVi);
+// Remove `objectKey` from the byte-keyed value-index inner set for `key`. No-op if absent.
+// Mirrors intValueIndexRemove's empty-set pruning: byteKeyIndex.remove frees
+// the key's own blob, so nothing else is needed to reclaim it.
+fn blobValueIndexRemove(transaction: *WriteTransaction, valueIndexReference: Reference, key: []const u8, objectKey: u64) !Reference {
+    const existing = try byteKeyIndex.get(transaction, valueIndexReference, key);
+    const setRoot = existing orelse return valueIndexReference;
+    const newSet = try Index.remove(transaction, setRoot, objectKey);
+    if ((try Index.count(transaction, newSet)) == 0) {
+        const newVi = try byteKeyIndex.remove(transaction, valueIndexReference, key);
+        try Index.freeTree(transaction, newSet);
+        return newVi;
+    }
+    return try byteKeyIndex.insert(transaction, valueIndexReference, key, newSet);
 }
 
-// Remove objectKey from indexed property p's value-index set for `value`.
-fn removeValueIndex(transaction: *WriteTransaction, catalogReference: Reference, propertyIndex: usize, value: u64, objectKey: u64) !Reference {
+// Add objectKey under indexed property propertyIndex's key for `raw`, returning
+// the new catalog. The property's kind decides the keying: an int or link
+// property keys on the column word itself; a `.blob` property keys on the
+// stored bytes truncated to blobIndexKey.maxLength, which makes the index a
+// CANDIDATE index (see blobIndexKey.zig) rather than a covering one.
+// One catalog load, one index descent and one insert; a blob property adds
+// one blob prefix read. I/O.
+fn addToValueIndex(transaction: *WriteTransaction, catalogReference: Reference, propertyIndex: usize, raw: u64, objectKey: u64) !Reference {
     const view = try loadCatalog(transaction, catalogReference);
-    const newVi = try valueIndexRemove(transaction, view.valueIndexReference(propertyIndex), value, objectKey);
-    return try catalog.setValueIndexReference(transaction, catalogReference, propertyIndex, newVi);
+    const valueIndexReference = view.valueIndexReference(propertyIndex);
+    const newValueIndex = switch (view.kind(propertyIndex)) {
+        .blob => blk: {
+            var keyBuffer: [blobIndexKey.maxLength]u8 = undefined;
+            const key = try blobIndexKey.read(transaction, raw, &keyBuffer);
+            break :blk try blobValueIndexAdd(transaction, valueIndexReference, key, objectKey);
+        },
+        else => try intValueIndexAdd(transaction, valueIndexReference, raw, objectKey),
+    };
+    return try catalog.setValueIndexReference(transaction, catalogReference, propertyIndex, newValueIndex);
+}
+
+// The exact mirror of addToValueIndex: removes objectKey from indexed
+// property propertyIndex's key for `raw`, keyed the same way addToValueIndex
+// keys it.
+fn removeFromValueIndex(transaction: *WriteTransaction, catalogReference: Reference, propertyIndex: usize, raw: u64, objectKey: u64) !Reference {
+    const view = try loadCatalog(transaction, catalogReference);
+    const valueIndexReference = view.valueIndexReference(propertyIndex);
+    const newValueIndex = switch (view.kind(propertyIndex)) {
+        .blob => blk: {
+            var keyBuffer: [blobIndexKey.maxLength]u8 = undefined;
+            const key = try blobIndexKey.read(transaction, raw, &keyBuffer);
+            break :blk try blobValueIndexRemove(transaction, valueIndexReference, key, objectKey);
+        },
+        else => try intValueIndexRemove(transaction, valueIndexReference, raw, objectKey),
+    };
+    return try catalog.setValueIndexReference(transaction, catalogReference, propertyIndex, newValueIndex);
 }
 
 /// Append a new row to all columns and update the primaryKey index.
@@ -106,7 +158,7 @@ pub fn insert(transaction: *WriteTransaction, catalogReference: Reference, value
     {
         var propertyIndex: usize = 0;
         while (propertyIndex < propertyCount) : (propertyIndex += 1) {
-            if (snapshot.properties[propertyIndex].indexed) updatedCatalog = try addValueIndex(transaction, updatedCatalog, propertyIndex, values[propertyIndex], objectKey);
+            if (snapshot.properties[propertyIndex].indexed) updatedCatalog = try addToValueIndex(transaction, updatedCatalog, propertyIndex, values[propertyIndex], objectKey);
         }
     }
     return .{ .catalogReference = updatedCatalog, .objectKey = objectKey };
@@ -170,8 +222,8 @@ pub fn update(transaction: *WriteTransaction, catalogReference: Reference, prima
         var reindexIndex: usize = 0;
         while (reindexIndex < propertyCount) : (reindexIndex += 1) {
             if (snapshot.properties[reindexIndex].indexed and oldValues[reindexIndex] != values[reindexIndex]) {
-                updatedCatalog = try removeValueIndex(transaction, updatedCatalog, reindexIndex, oldValues[reindexIndex], objectKey);
-                updatedCatalog = try addValueIndex(transaction, updatedCatalog, reindexIndex, values[reindexIndex], objectKey);
+                updatedCatalog = try removeFromValueIndex(transaction, updatedCatalog, reindexIndex, oldValues[reindexIndex], objectKey);
+                updatedCatalog = try addToValueIndex(transaction, updatedCatalog, reindexIndex, values[reindexIndex], objectKey);
             }
         }
     }
@@ -215,7 +267,7 @@ pub fn delete(transaction: *WriteTransaction, catalogReference: Reference, prima
     {
         var propertyIndex: usize = 0;
         while (propertyIndex < propertyCount) : (propertyIndex += 1) {
-            if (snapshot.properties[propertyIndex].indexed) updatedCatalog = try removeValueIndex(transaction, updatedCatalog, propertyIndex, oldValues[propertyIndex], objectKey);
+            if (snapshot.properties[propertyIndex].indexed) updatedCatalog = try removeFromValueIndex(transaction, updatedCatalog, propertyIndex, oldValues[propertyIndex], objectKey);
         }
     }
     return .{ .ok = updatedCatalog };

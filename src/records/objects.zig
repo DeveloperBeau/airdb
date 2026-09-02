@@ -182,7 +182,7 @@ pub fn deleteAndNullify(transaction: *WriteTransaction, catalogReference: Refere
 /// MVCC-safe: it does NOT free any blob unless the version check passes.
 /// Steps: read current row, check version, then on the apply path free old
 /// blobs and allocate new ones before delegating to rows.update.
-/// Deliberately one long function: the read/check/free/allocate/update
+/// Deliberately one long function: the read/check/allocate/update/free
 /// sequence is one irreducible MVCC step -- splitting it would scatter the
 /// frees from the version check that alone makes them safe.
 pub fn updateTyped(
@@ -208,31 +208,38 @@ pub fn updateTyped(
     // Step 2: version check BEFORE freeing or allocating any blob.
     if (currentVersion != expectedVersion)
         return .{ .conflict = .{ .currentVersion = currentVersion } };
-    // Step 3: apply path -- free old blobs and allocate new ones. Collection
-    // properties are CARRIED THROUGH unchanged (mutate them via their own
-    // APIs): updating any row of a collection-bearing type must not require
-    // the caller to re-supply roots, and must never crash.
+    // Step 3: apply path -- allocate new blobs. The OLD blob is not freed
+    // here: rows.update (called next) dereferences curRaw to compute the OLD
+    // value-index key it must remove, and WriteTransaction.free routes a
+    // same-transaction extent into transactionReuse, which alloc draws from
+    // FIRST on an exact size match. Freeing before rows.update would let this
+    // very blob.put reclaim the just-freed extent and overwrite the old bytes
+    // the removal is about to read, computing the NEW bytes as the OLD key --
+    // removing nothing and leaving a permanent stale value-index entry.
+    // Collection properties are CARRIED THROUGH unchanged (mutate them via
+    // their own APIs): updating any row of a collection-bearing type must not
+    // require the caller to re-supply roots, and must never crash.
     var newRaw: [maxPropertyCount]u64 = undefined;
     var propertyIndex: usize = 0;
     while (propertyIndex < propertyCount) : (propertyIndex += 1) {
         newRaw[propertyIndex] = switch (kinds[propertyIndex]) {
             .int => values[propertyIndex].int,
-            .blob => blk: {
-                try blob.free(transaction, curRaw[propertyIndex]);
-                break :blk try blob.put(transaction, values[propertyIndex].bytes);
-            },
+            .blob => try blob.put(transaction, values[propertyIndex].bytes),
             .list, .set, .dict, .linkSet => curRaw[propertyIndex],
             .link => if (values[propertyIndex].link) |target| target + 1 else 0,
         };
     }
     // Step 4: delegate to the core update; it will re-check the version (match).
     const result = try rows.update(transaction, catalogReference, primaryKey, newRaw[0..propertyCount], expectedVersion);
-    // Step 5: maintain backlinks for any changed to-one link, mirroring
-    // setLink. Skipping this left the old target's backlink set naming this
-    // source forever and the new target's set missing it -- corrupting
-    // nullify/cascade/block enforcement. The backlink source is the objectKey.
+    // Step 5: on the apply path, free the blobs this update replaced (MVCC-safe:
+    // a .conflict or .notFound frees nothing) and maintain backlinks for any
+    // changed to-one link, mirroring setLink. Skipping the backlink step left the
+    // old target's backlink set naming this source forever and the new target's
+    // set missing it -- corrupting nullify/cascade/block enforcement. The
+    // backlink source is the objectKey.
     switch (result) {
         .ok => |ok| {
+            try freeReplacedBlobs(transaction, kinds[0..propertyCount], curRaw[0..propertyCount]);
             var updatedCatalog = ok.catalogReference;
             var changed = false;
             var linkIndex: usize = 0;
@@ -250,6 +257,19 @@ pub fn updateTyped(
             return result;
         },
         else => return result,
+    }
+}
+
+// Free the blobs a successful update replaced. Runs only after rows.update has
+// returned .ok, because the value-index maintenance inside it reads the OLD
+// blob's bytes to compute the key it must remove: freeing first routes a
+// same-transaction node to the immediate-reuse pool, where the replacement
+// blob.put can reclaim the identical extent and overwrite the bytes the
+// removal is about to read.
+fn freeReplacedBlobs(transaction: *WriteTransaction, kinds: []const PropertyKind, previousRaw: []const u64) !void {
+    var propertyIndex: usize = 0;
+    while (propertyIndex < kinds.len) : (propertyIndex += 1) {
+        if (kinds[propertyIndex] == .blob) try blob.free(transaction, previousRaw[propertyIndex]);
     }
 }
 
