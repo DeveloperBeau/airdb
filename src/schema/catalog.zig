@@ -171,6 +171,9 @@ pub fn createFromDefinitions(transaction: *WriteTransaction, definitions: []cons
     // not a value. migrations.addProperty has rejected this since it was
     // written; accepting it here let a caller build a type whose "index" was
     // meaningless and whose collection writers had no index to maintain.
+    // This closes creation going forward only: a database file written before
+    // this check keeps whatever indexed collection property it already had,
+    // with an index nothing here rejects, repairs, or removes.
     for (definitions) |definition| {
         const isCollection = switch (definition.kind) {
             .list, .set, .dict, .linkSet => true,

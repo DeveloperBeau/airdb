@@ -1333,3 +1333,49 @@ test "L13: a link property with no value index is left alone by setLink" {
     try testing.expectEqual(@as(usize, 1), hits.items.len);
     try testing.expectEqual(source.objectKey, hits.items[0]);
 }
+
+test "L14: a cross-type inbound nullify moves the value index too" {
+    // Fix A's `!matchAll` seam (source type differs from the deleted
+    // object's type) is reached only when the directory holds more than one
+    // type. L1-L13 all build a single-type directory, so nullifyInboundInCatalog
+    // is always called with matchAll = true there and this branch never runs
+    // in the suite. Two types: Target (property 0 only) and Source, whose
+    // property 1 is an indexed link into Target.
+    const query = @import("../query.zig");
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "l14.airdb");
+    defer testing.allocator.free(path);
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+
+    var writeTransaction = try database.beginWrite();
+    defer writeTransaction.deinit();
+    const PD = catalog.PropertyDefinition;
+    const schema = [_][]const PD{
+        &.{.{ .kind = .int }}, // 0: Target
+        &.{ .{ .kind = .int }, .{ .kind = .link, .linkTarget = 0, .indexed = true } }, // 1: Source
+    };
+    var directoryReference = try typeDirectory.createWithDefinitions(&writeTransaction, &schema);
+    const target = try typeRouting.insert(&writeTransaction, directoryReference, 0, &.{.{ .int = 1 }});
+    directoryReference = target.directoryReference;
+    const source = try typeRouting.insert(&writeTransaction, directoryReference, 1, &.{ .{ .int = 1 }, .{ .link = target.objectKey } });
+    directoryReference = source.directoryReference;
+
+    var buffer: [1]catalog.Value = undefined;
+    const targetVersion = (try typeRouting.get(&writeTransaction, directoryReference, 0, 1, &buffer)).?;
+    directoryReference = (try typeRouting.deleteNullifyCrossType(&writeTransaction, directoryReference, 0, 1, targetVersion)).ok;
+    writeTransaction.setRoot(directoryReference);
+    _ = try writeTransaction.commit();
+
+    var readTransaction = try database.beginRead();
+    defer readTransaction.end();
+    const sourceCatalog = try typeDirectory.catalogReference(&readTransaction, readTransaction.root(), 1);
+    try testing.expectEqual(@as(?u64, null), try getLink(&readTransaction, sourceCatalog, 1, 1));
+    var hits = std.ArrayList(u64).empty;
+    defer hits.deinit(testing.allocator);
+    try query.where(&readTransaction, sourceCatalog, .{ .predicate = .{ .comparison = .{ .property = 1, .operator = .eq, .value = .{ .int = 0 } } } }, &hits, testing.allocator);
+    try testing.expectEqual(@as(usize, 1), hits.items.len);
+    try testing.expectEqual(source.objectKey, hits.items[0]);
+    try verification.verifyIntegrity(&database);
+}

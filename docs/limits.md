@@ -85,6 +85,9 @@ newer one. Ship a matched engine with your app.
   candidate against its full bytes).
 - `bulkImport` refuses a type with an indexed `.blob` property
   (`error.UnsupportedForBulk`); an unindexed `.blob` property is unaffected.
+- `createFromDefinitions` (and `addProperty`) refuse `indexed = true` on a
+  `.list`/`.set`/`.dict`/`.linkSet` property (`error.Unsupported`): indexing a
+  collection's per-row storage reference is not indexing a value.
 - `Database.create`/`open` require absolute paths.
 
 ## Failed commits
