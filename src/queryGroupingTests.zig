@@ -20,6 +20,7 @@ const rows = @import("records/rows.zig");
 const index = @import("trees/index.zig");
 const relocation = @import("storage/relocation.zig");
 const Reference = @import("storage/reference.zig").Reference;
+const Column = @import("trees/column.zig");
 const Database = @import("database.zig").Database;
 const WriteTransaction = @import("database.zig").WriteTransaction;
 
@@ -462,7 +463,7 @@ test "D12: each rejected kind raises error.UnsupportedGrouping" {
     }
 }
 
-test "D13: after relocation, distinct still returns the objectKey" {
+test "D13: after relocation, distinct still returns the objectKey, both paths" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try qgTmpPath(testing.allocator, &tmp, "d13.airdb");
@@ -472,21 +473,25 @@ test "D13: after relocation, distinct still returns the objectKey" {
     var writeTransaction = try database.beginWrite();
     defer writeTransaction.deinit();
 
-    // primaryKey + color(indexed). Insert a throwaway first to open a dead
-    // slot, then the target, matching src/queryTests.zig's relocation setup.
+    // primaryKey + colorUnindexed + colorIndexed(indexed), the same twin-color
+    // shape fixture A uses, so one relocation pins both the unindexed (scan)
+    // sink and the indexed sink against the objectKey/row crossing. Insert a
+    // throwaway first to open a dead slot, then the target, matching
+    // src/queryTests.zig's relocation setup.
     const definitions = [_]catalog.PropertyDefinition{
+        .{ .kind = .int },
         .{ .kind = .int },
         .{ .kind = .int, .indexed = true },
     };
     var catalogReference = try catalog.createFromDefinitions(&writeTransaction, &definitions);
-    const throwaway = try rows.insert(&writeTransaction, catalogReference, &.{ 1, 99 });
+    const throwaway = try rows.insert(&writeTransaction, catalogReference, &.{ 1, 99, 99 });
     catalogReference = throwaway.catalogReference;
-    const target = try rows.insert(&writeTransaction, catalogReference, &.{ 2, 30 });
+    const target = try rows.insert(&writeTransaction, catalogReference, &.{ 2, 30, 30 });
     catalogReference = target.catalogReference;
     const targetObjectKey = target.objectKey;
 
     const deadRow = (try catalog.objectKeyToRow(&writeTransaction, catalogReference, throwaway.objectKey)).?;
-    var versionBuffer: [2]u64 = undefined;
+    var versionBuffer: [3]u64 = undefined;
     const rowVersion = (try rows.getByPrimaryKey(&writeTransaction, catalogReference, 1, &versionBuffer)).?;
     catalogReference = (try rows.delete(&writeTransaction, catalogReference, 1, rowVersion)).ok;
     catalogReference = try relocation.relocateRow(&writeTransaction, catalogReference, targetObjectKey, deadRow);
@@ -495,17 +500,15 @@ test "D13: after relocation, distinct still returns the objectKey" {
     const resolvedRow = (try catalog.objectKeyToRow(&writeTransaction, catalogReference, targetObjectKey)).?;
     try testing.expect(resolvedRow != targetObjectKey);
 
-    var indexed = std.ArrayList(u64).empty;
-    defer indexed.deinit(testing.allocator);
-    try query.distinct(&writeTransaction, catalogReference, 1, emptyPredicate, .{}, &indexed, testing.allocator);
-    try testing.expectEqualSlices(u64, &.{targetObjectKey}, indexed.items);
-
-    var unindexedCatalog = try catalog.createFromDefinitions(&writeTransaction, &.{ .{ .kind = .int }, .{ .kind = .int } });
-    unindexedCatalog = (try rows.insert(&writeTransaction, unindexedCatalog, &.{ 2, 30 })).catalogReference;
     var unindexed = std.ArrayList(u64).empty;
     defer unindexed.deinit(testing.allocator);
-    try query.distinct(&writeTransaction, unindexedCatalog, 1, emptyPredicate, .{}, &unindexed, testing.allocator);
-    try testing.expectEqual(@as(usize, 1), unindexed.items.len);
+    try query.distinct(&writeTransaction, catalogReference, 1, emptyPredicate, .{}, &unindexed, testing.allocator);
+    try testing.expectEqualSlices(u64, &.{targetObjectKey}, unindexed.items);
+
+    var indexed = std.ArrayList(u64).empty;
+    defer indexed.deinit(testing.allocator);
+    try query.distinct(&writeTransaction, catalogReference, 2, emptyPredicate, .{}, &indexed, testing.allocator);
+    try testing.expectEqualSlices(u64, &.{targetObjectKey}, indexed.items);
 }
 
 test "D14: out pre-loaded with a sentinel survives; distinct only appends" {
@@ -569,6 +572,54 @@ test "D16: indexed distinct omits a value with no representative under a predica
     defer indexed.deinit(testing.allocator);
     try query.distinct(&writeTransaction, fixture.catalogReference, 2, predicate, .{}, &indexed, testing.allocator);
     try testing.expectEqualSlices(u64, &expected, indexed.items);
+}
+
+test "D17: page.limit = 0 appends nothing, both paths" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try qgTmpPath(testing.allocator, &tmp, "d17.airdb");
+    defer testing.allocator.free(path);
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var writeTransaction = try database.beginWrite();
+    defer writeTransaction.deinit();
+    const fixture = try seedGroupingFixture(&writeTransaction);
+    const page: Page = .{ .limit = 0 };
+
+    var unindexed = std.ArrayList(u64).empty;
+    defer unindexed.deinit(testing.allocator);
+    try query.distinct(&writeTransaction, fixture.catalogReference, 1, emptyPredicate, page, &unindexed, testing.allocator);
+    try testing.expectEqual(@as(usize, 0), unindexed.items.len);
+
+    var indexed = std.ArrayList(u64).empty;
+    defer indexed.deinit(testing.allocator);
+    try query.distinct(&writeTransaction, fixture.catalogReference, 2, emptyPredicate, page, &indexed, testing.allocator);
+    try testing.expectEqual(@as(usize, 0), indexed.items.len);
+}
+
+test "D18: an offset past the distinct count appends nothing, no error, both paths" {
+    // Fixture A has exactly 3 distinct values (10, 20, 30); an offset of 10
+    // is past every one of them.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try qgTmpPath(testing.allocator, &tmp, "d18.airdb");
+    defer testing.allocator.free(path);
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var writeTransaction = try database.beginWrite();
+    defer writeTransaction.deinit();
+    const fixture = try seedGroupingFixture(&writeTransaction);
+    const page: Page = .{ .start = .{ .offset = 10 } };
+
+    var unindexed = std.ArrayList(u64).empty;
+    defer unindexed.deinit(testing.allocator);
+    try query.distinct(&writeTransaction, fixture.catalogReference, 1, emptyPredicate, page, &unindexed, testing.allocator);
+    try testing.expectEqual(@as(usize, 0), unindexed.items.len);
+
+    var indexed = std.ArrayList(u64).empty;
+    defer indexed.deinit(testing.allocator);
+    try query.distinct(&writeTransaction, fixture.catalogReference, 2, emptyPredicate, page, &indexed, testing.allocator);
+    try testing.expectEqual(@as(usize, 0), indexed.items.len);
 }
 
 // ---------------------------------------------------------------------------
@@ -867,7 +918,7 @@ test "G13: either property out of range raises error.BadProperty" {
     try testing.expectError(error.BadProperty, query.groupBy(&writeTransaction, fixture.catalogReference, .{ .groupProperty = 1, .aggregateProperty = 100 }, emptyPredicate, &out, testing.allocator));
 }
 
-test "G14: after relocation, the aggregate is read from the row the objectKey now resolves to" {
+test "G14: after relocation, the aggregate is read from the row the objectKey now resolves to, both paths" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try qgTmpPath(testing.allocator, &tmp, "g14.airdb");
@@ -877,24 +928,28 @@ test "G14: after relocation, the aggregate is read from the row the objectKey no
     var writeTransaction = try database.beginWrite();
     defer writeTransaction.deinit();
 
-    // primaryKey + group(indexed) + price. Insert a throwaway first to open a
-    // dead slot, then two same-group rows with distinct prices, and relocate
-    // the second into the freed slot.
+    // primaryKey + groupUnindexed + groupIndexed(indexed) + price, the same
+    // twin-color shape fixture A uses, so one relocation pins both
+    // `deliverGroupsFromScan` and `deliverGroupsFromIndex` against the row the
+    // objectKey now resolves to. Insert a throwaway first to open a dead slot,
+    // then two same-group rows with distinct prices, and relocate the second
+    // into the freed slot.
     const definitions = [_]catalog.PropertyDefinition{
+        .{ .kind = .int },
         .{ .kind = .int },
         .{ .kind = .int, .indexed = true },
         .{ .kind = .int },
     };
     var catalogReference = try catalog.createFromDefinitions(&writeTransaction, &definitions);
-    const throwaway = try rows.insert(&writeTransaction, catalogReference, &.{ 100, 7, 999 });
+    const throwaway = try rows.insert(&writeTransaction, catalogReference, &.{ 100, 7, 7, 999 });
     catalogReference = throwaway.catalogReference;
-    const rowA = try rows.insert(&writeTransaction, catalogReference, &.{ 1, 7, 10 });
+    const rowA = try rows.insert(&writeTransaction, catalogReference, &.{ 1, 7, 7, 10 });
     catalogReference = rowA.catalogReference;
-    const rowB = try rows.insert(&writeTransaction, catalogReference, &.{ 2, 7, 20 });
+    const rowB = try rows.insert(&writeTransaction, catalogReference, &.{ 2, 7, 7, 20 });
     catalogReference = rowB.catalogReference;
 
     const deadRow = (try catalog.objectKeyToRow(&writeTransaction, catalogReference, throwaway.objectKey)).?;
-    var versionBuffer: [3]u64 = undefined;
+    var versionBuffer: [4]u64 = undefined;
     const throwawayVersion = (try rows.getByPrimaryKey(&writeTransaction, catalogReference, 100, &versionBuffer)).?;
     catalogReference = (try rows.delete(&writeTransaction, catalogReference, 100, throwawayVersion)).ok;
     catalogReference = try relocation.relocateRow(&writeTransaction, catalogReference, rowB.objectKey, deadRow);
@@ -904,11 +959,28 @@ test "G14: after relocation, the aggregate is read from the row the objectKey no
     const resolvedRow = (try catalog.objectKeyToRow(&writeTransaction, catalogReference, rowB.objectKey)).?;
     try testing.expect(resolvedRow != rowB.objectKey);
 
+    // relocateRow copies rowB's cells into resolvedRow but never clears its
+    // old physical slot, so that slot (which happens to sit at row index
+    // rowB.objectKey, since inserts advance row and objectKey in lockstep)
+    // still holds an untouched copy of rowB's original price. Overwrite it
+    // with a value that could never belong to this group, so a sink that
+    // reads at objectKey instead of the resolved row is caught rather than
+    // coincidentally reading a stale-but-still-correct copy.
+    const priceColumn = (try catalog.loadCatalog(&writeTransaction, catalogReference)).propertyColumnReference(3);
+    const corruptedPriceColumn = try Column.set(&writeTransaction, priceColumn, rowB.objectKey, 555555);
+    catalogReference = try catalog.setPropertyColumnReference(&writeTransaction, catalogReference, 3, corruptedPriceColumn);
+
     const expected = [_]Group{.{ .value = 7, .aggregate = .{ .count = 2, .sum = 30, .min = 10, .max = 20 } }};
-    var out = std.ArrayList(Group).empty;
-    defer out.deinit(testing.allocator);
-    try query.groupBy(&writeTransaction, catalogReference, .{ .groupProperty = 1, .aggregateProperty = 2 }, emptyPredicate, &out, testing.allocator);
-    try testing.expectEqualSlices(Group, &expected, out.items);
+
+    var unindexed = std.ArrayList(Group).empty;
+    defer unindexed.deinit(testing.allocator);
+    try query.groupBy(&writeTransaction, catalogReference, .{ .groupProperty = 1, .aggregateProperty = 3 }, emptyPredicate, &unindexed, testing.allocator);
+    try testing.expectEqualSlices(Group, &expected, unindexed.items);
+
+    var indexed = std.ArrayList(Group).empty;
+    defer indexed.deinit(testing.allocator);
+    try query.groupBy(&writeTransaction, catalogReference, .{ .groupProperty = 2, .aggregateProperty = 3 }, emptyPredicate, &indexed, testing.allocator);
+    try testing.expectEqualSlices(Group, &expected, indexed.items);
 }
 
 test "G15: sum wraps, two rows of maxInt in one group" {

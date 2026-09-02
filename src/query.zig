@@ -18,7 +18,10 @@
 //! neither has an order and neither has a page, so a `Request` would offer fields
 //! that do nothing for them. `minimum` and `maximum` take no predicate at all:
 //! their fast path is the value index's own endpoint, and a predicate would
-//! silently disable it.
+//! silently disable it. `distinct` takes a `Predicate` and a `Page` but no
+//! `Ordering`, because its order is fixed by its own property; `groupBy` takes
+//! neither an order nor a page, because a group is only correct once complete,
+//! so a limit would bound what is copied out and not what is read.
 
 const std = @import("std");
 const catalog = @import("schema/catalog.zig");
@@ -172,6 +175,10 @@ pub fn aggregateInt(
 ///     before it knows which values are distinct, so `page.limit` bounds what
 ///     is delivered and not what is read. O(matching rows) time with I/O and
 ///     O(distinct values) memory whatever the limit.
+///
+/// The indexed path sees only rows present in `property`'s value index; a
+/// future nullable-properties phase will need the same treatment
+/// `paging.deliverByIndexedProperty` already flags for null rows.
 pub fn distinct(
     transaction: anytype,
     catalogReference: Reference,
@@ -212,6 +219,10 @@ pub fn distinct(
 ///   - unindexed: one scan pass into an `AutoHashMap(u64, Aggregate)`, then a
 ///     sort by value. O(matching rows) time with I/O, O(distinct values)
 ///     memory.
+///
+/// The indexed path sees only rows present in `grouping.groupProperty`'s value
+/// index; a future nullable-properties phase will need the same treatment
+/// `paging.deliverByIndexedProperty` already flags for null rows.
 pub fn groupBy(
     transaction: anytype,
     catalogReference: Reference,
