@@ -265,7 +265,7 @@ test "T-B8: chunked, probe longer than the blob; and (T-B14) a corrupted chunk h
     try testing.expectError(error.Corrupt, blob.startsWith(&writeTransaction, reference, source));
 }
 
-test "T-B9: startsWith across a chunk boundary; and (T-B10) the helpers serve what get cannot" {
+test "T-B9: startsWith across a chunk boundary, a short probe within chunk 0; and (T-B10) the helpers serve what get cannot" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try blobTestTmpPath(testing.allocator, &tmp, "b9.airdb");
@@ -317,6 +317,29 @@ test "T-B9: startsWith across a chunk boundary; and (T-B10) the helpers serve wh
 
     // Empty prefix: true.
     try testing.expect(try blob.startsWith(&writeTransaction, reference, ""));
+
+    // A probe shorter than one chunk (10 bytes, entirely inside chunk 0)
+    // against this genuinely chunked value: the most common real use of
+    // beginsWith/eq is a short search string against a large stored blob, and
+    // every other case in this test uses a probe that is chunk-scale or
+    // larger. Both sides come from RAM buffers this test owns; only compare
+    // and startsWith touch storage.
+    {
+        const shortProbe = try testing.allocator.dupe(u8, source[0..10]);
+        defer testing.allocator.free(shortProbe);
+        try testing.expectEqual(std.mem.order(u8, source, shortProbe), try blob.compare(&writeTransaction, reference, shortProbe));
+        try testing.expect(try blob.startsWith(&writeTransaction, reference, shortProbe));
+    }
+
+    // Same short probe, last byte flipped: compare's order flips and
+    // startsWith turns false.
+    {
+        const shortProbe = try testing.allocator.dupe(u8, source[0..10]);
+        defer testing.allocator.free(shortProbe);
+        shortProbe[9] += 1;
+        try testing.expectEqual(std.mem.order(u8, source, shortProbe), try blob.compare(&writeTransaction, reference, shortProbe));
+        try testing.expect(!(try blob.startsWith(&writeTransaction, reference, shortProbe)));
+    }
 
     // T-B10: get() cannot serve a chunked blob; compare/startsWith can. This is
     // the direct proof that the helpers do not route through get, and the test

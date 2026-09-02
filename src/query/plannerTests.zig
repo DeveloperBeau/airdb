@@ -228,7 +228,13 @@ fn makeRandomTree(allocator: std.mem.Allocator, random: std.Random, depth: usize
         0 => {
             const property = random.intRangeLessThan(usize, 0, 3);
             const operator: Operator = @enumFromInt(random.intRangeLessThan(u8, 0, 7));
-            return intComparison(property, operator, random.int(u64));
+            // Half int, half bytes leaves, so both isIndexFriendly arms and
+            // the mixed-child conjunction/disjunction paths get covered.
+            if (random.boolean()) return intComparison(property, operator, random.int(u64));
+            const probeLength = random.intRangeLessThan(usize, 0, 6);
+            const probe = try allocator.alloc(u8, probeLength);
+            for (probe) |*byte| byte.* = random.intRangeLessThan(u8, 'a', 'd');
+            return bytesComparison(property, operator, probe);
         },
         1, 2 => {
             const childCount = random.intRangeLessThan(u8, 0, 4);
@@ -494,7 +500,12 @@ test "canDriveFromIndex and collectCandidates never disagree, over 200 random tr
     defer database.deinit();
     var writeTransaction = try database.beginWrite();
     defer writeTransaction.deinit();
-    const indexedCatalog = try seedTwoIndexedCatalog(&writeTransaction, 500);
+    // Property 1 is a genuinely indexed .blob property (not merely .int), the
+    // exact shape that produced the C4 disagreement: canDriveFromIndex said
+    // yes for a .bytes comparison against an indexed blob property, and
+    // collectCandidates then hit its .bytes => error.NoIndexPlan arm. A
+    // schema with no indexed blob property would not exercise that shape.
+    const indexedCatalog = try seedBlobPlusIntCatalog(&writeTransaction, 500);
     const scan = try Scan.open(&writeTransaction, indexedCatalog);
 
     var seed: u64 = 0;

@@ -356,4 +356,14 @@ test "T-Q8: a chunked value end to end through the facade" {
     hits.clearRetainingCapacity();
     try whereSorted(&writeTransaction, catalogReference, bytesComparison(1, .beginsWith, prefix), &hits);
     try testing.expectEqualSlices(u64, &.{inserted.objectKey}, hits.items);
+
+    // A short prefix (10 bytes, entirely within chunk 0) against the same
+    // chunked row through the facade: the ordinary "does this large value
+    // begin with this short string" shape, absent above where every prefix
+    // is chunk-scale or larger.
+    const shortPrefix = try testing.allocator.dupe(u8, source[0..10]);
+    defer testing.allocator.free(shortPrefix);
+    hits.clearRetainingCapacity();
+    try whereSorted(&writeTransaction, catalogReference, bytesComparison(1, .beginsWith, shortPrefix), &hits);
+    try testing.expectEqualSlices(u64, &.{inserted.objectKey}, hits.items);
 }
