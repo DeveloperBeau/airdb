@@ -117,6 +117,12 @@ Code pointers use `module.function` names under `src/`.
   between two page fetches, that row can cross the cursor and be skipped or
   re-delivered. Cursors also require an indexed sort property; a cursor
   against an unindexed property ordering is rejected by validation.
+- `query.materializePage` fetches one page (same `Request` semantics as
+  `query.where`) and resolves its requested to-one `.link` relations in
+  batch, breadth-first, up to `Relations.depth` levels, returning nested
+  `MaterializedObject`s from a caller-supplied arena (one `arena.deinit()`
+  frees the whole result); to-many `.linkSet` includes are not implemented and
+  fail with `error.UnsupportedInclude` at validation, before any row is read.
 
 ## Bulk operations
 

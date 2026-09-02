@@ -13,6 +13,9 @@
 //! Results are object keys (objectKeys); materialize them with
 //! objects.getTypedByObjectKey. The fetch model is stale-snapshot: a query reads one
 //! committed snapshot and returns detached keys, never live cursors.
+//! `materializePage` is the one exception: it returns nested `MaterializedObject`s,
+//! resolved from a caller-supplied arena, with its included relations fetched in
+//! batch; every other terminal here still returns keys.
 //!
 //! `countWhere` and `aggregateInt` take a bare `Predicate` rather than a `Request`:
 //! neither has an order and neither has a page, so a `Request` would offer fields
@@ -36,6 +39,7 @@ const paging = @import("query/paging.zig");
 const aggregateModule = @import("query/aggregate.zig");
 const groupingModule = @import("query/grouping.zig");
 const materialized = @import("query/materialized.zig");
+const include = @import("query/include.zig");
 
 /// Direction an ordered query emits in.
 pub const SortOrder = orderingLanguage.SortOrder;
@@ -66,6 +70,26 @@ pub const Match = predicateLanguage.Match;
 /// Deepest predicate nesting accepted. Predicates are caller-supplied and will
 /// eventually arrive across the C ABI, which is an untrusted boundary.
 pub const maxPredicateDepth = predicateLanguage.maxPredicateDepth;
+
+/// One object materialized by an include fetch: its identity, its property
+/// values, and its resolved relations.
+pub const MaterializedObject = materialized.MaterializedObject;
+/// One property's value inside a materialized object.
+pub const PropertyValue = materialized.PropertyValue;
+/// One included relation on one object.
+pub const IncludedRelation = materialized.IncludedRelation;
+/// What an included relation resolved to: nothing, a bare key, or an object.
+pub const RelationTarget = materialized.RelationTarget;
+/// Which relations an include fetch resolves, and how deep.
+pub const Relations = materialized.Relations;
+/// Deepest include nesting accepted.
+pub const maxIncludeDepth = materialized.maxIncludeDepth;
+
+/// Fetch one page and materialize it with its included relations resolved in
+/// batch. Directory-scoped, unlike every other terminal here, because
+/// resolving a link crosses types. See `include.materializePage` for the full
+/// contract, the arena's ownership rules and the cost profile.
+pub const materializePage = include.materializePage;
 
 /// Append one page of the objectKeys satisfying `request` to `out`, in the
 /// order `request.ordering` asks for. `out` grows with `allocator`, the caller
@@ -417,9 +441,6 @@ test {
     _ = @import("queryStringTests.zig");
     _ = @import("queryIndexedStringTests.zig");
     _ = @import("queryGroupingTests.zig");
-    // Pulled in directly, ahead of the facade re-exports added later in this
-    // branch, so materializedTests.zig and batchTests.zig run as soon as their
-    // production files exist.
-    _ = @import("query/materialized.zig");
-    _ = @import("query/batch.zig");
+    _ = @import("queryIncludeTests.zig");
+    _ = @import("queryIncludeCostTests.zig");
 }

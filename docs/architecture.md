@@ -123,6 +123,14 @@ Secondary structures are maintained transactionally with the row:
 - **Backlinks** (per link property): target objectKey → set of source objectKeys. They
   power `nullify`/`cascade`/`block` delete rules.
 
+`query.materializePage` (`query/include.zig`) resolves a page's requested
+to-one `.link` relations by sorting each level's target keys and walking the
+target type's key→row index once (`query/batch.zig`), rather than descending
+it once per key; the cost is the span between the smallest and largest target
+key, not the target count, so it wins when keys are dense (the normal case,
+since object keys are handed out in insertion order) and loses nothing an
+N-descent implementation wouldn't already pay when they are sparse.
+
 `verifyIntegrity` audits both structures in both directions (every live row
 covered; every entry resolves to a live, agreeing row), on top of header,
 slot, root, and free-list validation.
