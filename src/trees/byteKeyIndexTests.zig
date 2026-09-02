@@ -596,3 +596,71 @@ test "forEachEntryFromWhile: MUST exclude a key below the start, MUST include th
     // strict lower bound.
     try testing.expect(std.mem.indexOfScalar(u64, vals.items, 2) != null);
 }
+
+// Wraps a transaction and counts every dereference() call, so a test can
+// measure node-visit cost directly rather than trusting that an optimization
+// ran. Mirrors queryLazinessTests.zig's CountingTransaction.
+const CountingTransaction = struct {
+    inner: *@import("../transactions/writeTransaction.zig").WriteTransaction,
+    dereferenceCount: u64 = 0,
+
+    pub fn dereference(self: *CountingTransaction, reference: u64, length: usize) ![]const u8 {
+        self.dereferenceCount += 1;
+        return self.inner.dereference(reference, length);
+    }
+};
+
+// Stops after the first entry, so the walk's own output cost (one
+// blob.get) is the same constant regardless of where the start key lands;
+// whatever varies with the start key's position is the cost of REACHING it.
+const StopAfterFirst = struct {
+    fn onEntry(_: @This(), _: []const u8, _: u64) anyerror!bool {
+        return false;
+    }
+};
+
+test "forEachEntryFromWhile: reaching a start key near the end of the range costs about as little as reaching one near the beginning (M15 guard)" {
+    // childIndexForKey's descent is a traversal shortcut: forcing it to
+    // always start at child 0 (M15 in the mutation table) is correctness
+    // -equivalent (leafLowerBound filters every leaf regardless of how it was
+    // reached) but touches every node between the first child and the start
+    // key instead of descending straight to it. A pure key-sequence assertion
+    // cannot see that difference; a dereference count can. Stopping the walk
+    // after its first entry isolates the cost of REACHING the start key from
+    // the cost of the entries it then reports, so a start key near the END of
+    // the 1000-key range (which the shortcut reaches in O(height)) is
+    // compared against one where the lost shortcut would instead cost
+    // O(number of leaves before it).
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try bidxTmpPath(testing.allocator, &tmp, "bidx_from_derefcount.airdb");
+    defer testing.allocator.free(path);
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var writeTransaction = try database.beginWrite();
+    defer writeTransaction.deinit();
+
+    var root = try create(&writeTransaction);
+    const N: u64 = 1000;
+    var buffer: [64]u8 = undefined;
+    var round: u64 = 0;
+    while (round < N) : (round += 1) {
+        const keyNumber = (round *% 2654435761) % N;
+        const key = try std.fmt.bufPrint(&buffer, "key-{d:0>5}", .{keyNumber});
+        root = try insert(&writeTransaction, root, key, keyNumber);
+    }
+
+    var nearEnd = CountingTransaction{ .inner = &writeTransaction };
+    _ = try forEachEntryFromWhile(&nearEnd, root, "key-00990", StopAfterFirst{}, StopAfterFirst.onEntry);
+
+    // An absolute bound, hand-measured rather than pinned to a ratio: with the
+    // shortcut intact, reaching this start key measures 82 dereferences
+    // (childIndexForKey's own per-level linear scan of low keys dominates,
+    // not the descent depth); with the shortcut lost (childIndex forced to 0,
+    // M15's mutation), the same walk measures 403, because every level then
+    // recurses into every child from the first one instead of only from the
+    // correct starting child onward. 200 sits comfortably above measurement
+    // noise on the correct path and comfortably below the mutated path's
+    // result.
+    try testing.expect(nearEnd.dereferenceCount < 200);
+}
