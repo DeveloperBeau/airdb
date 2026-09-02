@@ -215,6 +215,39 @@ pub fn free(transaction: *WriteTransaction, reference: Reference) !void {
     try transaction.free(reference, header.nodeSize);
 }
 
+/// Copy up to `out.len` leading bytes of the blob at `reference` into `out`
+/// and return how many were copied, which is `@min(out.len, value length)`.
+/// Reads only the chunks the prefix touches, so a 256-byte prefix of a 40 MiB
+/// value costs one chunk read. The null reference copies zero bytes.
+/// No allocation. O(bytes copied) with I/O.
+/// Accepts any transaction type exposing `dereference(reference, length) ![]const u8`.
+pub fn readPrefix(transaction: anytype, reference: Reference, out: []u8) !usize {
+    if (reference == 0) return 0;
+    const tag = (try transaction.dereference(reference, 1))[0];
+    if (tag == tagInline) {
+        const stored = try get(transaction, reference);
+        const copyLength = @min(stored.len, out.len);
+        @memcpy(out[0..copyLength], stored[0..copyLength]);
+        return copyLength;
+    }
+    const header = try chunkedHeader(transaction, reference);
+    var copied: usize = 0;
+    var chunkIndex: usize = 0;
+    while (chunkIndex < header.chunkCount and copied < out.len) : (chunkIndex += 1) {
+        const start = chunkIndex * chunkSize;
+        const chunkLength = @min(chunkSize, header.totalLen - start);
+        // Re-dereference the index node each iteration, as readInto does, so the
+        // read is independent of any prior chunk dereference slice.
+        const node = try transaction.dereference(reference, header.nodeSize);
+        const chunkReference = std.mem.readInt(u64, node[chunkRefsOffset + 8 * chunkIndex ..][0..8], .little);
+        const wanted = @min(chunkLength, out.len - copied);
+        const chunk = try transaction.dereference(chunkReference, wanted);
+        @memcpy(out[copied .. copied + wanted], chunk[0..wanted]);
+        copied += wanted;
+    }
+    return copied;
+}
+
 /// The stored blob's total size and the order of its first `min(size,
 /// probe.len)` bytes against the head of `probe`. `.eq` means the two agree
 /// over that overlap, which leaves only the lengths to break the tie.
@@ -441,6 +474,136 @@ test "free of a chunked blob" {
     const reference = try put(&writeTransaction, source);
     try free(&writeTransaction, reference); // must not error
     writeTransaction.deinit();
+}
+
+test "readPrefix of an inline value shorter than out copies exactly those bytes and leaves the tail untouched" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try blobTmpPath(testing.allocator, &tmp, "blob_readprefix1.airdb");
+    defer testing.allocator.free(path);
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var writeTransaction = try database.beginWrite();
+    defer writeTransaction.deinit();
+
+    const reference = try put(&writeTransaction, "hi");
+    var out: [8]u8 = undefined;
+    @memset(&out, 0xAA);
+    const copied = try readPrefix(&writeTransaction, reference, &out);
+    try testing.expectEqual(@as(usize, 2), copied);
+    try testing.expectEqualSlices(u8, "hi", out[0..2]);
+    for (out[2..]) |byte| try testing.expectEqual(@as(u8, 0xAA), byte);
+}
+
+test "readPrefix of an inline value longer than out copies exactly out.len bytes" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try blobTmpPath(testing.allocator, &tmp, "blob_readprefix2.airdb");
+    defer testing.allocator.free(path);
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var writeTransaction = try database.beginWrite();
+    defer writeTransaction.deinit();
+
+    const reference = try put(&writeTransaction, "hello world");
+    var out: [5]u8 = undefined;
+    const copied = try readPrefix(&writeTransaction, reference, &out);
+    try testing.expectEqual(@as(usize, 5), copied);
+    try testing.expectEqualSlices(u8, "hello", out[0..5]);
+}
+
+test "readPrefix of a chunked value returns the correct byte count and bytes at three boundary points" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try blobTmpPath(testing.allocator, &tmp, "blob_readprefix_chunked.airdb");
+    defer testing.allocator.free(path);
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var writeTransaction = try database.beginWrite();
+    defer writeTransaction.deinit();
+
+    const byteCount = 2 * chunkSize + 7; // 3 chunks: chunkSize, chunkSize, 7.
+    const source = try testing.allocator.alloc(u8, byteCount);
+    defer testing.allocator.free(source);
+    for (source, 0..) |*byte, position| byte.* = @truncate(position);
+
+    const reference = try put(&writeTransaction, source);
+
+    // (a) inside chunk 0.
+    {
+        var out: [100]u8 = undefined;
+        const copied = try readPrefix(&writeTransaction, reference, &out);
+        try testing.expectEqual(@as(usize, 100), copied);
+        try testing.expectEqualSlices(u8, source[0..100], out[0..]);
+    }
+    // (b) exactly on the chunk 0 boundary.
+    {
+        const out = try testing.allocator.alloc(u8, chunkSize);
+        defer testing.allocator.free(out);
+        const copied = try readPrefix(&writeTransaction, reference, out);
+        try testing.expectEqual(chunkSize, copied);
+        try testing.expectEqualSlices(u8, source[0..chunkSize], out);
+    }
+    // (c) inside chunk 1.
+    {
+        const wanted = chunkSize + 50;
+        const out = try testing.allocator.alloc(u8, wanted);
+        defer testing.allocator.free(out);
+        const copied = try readPrefix(&writeTransaction, reference, out);
+        try testing.expectEqual(wanted, copied);
+        try testing.expectEqualSlices(u8, source[0..wanted], out);
+    }
+}
+
+test "readPrefix(reference = 0, out) returns 0" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try blobTmpPath(testing.allocator, &tmp, "blob_readprefix_null.airdb");
+    defer testing.allocator.free(path);
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var writeTransaction = try database.beginWrite();
+    defer writeTransaction.deinit();
+
+    var out: [4]u8 = undefined;
+    try testing.expectEqual(@as(usize, 0), try readPrefix(&writeTransaction, 0, &out));
+}
+
+test "readPrefix against a bad tag byte is error.Corrupt" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try blobTmpPath(testing.allocator, &tmp, "blob_readprefix_corrupt.airdb");
+    defer testing.allocator.free(path);
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var writeTransaction = try database.beginWrite();
+    defer writeTransaction.deinit();
+
+    const allocation = try writeTransaction.alloc(16);
+    allocation.bytes[0] = 7;
+    var out: [4]u8 = undefined;
+    try testing.expectError(error.Corrupt, readPrefix(&writeTransaction, allocation.reference, &out));
+}
+
+test "readPrefix with out.len == 0 returns 0 for both inline and chunked representations" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try blobTmpPath(testing.allocator, &tmp, "blob_readprefix_zero.airdb");
+    defer testing.allocator.free(path);
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var writeTransaction = try database.beginWrite();
+    defer writeTransaction.deinit();
+
+    var empty: [0]u8 = undefined;
+    const inlineReference = try put(&writeTransaction, "hello");
+    try testing.expectEqual(@as(usize, 0), try readPrefix(&writeTransaction, inlineReference, &empty));
+
+    const chunkedSource = try testing.allocator.alloc(u8, inlineMax + 1);
+    defer testing.allocator.free(chunkedSource);
+    @memset(chunkedSource, 1);
+    const chunkedReference = try put(&writeTransaction, chunkedSource);
+    try testing.expectEqual(@as(usize, 0), try readPrefix(&writeTransaction, chunkedReference, &empty));
 }
 
 test {

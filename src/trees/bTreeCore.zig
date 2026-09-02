@@ -527,6 +527,59 @@ pub fn BTreeCore(comptime Keying: type) type {
             return true;
         }
 
+        /// Visit every (storedKey, value) pair whose key is >= `startProbeKey`,
+        /// in ascending key order, until `onEntry` returns false. Returns
+        /// whether the walk ran to completion. Routes into the child holding
+        /// `startProbeKey` via childIndexForKey and starts each leaf at its
+        /// lower bound, so no entry below the start is visited.
+        ///
+        /// There is no upper bound, deliberately: what ends a walk is
+        /// key-type specific (index.zig expresses a numeric [low, high]; a
+        /// byte-keyed caller wants a prefix that stops matching, or a
+        /// byte-order high), so `onEntry` returns false at the caller's bound.
+        /// Read-only, O(log n + visited) with I/O.
+        pub fn forEachEntryFromWhile(
+            transaction: anytype,
+            root: Reference,
+            startProbeKey: Keying.ProbeKey,
+            context: anytype,
+            comptime onEntry: fn (@TypeOf(context), u64, u64) anyerror!bool,
+        ) !bool {
+            return forEachEntryFromWhileAt(transaction, root, startProbeKey, context, onEntry, 0);
+        }
+
+        fn forEachEntryFromWhileAt(
+            transaction: anytype,
+            root: Reference,
+            startProbeKey: Keying.ProbeKey,
+            context: anytype,
+            comptime onEntry: fn (@TypeOf(context), u64, u64) anyerror!bool,
+            depth: usize,
+        ) !bool {
+            if (root == 0) return true;
+            if (depth >= maxDepth) return error.Corrupt;
+            const bytes = try dereferenceNode(transaction, root);
+            if (bytes[0] == kindLeaf) {
+                const leaf = try parseLeaf(bytes);
+                // Applying leafLowerBound to every leaf, not only the first
+                // one on the descent path, is correct: a leaf entirely above
+                // the start returns slot 0, which is exactly "visit
+                // everything in this leaf" -- the same shape
+                // index.forEachEntryInRangeWhileAt relies on for its low bound.
+                var slot: usize = try leafLowerBound(transaction, leaf, startProbeKey);
+                while (slot < leaf.count) : (slot += 1) {
+                    if (!try onEntry(context, leaf.key(slot), leaf.value(slot))) return false;
+                }
+                return true;
+            }
+            const inner = try parseInner(bytes);
+            var childIndex: usize = try childIndexForKey(transaction, inner, startProbeKey);
+            while (childIndex < inner.childCount) : (childIndex += 1) {
+                if (!try forEachEntryFromWhileAt(transaction, inner.childReference(childIndex), startProbeKey, context, onEntry, depth + 1)) return false;
+            }
+            return true;
+        }
+
         /// Visit every (storedKey, value) pair in ascending key order, calling
         /// onEntry(context, storedKey, value) for each. The always-continuing
         /// case of forEachEntryWhile. O(nodes) with I/O.
