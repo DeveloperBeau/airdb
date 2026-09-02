@@ -795,6 +795,99 @@ test "R27: a predicate matching nothing returns an empty slice without erroring"
 }
 
 // ---------------------------------------------------------------------------
+// R29: multi-target-type fan-out, expandLevel's per-type run split.
+// ---------------------------------------------------------------------------
+
+const hubType: u16 = 0;
+const alphaType: u16 = 1;
+const betaType: u16 = 2;
+const hubToAlphaProperty: usize = 1;
+const hubToBetaProperty: usize = 2;
+
+const MultiTargetTypeFixture = struct {
+    directoryReference: Reference,
+    alphaKey: u64,
+    betaKey: u64,
+};
+
+// Hub (0) carries two link properties, to Alpha (1) and to Beta (2): the one
+// fixture in the whole suite where a single level's pending list holds two
+// distinct target types, exercising expandLevel's contiguous-run split
+// (query/include.zig's runStart/runEnd loop). Alpha and Beta each get object
+// key 0 (independent per-type key spaces, same as fixture D's authors and
+// publishers), so a run split that collapsed both types into one run would
+// resolve both targets against the SAME catalog and land on the SAME object,
+// rather than two distinct ones.
+fn buildMultiTargetTypeFixture(writeTransaction: *WriteTransaction) !MultiTargetTypeFixture {
+    const hubDefinitions = [_]catalog.PropertyDefinition{
+        .{ .kind = .int },
+        .{ .kind = .link, .linkTarget = alphaType },
+        .{ .kind = .link, .linkTarget = betaType },
+    };
+    const alphaDefinitions = [_]catalog.PropertyDefinition{.{ .kind = .int }};
+    const betaDefinitions = [_]catalog.PropertyDefinition{.{ .kind = .int }};
+    var directoryReference = try typeDirectory.createWithDefinitions(writeTransaction, &.{ &hubDefinitions, &alphaDefinitions, &betaDefinitions });
+
+    const insertedAlpha = try typeRouting.insert(writeTransaction, directoryReference, alphaType, &.{.{ .int = 111 }});
+    directoryReference = insertedAlpha.directoryReference;
+    try testing.expectEqual(@as(u64, 0), insertedAlpha.objectKey);
+
+    const insertedBeta = try typeRouting.insert(writeTransaction, directoryReference, betaType, &.{.{ .int = 222 }});
+    directoryReference = insertedBeta.directoryReference;
+    try testing.expectEqual(@as(u64, 0), insertedBeta.objectKey);
+
+    const insertedHub = try typeRouting.insert(writeTransaction, directoryReference, hubType, &.{
+        .{ .int = 0 },
+        .{ .link = insertedAlpha.objectKey },
+        .{ .link = insertedBeta.objectKey },
+    });
+    directoryReference = insertedHub.directoryReference;
+
+    return .{ .directoryReference = directoryReference, .alphaKey = insertedAlpha.objectKey, .betaKey = insertedBeta.objectKey };
+}
+
+test "R29: a level fanning out to two target types resolves each in its own run" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try qiTmpPath(testing.allocator, &tmp, "qi29.airdb");
+    defer testing.allocator.free(path);
+    var testDatabase = try Database.create(testing.allocator, path);
+    defer testDatabase.deinit();
+    var writeTransaction = try testDatabase.beginWrite();
+    defer writeTransaction.deinit();
+    const fixture = try buildMultiTargetTypeFixture(&writeTransaction);
+
+    var resultArena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer resultArena.deinit();
+    const roots = try materializePage(
+        &writeTransaction,
+        fixture.directoryReference,
+        hubType,
+        .{},
+        .{ .linkProperties = &.{ hubToAlphaProperty, hubToBetaProperty }, .depth = 1 },
+        resultArena.allocator(),
+    );
+
+    try testing.expectEqual(@as(usize, 1), roots.len);
+    try testing.expectEqual(@as(usize, 2), roots[0].included.len);
+
+    const alphaObject = expectObject(roots[0].included[0].target);
+    try testing.expectEqual(alphaType, alphaObject.typeId);
+    try testing.expectEqual(fixture.alphaKey, alphaObject.objectKey);
+    try testing.expectEqual(PropertyValue{ .int = 111 }, alphaObject.values[0]);
+
+    const betaObject = expectObject(roots[0].included[1].target);
+    try testing.expectEqual(betaType, betaObject.typeId);
+    try testing.expectEqual(fixture.betaKey, betaObject.objectKey);
+    try testing.expectEqual(PropertyValue{ .int = 222 }, betaObject.values[0]);
+
+    // The two targets must not have collapsed onto one object: a run split
+    // that ignored the type boundary would resolve both against Alpha's
+    // catalog (the lower typeId, sorted first) and land both on this object.
+    try testing.expect(alphaObject != betaObject);
+}
+
+// ---------------------------------------------------------------------------
 // R28: fuzz over the shape.
 // ---------------------------------------------------------------------------
 

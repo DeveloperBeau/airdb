@@ -118,7 +118,11 @@ fn buildLinkedFixture(writeTransaction: *WriteTransaction, allocator: std.mem.Al
 }
 
 // ---------------------------------------------------------------------------
-// R20: the phase's central claim, on the resolver alone.
+// R20: one half of the phase's central claim, on the resolver alone: dense
+// beats N descents. The other half, that the range bound is load-bearing
+// rather than decorative, is R9 (src/query/batchTests.zig): R20's fixture is
+// dense and all-hit, so its walk count is bit-identical whether or not the
+// range bound does any pruning, and cannot show that half by itself.
 // ---------------------------------------------------------------------------
 
 test "R20: the resolver's one walk costs far less than N descents over a dense span" {
