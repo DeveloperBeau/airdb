@@ -636,6 +636,20 @@ test "R24: paging composes with materialization, ascending and descending" {
         try testing.expectEqual(@as(usize, 2), roots.len);
         try testing.expectEqual(fixture.bookKeys[5], roots[0].objectKey);
         try testing.expectEqual(fixture.bookKeys[4], roots[1].objectKey);
+
+        // The batch resolver works in ASCENDING sorted-key order (book 4
+        // before book 5), while this page is DESCENDING (book 5 before book
+        // 4): the two orders disagree here, which is exactly the case a
+        // page-order/sorted-order transposition in the row scatter would get
+        // wrong. Pin `values`, not just `objectKey`, on both roots, by hand
+        // from the fixture's own construction (property 0 is the primary
+        // key, property 2 is the year).
+        try testing.expectEqual(PropertyValue{ .int = fixture.bookKeys[5] }, roots[0].values[0]);
+        try testing.expectEqual(PropertyValue{ .int = bookYears[5] }, roots[0].values[2]);
+        try testing.expectEqual(PropertyValue{ .link = null }, roots[0].values[1]);
+        try testing.expectEqual(PropertyValue{ .int = fixture.bookKeys[4] }, roots[1].values[0]);
+        try testing.expectEqual(PropertyValue{ .int = bookYears[4] }, roots[1].values[2]);
+        try testing.expectEqual(PropertyValue{ .link = fixture.authorKeys[3] }, roots[1].values[1]);
     }
 }
 
