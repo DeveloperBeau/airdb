@@ -722,10 +722,16 @@ test "a bytes comparison against an int property is rejected with error.BadPredi
     try testing.expectError(error.BadPredicate, where(&writeTransaction, catalogReference, .{ .predicate = predicate }, &hits, testing.allocator));
 }
 
-test "comparing a blob property with bytes is rejected with error.UnsupportedPredicate" {
+test "comparing a blob property with bytes is supported (phase 4): it filters by content, not rejected" {
+    // Superseded expectation: this test previously pinned bytes-against-blob as
+    // error.UnsupportedPredicate. Phase 4 (query-string-predicates) makes that
+    // comparison a first-class scan predicate; see queryStringTests.zig for the
+    // full seven-operator suite. This test keeps the seam pinned here: bytes
+    // validation no longer rejects a blob property, and the comparison filters
+    // rows by their stored bytes.
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const path = try qTmpPath(testing.allocator, &tmp, "tree_unsupported.airdb");
+    const path = try qTmpPath(testing.allocator, &tmp, "tree_bytes_supported.airdb");
     defer testing.allocator.free(path);
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
@@ -735,9 +741,14 @@ test "comparing a blob property with bytes is rejected with error.UnsupportedPre
         .{ .kind = .int },
         .{ .kind = .blob },
     };
-    const catalogReference = try catalog.createFromDefinitions(&writeTransaction, &definitions);
+    var catalogReference = try catalog.createFromDefinitions(&writeTransaction, &definitions);
+    const blob = @import("records/blob.zig");
+    const matchingReference = try blob.put(&writeTransaction, "x");
+    const nonMatchingReference = try blob.put(&writeTransaction, "y");
+    catalogReference = (try rows.insert(&writeTransaction, catalogReference, &.{ 1, matchingReference })).catalogReference;
+    catalogReference = (try rows.insert(&writeTransaction, catalogReference, &.{ 2, nonMatchingReference })).catalogReference;
     const predicate = Predicate{ .comparison = .{ .property = 1, .operator = .eq, .value = .{ .bytes = "x" } } };
-    try testing.expectError(error.UnsupportedPredicate, countWhere(&writeTransaction, catalogReference, predicate, testing.allocator));
+    try testing.expectEqual(@as(u64, 1), try countWhere(&writeTransaction, catalogReference, predicate, testing.allocator));
 }
 
 test "index/scan equivalence over every predicate tree shape this phase adds" {

@@ -14,7 +14,9 @@
 //!   `chunkSize` bytes; the last is `totalLen - (chunkCount-1)*chunkSize`.
 //!
 //! Empty blob (zero-length bytes) is represented as the null reference (0); no node
-//! is allocated for it.
+//! is allocated for it. The null reference is therefore a VALUE (the empty
+//! string), not an absence: nullity must come from a null bitmap, never from
+//! `reference == 0`, or every legitimately empty string is reclassified as null.
 
 const std = @import("std");
 const Reference = @import("../storage/reference.zig").Reference;
@@ -23,10 +25,12 @@ const sectionSize = @import("../platform.zig").sectionSize;
 
 /// Largest blob stored as a single inline node. The +5 node header (tag + length)
 /// plus the bytes must stay under `sectionSize`; the 64-byte margin covers it.
-const inlineMax: usize = sectionSize - 64;
+/// A blob of this size or smaller has a single contiguous slice and is readable
+/// with `get`; anything larger is chunked.
+pub const inlineMax: usize = sectionSize - 64;
 /// Maximum RAW bytes per chunk node. Each chunk node is a bare byte allocation,
 /// so it must itself fit within one section.
-const chunkSize: usize = sectionSize - 64;
+pub const chunkSize: usize = sectionSize - 64;
 
 const tagInline: u8 = 0;
 const tagChunked: u8 = 1;
@@ -211,6 +215,77 @@ pub fn free(transaction: *WriteTransaction, reference: Reference) !void {
     try transaction.free(reference, header.nodeSize);
 }
 
+/// The stored blob's total size and the order of its first `min(size,
+/// probe.len)` bytes against the head of `probe`. `.eq` means the two agree
+/// over that overlap, which leaves only the lengths to break the tie.
+/// `storedByteCount` is the blob's full length, not the number of bytes the
+/// comparison actually examined.
+const HeadComparison = struct { order: std.math.Order, storedByteCount: usize };
+
+/// Compare the blob at `reference` against `probe` over the bytes they share,
+/// materializing neither side. Stops at the first difference, so a difference in
+/// the first chunk costs one chunk read whatever the total size.
+/// O(bytes examined) with I/O: one node read for an inline blob, two per chunk
+/// touched for a chunked one.
+fn compareHead(transaction: anytype, reference: Reference, probe: []const u8) !HeadComparison {
+    if (reference == 0) return .{ .order = .eq, .storedByteCount = 0 };
+    const tag = (try transaction.dereference(reference, 1))[0];
+    if (tag == tagInline) {
+        const stored = try get(transaction, reference);
+        const overlap = @min(stored.len, probe.len);
+        return .{ .order = std.mem.order(u8, stored[0..overlap], probe[0..overlap]), .storedByteCount = stored.len };
+    }
+    return compareChunkedHead(transaction, reference, probe);
+}
+
+/// `compareHead` for the chunked representation. Walks chunks in order,
+/// comparing each chunk against the window of `probe` that lines up with it, so
+/// a probe that ends inside a chunk compares only the overlap and a probe that
+/// ends before a chunk starts stops the walk. O(bytes examined) with I/O.
+fn compareChunkedHead(transaction: anytype, reference: Reference, probe: []const u8) !HeadComparison {
+    const header = try chunkedHeader(transaction, reference);
+    var chunkIndex: usize = 0;
+    while (chunkIndex < header.chunkCount) : (chunkIndex += 1) {
+        const start = chunkIndex * chunkSize;
+        if (start >= probe.len) break;
+        const chunkLength = @min(chunkSize, header.totalLen - start);
+        // Re-dereference the index node each iteration, as readInto does, so the
+        // read is independent of any prior chunk dereference slice.
+        const node = try transaction.dereference(reference, header.nodeSize);
+        const chunkReference = std.mem.readInt(u64, node[chunkRefsOffset + 8 * chunkIndex ..][0..8], .little);
+        const overlap = @min(chunkLength, probe.len - start);
+        const chunk = try transaction.dereference(chunkReference, chunkLength);
+        const outcome = std.mem.order(u8, chunk[0..overlap], probe[start .. start + overlap]);
+        if (outcome != .eq) return .{ .order = outcome, .storedByteCount = header.totalLen };
+    }
+    return .{ .order = .eq, .storedByteCount = header.totalLen };
+}
+
+/// The order of the blob at `reference` RELATIVE TO `probe`, comparing bytes
+/// unsigned and lexicographically, exactly as `std.mem.order` would over the
+/// same bytes. The null reference (0) is the empty byte string, so it orders
+/// before every non-empty probe and equal to an empty one. No allocation and no
+/// contiguous copy: works for a chunked blob, which `get` cannot serve.
+/// O(bytes examined) with I/O. `error.Corrupt` for a bad tag or a chunked header
+/// whose chunk count disagrees with its length.
+/// Accepts any transaction type exposing `dereference(reference, length) ![]const u8`.
+pub fn compare(transaction: anytype, reference: Reference, probe: []const u8) !std.math.Order {
+    const head = try compareHead(transaction, reference, probe);
+    if (head.order != .eq) return head.order;
+    return std.math.order(head.storedByteCount, probe.len);
+}
+
+/// Whether the blob at `reference` begins with `prefix`. An empty prefix is a
+/// prefix of everything, including the null reference; a prefix longer than the
+/// blob is not a prefix of it. No allocation and no contiguous copy: works for a
+/// chunked blob, and for a prefix that spans a chunk boundary.
+/// O(prefix length) with I/O. Same `error.Corrupt` conditions as `compare`.
+/// Accepts any transaction type exposing `dereference(reference, length) ![]const u8`.
+pub fn startsWith(transaction: anytype, reference: Reference, prefix: []const u8) !bool {
+    const head = try compareHead(transaction, reference, prefix);
+    return head.order == .eq and head.storedByteCount >= prefix.len;
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -366,4 +441,8 @@ test "free of a chunked blob" {
     const reference = try put(&writeTransaction, source);
     try free(&writeTransaction, reference); // must not error
     writeTransaction.deinit();
+}
+
+test {
+    _ = @import("blobTests.zig");
 }

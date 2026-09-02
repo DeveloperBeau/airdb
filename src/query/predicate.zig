@@ -9,11 +9,13 @@ const catalog = @import("../schema/catalog.zig");
 /// eventually arrive across the C ABI, which is an untrusted boundary.
 pub const maxPredicateDepth: usize = 32;
 
-/// Comparison a predicate applies to one property's value.
+/// Comparison a predicate applies to one property's value. `beginsWith`
+/// applies to blob properties only and is byte-wise (unsigned lexicographic,
+/// no case folding or normalization).
 pub const Operator = enum { eq, ne, lt, le, gt, ge, beginsWith };
 
 /// The right-hand side of a comparison: a raw u64 for int and link properties,
-/// or bytes for blob properties.
+/// or bytes compared against a blob property's stored bytes.
 pub const ComparisonValue = union(enum) { int: u64, bytes: []const u8 };
 
 /// One filter clause: property `property` compared against `value` with `operator`.
@@ -51,11 +53,11 @@ fn validateAt(self: Predicate, propertyKinds: []const catalog.PropertyKind, dept
                 // int and link properties store a raw scalar u64 (link stores target
                 // objectKey + 1); every other kind's column holds a tree root, so
                 // comparing it as an int would return a confidently wrong answer.
+                // The bytes arm below is the mirror of this one: bytes compare
+                // against the blob a reference points at, which is why .blob is
+                // the only kind it accepts.
                 .int => if (kind != .int and kind != .link) return error.BadPredicate,
-                .bytes => {
-                    if (kind != .blob) return error.BadPredicate;
-                    return error.UnsupportedPredicate;
-                },
+                .bytes => if (kind != .blob) return error.BadPredicate,
             }
             if (comparison.operator == .beginsWith and kind != .blob) return error.BadPredicate;
         },

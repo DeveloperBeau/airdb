@@ -64,10 +64,14 @@ Code pointers use `module.function` names under `src/`.
 - `query.where` takes a `Request` (predicate, ordering, page) and appends one
   page of matching objectKeys, in the requested order; `countWhere` and
   `aggregateInt` still take a bare predicate tree built from comparisons
-  (`eq/ne/lt/le/gt/ge`) combined with and/or/not. An empty conjunction matches
-  every live row; an empty disjunction matches nothing. The planner drives off
-  an indexed equality or range term, unions a disjunction's branches only when
-  every branch is indexed, and falls back to a streaming scan otherwise.
+  (`eq/ne/lt/le/gt/ge/beginsWith`) combined with and/or/not. An empty
+  conjunction matches every live row; an empty disjunction matches nothing.
+  The planner drives off an indexed equality or range term, unions a
+  disjunction's branches only when every branch is indexed, and falls back to
+  a streaming scan otherwise. A comparison over a blob property accepts all
+  seven operators, comparing the stored bytes unsigned and byte-wise (no case
+  folding or normalization); a value index cannot serve the bytes, so a blob
+  predicate always costs a full scan.
 - `query.rangeInclusive`, `query.sortByProperty` (ascending or descending, by
   int or link property).
 - **Pagination and ordering**: `Request.page` takes either an `offset` or a
