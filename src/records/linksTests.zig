@@ -1202,3 +1202,134 @@ test "L10: fuzz, indexed link writes keep the value index and the columns in agr
     try testing.expect(setLinkMoves > 0);
     try testing.expect(nullifyEvents > 0);
 }
+
+test "L12: an inbound nullify moves the value index at raw 1 and at a genuinely non-zero target objectKey" {
+    // Closes a coverage gap the test audit found: L1-L3's shared fixture
+    // (buildIndexedLinkFixture) happens to insert target first, so its
+    // objectKey is 0 and the nullified source's previousRaw is 1 -- exactly
+    // the boundary M4 (previousRaw != 0 -> previousRaw != 1) mutates. That
+    // match is an accident of insertion order in a fixture shared by other
+    // tests, not a property this suite asserts. Empirically reconfirmed here
+    // (see the round-2 changes notes): with M4 applied AND one extra filler
+    // inserted before target in buildIndexedLinkFixture (so target.objectKey
+    // becomes 1 and previousRaw becomes 2), L1-L3 all pass with the mutation
+    // still live.
+    //
+    // This fixture is standalone (it does not call buildIndexedLinkFixture)
+    // and pins both ends of the guard deliberately, by construction,
+    // independent of any other test's insertion order:
+    //   - targetZero is inserted FIRST in this fixture's own fresh type, so
+    //     its objectKey is 0 and sourceZero's previousRaw is 1 -- the exact
+    //     boundary value M4 mutates. That is explicit and load-bearing here,
+    //     not incidental: nothing outside this test can move it.
+    //   - targetNonZero is inserted after two other objects, so its
+    //     objectKey is genuinely non-zero and sourceNonZero's previousRaw is
+    //     3, proving the move is a property of "any nonzero previousRaw",
+    //     not a coincidence that only happens to hold at raw 1.
+    const query = @import("../query.zig");
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "l12.airdb");
+    defer testing.allocator.free(path);
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+
+    var writeTransaction = try database.beginWrite();
+    defer writeTransaction.deinit();
+    const definitions = [_]catalog.PropertyDefinition{
+        .{ .kind = .int },
+        .{ .kind = .link, .linkTarget = 0, .indexed = true },
+    };
+    var directoryReference = try typeDirectory.createWithDefinitions(&writeTransaction, &.{&definitions});
+    const targetZero = try typeRouting.insert(&writeTransaction, directoryReference, 0, &.{ .{ .int = 1 }, .{ .link = null } });
+    directoryReference = targetZero.directoryReference;
+    try testing.expectEqual(@as(u64, 0), targetZero.objectKey); // load-bearing: pins previousRaw == 1 below
+    const filler = try typeRouting.insert(&writeTransaction, directoryReference, 0, &.{ .{ .int = 2 }, .{ .link = null } });
+    directoryReference = filler.directoryReference;
+    const targetNonZero = try typeRouting.insert(&writeTransaction, directoryReference, 0, &.{ .{ .int = 3 }, .{ .link = null } });
+    directoryReference = targetNonZero.directoryReference;
+    try testing.expect(targetNonZero.objectKey != 0); // load-bearing: pins a genuinely non-zero previousRaw below
+    const sourceZero = try typeRouting.insert(&writeTransaction, directoryReference, 0, &.{ .{ .int = 4 }, .{ .link = targetZero.objectKey } });
+    directoryReference = sourceZero.directoryReference;
+    const sourceNonZero = try typeRouting.insert(&writeTransaction, directoryReference, 0, &.{ .{ .int = 5 }, .{ .link = targetNonZero.objectKey } });
+    directoryReference = sourceNonZero.directoryReference;
+
+    var buffer: [2]catalog.Value = undefined;
+    const targetZeroVersion = (try typeRouting.get(&writeTransaction, directoryReference, 0, 1, &buffer)).?;
+    directoryReference = (try typeRouting.deleteNullifyCrossType(&writeTransaction, directoryReference, 0, 1, targetZeroVersion)).ok;
+    const targetNonZeroVersion = (try typeRouting.get(&writeTransaction, directoryReference, 0, 3, &buffer)).?;
+    directoryReference = (try typeRouting.deleteNullifyCrossType(&writeTransaction, directoryReference, 0, 3, targetNonZeroVersion)).ok;
+    writeTransaction.setRoot(directoryReference);
+    _ = try writeTransaction.commit();
+
+    try verification.verifyIntegrity(&database);
+    var readTransaction = try database.beginRead();
+    defer readTransaction.end();
+    const catalogReference = try typeDirectory.catalogReference(&readTransaction, readTransaction.root(), 0);
+    var hits = std.ArrayList(u64).empty;
+    defer hits.deinit(testing.allocator);
+    try query.where(&readTransaction, catalogReference, .{ .predicate = .{ .comparison = .{ .property = 1, .operator = .eq, .value = .{ .int = 0 } } } }, &hits, testing.allocator);
+    try testing.expectEqual(@as(usize, 3), hits.items.len);
+    var containsFiller = false;
+    var containsSourceZero = false;
+    var containsSourceNonZero = false;
+    for (hits.items) |objectKey| {
+        if (objectKey == filler.objectKey) containsFiller = true;
+        if (objectKey == sourceZero.objectKey) containsSourceZero = true;
+        if (objectKey == sourceNonZero.objectKey) containsSourceNonZero = true;
+    }
+    try testing.expect(containsFiller);
+    try testing.expect(containsSourceZero);
+    try testing.expect(containsSourceNonZero);
+    try testing.expectEqual(@as(?u64, null), try getLink(&readTransaction, catalogReference, 4, 1));
+    try testing.expectEqual(@as(?u64, null), try getLink(&readTransaction, catalogReference, 5, 1));
+    try testing.expectEqual(@as(?u64, 0), try query.maximum(&readTransaction, catalogReference, 1, testing.allocator));
+    try testing.expectEqual(@as(?u64, 0), try query.minimum(&readTransaction, catalogReference, 1, testing.allocator));
+}
+
+test "L13: a link property with no value index is left alone by setLink" {
+    // Mirrors L6's coverage of the indexed guard, but for setLink (Fix B)
+    // rather than nullifySourceLink (Fix A). L6 only pins this branch for
+    // the nullify path; setLink carries the identical guard
+    // (`if (indexed) { ... }`) and had no test of its own on an unindexed
+    // property. If the Coder ever dropped that guard, rows.addToValueIndex
+    // would call Index.insert on a zero valueIndexReference (an unindexed
+    // property's valueIndexReference is 0, catalog.createFromDefinitions)
+    // and Arena.dereference would return error.BadReference -- name that
+    // expected error here too, so a silently-skipped path is visible.
+    const query = @import("../query.zig");
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "l13.airdb");
+    defer testing.allocator.free(path);
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+
+    var writeTransaction = try database.beginWrite();
+    defer writeTransaction.deinit();
+    const definitions = [_]catalog.PropertyDefinition{
+        .{ .kind = .int },
+        .{ .kind = .link, .linkTarget = 0 },
+    };
+    var directoryReference = try typeDirectory.createWithDefinitions(&writeTransaction, &.{&definitions});
+    const targetA = try typeRouting.insert(&writeTransaction, directoryReference, 0, &.{ .{ .int = 1 }, .{ .link = null } });
+    directoryReference = targetA.directoryReference;
+    const targetB = try typeRouting.insert(&writeTransaction, directoryReference, 0, &.{ .{ .int = 2 }, .{ .link = null } });
+    directoryReference = targetB.directoryReference;
+    const source = try typeRouting.insert(&writeTransaction, directoryReference, 0, &.{ .{ .int = 3 }, .{ .link = targetA.objectKey } });
+    directoryReference = source.directoryReference;
+    directoryReference = try typeRouting.setLink(&writeTransaction, directoryReference, 0, 3, 1, targetB.objectKey);
+    writeTransaction.setRoot(directoryReference);
+    _ = try writeTransaction.commit();
+
+    try verification.verifyIntegrity(&database);
+    var readTransaction = try database.beginRead();
+    defer readTransaction.end();
+    const catalogReference = try typeDirectory.catalogReference(&readTransaction, readTransaction.root(), 0);
+    try testing.expectEqual(@as(?u64, targetB.objectKey), try getLink(&readTransaction, catalogReference, 3, 1));
+    var hits = std.ArrayList(u64).empty;
+    defer hits.deinit(testing.allocator);
+    try query.where(&readTransaction, catalogReference, .{ .predicate = .{ .comparison = .{ .property = 1, .operator = .eq, .value = .{ .int = targetB.objectKey + 1 } } } }, &hits, testing.allocator);
+    try testing.expectEqual(@as(usize, 1), hits.items.len);
+    try testing.expectEqual(source.objectKey, hits.items[0]);
+}
