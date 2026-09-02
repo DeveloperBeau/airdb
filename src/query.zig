@@ -30,6 +30,7 @@ const execution = @import("query/execution.zig");
 const predicateLanguage = @import("query/predicate.zig");
 const orderingLanguage = @import("query/ordering.zig");
 const paging = @import("query/paging.zig");
+const aggregateModule = @import("query/aggregate.zig");
 
 /// Direction an ordered query emits in.
 pub const SortOrder = orderingLanguage.SortOrder;
@@ -104,9 +105,10 @@ pub fn countWhere(
     return rowCount;
 }
 
-/// The result of aggregateInt: matched-row count, wrapping sum, and the min/max
-/// values (null when no row matched).
-pub const Aggregate = struct { count: u64, sum: u64, min: ?u64, max: ?u64 };
+/// The result of aggregating one int or link property over a set of rows:
+/// matched-row count, wrapping sum, and the min/max values (null when no row
+/// contributed).
+pub const Aggregate = aggregateModule.Aggregate;
 
 /// Aggregate int property `property` over the live rows satisfying `predicate`.
 /// `sum` wraps on overflow; min/max are null when no row matches. O(n) over the
@@ -124,23 +126,20 @@ pub fn aggregateInt(
     const scan = try Scan.open(transaction, catalogReference);
     try predicate.validate(scan.propertyKinds[0..scan.propertyCount]);
     if (property >= scan.propertyCount) return error.BadProperty;
-    var agg = Aggregate{ .count = 0, .sum = 0, .min = null, .max = null };
+    var aggregate: Aggregate = .{};
     const Sink = struct {
         transaction: @TypeOf(transaction),
         scan: *const Scan,
         property: usize,
-        agg: *Aggregate,
+        aggregate: *Aggregate,
         fn onMatch(self: @This(), _: u64, row: u64) anyerror!bool {
             const value = try Column.get(self.transaction, self.scan.propertyReferences[self.property], row);
-            self.agg.count += 1;
-            self.agg.sum +%= value;
-            if (self.agg.min == null or value < self.agg.min.?) self.agg.min = value;
-            if (self.agg.max == null or value > self.agg.max.?) self.agg.max = value;
+            self.aggregate.accumulate(value);
             return true;
         }
     };
-    try execution.runQuery(transaction, &scan, predicate, .ascending, null, allocator, Sink{ .transaction = transaction, .scan = &scan, .property = property, .agg = &agg }, Sink.onMatch);
-    return agg;
+    try execution.runQuery(transaction, &scan, predicate, .ascending, null, allocator, Sink{ .transaction = transaction, .scan = &scan, .property = property, .aggregate = &aggregate }, Sink.onMatch);
+    return aggregate;
 }
 
 /// Which end of a property's value range an endpoint terminal wants.
