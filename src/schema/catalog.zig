@@ -182,6 +182,13 @@ pub fn createFromDefinitions(transaction: *WriteTransaction, definitions: []cons
         targets[propertyIndex] = definitions[propertyIndex].linkTarget;
         rules[propertyIndex] = definitions[propertyIndex].deletionRule;
         indexedFlags[propertyIndex] = definitions[propertyIndex].indexed;
+        // Index.create for every indexed property, blob included: Index and
+        // byteKeyIndex are both bTreeCore.BTreeCore(...).create, which
+        // allocates leafNodeSize and encodes an identical empty leaf, so an
+        // empty tree is byte-identical under either instantiation (pinned by
+        // blobIndexKey.zig's node-shape coupling test). A `.blob` property's
+        // value index is walked as byteKeyIndex from its first insert
+        // (rows.addToValueIndex), which is what actually decides its keying.
         valueIndexReferences[propertyIndex] = if (definitions[propertyIndex].indexed) try Index.create(transaction) else 0;
     }
     const versionColumnReference = try Column.create(transaction);

@@ -141,7 +141,10 @@ fn deliverByObjectKey(
 /// (the forward invariant `verification.auditValueIndexForward` audits). Phase 8
 /// breaks that for null rows: when a property becomes nullable, null rows are
 /// absent from its value index and this path would drop them from an ordered
-/// page. O(rows walked) with I/O, so lazy: the work tracks the page.
+/// page. This path is unreachable for a blob property because
+/// `Request.validate` rejects ordering by one, which is what keeps a
+/// byte-keyed tree from being walked as a numeric one. O(rows walked) with
+/// I/O, so lazy: the work tracks the page.
 ///
 /// Drives off the sort property's index and ignores the planner even when the
 /// predicate has a more selective indexed term: driving off the predicate

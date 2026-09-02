@@ -4,9 +4,11 @@
 //! Predicates compare the raw u64 stored in a property column, so they apply to
 //! int properties and to link properties (which store target objectKey + 1), and
 //! to blob properties, whose word is a storage reference the engine follows to
-//! compare the stored bytes against the probe. Blob comparison is byte-wise and
-//! unindexed: it streams each candidate row's bytes, so a blob predicate costs a
-//! full scan. Collection predicates are a later addition.
+//! compare the stored bytes against the probe. A `.blob` property may carry a
+//! value index keyed by its truncated bytes (see records/blobIndexKey.zig),
+//! which serves `eq`, `beginsWith` and the four range operators; an unindexed
+//! blob property still costs a full scan. Collection predicates are a later
+//! addition.
 //!
 //! Results are object keys (objectKeys); materialize them with
 //! objects.getTypedByObjectKey. The fetch model is stale-snapshot: a query reads one
@@ -79,7 +81,9 @@ pub fn where(
 
 /// Number of live rows satisfying `predicate`. The full-scan path streams,
 /// so this allocates nothing proportional to the table; still O(n) over the
-/// live set without a usable value index.
+/// live set without a usable value index. A blob value index is a candidate
+/// index, not a covering one (blobIndexKey.zig), so `countWhere` over a blob
+/// predicate reads every candidate row even when the index drives the plan.
 pub fn countWhere(
     transaction: anytype,
     catalogReference: Reference,
@@ -316,4 +320,5 @@ test {
     _ = @import("queryLazinessTests.zig");
     _ = @import("queryEndpointTests.zig");
     _ = @import("queryStringTests.zig");
+    _ = @import("queryIndexedStringTests.zig");
 }

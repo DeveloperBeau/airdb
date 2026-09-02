@@ -6,6 +6,7 @@ const Index = @import("../trees/index.zig");
 const byteKeyIndex = @import("../trees/byteKeyIndex.zig");
 const catalog = @import("catalog.zig");
 const blob = @import("../records/blob.zig");
+const blobIndexKey = @import("../records/blobIndexKey.zig");
 const rows = @import("../records/rows.zig");
 
 const PropertyKind = catalog.PropertyKind;
@@ -45,7 +46,7 @@ pub fn addProperty(transaction: *WriteTransaction, catalogReference: Reference, 
     if (def.indexed and isCollection) return error.Unsupported;
 
     const newColumn = try buildBackfilledColumn(transaction, &snapshot, def, defaultValue, isCollection);
-    const valueIndexReference: Reference = if (def.indexed) try backfillValueIndex(transaction, snapshot.keyToRowIndexReference, newColumn) else 0;
+    const valueIndexReference: Reference = if (def.indexed) try backfillValueIndex(transaction, snapshot.keyToRowIndexReference, newColumn, def.kind) else 0;
 
     snapshot.properties[propertyCount] = .{
         .column = newColumn,
@@ -108,20 +109,30 @@ fn buildBackfilledColumn(
 // planner trusts the indexed flag, so an empty index would silently drop
 // every pre-migration row from indexed queries (and fail the integrity
 // audit). Each row is indexed under its OWN raw column value (mirroring the
-// insert path) -- blob backfills give every row a distinct reference, so a single
-// shared key would diverge from what reads and audits expect.
-fn backfillValueIndex(transaction: *WriteTransaction, keyToRowIndexReference: Reference, newColumn: Reference) !Reference {
-    var valueIndexReference = try Index.create(transaction);
+// insert path). For a blob property, each live row gets its own copy of the
+// default bytes (buildBackfilledColumn), so a blob backfill indexes N
+// distinct references holding IDENTICAL bytes and therefore collapses to
+// exactly ONE outer key carrying N objectKeys -- correct, and what the audit
+// expects.
+fn backfillValueIndex(transaction: *WriteTransaction, keyToRowIndexReference: Reference, newColumn: Reference, kind: PropertyKind) !Reference {
+    var valueIndexReference = if (kind == .blob) try byteKeyIndex.create(transaction) else try Index.create(transaction);
     const Sink = struct {
         transaction: *WriteTransaction,
         valueIndexReference: *Reference,
         column: Reference,
+        kind: PropertyKind,
         fn onEntry(self: @This(), objectKey: u64, row: u64) anyerror!void {
             const raw = try Column.get(self.transaction, self.column, row);
-            self.valueIndexReference.* = try rows.valueIndexAdd(self.transaction, self.valueIndexReference.*, raw, objectKey);
+            if (self.kind == .blob) {
+                var keyBuffer: [blobIndexKey.maxLength]u8 = undefined;
+                const key = try blobIndexKey.read(self.transaction, raw, &keyBuffer);
+                self.valueIndexReference.* = try rows.blobValueIndexAdd(self.transaction, self.valueIndexReference.*, key, objectKey);
+            } else {
+                self.valueIndexReference.* = try rows.intValueIndexAdd(self.transaction, self.valueIndexReference.*, raw, objectKey);
+            }
         }
     };
-    try Index.forEachEntry(transaction, keyToRowIndexReference, Sink{ .transaction = transaction, .valueIndexReference = &valueIndexReference, .column = newColumn }, Sink.onEntry);
+    try Index.forEachEntry(transaction, keyToRowIndexReference, Sink{ .transaction = transaction, .valueIndexReference = &valueIndexReference, .column = newColumn, .kind = kind }, Sink.onEntry);
     return valueIndexReference;
 }
 

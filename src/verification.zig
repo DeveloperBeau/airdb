@@ -17,6 +17,8 @@ const typeDirectory = @import("schema/typeDirectory.zig");
 const catalog = @import("schema/catalog.zig");
 const Column = @import("trees/column.zig");
 const Index = @import("trees/index.zig");
+const byteKeyIndex = @import("trees/byteKeyIndex.zig");
+const blobIndexKey = @import("records/blobIndexKey.zig");
 
 /// Everything verifyIntegrity can report about a damaged database.
 pub const VerifyError = error{
@@ -103,8 +105,13 @@ fn auditValueIndexes(database: *Database) VerifyError!void {
             if (!catalogView.indexed(propertyIndex)) continue;
             const valueIndexReference = catalogView.valueIndexReference(propertyIndex);
             const propertyColumn = catalogView.propertyColumnReference(propertyIndex);
-            try auditValueIndexForward(&readTransaction, catalogView.keyToRowIndexReference, valueIndexReference, propertyColumn, catalogView.liveColumnReference);
-            try auditValueIndexBackward(&readTransaction, valueIndexReference, catalogView.keyToRowIndexReference, propertyColumn, catalogView.liveColumnReference);
+            if (kind == .blob) {
+                try auditBlobValueIndexForward(&readTransaction, catalogView.keyToRowIndexReference, valueIndexReference, propertyColumn, catalogView.liveColumnReference);
+                try auditBlobValueIndexBackward(&readTransaction, valueIndexReference, catalogView.keyToRowIndexReference, propertyColumn, catalogView.liveColumnReference);
+            } else {
+                try auditValueIndexForward(&readTransaction, catalogView.keyToRowIndexReference, valueIndexReference, propertyColumn, catalogView.liveColumnReference);
+                try auditValueIndexBackward(&readTransaction, valueIndexReference, catalogView.keyToRowIndexReference, propertyColumn, catalogView.liveColumnReference);
+            }
         }
     }
 }
@@ -162,6 +169,85 @@ fn auditValueIndexBackward(readTransaction: *ReadTransaction, valueIndexReferenc
         }
     };
     Index.forEachEntry(readTransaction, valueIndexReference, Ctx{ .readTransaction = readTransaction, .keyToRowIndexReference = keyToRowIndexReference, .propertyColumn = propertyColumn, .liveColumn = liveColumn }, Ctx.onEntry) catch return error.ValueIndexStaleEntry;
+}
+
+// Forward direction of the value-index invariant for a `.blob` property: walk
+// the live rows and assert each row's TRUNCATED key (blobIndexKey.read of its
+// stored bytes) carries that objectKey in the byte-keyed value index's inner
+// set. Asserting the row's truncated key, not its full bytes, is deliberate:
+// the write path only ever promises the truncated key (blobIndexKey.zig), so
+// asserting full bytes would be a stricter invariant than the index makes and
+// would fail on every value over 256 bytes. Missing at either level is
+// error.ValueIndexMissingEntry, matching the int-keyed direction.
+fn auditBlobValueIndexForward(readTransaction: *ReadTransaction, keyToRowIndexReference: Reference, valueIndexReference: Reference, propertyColumn: Reference, liveColumn: Reference) VerifyError!void {
+    const Ctx = struct {
+        readTransaction: *ReadTransaction,
+        valueIndexReference: Reference,
+        propertyColumn: Reference,
+        liveColumn: Reference,
+        fn onEntry(self: @This(), objectKey: u64, row: u64) anyerror!void {
+            if ((try Column.get(self.readTransaction, self.liveColumn, row)) == 0) return; // defensive: skip dead
+            const raw = try Column.get(self.readTransaction, self.propertyColumn, row);
+            var keyBuffer: [blobIndexKey.maxLength]u8 = undefined;
+            const key = try blobIndexKey.read(self.readTransaction, raw, &keyBuffer);
+            const inner = (try byteKeyIndex.get(self.readTransaction, self.valueIndexReference, key)) orelse return error.ValueIndexMissingEntry;
+            if ((try Index.get(self.readTransaction, inner, objectKey)) == null) return error.ValueIndexMissingEntry;
+        }
+    };
+    Index.forEachEntry(readTransaction, keyToRowIndexReference, Ctx{ .readTransaction = readTransaction, .valueIndexReference = valueIndexReference, .propertyColumn = propertyColumn, .liveColumn = liveColumn }, Ctx.onEntry) catch return error.ValueIndexMissingEntry;
+}
+
+// Backward direction of the value-index invariant for a `.blob` property: walk
+// every (key, inner-set) entry of the byte-keyed value index and, for each
+// objectKey in a non-empty inner set, assert it resolves through the
+// key-to-row index to a live row whose property value's own truncated key
+// equals the outer key. A stale/dangling objectKey or a key mismatch is
+// error.ValueIndexStaleEntry, matching the int-keyed direction. Empty inner
+// sets are skipped defensively, as in the int-keyed direction.
+//
+// The outer key slice points into mapped storage and the inner walk
+// dereferences other nodes (each objectKey's row and property column), so it
+// is copied into a stack buffer before the inner walk: that removes any
+// question about the slice's lifetime for the cost of one 256-byte buffer.
+fn auditBlobValueIndexBackward(readTransaction: *ReadTransaction, valueIndexReference: Reference, keyToRowIndexReference: Reference, propertyColumn: Reference, liveColumn: Reference) VerifyError!void {
+    const Ctx = struct {
+        readTransaction: *ReadTransaction,
+        keyToRowIndexReference: Reference,
+        propertyColumn: Reference,
+        liveColumn: Reference,
+        fn onEntry(self: @This(), key: []const u8, innerRoot: u64) anyerror!void {
+            if ((try Index.count(self.readTransaction, innerRoot)) == 0) return; // empty set left by delete
+            // Copy the outer key before the inner walk: it points into mapped
+            // storage and the inner walk dereferences other nodes (each
+            // objectKey's row and property column), so copying removes any
+            // question about the slice's lifetime for the cost of one
+            // 256-byte stack buffer.
+            var keyBuffer: [blobIndexKey.maxLength]u8 = undefined;
+            @memcpy(keyBuffer[0..key.len], key);
+            const copiedKey = keyBuffer[0..key.len];
+            const Inner = struct {
+                readTransaction: *ReadTransaction,
+                keyToRowIndexReference: Reference,
+                propertyColumn: Reference,
+                liveColumn: Reference,
+                key: []const u8,
+                fn onKey(inner: @This(), objectKey: u64) anyerror!void {
+                    const row = (try Index.get(inner.readTransaction, inner.keyToRowIndexReference, objectKey)) orelse return error.ValueIndexStaleEntry;
+                    if ((try Column.get(inner.readTransaction, inner.liveColumn, row)) == 0) return error.ValueIndexStaleEntry;
+                    const raw = try Column.get(inner.readTransaction, inner.propertyColumn, row);
+                    // The invariant asserted is the row's TRUNCATED key, exactly
+                    // what the write path maintains: asserting full bytes would be
+                    // a stricter invariant than the index promises and would fail
+                    // on every value over 256 bytes.
+                    var rowKeyBuffer: [blobIndexKey.maxLength]u8 = undefined;
+                    const rowKey = try blobIndexKey.read(inner.readTransaction, raw, &rowKeyBuffer);
+                    if (!std.mem.eql(u8, rowKey, inner.key)) return error.ValueIndexStaleEntry;
+                }
+            };
+            try Index.forEachKey(self.readTransaction, innerRoot, Inner{ .readTransaction = self.readTransaction, .keyToRowIndexReference = self.keyToRowIndexReference, .propertyColumn = self.propertyColumn, .liveColumn = self.liveColumn, .key = copiedKey }, Inner.onKey);
+        }
+    };
+    byteKeyIndex.forEachEntry(readTransaction, valueIndexReference, Ctx{ .readTransaction = readTransaction, .keyToRowIndexReference = keyToRowIndexReference, .propertyColumn = propertyColumn, .liveColumn = liveColumn }, Ctx.onEntry) catch return error.ValueIndexStaleEntry;
 }
 
 // Forward direction of the backlink invariant: every live row's outbound
