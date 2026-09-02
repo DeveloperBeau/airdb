@@ -330,7 +330,7 @@ test "minKey and maxKey track a model set under churn" {
 
     var root = try create(&writeTransaction);
     const domain: u64 = 300;
-    const edgeFillCount: u64 = 65; // matches the 0..=64 fill in the hand-written boundary tests
+    const edgeFillCount: u64 = @as(u64, node.leafCap) + 1; // one past a full leaf, so the edge splits exactly once
     const lowSplitBoundary: u64 = edgeFillCount / 2; // keys below this are the known emptied-in-T1 leftmost leaf
     const highEdgeStart: u64 = domain - edgeFillCount;
     const highSplitBoundary: u64 = highEdgeStart + lowSplitBoundary; // keys from here up are the mirrored rightmost leaf
