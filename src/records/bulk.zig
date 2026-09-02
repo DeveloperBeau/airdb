@@ -160,13 +160,19 @@ pub fn bulkImport(
     return snapshot.replace(transaction);
 }
 
-// Reject a link-bearing type and any malformed row width here, before a single
-// node is written.
+// Reject a link-bearing type, an indexed blob property, and any malformed row
+// width here, before a single node is written. An indexed blob property must
+// be rejected here rather than anywhere later: bulkImport frees the type's
+// pre-allocated columns and indexes right after this call
+// (freePreallocatedTrees), so a rejection after that point would leave the
+// catalog pointing at freed nodes. buildPropertyValueIndex/bulkValueIndex stay
+// numeric and unreachable for a blob property as a result.
 fn validateImportInput(snapshot: *const catalog.CatalogSnapshot, rows: []const []const u64) !void {
     var propertyIndex: usize = 0;
     while (propertyIndex < snapshot.propertyCount) : (propertyIndex += 1) {
         const kind = snapshot.properties[propertyIndex].kind;
         if (kind == .link or kind == .linkSet) return error.UnsupportedForBulk;
+        if (kind == .blob and snapshot.properties[propertyIndex].indexed) return error.UnsupportedForBulk;
     }
     for (rows) |row| {
         if (row.len != snapshot.propertyCount) return error.BadRow;
@@ -213,6 +219,9 @@ fn freePreallocatedTrees(transaction: *WriteTransaction, snapshot: *const catalo
     var propertyIndex: usize = 0;
     while (propertyIndex < snapshot.propertyCount) : (propertyIndex += 1) {
         try Column.freeTree(transaction, snapshot.properties[propertyIndex].column);
+        // Index.freeTree, not a kind switch: validateImportInput already rejected
+        // an indexed .blob property, so every indexed property reaching here is
+        // int or link, correctly freed as the numeric tree it is.
         if (snapshot.properties[propertyIndex].indexed) try Index.freeTree(transaction, snapshot.properties[propertyIndex].valueIndex);
     }
     try Column.freeTree(transaction, snapshot.versionColumnReference);

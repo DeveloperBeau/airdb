@@ -516,6 +516,80 @@ test "bulkImport rejects a link-bearing type" {
     writeTransaction.deinit();
 }
 
+test "bulkImport rejects a type with an indexed blob property" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try bulkTmpPath(testing.allocator, &tmp, "import_blob_indexed.airdb");
+    defer testing.allocator.free(path);
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var writeTransaction = try database.beginWrite();
+    defer writeTransaction.deinit();
+    const definitions = [_]catalog.PropertyDefinition{ .{ .kind = .int }, .{ .kind = .blob, .indexed = true } };
+    const catalogReference = try catalog.createFromDefinitions(&writeTransaction, &definitions);
+
+    const rws = [_][]const u64{&.{ 1, 0 }};
+    try testing.expectError(error.UnsupportedForBulk, bulkImport(&writeTransaction, catalogReference, &rws, .{}));
+}
+
+test "bulkImport on a type with an indexed blob property writes nothing: arena unchanged, the type stays empty and usable" {
+    // Three assertions rather than one, because assertion 1 alone would be a
+    // before-and-after self-comparison: it fails specifically when the
+    // rejection is moved after freePreallocatedTrees, which is what
+    // assertions 2 and 3 catch.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try bulkTmpPath(testing.allocator, &tmp, "import_blob_indexed_nothing.airdb");
+    defer testing.allocator.free(path);
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var writeTransaction = try database.beginWrite();
+    const definitions = [_]catalog.PropertyDefinition{ .{ .kind = .int }, .{ .kind = .blob, .indexed = true } };
+    const directoryReference = try typeDirectory.createTypes(&writeTransaction, &.{&definitions}, &.{false});
+    const catalogReference = try typeDirectory.catalogReference(&writeTransaction, directoryReference, 0);
+
+    const topBefore = database.arena.top;
+    const rws = [_][]const u64{&.{ 1, 0 }};
+    try testing.expectError(error.UnsupportedForBulk, bulkImport(&writeTransaction, catalogReference, &rws, .{}));
+
+    // 1. The bump pointer did not move.
+    try testing.expectEqual(topBefore, database.arena.top);
+
+    // 2. The type's nextRow is still 0 and every pre-allocated tree is still
+    // readable, which is what freePreallocatedTrees would have destroyed.
+    const view = try catalog.loadCatalog(&writeTransaction, catalogReference);
+    try testing.expectEqual(@as(u64, 0), view.nextRow);
+    try testing.expectEqual(@as(u64, 0), try Index.count(&writeTransaction, view.valueIndexReference(1)));
+    try testing.expectEqual(@as(u64, 0), try Column.length(&writeTransaction, view.propertyColumnReference(0)));
+
+    // 3. A subsequent ordinary insert into the same type succeeds and
+    // verifyIntegrity passes after commit.
+    const inserted = try objects.insertTyped(&writeTransaction, catalogReference, &.{ .{ .int = 1 }, .{ .bytes = "hello" } });
+    const newDirectoryReference = try typeDirectory.setCatalogReference(&writeTransaction, directoryReference, 0, inserted.catalogReference);
+    writeTransaction.setRoot(newDirectoryReference);
+    _ = try writeTransaction.commit();
+    try verification.verifyIntegrity(&database);
+}
+
+test "bulkImport on a type with an UNINDEXED blob property still succeeds" {
+    // False-positive guard: without checking `indexed`, a rejection that
+    // fired on every blob property would pass this test's absence check too.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try bulkTmpPath(testing.allocator, &tmp, "import_blob_unindexed.airdb");
+    defer testing.allocator.free(path);
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var writeTransaction = try database.beginWrite();
+    defer writeTransaction.deinit();
+    const definitions = [_]catalog.PropertyDefinition{ .{ .kind = .int }, .{ .kind = .blob } };
+    const catalogReference = try catalog.createFromDefinitions(&writeTransaction, &definitions);
+
+    const rws = [_][]const u64{ &.{ 1, 0 }, &.{ 2, 0 } };
+    const newCatalog = try bulkImport(&writeTransaction, catalogReference, &rws, .{});
+    try testing.expectEqual(@as(u64, 2), try catalog.liveCount(&writeTransaction, newCatalog));
+}
+
 test "bulkImport edge sizes: empty, single, leafCap" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
