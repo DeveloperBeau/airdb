@@ -82,7 +82,10 @@ fn packVisitedKey(typeId: u16, objectKey: u64) u64 {
 /// Errors: everything `Request.validate` and `Relations.validate` raise;
 /// `error.NoSuchType` for a `typeId` outside the directory; `error.NotFound`
 /// if a page key does not resolve to a row, which a consistent snapshot cannot
-/// produce and a corrupt index can.
+/// produce and a corrupt index can; `error.UnsortedObjectKeys` from
+/// `collectRowsForSortedKeys` if `paging.collectPage` ever returns a
+/// duplicate key, same class as `error.NotFound`: unreachable on a
+/// consistent snapshot.
 pub fn materializePage(
     transaction: anytype,
     directoryReference: Reference,
@@ -167,20 +170,24 @@ fn materializeRoots(
     const isAtBound = fetch.depth == 0;
     const roots = try fetch.arena.alloc(MaterializedObject, pageKeys.len);
     for (pageKeys, 0..) |objectKey, pageIndex| {
-        try fillObject(transaction, fetch, &snapshot, typeId, objectKey, rowsInPageOrder[pageIndex], rootLinkProperties, isAtBound, &roots[pageIndex]);
+        const row = rowsInPageOrder[pageIndex];
+        const live = try Column.get(transaction, snapshot.liveColumnReference, row);
+        if (live == 0) return error.NotFound;
+        try fillObject(transaction, fetch, &snapshot, typeId, objectKey, row, rootLinkProperties, isAtBound, &roots[pageIndex]);
         try fetch.visited.put(packVisitedKey(typeId, objectKey), &roots[pageIndex]);
     }
     return roots;
 }
 
-// Read one object's live/version cells and every property cell, decode them
-// per materialized.PropertyValue's table, and fill `included` from
+// Read one object's version cell and every property cell, decode them per
+// materialized.PropertyValue's table, and fill `included` from
 // `includedProperties`: one entry per requested link property, pre-filled
 // from the decoded `.link` value (`.absent` for null, `.key` otherwise; the
 // caller resolves `.key` entries to `.object` afterward). `included` stays
-// empty at the depth bound, and empty when no property was requested. One
-// column read per property plus the live and version cells, O(propertyCount)
-// with I/O.
+// empty at the depth bound, and empty when no property was requested. The
+// caller has already read the live cell and confirmed the row is live before
+// calling; fillObject does not re-read it. One column read per property plus
+// the version cell, O(propertyCount) with I/O.
 fn fillObject(
     transaction: anytype,
     fetch: *const Fetch,
@@ -192,8 +199,6 @@ fn fillObject(
     isAtBound: bool,
     out: *MaterializedObject,
 ) !void {
-    const live = try Column.get(transaction, snapshot.liveColumnReference, row);
-    if (live == 0) return error.NotFound;
     const version = try Column.get(transaction, snapshot.versionColumnReference, row);
 
     const values = try fetch.arena.alloc(PropertyValue, snapshot.propertyCount);
@@ -251,25 +256,34 @@ fn includedPropertiesFor(snapshot: *const catalog.CatalogSnapshot, buffer: []usi
 // For each object at this level, push a PendingRelation for every included
 // entry that is a not-yet-visited `.key` (a target reached for the first
 // time). An entry already in `visited` is a back edge (2.7 rule 2) and is
-// left as `.key` untouched. One directory lookup and one catalog load per
-// distinct source type encountered, plus one visited-set probe per included
-// entry, O(objects x includedPerObject) with I/O.
+// left as `.key` untouched. `objects` arrives grouped by typeId (level 0 is
+// one page of one type; every deeper level is built run by run in
+// expandLevel, one run per target type), so the source view is reloaded only
+// when `object.typeId` changes from the previous object's: one directory
+// lookup and one catalog load per distinct source type encountered, plus one
+// visited-set probe per included entry, O(objects x includedPerObject) with
+// I/O.
 fn gatherPending(
     transaction: anytype,
     fetch: *const Fetch,
     objects: []const *MaterializedObject,
     out: *std.ArrayList(PendingRelation),
 ) !void {
+    var currentSourceType: ?u16 = null;
+    var currentSourceView: catalog.CatalogView = undefined;
     for (objects) |object| {
         if (object.included.len == 0) continue;
-        const sourceCatalogReference = try typeDirectory.catalogReference(transaction, fetch.directoryReference, object.typeId);
-        const sourceView = try catalog.loadCatalog(transaction, sourceCatalogReference);
+        if (currentSourceType == null or currentSourceType.? != object.typeId) {
+            const sourceCatalogReference = try typeDirectory.catalogReference(transaction, fetch.directoryReference, object.typeId);
+            currentSourceView = try catalog.loadCatalog(transaction, sourceCatalogReference);
+            currentSourceType = object.typeId;
+        }
         for (object.included, 0..) |relation, slot| {
             const targetKey = switch (relation.target) {
                 .key => |key| key,
                 .absent, .object => continue,
             };
-            const targetType = sourceView.linkTarget(relation.property);
+            const targetType = currentSourceView.linkTarget(relation.property);
             if (fetch.visited.contains(packVisitedKey(targetType, targetKey))) continue;
             try out.append(fetch.arena, .{ .parent = object, .includedSlot = slot, .targetType = targetType, .targetKey = targetKey });
         }
@@ -340,9 +354,18 @@ fn expandRun(transaction: anytype, fetch: *const Fetch, level: usize, runPending
 
     var filledCount: usize = 0;
     for (sortedUniqueKeys, 0..) |targetKey, index| {
-        const row = resolvedRows[index] orelse continue; // stays .key: no index entry
+        // stays .key: no index entry. Ordinarily reachable: links.setLink never
+        // checks that its target key exists, so a link to a key nobody ever
+        // inserted lands here (see "R30" in queryIncludeTests.zig).
+        const row = resolvedRows[index] orelse continue;
         const live = try Column.get(transaction, snapshot.liveColumnReference, row);
-        if (live == 0) continue; // stays .key: tombstoned
+        // stays .key: tombstoned. rows.delete always removes the key-to-row
+        // index entry in the same step it tombstones the row, so this arm is
+        // unreachable through any exposed write path today; it only guards
+        // against an index entry left stale by something outside that
+        // contract (see "R31" in queryIncludeTests.zig, which corrupts the
+        // catalog directly to exercise it).
+        if (live == 0) continue;
         const object = &out[filledCount];
         try fillObject(transaction, fetch, &snapshot, targetType, targetKey, row, includedProperties, isAtBound, object);
         try fetch.visited.put(packVisitedKey(targetType, targetKey), object);

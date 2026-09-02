@@ -296,10 +296,26 @@ test "R22: materializePage shows the dense-vs-sparse span difference an N-descen
     try testing.expect(sparseCost > denseCost + 600);
 
     // R23, a coarse end-to-end regression bound: NOT a proof of the batch
-    // (see R20 for that), only a bound loose enough to catch a quadratic or
-    // per-object-catalog-reload implementation. Hand-derived: 400 objects
-    // (200 sources + 200 targets) times up to 3 column reads times up to 3
-    // tree levels times two dereferences is ~7_200, plus the page walk and
-    // catalog loads; 40_000 is deliberately loose.
-    try testing.expect(denseCost < 40_000);
+    // (see R20 for that), but tight enough to catch a per-object-catalog-
+    // reload implementation, which a bound loose enough only to catch a
+    // quadratic (e.g. 40_000) would not.
+    //
+    // Hand-derived from leafCap = fanout = 64 (columnNode.zig): the 200-row
+    // source column tree is height 2 (4 raw dereferences per Column.get); the
+    // 40_000-row target column tree is height 3 (6 raw dereferences per
+    // Column.get). Materializing 200 sources (4 columns: int, link, live,
+    // version) costs 200 x 4 x 4 = 3_200; materializing 200 targets (3
+    // columns: int, live, version) costs 200 x 3 x 6 = 3_600. Paging's own
+    // liveness filter walks the 200-row page once more, another 200 x 4 =
+    // 800. Every directory lookup and catalog load now runs once per
+    // distinct type (this is the fix): well under 100 more. Total ~7_800,
+    // matching the measured baseline of 7_656.
+    //
+    // A per-object-catalog-reload regression adds one directory lookup and
+    // one catalog load (2 + 2 raw dereferences) for every one of the 200
+    // roots that has an included property, +800, landing at ~8_600: measured
+    // at 8_452 with the reload reintroduced. 8_000 sits inside that 800-wide
+    // gap: comfortably above the derived fixed cost, comfortably below the
+    // regression, and exact every run (this fixture has no randomness).
+    try testing.expect(denseCost < 8_000);
 }

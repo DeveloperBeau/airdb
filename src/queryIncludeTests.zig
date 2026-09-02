@@ -225,6 +225,18 @@ test "R11: objectKey is not row, a relocated target resolves through its physica
     const fixture = try buildIncludeFixture(&writeTransaction);
     var directoryReference = fixture.directoryReference;
 
+    // Author 2's version, hand-carried from before relocation ever touches it
+    // (spec 6.6, R11: the materialized author's version must be the version
+    // author 2 actually had, not whatever the abandoned slot's corrupted
+    // version cell holds).
+    var preRelocationValues: [3]u64 = undefined;
+    const authorTwoVersionBeforeRelocation = (try rows.getByObjectKey(
+        &writeTransaction,
+        try typeDirectory.catalogReference(&writeTransaction, directoryReference, authorType),
+        fixture.authorKeys[2],
+        &preRelocationValues,
+    )).?;
+
     // Open a dead slot: insert a throwaway author, then delete it (the recipe
     // in queryTests.zig, "query returns stable object keys after relocation").
     const throwaway = try typeRouting.insert(&writeTransaction, directoryReference, authorType, &.{ .{ .int = 99 }, .{ .link = null }, .{ .int = 0 } });
@@ -276,6 +288,9 @@ test "R11: objectKey is not row, a relocated target resolves through its physica
     const authorObject = expectObject(roots[0].included[0].target);
     try testing.expectEqual(fixture.authorKeys[2], authorObject.objectKey);
     try testing.expectEqual(PropertyValue{ .int = authorBirthYears[2] }, authorObject.values[2]);
+    // A transposed read would return the abandoned slot's corrupted version,
+    // 0xDEAD_BEEF, in place of author 2's real one.
+    try testing.expectEqual(authorTwoVersionBeforeRelocation, authorObject.version);
 }
 
 test "R12: identity and plain values survive the producing transaction's end" {
@@ -587,6 +602,106 @@ test "R19b: a target that is also a root is a back edge, never a second object" 
                 .absent, .key => {},
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// R30-R31: spec edge case 8, a target that stays .key rather than failing
+// the fetch.
+// ---------------------------------------------------------------------------
+
+test "R30: a link to a key nobody ever inserted stays .key, the fetch does not fail" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try qiTmpPath(testing.allocator, &tmp, "qi30.airdb");
+    defer testing.allocator.free(path);
+    var testDatabase = try Database.create(testing.allocator, path);
+    defer testDatabase.deinit();
+    var writeTransaction = try testDatabase.beginWrite();
+    defer writeTransaction.deinit();
+    const fixture = try buildIncludeFixture(&writeTransaction);
+    var directoryReference = fixture.directoryReference;
+
+    // links.setLink never checks that its target exists, so an ordinary
+    // caller can point a link at a key nobody ever inserted (spec 4, edge
+    // case 8, first half). Book 5's author link is unset (bookAuthorIndex[5]
+    // == null); repoint it at a key that was never allocated in this fixture.
+    const neverInsertedAuthorKey: u64 = 999;
+    directoryReference = try typeRouting.setLink(&writeTransaction, directoryReference, bookType, 5, authorLinkProperty, neverInsertedAuthorKey);
+
+    var resultArena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer resultArena.deinit();
+    const roots = try materializePage(
+        &writeTransaction,
+        directoryReference,
+        bookType,
+        .{ .predicate = intComparison(0, .eq, 5) },
+        .{ .linkProperties = &.{authorLinkProperty}, .depth = 1 },
+        resultArena.allocator(),
+    );
+
+    try testing.expectEqual(@as(usize, 1), roots.len);
+    try testing.expectEqual(fixture.bookKeys[5], roots[0].objectKey);
+    // The root fetched normally: its own values are intact.
+    try testing.expectEqual(PropertyValue{ .int = 5 }, roots[0].values[0]);
+    try testing.expectEqual(@as(usize, 1), roots[0].included.len);
+    switch (roots[0].included[0].target) {
+        .key => |key| try testing.expectEqual(neverInsertedAuthorKey, key),
+        else => try testing.expect(false),
+    }
+}
+
+test "R31: a tombstoned target with a stale index entry stays .key, the fetch does not fail" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try qiTmpPath(testing.allocator, &tmp, "qi31.airdb");
+    defer testing.allocator.free(path);
+    var testDatabase = try Database.create(testing.allocator, path);
+    defer testDatabase.deinit();
+    var writeTransaction = try testDatabase.beginWrite();
+    defer writeTransaction.deinit();
+    const fixture = try buildIncludeFixture(&writeTransaction);
+    var directoryReference = fixture.directoryReference;
+
+    // rows.delete always tombstones a row and removes its key-to-row index
+    // entry in the same step, so a live tombstone with a still-resolving
+    // index entry cannot arise through any exposed write path. Build one by
+    // hand to exercise the guard anyway (spec 4, edge case 8, second half):
+    // insert a fifth author, link book 5 to it, then tombstone its row
+    // directly without touching the index, leaving the index entry stale.
+    const extraAuthor = try typeRouting.insert(&writeTransaction, directoryReference, authorType, &.{ .{ .int = 50 }, .{ .link = null }, .{ .int = 1950 } });
+    directoryReference = extraAuthor.directoryReference;
+    directoryReference = try typeRouting.setLink(&writeTransaction, directoryReference, bookType, 5, authorLinkProperty, extraAuthor.objectKey);
+
+    var authorCatalogReference = try typeDirectory.catalogReference(&writeTransaction, directoryReference, authorType);
+    const extraAuthorRow = (try catalog.objectKeyToRow(&writeTransaction, authorCatalogReference, extraAuthor.objectKey)).?;
+    var authorSnapshot = try catalog.CatalogSnapshot.load(&writeTransaction, authorCatalogReference);
+    authorSnapshot.liveColumnReference = try Column.set(&writeTransaction, authorSnapshot.liveColumnReference, extraAuthorRow, 0);
+    authorCatalogReference = try authorSnapshot.replace(&writeTransaction);
+    directoryReference = try typeDirectory.setCatalogReference(&writeTransaction, directoryReference, authorType, authorCatalogReference);
+
+    // The corruption must actually have happened: the index still resolves
+    // the key, but the row it names is now dead, or this test is vacuous.
+    try testing.expectEqual(@as(?u64, extraAuthorRow), try catalog.objectKeyToRow(&writeTransaction, authorCatalogReference, extraAuthor.objectKey));
+
+    var resultArena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer resultArena.deinit();
+    const roots = try materializePage(
+        &writeTransaction,
+        directoryReference,
+        bookType,
+        .{ .predicate = intComparison(0, .eq, 5) },
+        .{ .linkProperties = &.{authorLinkProperty}, .depth = 1 },
+        resultArena.allocator(),
+    );
+
+    try testing.expectEqual(@as(usize, 1), roots.len);
+    try testing.expectEqual(fixture.bookKeys[5], roots[0].objectKey);
+    try testing.expectEqual(PropertyValue{ .int = 5 }, roots[0].values[0]);
+    try testing.expectEqual(@as(usize, 1), roots[0].included.len);
+    switch (roots[0].included[0].target) {
+        .key => |key| try testing.expectEqual(extraAuthor.objectKey, key),
+        else => try testing.expect(false),
     }
 }
 
