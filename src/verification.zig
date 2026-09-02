@@ -31,7 +31,10 @@ pub const VerifyError = error{
     // value index (forward direction of the value-index invariant).
     ValueIndexMissingEntry,
     // A value-index entry points at a dead/absent row, or at a live row whose
-    // property value differs from the indexed value (backward direction).
+    // property value differs from the indexed value (backward direction). Also
+    // returned for a byte-keyed outer key longer than a key this database could
+    // have written: no writer produces one, so the file is damaged rather than
+    // merely out of step.
     ValueIndexStaleEntry,
     // A live row's outbound link/linkSet target is missing from the target's
     // backlink set (forward direction of the backlink invariant).
