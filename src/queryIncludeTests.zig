@@ -961,6 +961,156 @@ fn buildMultiTargetTypeFixture(writeTransaction: *WriteTransaction) !MultiTarget
     return .{ .directoryReference = directoryReference, .alphaKey = insertedAlpha.objectKey, .betaKey = insertedBeta.objectKey };
 }
 
+// ---------------------------------------------------------------------------
+// R32: a level's pending list spans two source types, gatherPending's
+// reload-on-type-change branch.
+// ---------------------------------------------------------------------------
+
+const gammaType: u16 = 3;
+const deltaType: u16 = 4;
+const alphaToGammaProperty: usize = 1;
+const betaToDeltaProperty: usize = 1;
+
+const MultiSourceTypeFixture = struct {
+    directoryReference: Reference,
+    alphaKey: u64,
+    betaKey: u64,
+    gammaKey: u64,
+    deltaKey: u64,
+};
+
+// Extends the hub/alpha/beta shape with a further level: Alpha (1) and Beta
+// (2) each carry a second property, a link onward to a distinct target type
+// (Gamma, 3, and Delta, 4 respectively) at the SAME property index (1) in
+// their own catalogs. Depth 2 makes level 1's pending list come from
+// expandLevel's parents = [alphaObject, betaObject], the one point in the
+// whole suite where gatherPending's `objects` slice spans two distinct
+// SOURCE types (not just two target types, R29's case): processing alpha
+// then beta must reload the source catalog view when `object.typeId`
+// changes, or beta's `relation.property` (1) is looked up against Alpha's
+// catalog, which also calls property 1 a link, but to Gamma, not Delta.
+// Gamma and Delta each get object key 0 (independent per-type key spaces),
+// so a skipped reload does not error: it silently resolves Beta's link
+// against Gamma's catalog and collapses the two distinct targets onto one
+// object.
+fn buildMultiSourceTypeFixture(writeTransaction: *WriteTransaction) !MultiSourceTypeFixture {
+    const hubDefinitions = [_]catalog.PropertyDefinition{
+        .{ .kind = .int },
+        .{ .kind = .link, .linkTarget = alphaType },
+        .{ .kind = .link, .linkTarget = betaType },
+    };
+    const alphaDefinitions = [_]catalog.PropertyDefinition{
+        .{ .kind = .int },
+        .{ .kind = .link, .linkTarget = gammaType },
+    };
+    const betaDefinitions = [_]catalog.PropertyDefinition{
+        .{ .kind = .int },
+        .{ .kind = .link, .linkTarget = deltaType },
+    };
+    const gammaDefinitions = [_]catalog.PropertyDefinition{.{ .kind = .int }};
+    const deltaDefinitions = [_]catalog.PropertyDefinition{.{ .kind = .int }};
+    var directoryReference = try typeDirectory.createWithDefinitions(writeTransaction, &.{
+        &hubDefinitions, &alphaDefinitions, &betaDefinitions, &gammaDefinitions, &deltaDefinitions,
+    });
+
+    const insertedGamma = try typeRouting.insert(writeTransaction, directoryReference, gammaType, &.{.{ .int = 333 }});
+    directoryReference = insertedGamma.directoryReference;
+    try testing.expectEqual(@as(u64, 0), insertedGamma.objectKey);
+
+    const insertedDelta = try typeRouting.insert(writeTransaction, directoryReference, deltaType, &.{.{ .int = 444 }});
+    directoryReference = insertedDelta.directoryReference;
+    try testing.expectEqual(@as(u64, 0), insertedDelta.objectKey);
+
+    const insertedAlpha = try typeRouting.insert(writeTransaction, directoryReference, alphaType, &.{
+        .{ .int = 111 },
+        .{ .link = insertedGamma.objectKey },
+    });
+    directoryReference = insertedAlpha.directoryReference;
+    try testing.expectEqual(@as(u64, 0), insertedAlpha.objectKey);
+
+    const insertedBeta = try typeRouting.insert(writeTransaction, directoryReference, betaType, &.{
+        .{ .int = 222 },
+        .{ .link = insertedDelta.objectKey },
+    });
+    directoryReference = insertedBeta.directoryReference;
+    try testing.expectEqual(@as(u64, 0), insertedBeta.objectKey);
+
+    const insertedHub = try typeRouting.insert(writeTransaction, directoryReference, hubType, &.{
+        .{ .int = 0 },
+        .{ .link = insertedAlpha.objectKey },
+        .{ .link = insertedBeta.objectKey },
+    });
+    directoryReference = insertedHub.directoryReference;
+
+    return .{
+        .directoryReference = directoryReference,
+        .alphaKey = insertedAlpha.objectKey,
+        .betaKey = insertedBeta.objectKey,
+        .gammaKey = insertedGamma.objectKey,
+        .deltaKey = insertedDelta.objectKey,
+    };
+}
+
+test "R32: a level's pending list spans two source types, each resolved against its own catalog" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try qiTmpPath(testing.allocator, &tmp, "qi32.airdb");
+    defer testing.allocator.free(path);
+    var testDatabase = try Database.create(testing.allocator, path);
+    defer testDatabase.deinit();
+    var writeTransaction = try testDatabase.beginWrite();
+    defer writeTransaction.deinit();
+    const fixture = try buildMultiSourceTypeFixture(&writeTransaction);
+
+    var resultArena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer resultArena.deinit();
+    const roots = try materializePage(
+        &writeTransaction,
+        fixture.directoryReference,
+        hubType,
+        .{},
+        .{ .linkProperties = &.{ hubToAlphaProperty, hubToBetaProperty }, .depth = 2 },
+        resultArena.allocator(),
+    );
+
+    try testing.expectEqual(@as(usize, 1), roots.len);
+    try testing.expectEqual(@as(usize, 2), roots[0].included.len);
+
+    const alphaObject = expectObject(roots[0].included[0].target);
+    try testing.expectEqual(alphaType, alphaObject.typeId);
+    try testing.expectEqual(fixture.alphaKey, alphaObject.objectKey);
+    try testing.expectEqual(PropertyValue{ .int = 111 }, alphaObject.values[0]);
+    try testing.expectEqual(@as(usize, 1), alphaObject.included.len);
+
+    const betaObject = expectObject(roots[0].included[1].target);
+    try testing.expectEqual(betaType, betaObject.typeId);
+    try testing.expectEqual(fixture.betaKey, betaObject.objectKey);
+    try testing.expectEqual(PropertyValue{ .int = 222 }, betaObject.values[0]);
+    try testing.expectEqual(@as(usize, 1), betaObject.included.len);
+
+    // Alpha's own link (property 1) must resolve against Alpha's catalog,
+    // which calls it a link to Gamma.
+    const gammaObject = expectObject(alphaObject.included[0].target);
+    try testing.expectEqual(gammaType, gammaObject.typeId);
+    try testing.expectEqual(fixture.gammaKey, gammaObject.objectKey);
+    try testing.expectEqual(PropertyValue{ .int = 333 }, gammaObject.values[0]);
+    try testing.expectEqual(@as(usize, 0), gammaObject.included.len); // depth bound
+
+    // Beta's own link (same property index, 1) must resolve against Beta's
+    // catalog, which calls it a link to Delta, not against a reused Alpha
+    // view left over from the previous object in gatherPending's loop.
+    const deltaObject = expectObject(betaObject.included[0].target);
+    try testing.expectEqual(deltaType, deltaObject.typeId);
+    try testing.expectEqual(fixture.deltaKey, deltaObject.objectKey);
+    try testing.expectEqual(PropertyValue{ .int = 444 }, deltaObject.values[0]);
+    try testing.expectEqual(@as(usize, 0), deltaObject.included.len); // depth bound
+
+    // A skipped reload resolves Beta's link against Gamma's catalog and
+    // Gamma's key space (both objects sit at key 0), collapsing the two
+    // distinct targets onto one materialized object.
+    try testing.expect(gammaObject != deltaObject);
+}
+
 test "R29: a level fanning out to two target types resolves each in its own run" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
