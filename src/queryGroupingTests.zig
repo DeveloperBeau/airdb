@@ -159,6 +159,40 @@ fn seedRejectedKindFixture(writeTransaction: *WriteTransaction) !Reference {
     return catalog.createFromDefinitions(writeTransaction, &definitions);
 }
 
+// Fixture G. Same four-property shape as fixture A (primaryKey,
+// colorUnindexed, colorIndexed(indexed), price), but only two color values
+// and four rows, with prices arranged so a predicate excludes one color's
+// rows entirely while leaving the other's untouched. Exercises the indexed
+// delivery path's "whole outer key filtered to zero rows" guard, which
+// fixture A's own filtered-groups case stopped exercising once its
+// corrected numbers left every indexed color with at least one surviving
+// row (see D5/G5's comments).
+fn seedZeroedGroupFixture(writeTransaction: *WriteTransaction) !struct { catalogReference: Reference, objectKeys: [4]u64 } {
+    const definitions = [_]catalog.PropertyDefinition{
+        .{ .kind = .int },
+        .{ .kind = .int },
+        .{ .kind = .int, .indexed = true },
+        .{ .kind = .int },
+    };
+    var catalogReference = try catalog.createFromDefinitions(writeTransaction, &definitions);
+    const rowsData = [_][3]u64{
+        .{ 0, 10, 5 },
+        .{ 1, 10, 7 },
+        .{ 2, 20, 1 },
+        .{ 3, 20, 2 },
+    };
+    var objectKeys: [4]u64 = undefined;
+    for (rowsData, 0..) |row, rowIndex| {
+        const primaryKey = row[0];
+        const color = row[1];
+        const price = row[2];
+        const inserted = try rows.insert(writeTransaction, catalogReference, &.{ primaryKey, color, color, price });
+        catalogReference = inserted.catalogReference;
+        objectKeys[rowIndex] = inserted.objectKey;
+    }
+    return .{ .catalogReference = catalogReference, .objectKeys = objectKeys };
+}
+
 // ---------------------------------------------------------------------------
 // distinct
 // ---------------------------------------------------------------------------
@@ -491,6 +525,50 @@ test "D14: out pre-loaded with a sentinel survives; distinct only appends" {
     try query.distinct(&writeTransaction, fixture.catalogReference, 1, emptyPredicate, .{}, &out, testing.allocator);
     try testing.expectEqual(@as(u64, 999), out.items[0]);
     try testing.expectEqualSlices(u64, &.{ fixture.objectKeys[0], fixture.objectKeys[2], fixture.objectKeys[3] }, out.items[1..]);
+}
+
+test "D15: distinct raises error.BadProperty when property is out of range" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try qgTmpPath(testing.allocator, &tmp, "d15.airdb");
+    defer testing.allocator.free(path);
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var writeTransaction = try database.beginWrite();
+    defer writeTransaction.deinit();
+    const fixture = try seedGroupingFixture(&writeTransaction);
+
+    var out = std.ArrayList(u64).empty;
+    defer out.deinit(testing.allocator);
+    try testing.expectError(error.BadProperty, query.distinct(&writeTransaction, fixture.catalogReference, 100, emptyPredicate, .{}, &out, testing.allocator));
+}
+
+test "D16: indexed distinct omits a value with no representative under a predicate that zeroes its whole outer key" {
+    // Hand-computed from fixture G's table: price >= 4 matches rows 0
+    // (price5) and 1 (price7), both color 10; rows 2 (price1) and 3
+    // (price2), both color 20, are entirely excluded. Color 20 must not
+    // appear at all, on either path.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try qgTmpPath(testing.allocator, &tmp, "d16.airdb");
+    defer testing.allocator.free(path);
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var writeTransaction = try database.beginWrite();
+    defer writeTransaction.deinit();
+    const fixture = try seedZeroedGroupFixture(&writeTransaction);
+    const predicate = intComparison(3, .ge, 4);
+    const expected = [_]u64{fixture.objectKeys[0]};
+
+    var unindexed = std.ArrayList(u64).empty;
+    defer unindexed.deinit(testing.allocator);
+    try query.distinct(&writeTransaction, fixture.catalogReference, 1, predicate, .{}, &unindexed, testing.allocator);
+    try testing.expectEqualSlices(u64, &expected, unindexed.items);
+
+    var indexed = std.ArrayList(u64).empty;
+    defer indexed.deinit(testing.allocator);
+    try query.distinct(&writeTransaction, fixture.catalogReference, 2, predicate, .{}, &indexed, testing.allocator);
+    try testing.expectEqualSlices(u64, &expected, indexed.items);
 }
 
 // ---------------------------------------------------------------------------
@@ -877,6 +955,34 @@ test "G16: out pre-loaded with a sentinel group; only the tail is sorted" {
     try testing.expectEqual(sentinel, out.items[0]);
     try testing.expectEqual(@as(usize, 6), out.items.len);
     for (out.items[1 .. out.items.len - 1], out.items[2..]) |left, right| try testing.expect(left.value < right.value);
+}
+
+test "G17: indexed groupBy omits a value whose rows are entirely filtered out by a predicate" {
+    // Hand-computed from fixture G's table: price >= 4 matches rows 0
+    // (price5) and 1 (price7), both color 10 (count 2, sum 12, min 5, max
+    // 7); rows 2 (price1) and 3 (price2), both color 20, are entirely
+    // excluded, so color 20 must not appear as a group at all, not as a
+    // zero-count entry.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try qgTmpPath(testing.allocator, &tmp, "g17.airdb");
+    defer testing.allocator.free(path);
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var writeTransaction = try database.beginWrite();
+    defer writeTransaction.deinit();
+    const fixture = try seedZeroedGroupFixture(&writeTransaction);
+    const predicate = intComparison(3, .ge, 4);
+    const expected = [_]Group{
+        .{ .value = 10, .aggregate = .{ .count = 2, .sum = 12, .min = 5, .max = 7 } },
+    };
+
+    inline for (.{ 1, 2 }) |groupProperty| {
+        var out = std.ArrayList(Group).empty;
+        defer out.deinit(testing.allocator);
+        try query.groupBy(&writeTransaction, fixture.catalogReference, .{ .groupProperty = groupProperty, .aggregateProperty = 3 }, predicate, &out, testing.allocator);
+        try testing.expectEqualSlices(Group, &expected, out.items);
+    }
 }
 
 // ---------------------------------------------------------------------------
