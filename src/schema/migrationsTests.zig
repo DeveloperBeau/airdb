@@ -21,6 +21,8 @@ const insert = @import("../records/rows.zig").insert;
 
 const getByPrimaryKey = @import("../records/rows.zig").getByPrimaryKey;
 
+const rowsDelete = @import("../records/rows.zig").delete;
+
 const getLink = @import("../records/links.zig").getLink;
 
 fn objTmpPath(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const u8) ![]const u8 {
@@ -245,5 +247,86 @@ test "addProperty copies a blob default per row instead of sharing one node" {
     for (writeTransaction.inFlightFrees.items) |item| {
         const gop = try seen.getOrPut(item.offset);
         try testing.expect(!gop.found_existing);
+    }
+}
+
+test "addProperty(.blob, indexed) backfills one outer key carrying every live row's objectKey" {
+    const byteKeyIndex = @import("../trees/byteKeyIndex.zig");
+    const Index = @import("../trees/index.zig");
+    const blobIndexKey = @import("../records/blobIndexKey.zig");
+    const query = @import("../query.zig");
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try objTmpPath(testing.allocator, &tmp, "mig_blob_vidx.airdb");
+    defer testing.allocator.free(path);
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+
+    var objectKeys: [12]u64 = undefined;
+    {
+        var writeTransaction = try database.beginWrite();
+        var catalogReference = try create(&writeTransaction, 1);
+        var primaryKey: u64 = 0;
+        while (primaryKey < 12) : (primaryKey += 1) {
+            const inserted = try insert(&writeTransaction, catalogReference, &.{primaryKey});
+            catalogReference = inserted.catalogReference;
+            objectKeys[primaryKey] = inserted.objectKey;
+        }
+        // 3 tombstoned rows: still counted as `nextRow` but must not appear in
+        // the backfilled index.
+        while (primaryKey < 15) : (primaryKey += 1) {
+            const inserted = try insert(&writeTransaction, catalogReference, &.{primaryKey});
+            catalogReference = inserted.catalogReference;
+            switch (try rowsDelete(&writeTransaction, catalogReference, primaryKey, writeTransaction.newVersion)) {
+                .ok => |newCatalog| catalogReference = newCatalog,
+                else => return error.TestUnexpectedResult,
+            }
+        }
+        const dflt = try blob.put(&writeTransaction, "default-bytes");
+        catalogReference = try addProperty(&writeTransaction, catalogReference, .{ .kind = .blob, .indexed = true }, dflt);
+        writeTransaction.setRoot(catalogReference);
+        _ = try writeTransaction.commit();
+    }
+
+    // Exactly one outer key (the default bytes, truncated) carrying exactly 12
+    // objectKeys: both numbers hand-known from the fixture above.
+    {
+        var writeTransaction = try database.beginWrite();
+        defer writeTransaction.deinit();
+        const view = try catalog.loadCatalog(&writeTransaction, writeTransaction.newRoot);
+        const valueIndexReference = view.valueIndexReference(1);
+        try testing.expectEqual(@as(u64, 1), try byteKeyIndex.count(&writeTransaction, valueIndexReference));
+        const innerRoot = (try byteKeyIndex.get(&writeTransaction, valueIndexReference, blobIndexKey.truncated("default-bytes"))).?;
+        try testing.expectEqual(@as(u64, 12), try Index.count(&writeTransaction, innerRoot));
+    }
+
+    try verification.verifyIntegrity(&database);
+
+    // Queries find every pre-migration row.
+    {
+        var readTransaction = try database.beginRead();
+        defer readTransaction.end();
+        var hits = std.ArrayList(u64).empty;
+        defer hits.deinit(testing.allocator);
+        try query.where(&readTransaction, readTransaction.root(), .{ .predicate = .{ .comparison = .{ .property = 1, .operator = .eq, .value = .{ .bytes = "default-bytes" } } } }, &hits, testing.allocator);
+        std.mem.sort(u64, hits.items, {}, std.sort.asc(u64));
+        var expected = objectKeys;
+        std.mem.sort(u64, &expected, {}, std.sort.asc(u64));
+        try testing.expectEqualSlices(u64, &expected, hits.items);
+    }
+
+    // Insert one new row with a different value: two outer keys, 12 and 1.
+    {
+        var writeTransaction = try database.beginWrite();
+        const catalogReference = writeTransaction.newRoot;
+        const inserted = try objects.insertTyped(&writeTransaction, catalogReference, &.{ .{ .int = 100 }, .{ .bytes = "other-bytes" } });
+        const view = try catalog.loadCatalog(&writeTransaction, inserted.catalogReference);
+        const valueIndexReference = view.valueIndexReference(1);
+        try testing.expectEqual(@as(u64, 2), try byteKeyIndex.count(&writeTransaction, valueIndexReference));
+        const defaultInnerRoot = (try byteKeyIndex.get(&writeTransaction, valueIndexReference, blobIndexKey.truncated("default-bytes"))).?;
+        try testing.expectEqual(@as(u64, 12), try Index.count(&writeTransaction, defaultInnerRoot));
+        const otherInnerRoot = (try byteKeyIndex.get(&writeTransaction, valueIndexReference, blobIndexKey.truncated("other-bytes"))).?;
+        try testing.expectEqual(@as(u64, 1), try Index.count(&writeTransaction, otherInnerRoot));
+        writeTransaction.deinit();
     }
 }
