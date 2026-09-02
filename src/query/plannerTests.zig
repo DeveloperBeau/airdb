@@ -11,6 +11,7 @@ const predicateModule = @import("predicate.zig");
 const Scan = @import("scan.zig").Scan;
 const catalog = @import("../schema/catalog.zig");
 const rows = @import("../records/rows.zig");
+const blob = @import("../records/blob.zig");
 const Database = @import("../database.zig").Database;
 const WriteTransaction = @import("../database.zig").WriteTransaction;
 const Reference = @import("../storage/reference.zig").Reference;
@@ -25,6 +26,27 @@ const Selectivity = planner.Selectivity;
 
 fn intComparison(property: usize, operator: Operator, value: u64) Predicate {
     return .{ .comparison = .{ .property = property, .operator = operator, .value = .{ .int = value } } };
+}
+
+fn bytesComparison(property: usize, operator: Operator, value: []const u8) Predicate {
+    return .{ .comparison = .{ .property = property, .operator = operator, .value = .{ .bytes = value } } };
+}
+
+// Build a Scan by hand with an explicit kind per property, alongside its
+// indexed flag. No I/O: propertyReferences/valueIndexReferences are never
+// dereferenced by the pure decision functions under test.
+fn makeScanForTestWithKinds(kinds: []const catalog.PropertyKind, indexedFlags: []const bool) Scan {
+    var scan: Scan = undefined;
+    scan.propertyCount = kinds.len;
+    for (kinds, 0..) |kind, propertyIndex| {
+        scan.propertyReferences[propertyIndex] = 0;
+        scan.propertyKinds[propertyIndex] = kind;
+        scan.indexed[propertyIndex] = indexedFlags[propertyIndex];
+        scan.valueIndexReferences[propertyIndex] = 0;
+    }
+    scan.liveColumnReference = 0;
+    scan.keyToRowIndexReference = 0;
+    return scan;
 }
 
 // Build a Scan by hand: property 0 unindexed, remaining properties indexed
@@ -77,6 +99,19 @@ test "canDriveFromIndex: ne and beginsWith on an indexed property are not drivab
     const scan = makeScanForTest(&.{true});
     try testing.expect(!planner.canDriveFromIndex(&scan, intComparison(0, .ne, 5)));
     try testing.expect(!planner.canDriveFromIndex(&scan, intComparison(0, .beginsWith, 5)));
+}
+
+test "T-N1: a bytes comparison on an indexed blob property is never drivable from the index (C4)" {
+    const kinds = [_]catalog.PropertyKind{ .int, .blob, .int };
+    const indexedFlags = [_]bool{ false, true, true };
+    const scan = makeScanForTestWithKinds(&kinds, &indexedFlags);
+    const operators = [_]Operator{ .eq, .lt, .le, .gt, .ge, .ne, .beginsWith };
+    for (operators) |operator| {
+        try testing.expect(!planner.canDriveFromIndex(&scan, bytesComparison(1, operator, "x")));
+    }
+    // False-positive guard: without it, an isIndexFriendly that returned false
+    // unconditionally would pass. An eq int comparison on property 2 IS drivable.
+    try testing.expect(planner.canDriveFromIndex(&scan, intComparison(2, .eq, 5)));
 }
 
 test "canDriveFromIndex: eq on an unindexed property is not drivable" {
@@ -482,4 +517,73 @@ test "canDriveFromIndex and collectCandidates never disagree, over 200 random tr
             try testing.expectError(error.NoIndexPlan, result);
         }
     }
+}
+
+// property0 = primaryKey(int), property1 = blob (indexed), property2 = int
+// (indexed, value rowIndex % 100). Every row's blob is "x": T-N2/T-N3 only
+// need the bytes comparison to be present in the tree, never actually
+// evaluated by an index.
+fn seedBlobPlusIntCatalog(writeTransaction: *WriteTransaction, rowCount: u64) !Reference {
+    const definitions = [_]catalog.PropertyDefinition{
+        .{ .kind = .int },
+        .{ .kind = .blob, .indexed = true },
+        .{ .kind = .int, .indexed = true },
+    };
+    var catalogReference = try catalog.createFromDefinitions(writeTransaction, &definitions);
+    var rowIndex: u64 = 0;
+    while (rowIndex < rowCount) : (rowIndex += 1) {
+        const blobReference = try blob.put(writeTransaction, "x");
+        catalogReference = (try rows.insert(writeTransaction, catalogReference, &.{ rowIndex, blobReference, rowIndex % 100 })).catalogReference;
+    }
+    return catalogReference;
+}
+
+test "T-N2: collectCandidates on the property-1 bytes comparison still returns error.NoIndexPlan" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try plannerTmpPath(testing.allocator, &tmp, "planner_n2.airdb");
+    defer testing.allocator.free(path);
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var writeTransaction = try database.beginWrite();
+    defer writeTransaction.deinit();
+    const catalogReference = try seedBlobPlusIntCatalog(&writeTransaction, 10);
+    const scan = try Scan.open(&writeTransaction, catalogReference);
+
+    var candidates = std.ArrayList(u64).empty;
+    defer candidates.deinit(testing.allocator);
+    // Pins the defensive guard in collectCandidates's .bytes arm, which
+    // isIndexFriendly now normally forecloses from ever being reached through
+    // runQuery.
+    try testing.expectError(error.NoIndexPlan, planner.collectCandidates(&writeTransaction, &scan, bytesComparison(1, .eq, "x"), &candidates, testing.allocator, 0));
+}
+
+test "T-N3: a conjunction with one bytes child and one drivable int child is drivable, and drives off the int child" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try plannerTmpPath(testing.allocator, &tmp, "planner_n3.airdb");
+    defer testing.allocator.free(path);
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var writeTransaction = try database.beginWrite();
+    defer writeTransaction.deinit();
+    const catalogReference = try seedBlobPlusIntCatalog(&writeTransaction, 200);
+    const scan = try Scan.open(&writeTransaction, catalogReference);
+
+    const children = [_]Predicate{ bytesComparison(1, .eq, "x"), intComparison(2, .eq, 7) };
+    const tree = Predicate{ .conjunction = &children };
+    // One drivable child (property 2) is enough.
+    try testing.expect(planner.canDriveFromIndex(&scan, tree));
+
+    var candidates = std.ArrayList(u64).empty;
+    defer candidates.deinit(testing.allocator);
+    try planner.collectCandidates(&writeTransaction, &scan, tree, &candidates, testing.allocator, 0);
+    std.mem.sort(u64, candidates.items, {}, std.sort.asc(u64));
+
+    var expected = std.ArrayList(u64).empty;
+    defer expected.deinit(testing.allocator);
+    try query.where(&writeTransaction, catalogReference, .{ .predicate = intComparison(2, .eq, 7) }, &expected, testing.allocator);
+    std.mem.sort(u64, expected.items, {}, std.sort.asc(u64));
+
+    try testing.expectEqualSlices(u64, expected.items, candidates.items);
 }

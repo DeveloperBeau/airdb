@@ -157,8 +157,29 @@ test "validate rejects a bytes value against an int property" {
     try testing.expectError(error.BadPredicate, (bytesComparison(0, .eq, "x")).validate(&intKinds));
 }
 
-test "validate rejects a bytes value against a blob property as unsupported, not malformed" {
-    try testing.expectError(error.UnsupportedPredicate, (bytesComparison(2, .eq, "x")).validate(&intKinds));
+const allOperators = [_]predicate.Operator{ .eq, .ne, .lt, .le, .gt, .ge, .beginsWith };
+
+test "T-P1: a bytes comparison against a blob property validates, for every operator" {
+    for (allOperators) |operator| try (bytesComparison(2, operator, "x")).validate(&intKinds);
+}
+
+test "T-P2: a bytes comparison is BadPredicate against every non-blob kind" {
+    // everyKind holds int, list, set, link, linkSet, dict (no blob) -- the
+    // mirror-image fixture of the int check below, looped so a newly added
+    // kind is not silently admitted.
+    for (everyKind) |kind| {
+        const kinds = [_]catalog.PropertyKind{kind};
+        try testing.expectError(error.BadPredicate, (bytesComparison(0, .eq, "x")).validate(&kinds));
+    }
+}
+
+test "T-P3: an int comparison against a blob property is still BadPredicate" {
+    try testing.expectError(error.BadPredicate, (intComparison(2, .eq, 1)).validate(&intKinds));
+}
+
+test "T-P4: beginsWith with a bytes value on a blob property validates; with an int value on an int property it is still BadPredicate" {
+    try (bytesComparison(2, .beginsWith, "x")).validate(&intKinds);
+    try testing.expectError(error.BadPredicate, (intComparison(0, .beginsWith, 1)).validate(&intKinds));
 }
 
 test "validate rejects beginsWith against an int property" {
@@ -187,6 +208,9 @@ test "validate rejects a conjunction whose 33rd level holds a comparison" {
     try testing.expectError(error.PredicateTooDeep, current.validate(&intKinds));
 }
 
+// T-P5: error.UnsupportedPredicate is no longer in the accepted set below --
+// validate can no longer produce it, and leaving it in would let a regression
+// that reintroduces the rejection pass unnoticed.
 test "validate fuzz: never panics, error is one of the named set, and validated trees hold no out-of-range property" {
     var acceptedCount: usize = 0;
     var seed: u64 = 0;
@@ -202,7 +226,7 @@ test "validate fuzz: never panics, error is one of the named set, and validated 
             try expectNoOutOfRangeProperty(tree);
         } else |err| {
             switch (err) {
-                error.BadProperty, error.BadPredicate, error.UnsupportedPredicate, error.PredicateTooDeep => {},
+                error.BadProperty, error.BadPredicate, error.PredicateTooDeep => {},
             }
         }
     }

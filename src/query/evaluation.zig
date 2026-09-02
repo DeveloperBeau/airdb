@@ -1,5 +1,6 @@
 //! Evaluates a predicate tree against one physical row's column values.
 
+const std = @import("std");
 const predicateModule = @import("predicate.zig");
 const Operator = predicateModule.Operator;
 const Predicate = predicateModule.Predicate;
@@ -7,10 +8,12 @@ const Match = predicateModule.Match;
 const maxPredicateDepth = predicateModule.maxPredicateDepth;
 const Scan = @import("scan.zig").Scan;
 const Column = @import("../trees/column.zig");
+const Reference = @import("../storage/reference.zig").Reference;
+const blob = @import("../records/blob.zig");
 
 /// Whether `storedValue` satisfies `operator` against `probeValue`.
 /// `beginsWith` has no int form and is rejected.
-pub fn matches(operator: Operator, storedValue: u64, probeValue: u64) !bool {
+pub fn matchesInt(operator: Operator, storedValue: u64, probeValue: u64) !bool {
     return switch (operator) {
         .eq => storedValue == probeValue,
         .ne => storedValue != probeValue,
@@ -22,9 +25,36 @@ pub fn matches(operator: Operator, storedValue: u64, probeValue: u64) !bool {
     };
 }
 
+/// Whether `order`, the order of a stored value relative to a probe, satisfies
+/// `operator`. `beginsWith` is not an order comparison and is rejected. O(1),
+/// no I/O.
+pub fn matchesOrder(operator: Operator, order: std.math.Order) !bool {
+    return switch (operator) {
+        .eq => order == .eq,
+        .ne => order != .eq,
+        .lt => order == .lt,
+        .le => order != .gt,
+        .gt => order == .gt,
+        .ge => order != .lt,
+        .beginsWith => error.UnsupportedPredicate,
+    };
+}
+
+/// Whether the blob at `storedReference` satisfies `operator` against `probe`,
+/// comparing bytes unsigned and lexicographically. The null reference is the
+/// empty byte string. Streams the stored bytes, so a chunked blob costs no
+/// allocation. O(bytes examined) with I/O.
+pub fn matchesBytes(transaction: anytype, operator: Operator, storedReference: Reference, probe: []const u8) !bool {
+    // The query language says beginsWith; the byte layer says startsWith.
+    if (operator == .beginsWith) return blob.startsWith(transaction, storedReference, probe);
+    return matchesOrder(operator, try blob.compare(transaction, storedReference, probe));
+}
+
 /// Evaluate `predicate` against one physical row. Reads one column value per
-/// comparison node reached, so O(nodes) tree reads; short-circuits, which is
-/// sound only because `Predicate.validate` has already walked every node.
+/// comparison node reached (plus, for a bytes comparison, the blob reads that
+/// comparison needs), so O(nodes) tree reads plus O(bytes examined);
+/// short-circuits, which is sound only because `Predicate.validate` has
+/// already walked every node.
 pub fn evaluatePredicate(transaction: anytype, scan: *const Scan, row: u64, predicate: Predicate) !Match {
     return evaluatePredicateAt(transaction, scan, row, predicate, 0);
 }
@@ -33,12 +63,15 @@ fn evaluatePredicateAt(transaction: anytype, scan: *const Scan, row: u64, predic
     if (depth >= maxPredicateDepth) return error.PredicateTooDeep;
     switch (predicate) {
         .comparison => |comparison| {
-            const probeValue = switch (comparison.value) {
-                .int => |value| value,
-                .bytes => return error.UnsupportedPredicate,
-            };
+            // A blob column's word IS the blob's storage reference, which is what
+            // matchesBytes dereferences; every other supported kind's word is the
+            // value itself.
             const storedValue = try Column.get(transaction, scan.propertyReferences[comparison.property], row);
-            return if (try matches(comparison.operator, storedValue, probeValue)) .matched else .unmatched;
+            const satisfied = switch (comparison.value) {
+                .int => |probeValue| try matchesInt(comparison.operator, storedValue, probeValue),
+                .bytes => |probeBytes| try matchesBytes(transaction, comparison.operator, storedValue, probeBytes),
+            };
+            return if (satisfied) .matched else .unmatched;
         },
         .conjunction => |children| {
             var outcome: Match = .matched;

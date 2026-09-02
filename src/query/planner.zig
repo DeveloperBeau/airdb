@@ -8,6 +8,7 @@
 const std = @import("std");
 const predicateModule = @import("predicate.zig");
 const Operator = predicateModule.Operator;
+const ComparisonValue = predicateModule.ComparisonValue;
 const Predicate = predicateModule.Predicate;
 const maxPredicateDepth = predicateModule.maxPredicateDepth;
 const Scan = @import("scan.zig").Scan;
@@ -18,11 +19,23 @@ const index = @import("../trees/index.zig");
 /// never a wrong answer. `unbounded` marks a range node, always ranked last.
 pub const Selectivity = union(enum) { exact: u64, unbounded };
 
-/// Whether a value index can serve `operator` directly.
-fn isIndexFriendly(operator: Operator) bool {
-    return switch (operator) {
-        .eq, .lt, .le, .gt, .ge => true,
-        .ne, .beginsWith => false,
+/// Whether a value index can serve `operator` over `value`. A `.bytes`
+/// comparison never can: a value index is keyed by the property's raw column
+/// word, and for a blob property that word is a storage reference, so the index
+/// holds an order over references and none at all over the bytes. That is why
+/// every string predicate in this phase is a residual filter over a full scan,
+/// which is trivially correct: the candidate set is the whole live set, a
+/// superset by definition, and the residual filter is the only filter. Phase 5's
+/// prefix index changes this, and from then on the residual filter is
+/// load-bearing rather than merely sufficient, because a truncated prefix key
+/// over-matches.
+fn isIndexFriendly(operator: Operator, value: ComparisonValue) bool {
+    return switch (value) {
+        .bytes => false,
+        .int => switch (operator) {
+            .eq, .lt, .le, .gt, .ge => true,
+            .ne, .beginsWith => false,
+        },
     };
 }
 
@@ -37,7 +50,7 @@ fn canDriveFromIndexAt(scan: *const Scan, predicate: Predicate, depth: usize) bo
     if (depth >= maxPredicateDepth) return false;
     return switch (predicate) {
         .comparison => |comparison| comparison.property < scan.propertyCount and
-            scan.indexed[comparison.property] and isIndexFriendly(comparison.operator),
+            scan.indexed[comparison.property] and isIndexFriendly(comparison.operator, comparison.value),
         .conjunction => |children| blk: {
             for (children) |child| if (canDriveFromIndexAt(scan, child, depth + 1)) break :blk true;
             break :blk false;
@@ -105,6 +118,9 @@ pub fn selectivityOf(transaction: anytype, scan: *const Scan, predicate: Predica
             if (comparison.property >= scan.propertyCount or !scan.indexed[comparison.property] or comparison.operator != .eq) return .unbounded;
             const probeValue = switch (comparison.value) {
                 .int => |value| value,
+                // Defensive guard: isIndexFriendly already forecloses .bytes from
+                // reaching here through canDriveFromIndex/runQuery. Correct for a
+                // direct caller regardless.
                 .bytes => return .unbounded,
             };
             const valueIndexReference = scan.valueIndexReferences[comparison.property];
@@ -164,10 +180,13 @@ pub fn collectCandidates(
     if (depth >= maxPredicateDepth) return error.PredicateTooDeep;
     switch (predicate) {
         .comparison => |comparison| {
-            if (comparison.property >= scan.propertyCount or !scan.indexed[comparison.property] or !isIndexFriendly(comparison.operator))
+            if (comparison.property >= scan.propertyCount or !scan.indexed[comparison.property] or !isIndexFriendly(comparison.operator, comparison.value))
                 return error.NoIndexPlan;
             const probeValue = switch (comparison.value) {
                 .int => |value| value,
+                // Defensive guard: isIndexFriendly already forecloses .bytes from
+                // reaching here through canDriveFromIndex/runQuery. Correct for a
+                // direct caller regardless.
                 .bytes => return error.NoIndexPlan,
             };
             const valueIndexReference = scan.valueIndexReferences[comparison.property];

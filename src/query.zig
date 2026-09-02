@@ -2,8 +2,11 @@
 //! space: a scan walks the per-type key->row index, so each entry maps an objectKey to
 //! the physical row that currently holds its data (rows can move via relocation).
 //! Predicates compare the raw u64 stored in a property column, so they apply to
-//! int properties and to link properties (which store target objectKey + 1). Blob and
-//! collection predicates are a later addition.
+//! int properties and to link properties (which store target objectKey + 1), and
+//! to blob properties, whose word is a storage reference the engine follows to
+//! compare the stored bytes against the probe. Blob comparison is byte-wise and
+//! unindexed: it streams each candidate row's bytes, so a blob predicate costs a
+//! full scan. Collection predicates are a later addition.
 //!
 //! Results are object keys (objectKeys); materialize them with
 //! objects.getTypedByObjectKey. The fetch model is stale-snapshot: a query reads one
@@ -312,4 +315,5 @@ test {
     _ = @import("queryPaginationTests.zig");
     _ = @import("queryLazinessTests.zig");
     _ = @import("queryEndpointTests.zig");
+    _ = @import("queryStringTests.zig");
 }
