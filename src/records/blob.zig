@@ -14,7 +14,9 @@
 //!   `chunkSize` bytes; the last is `totalLen - (chunkCount-1)*chunkSize`.
 //!
 //! Empty blob (zero-length bytes) is represented as the null reference (0); no node
-//! is allocated for it.
+//! is allocated for it. The null reference is therefore a VALUE (the empty
+//! string), not an absence: nullity must come from a null bitmap, never from
+//! `reference == 0`, or every legitimately empty string is reclassified as null.
 
 const std = @import("std");
 const Reference = @import("../storage/reference.zig").Reference;
@@ -213,10 +215,12 @@ pub fn free(transaction: *WriteTransaction, reference: Reference) !void {
     try transaction.free(reference, header.nodeSize);
 }
 
-/// The stored blob's size and the order of its first `min(size, probe.len)`
-/// bytes against the head of `probe`. `.eq` means the two agree over that
-/// overlap, which leaves only the lengths to break the tie.
-const HeadComparison = struct { order: std.math.Order, byteCount: usize };
+/// The stored blob's total size and the order of its first `min(size,
+/// probe.len)` bytes against the head of `probe`. `.eq` means the two agree
+/// over that overlap, which leaves only the lengths to break the tie.
+/// `storedByteCount` is the blob's full length, not the number of bytes the
+/// comparison actually examined.
+const HeadComparison = struct { order: std.math.Order, storedByteCount: usize };
 
 /// Compare the blob at `reference` against `probe` over the bytes they share,
 /// materializing neither side. Stops at the first difference, so a difference in
@@ -224,12 +228,12 @@ const HeadComparison = struct { order: std.math.Order, byteCount: usize };
 /// O(bytes examined) with I/O: one node read for an inline blob, two per chunk
 /// touched for a chunked one.
 fn compareHead(transaction: anytype, reference: Reference, probe: []const u8) !HeadComparison {
-    if (reference == 0) return .{ .order = .eq, .byteCount = 0 };
+    if (reference == 0) return .{ .order = .eq, .storedByteCount = 0 };
     const tag = (try transaction.dereference(reference, 1))[0];
     if (tag == tagInline) {
         const stored = try get(transaction, reference);
         const overlap = @min(stored.len, probe.len);
-        return .{ .order = std.mem.order(u8, stored[0..overlap], probe[0..overlap]), .byteCount = stored.len };
+        return .{ .order = std.mem.order(u8, stored[0..overlap], probe[0..overlap]), .storedByteCount = stored.len };
     }
     return compareChunkedHead(transaction, reference, probe);
 }
@@ -252,9 +256,9 @@ fn compareChunkedHead(transaction: anytype, reference: Reference, probe: []const
         const overlap = @min(chunkLength, probe.len - start);
         const chunk = try transaction.dereference(chunkReference, chunkLength);
         const outcome = std.mem.order(u8, chunk[0..overlap], probe[start .. start + overlap]);
-        if (outcome != .eq) return .{ .order = outcome, .byteCount = header.totalLen };
+        if (outcome != .eq) return .{ .order = outcome, .storedByteCount = header.totalLen };
     }
-    return .{ .order = .eq, .byteCount = header.totalLen };
+    return .{ .order = .eq, .storedByteCount = header.totalLen };
 }
 
 /// The order of the blob at `reference` RELATIVE TO `probe`, comparing bytes
@@ -268,7 +272,7 @@ fn compareChunkedHead(transaction: anytype, reference: Reference, probe: []const
 pub fn compare(transaction: anytype, reference: Reference, probe: []const u8) !std.math.Order {
     const head = try compareHead(transaction, reference, probe);
     if (head.order != .eq) return head.order;
-    return std.math.order(head.byteCount, probe.len);
+    return std.math.order(head.storedByteCount, probe.len);
 }
 
 /// Whether the blob at `reference` begins with `prefix`. An empty prefix is a
@@ -279,7 +283,7 @@ pub fn compare(transaction: anytype, reference: Reference, probe: []const u8) !s
 /// Accepts any transaction type exposing `dereference(reference, length) ![]const u8`.
 pub fn startsWith(transaction: anytype, reference: Reference, prefix: []const u8) !bool {
     const head = try compareHead(transaction, reference, prefix);
-    return head.order == .eq and head.byteCount >= prefix.len;
+    return head.order == .eq and head.storedByteCount >= prefix.len;
 }
 
 // ---------------------------------------------------------------------------

@@ -165,8 +165,10 @@ test "T-P1: a bytes comparison against a blob property validates, for every oper
 
 test "T-P2: a bytes comparison is BadPredicate against every non-blob kind" {
     // everyKind holds int, list, set, link, linkSet, dict (no blob) -- the
-    // mirror-image fixture of the int check below, looped so a newly added
-    // kind is not silently admitted.
+    // mirror-image fixture of the int check below. It is a hand-written
+    // array, not derived from PropertyKind, so this loop covers exactly the
+    // six kinds listed today; a kind added later still needs adding here to
+    // be covered by this test.
     for (everyKind) |kind| {
         const kinds = [_]catalog.PropertyKind{kind};
         try testing.expectError(error.BadPredicate, (bytesComparison(0, .eq, "x")).validate(&kinds));

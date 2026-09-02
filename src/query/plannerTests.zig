@@ -505,7 +505,7 @@ test "canDriveFromIndex and collectCandidates never disagree, over 200 random tr
     // yes for a .bytes comparison against an indexed blob property, and
     // collectCandidates then hit its .bytes => error.NoIndexPlan arm. A
     // schema with no indexed blob property would not exercise that shape.
-    const indexedCatalog = try seedBlobPlusIntCatalog(&writeTransaction, 500);
+    const indexedCatalog = try seedBlobPlusIntCatalog(&writeTransaction, 500, null);
     const scan = try Scan.open(&writeTransaction, indexedCatalog);
 
     var seed: u64 = 0;
@@ -534,7 +534,10 @@ test "canDriveFromIndex and collectCandidates never disagree, over 200 random tr
 // (indexed, value rowIndex % 100). Every row's blob is "x": T-N2/T-N3 only
 // need the bytes comparison to be present in the tree, never actually
 // evaluated by an index.
-fn seedBlobPlusIntCatalog(writeTransaction: *WriteTransaction, rowCount: u64) !Reference {
+// objectKeysOut, when non-null, must have length rowCount; filled with each
+// row's returned objectKey at its rowIndex, so a caller that needs to assert
+// against specific rows never assumes objectKey equals the insertion ordinal.
+fn seedBlobPlusIntCatalog(writeTransaction: *WriteTransaction, rowCount: u64, objectKeysOut: ?[]u64) !Reference {
     const definitions = [_]catalog.PropertyDefinition{
         .{ .kind = .int },
         .{ .kind = .blob, .indexed = true },
@@ -544,7 +547,9 @@ fn seedBlobPlusIntCatalog(writeTransaction: *WriteTransaction, rowCount: u64) !R
     var rowIndex: u64 = 0;
     while (rowIndex < rowCount) : (rowIndex += 1) {
         const blobReference = try blob.put(writeTransaction, "x");
-        catalogReference = (try rows.insert(writeTransaction, catalogReference, &.{ rowIndex, blobReference, rowIndex % 100 })).catalogReference;
+        const insertion = try rows.insert(writeTransaction, catalogReference, &.{ rowIndex, blobReference, rowIndex % 100 });
+        catalogReference = insertion.catalogReference;
+        if (objectKeysOut) |objectKeys| objectKeys[rowIndex] = insertion.objectKey;
     }
     return catalogReference;
 }
@@ -558,7 +563,7 @@ test "T-N2: collectCandidates on the property-1 bytes comparison still returns e
     defer database.deinit();
     var writeTransaction = try database.beginWrite();
     defer writeTransaction.deinit();
-    const catalogReference = try seedBlobPlusIntCatalog(&writeTransaction, 10);
+    const catalogReference = try seedBlobPlusIntCatalog(&writeTransaction, 10, null);
     const scan = try Scan.open(&writeTransaction, catalogReference);
 
     var candidates = std.ArrayList(u64).empty;
@@ -567,6 +572,28 @@ test "T-N2: collectCandidates on the property-1 bytes comparison still returns e
     // isIndexFriendly now normally forecloses from ever being reached through
     // runQuery.
     try testing.expectError(error.NoIndexPlan, planner.collectCandidates(&writeTransaction, &scan, bytesComparison(1, .eq, "x"), &candidates, testing.allocator, 0));
+}
+
+test "selectivityOf: a bytes eq comparison on an indexed blob property returns unbounded (defensive guard)" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try plannerTmpPath(testing.allocator, &tmp, "planner_sel_bytes.airdb");
+    defer testing.allocator.free(path);
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var writeTransaction = try database.beginWrite();
+    defer writeTransaction.deinit();
+    const catalogReference = try seedBlobPlusIntCatalog(&writeTransaction, 10, null);
+    const scan = try Scan.open(&writeTransaction, catalogReference);
+
+    // Pins selectivityOf's own defensive guard, the twin of T-N2's guard in
+    // collectCandidates, which isIndexFriendly now normally forecloses from
+    // ever being reached through runQuery. The operator must be .eq:
+    // selectivityOf's `comparison.operator != .eq` check returns .unbounded
+    // first for any other operator, so a non-eq probe would pass without
+    // reaching the .bytes arm under test.
+    const selectivity = try planner.selectivityOf(&writeTransaction, &scan, bytesComparison(1, .eq, "x"), 0);
+    try testing.expectEqual(Selectivity.unbounded, selectivity);
 }
 
 test "T-N3: a conjunction with one bytes child and one drivable int child is drivable, and drives off the int child" {
@@ -578,7 +605,11 @@ test "T-N3: a conjunction with one bytes child and one drivable int child is dri
     defer database.deinit();
     var writeTransaction = try database.beginWrite();
     defer writeTransaction.deinit();
-    const catalogReference = try seedBlobPlusIntCatalog(&writeTransaction, 200);
+    // Property 2 is rowIndex % 100 over 200 rows, so eq 7 matches exactly
+    // rowIndex 7 and rowIndex 107; captured objectKeys, not assumed equal to
+    // rowIndex, so this expectation shares no code with collectCandidates.
+    var objectKeys: [200]u64 = undefined;
+    const catalogReference = try seedBlobPlusIntCatalog(&writeTransaction, 200, &objectKeys);
     const scan = try Scan.open(&writeTransaction, catalogReference);
 
     const children = [_]Predicate{ bytesComparison(1, .eq, "x"), intComparison(2, .eq, 7) };
@@ -591,10 +622,6 @@ test "T-N3: a conjunction with one bytes child and one drivable int child is dri
     try planner.collectCandidates(&writeTransaction, &scan, tree, &candidates, testing.allocator, 0);
     std.mem.sort(u64, candidates.items, {}, std.sort.asc(u64));
 
-    var expected = std.ArrayList(u64).empty;
-    defer expected.deinit(testing.allocator);
-    try query.where(&writeTransaction, catalogReference, .{ .predicate = intComparison(2, .eq, 7) }, &expected, testing.allocator);
-    std.mem.sort(u64, expected.items, {}, std.sort.asc(u64));
-
-    try testing.expectEqualSlices(u64, expected.items, candidates.items);
+    const expected = [_]u64{ objectKeys[7], objectKeys[107] };
+    try testing.expectEqualSlices(u64, &expected, candidates.items);
 }
