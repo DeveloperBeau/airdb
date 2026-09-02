@@ -614,6 +614,52 @@ test "selectivityOf: a bytes eq comparison on an indexed blob property counts th
     try testing.expectEqual(Selectivity.unbounded, mismatched);
 }
 
+test "selectivityOf: two values sharing a 256-byte prefix but differing after it overestimate to atMost 2, true match count 1" {
+    // Pins that Selectivity is now an upper bound, not an exact count: the
+    // truncated key cannot distinguish the two rows, so the outer key's inner
+    // set holds both, even though eq only truly matches one.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try plannerTmpPath(testing.allocator, &tmp, "planner_sel_shared_prefix.airdb");
+    defer testing.allocator.free(path);
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var writeTransaction = try database.beginWrite();
+    defer writeTransaction.deinit();
+
+    var sharedPrefix: [260]u8 = undefined;
+    @memset(&sharedPrefix, 'x');
+    var valueA: [263]u8 = undefined;
+    @memcpy(valueA[0..260], &sharedPrefix);
+    @memcpy(valueA[260..263], "AAA");
+    var valueB: [263]u8 = undefined;
+    @memcpy(valueB[0..260], &sharedPrefix);
+    @memcpy(valueB[260..263], "BBB");
+
+    const definitions = [_]catalog.PropertyDefinition{ .{ .kind = .int }, .{ .kind = .blob, .indexed = true } };
+    var catalogReference = try catalog.createFromDefinitions(&writeTransaction, &definitions);
+    const referenceA = try blob.put(&writeTransaction, &valueA);
+    const referenceB = try blob.put(&writeTransaction, &valueB);
+    catalogReference = (try rows.insert(&writeTransaction, catalogReference, &.{ 0, referenceA })).catalogReference;
+    catalogReference = (try rows.insert(&writeTransaction, catalogReference, &.{ 1, referenceB })).catalogReference;
+    const scan = try Scan.open(&writeTransaction, catalogReference);
+
+    const selectivityForA = try planner.selectivityOf(&writeTransaction, &scan, bytesComparison(1, .eq, &valueA), 0);
+    try testing.expectEqual(Selectivity{ .atMost = 2 }, selectivityForA);
+    const selectivityForB = try planner.selectivityOf(&writeTransaction, &scan, bytesComparison(1, .eq, &valueB), 0);
+    try testing.expectEqual(Selectivity{ .atMost = 2 }, selectivityForB);
+}
+
+test "canDriveFromIndex: a bytes comparison on an indexed .int property is never drivable" {
+    const kinds = [_]catalog.PropertyKind{.int};
+    const indexedFlags = [_]bool{true};
+    const scan = makeScanForTestWithKinds(&kinds, &indexedFlags);
+    const operators = [_]Operator{ .eq, .lt, .le, .gt, .ge, .ne, .beginsWith };
+    for (operators) |operator| {
+        try testing.expect(!planner.canDriveFromIndex(&scan, bytesComparison(0, operator, "x")));
+    }
+}
+
 test "T-N3: a conjunction with one bytes child and one drivable int child is drivable, and drives off the int child" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
