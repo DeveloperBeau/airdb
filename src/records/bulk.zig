@@ -91,7 +91,7 @@ pub fn bulkIndex(transaction: *WriteTransaction, keys: []const u64, values: []co
 
 /// Build a value index (value -> inner objectKey-set) from `entries`, sorted by
 /// value, each with ascending objectKeys. Each inner set maps objectKey -> 1, matching
-/// the shape rows.valueIndexAdd maintains (value -> Index{objectKey -> 1}).
+/// the shape rows.intValueIndexAdd maintains (value -> Index{objectKey -> 1}).
 pub fn bulkValueIndex(transaction: *WriteTransaction, entries: []const ValueObjectKeys) !Reference {
     if (entries.len == 0) return Index.create(transaction);
     const allocator = transaction.database.store.allocator;
@@ -301,7 +301,7 @@ fn buildValueIndexes(
 
 // Build the value index for indexed property `p`: emit (value -> {objectKey -> 1})
 // with values ascending and each inner objectKey set ascending, matching the shape
-// rows.valueIndexAdd maintains. objectKeys are assigned in sorted-primaryKey order (objectKeyR =
+// rows.intValueIndexAdd maintains. objectKeys are assigned in sorted-primaryKey order (objectKeyR =
 // oldNextKey + r), so sorting (value, objectKey) pairs yields ascending objectKeys
 // within each value group.
 fn buildPropertyValueIndex(

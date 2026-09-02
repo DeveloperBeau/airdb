@@ -195,7 +195,7 @@ test "canDriveFromIndex: a chain of single-child conjunctions reaching exactly d
     try testing.expect(!planner.canDriveFromIndex(&scan, current));
 }
 
-test "isMoreSelective: exact counts order ascending, exact beats unbounded, unbounded beats nothing" {
+test "isMoreSelective: atMost counts order ascending, atMost beats unbounded, unbounded beats nothing" {
     try testing.expect(planner.isMoreSelective(.{ .atMost = 1 }, .{ .atMost = 2 }));
     try testing.expect(!planner.isMoreSelective(.{ .atMost = 2 }, .{ .atMost = 1 }));
     try testing.expect(planner.isMoreSelective(.{ .atMost = 0 }, .{ .atMost = 1 }));

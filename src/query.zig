@@ -188,7 +188,7 @@ fn endpointValue(
     const kind = scan.propertyKinds[property];
     if (kind != .int and kind != .link) return error.UnsupportedAggregate;
     if (scan.indexed[property]) {
-        // No residual liveness filtering needed here: rows.valueIndexRemove
+        // No residual liveness filtering needed here: rows.intValueIndexRemove
         // drops an outer key the moment its last live objectKey is removed
         // (delete, or update moving off the old value), so the value index's
         // outer key set already equals exactly the live values.

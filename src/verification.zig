@@ -217,6 +217,13 @@ fn auditBlobValueIndexBackward(readTransaction: *ReadTransaction, valueIndexRefe
         liveColumn: Reference,
         fn onEntry(self: @This(), key: []const u8, innerRoot: u64) anyerror!void {
             if ((try Index.count(self.readTransaction, innerRoot)) == 0) return; // empty set left by delete
+            // No writer of ours ever stores an outer key longer than
+            // blobIndexKey.maxLength (rows.blobValueIndexAdd routes every key
+            // through blobIndexKey.read into a 256-byte buffer), so a longer one
+            // here means the file disagrees with that invariant. Reject it as
+            // the corruption it is before the copy below, rather than reading
+            // past the end of the stack buffer.
+            if (key.len > blobIndexKey.maxLength) return error.ValueIndexStaleEntry;
             // Copy the outer key before the inner walk: it points into mapped
             // storage and the inner walk dereferences other nodes (each
             // objectKey's row and property column), so copying removes any

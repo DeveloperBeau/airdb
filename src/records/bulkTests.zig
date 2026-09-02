@@ -310,7 +310,7 @@ test "bulkValueIndex equals sequential maintenance" {
     const built = try bulkValueIndex(&writeTransaction, entries.items);
 
     // Sequential maintenance mirror: for each (value, objectKey) add objectKey to the inner
-    // set for value, exactly as rows.valueIndexAdd does.
+    // set for value, exactly as rows.intValueIndexAdd does.
     var seq = try Index.create(&writeTransaction);
     var index: u64 = 0;
     while (index < N) : (index += 1) {

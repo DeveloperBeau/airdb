@@ -665,6 +665,16 @@ test "a cursor against a blob property ordering is rejected before the ordering 
 // 12.9: fuzz.
 // ---------------------------------------------------------------------------
 
+// The 4-symbol alphabet makes short shared prefixes common rather than
+// astronomically rare, which is what exercises byte ordering (including the
+// 0xFF high-bit case) and the superset/verifyIntegrity invariants below over
+// many seeds. It does NOT make a 256-byte shared-prefix collision reachable:
+// two independently drawn values agreeing on 256 consecutive bytes from a
+// uniform 4-symbol alphabet has probability 4^-256, so neither this generator
+// nor the fixed 257-byte `longX` probe below will ever exercise that case
+// over any realistic seed count. That case is instead covered by five
+// hand-written tests: R1, the `gt` shared-prefix test, the >256-byte
+// `beginsWith` test, the `countWhere` shared-prefix test, and the churn test.
 fn generateFuzzValue(random: std.Random, allocator: std.mem.Allocator) ![]u8 {
     const boundaryLengths = [_]usize{ 0, 1, 2, 255, 256, 257 };
     const length = if (random.boolean())

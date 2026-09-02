@@ -619,7 +619,7 @@ const StopAfterFirst = struct {
     }
 };
 
-test "forEachEntryFromWhile: reaching a start key near the end of the range costs about as little as reaching one near the beginning (M15 guard)" {
+test "forEachEntryFromWhile: reaching a start key near the end of the range costs under 200 dereferences, so the descent shortcut is not silently lost (M15 guard)" {
     // childIndexForKey's descent is a traversal shortcut: forcing it to
     // always start at child 0 (M15 in the mutation table) is correctness
     // -equivalent (leafLowerBound filters every leaf regardless of how it was

@@ -225,7 +225,7 @@ test "maxKey survives an emptied rightmost leaf" {
 test "minKey survives an emptied leftmost leaf" {
     // The mirror of "maxKey survives an emptied rightmost leaf", exercised at
     // the low end: deleting the lowest range of an indexed property's values
-    // (rows.valueIndexRemove, run once per delete) empties the value index's
+    // (rows.intValueIndexRemove, run once per delete) empties the value index's
     // leftmost leaf without merging or dropping it. minKey must skip that
     // empty leaf and keep descending rather than reporting the tree empty or
     // returning a stale key out of it.

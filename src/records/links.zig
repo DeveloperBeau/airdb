@@ -32,7 +32,7 @@ fn blAdd(transaction: *WriteTransaction, backlinkReference: Reference, target: u
 
 // Remove `source` from the backlink set for `target`. No-op if absent.
 // When the set empties, its outer entry is removed and the set's nodes freed,
-// mirroring valueIndexRemove: link churn must not accumulate empty sets forever.
+// mirroring intValueIndexRemove: link churn must not accumulate empty sets forever.
 fn blRemove(transaction: *WriteTransaction, backlinkReference: Reference, target: u64, source: u64) !Reference {
     const existing = try Index.get(transaction, backlinkReference, target);
     const setRoot = existing orelse return backlinkReference;

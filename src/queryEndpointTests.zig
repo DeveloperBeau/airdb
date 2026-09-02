@@ -107,7 +107,7 @@ test "E2: unindexed path, same literals" {
 test "E3: the boundary-leaf case at the low end, end to end" {
     // The facade counterpart of the index-level "minKey survives an emptied
     // leftmost leaf" test, and the reason this phase exists: deleting the
-    // lowest primaryKeys drives rows.valueIndexRemove 32 times, emptying the
+    // lowest primaryKeys drives rows.intValueIndexRemove 32 times, emptying the
     // value index's leftmost leaf.
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
