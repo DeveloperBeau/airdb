@@ -9,6 +9,8 @@ const objects = @import("../records/objects.zig");
 const relocateRow = @import("relocation.zig").relocateRow;
 const fileStore = @import("fileStore.zig");
 const compactionCopy = @import("compactionCopy.zig");
+const byteKeyIndex = @import("../trees/byteKeyIndex.zig");
+const blobIndexKey = @import("../records/blobIndexKey.zig");
 
 const maxPropertyCount = catalog.maxPropertyCount;
 
@@ -348,7 +350,14 @@ fn checkRowProperties(
         }
         if (destinationView.indexed(propertyIndex)) {
             const dRaw = try Column.get(destination, destinationPropertyColumns[propertyIndex], drow);
-            const inner = (try Index.get(destination, destinationView.valueIndexReference(propertyIndex), dRaw)) orelse return error.CompactionMismatch;
+            const inner = switch (kinds[propertyIndex]) {
+                .blob => blk: {
+                    var keyBuffer: [blobIndexKey.maxLength]u8 = undefined;
+                    const key = try blobIndexKey.read(destination, dRaw, &keyBuffer);
+                    break :blk (try byteKeyIndex.get(destination, destinationView.valueIndexReference(propertyIndex), key)) orelse return error.CompactionMismatch;
+                },
+                else => (try Index.get(destination, destinationView.valueIndexReference(propertyIndex), dRaw)) orelse return error.CompactionMismatch,
+            };
             if ((try Index.get(destination, inner, pair.objectKey)) == null) return error.CompactionMismatch;
         }
     }
