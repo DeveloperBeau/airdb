@@ -248,6 +248,36 @@ test "beginsWith with a prefix longer than 256 bytes returns only the exactly-ma
     try testing.expectEqualSlices(u64, &.{fixture.objectKeys[9]}, hits.items);
 }
 
+test "M4 guard: collectCandidates for beginsWith stops at the first non-matching key, not merely filtering after the fact" {
+    // The final where() result is unaffected by an over-collecting walk (the
+    // residual filter cleans it up either way), so this asserts the raw
+    // candidate set planner.collectCandidates produces directly: with probe
+    // "b" the ascending walk must stop at "cherry" (which sorts after
+    // "banana"/"bananas" but does not begin with "b"), not continue picking up
+    // every later key (value255, value256, and the shared-prefix pair).
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try qisTmpPath(testing.allocator, &tmp, "qis_m4_guard.airdb");
+    defer testing.allocator.free(path);
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    var writeTransaction = try database.beginWrite();
+    defer writeTransaction.deinit();
+    const fixture = try seedIndexedStringCatalog(&writeTransaction);
+
+    const scan = try Scan.open(&writeTransaction, fixture.catalogReference);
+    var candidates = std.ArrayList(u64).empty;
+    defer candidates.deinit(testing.allocator);
+    try planner.collectCandidates(&writeTransaction, &scan, bytesComparison(2, .beginsWith, "b"), &candidates, testing.allocator, 0);
+    std.mem.sort(u64, candidates.items, {}, std.sort.asc(u64));
+
+    // Hand-known from the fixture: only "banana" (index 3) and "bananas"
+    // (index 4) begin with "b".
+    var expected = [_]u64{ fixture.objectKeys[3], fixture.objectKeys[4] };
+    std.mem.sort(u64, &expected, {}, std.sort.asc(u64));
+    try testing.expectEqualSlices(u64, &expected, candidates.items);
+}
+
 test "beginsWith the empty prefix returns every live row" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -417,6 +447,86 @@ test "R2: an insert and update in one transaction leaves no stale index key" {
     try testing.expectEqualSlices(u64, &.{inserted.objectKey}, gammaHits.items);
 
     try verification.verifyIntegrity(&database);
+}
+
+// Runs `updateCount` updates of property 1 (a blob), each in its own
+// committed transaction, and returns the arena's total growth over the loop.
+// `sizeAt(updateIndex)` decides each iteration's replacement length: a
+// constant makes every replacement the same size (exact-size-class reuse can
+// apply), while a strictly increasing function makes every replacement a
+// fresh size (reuse can never apply, the baseline for "no reclamation is
+// possible here regardless of the fix").
+fn arenaGrowthOverUpdateLoop(path: []const u8, updateCount: usize, sizeAt: fn (usize) usize) !u64 {
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+    const definitions = [_]catalog.PropertyDefinition{ .{ .kind = .int }, .{ .kind = .blob, .indexed = true } };
+    const initialBytes = try testing.allocator.alloc(u8, sizeAt(0));
+    defer testing.allocator.free(initialBytes);
+    @memset(initialBytes, 0);
+    {
+        var writeTransaction = try database.beginWrite();
+        var directoryReference = try typeDirectory.createWithDefinitions(&writeTransaction, &.{&definitions});
+        const inserted = try typeRouting.insert(&writeTransaction, directoryReference, directoryTypeId, &.{ .{ .int = 1 }, .{ .bytes = initialBytes } });
+        directoryReference = inserted.directoryReference;
+        writeTransaction.setRoot(directoryReference);
+        _ = try writeTransaction.commit();
+    }
+
+    const topAfterSetup = database.arena.top;
+    var updateIndex: usize = 0;
+    while (updateIndex < updateCount) : (updateIndex += 1) {
+        const buffer = try testing.allocator.alloc(u8, sizeAt(updateIndex));
+        defer testing.allocator.free(buffer);
+        @memset(buffer, @truncate(updateIndex));
+        var writeTransaction = try database.beginWrite();
+        var propertyBuffer: [2]catalog.Value = undefined;
+        const version = (try typeRouting.get(&writeTransaction, database.activeRoot, directoryTypeId, 1, &propertyBuffer)).?;
+        const directoryReference = (try typeRouting.update(&writeTransaction, database.activeRoot, directoryTypeId, 1, &.{ .{ .int = 1 }, .{ .bytes = buffer } }, version)).ok.directoryReference;
+        writeTransaction.setRoot(directoryReference);
+        _ = try writeTransaction.commit();
+    }
+    return database.arena.top - topAfterSetup;
+}
+
+fn constantBlobSize(_: usize) usize {
+    return 1000;
+}
+
+fn increasingBlobSize(updateIndex: usize) usize {
+    return 1000 + updateIndex; // strictly distinct every iteration: never reusable
+}
+
+test "M7 guard: reclaiming a same-size replacement grows the arena measurably less than a scenario where reuse is impossible" {
+    // R2's correctness assertions (eq "alpha" empty, eq "gamma" present) do not
+    // fail if freeReplacedBlobs is deleted entirely: a leaked old blob is
+    // still a valid, readable node the query engine never looks at again, so
+    // the result set is unaffected. What a deleted freeReplacedBlobs call DOES
+    // do is stop reclaiming space, which this test measures directly and
+    // self-calibrates against a baseline where reclamation cannot help even
+    // when it runs, rather than asserting a hand-guessed byte threshold.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const reusablePath = try qisTmpPath(testing.allocator, &tmp, "qis_m7_reusable.airdb");
+    defer testing.allocator.free(reusablePath);
+    const neverReusablePath = try qisTmpPath(testing.allocator, &tmp, "qis_m7_never_reusable.airdb");
+    defer testing.allocator.free(neverReusablePath);
+
+    const updateCount = 100;
+    const reusableGrowth = try arenaGrowthOverUpdateLoop(reusablePath, updateCount, constantBlobSize);
+    const neverReusableGrowth = try arenaGrowthOverUpdateLoop(neverReusablePath, updateCount, increasingBlobSize);
+
+    // With freeReplacedBlobs freeing the old same-size extent each time, later
+    // commits reuse it; when no replacement can ever be reused (sizes always
+    // differ), nothing is ever reclaimable regardless of the fix. If
+    // freeReplacedBlobs were deleted, neither loop would ever reclaim
+    // anything, and this inequality would collapse.
+    // A fixed absolute margin, not a ratio: per-transaction overhead unrelated
+    // to the blob payload (catalog COW, version/live columns, free-list
+    // bookkeeping) is paid by both loops alike, so only a margin comfortably
+    // smaller than the measured reuse saving (~49,000 bytes over 100
+    // iterations) survives; deleting freeReplacedBlobs collapses the gap
+    // between the two loops to near zero.
+    try testing.expect(reusableGrowth + 20_000 < neverReusableGrowth);
 }
 
 test "a chunked value on the indexed property: beginsWith on its first 256 bytes finds it, eq on the full copy finds it" {
