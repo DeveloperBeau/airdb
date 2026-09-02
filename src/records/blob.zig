@@ -512,7 +512,7 @@ test "readPrefix of an inline value longer than out copies exactly out.len bytes
     try testing.expectEqualSlices(u8, "hello", out[0..5]);
 }
 
-test "readPrefix of a chunked value returns the correct byte count and bytes at three boundary points" {
+test "readPrefix of a chunked value returns the correct byte count and bytes at four boundary points" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try blobTmpPath(testing.allocator, &tmp, "blob_readprefix_chunked.airdb");
@@ -552,6 +552,16 @@ test "readPrefix of a chunked value returns the correct byte count and bytes at 
         const copied = try readPrefix(&writeTransaction, reference, out);
         try testing.expectEqual(wanted, copied);
         try testing.expectEqualSlices(u8, source[0..wanted], out);
+    }
+    // (d) out.len == the value's full length: the loop reads all 3 chunks
+    // and exits via chunkIndex == header.chunkCount, a different exit than
+    // (a)-(c)'s copied == out.len, and the only way to reach chunk 2.
+    {
+        const out = try testing.allocator.alloc(u8, byteCount);
+        defer testing.allocator.free(out);
+        const copied = try readPrefix(&writeTransaction, reference, out);
+        try testing.expectEqual(byteCount, copied);
+        try testing.expectEqualSlices(u8, source, out);
     }
 }
 

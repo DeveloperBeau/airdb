@@ -420,33 +420,88 @@ test "R2: an insert and update in one transaction leaves no stale index key" {
     var database = try Database.create(testing.allocator, path);
     defer database.deinit();
 
+    // Uses the raw catalog/objects API, not typeDirectory/typeRouting: routing
+    // through typeDirectory would call setCatalogReference after this row's
+    // own insert, freeing an 11-byte directory node into the SAME free-list
+    // bucket (round8(11) == round8(10) == 16) as the "alpha"/"gamma" blob
+    // value below, ahead of it in the reuse queue -- which shields the exact
+    // aliasing this test exists to catch (see the section 4.4 fix this test
+    // pins). The bare catalog reference this creates is never registered
+    // under a type directory, so verifyIntegrity's typeDirectory walk below
+    // finds nothing to audit and returns cleanly without having checked
+    // anything further; the where() queries above it are what actually prove
+    // the invariant.
     var writeTransaction = try database.beginWrite();
-    const definitions = [_]catalog.PropertyDefinition{ .{ .kind = .int }, .{ .kind = .blob, .indexed = true } };
-    var directoryReference = try typeDirectory.createWithDefinitions(&writeTransaction, &.{&definitions});
-    const inserted = try typeRouting.insert(&writeTransaction, directoryReference, directoryTypeId, &.{ .{ .int = 1 }, .{ .bytes = "alpha" } });
-    directoryReference = inserted.directoryReference;
+    var catalogReference = try catalog.createFromDefinitions(&writeTransaction, &.{ .{ .kind = .int }, .{ .kind = .blob, .indexed = true } });
+    const inserted = try objects.insertTyped(&writeTransaction, catalogReference, &.{ .{ .int = 1 }, .{ .bytes = "alpha" } });
+    catalogReference = inserted.catalogReference;
     var propertyBuffer: [2]catalog.Value = undefined;
-    const insertedVersion = (try typeRouting.get(&writeTransaction, directoryReference, directoryTypeId, 1, &propertyBuffer)).?;
+    const insertedVersion = (try objects.getTyped(&writeTransaction, catalogReference, 1, &propertyBuffer)).?;
     // "alpha" and "gamma" are the same length, which is what makes the freed
     // extent exactly reusable and would trigger the bug section 4.4 fixes.
-    directoryReference = (try typeRouting.update(&writeTransaction, directoryReference, directoryTypeId, 1, &.{ .{ .int = 1 }, .{ .bytes = "gamma" } }, insertedVersion)).ok.directoryReference;
-    writeTransaction.setRoot(directoryReference);
+    catalogReference = (try objects.updateTyped(&writeTransaction, catalogReference, 1, &.{ .{ .int = 1 }, .{ .bytes = "gamma" } }, insertedVersion)).ok.catalogReference;
+    writeTransaction.setRoot(catalogReference);
     _ = try writeTransaction.commit();
 
     var readTransaction = try database.beginWrite();
     defer readTransaction.deinit();
-    const catalogReference = try typeDirectory.catalogReference(&readTransaction, database.activeRoot, directoryTypeId);
     var alphaHits = std.ArrayList(u64).empty;
     defer alphaHits.deinit(testing.allocator);
-    try where(&readTransaction, catalogReference, .{ .predicate = bytesComparison(1, .eq, "alpha") }, &alphaHits, testing.allocator);
+    try where(&readTransaction, database.activeRoot, .{ .predicate = bytesComparison(1, .eq, "alpha") }, &alphaHits, testing.allocator);
     try testing.expectEqual(@as(usize, 0), alphaHits.items.len);
 
     var gammaHits = std.ArrayList(u64).empty;
     defer gammaHits.deinit(testing.allocator);
-    try where(&readTransaction, catalogReference, .{ .predicate = bytesComparison(1, .eq, "gamma") }, &gammaHits, testing.allocator);
+    try where(&readTransaction, database.activeRoot, .{ .predicate = bytesComparison(1, .eq, "gamma") }, &gammaHits, testing.allocator);
     try testing.expectEqualSlices(u64, &.{inserted.objectKey}, gammaHits.items);
 
     try verification.verifyIntegrity(&database);
+}
+
+test "no-op guard: a same-bytes blob update on a multi-blob-property type leaves the index and the other blob property intact" {
+    // Same mechanism family as R2/M8: updateTyped always reallocates and
+    // frees the old blob for every .blob property present, even when the
+    // caller passes back the SAME bytes. A no-op "update" still runs the
+    // free/put/remove/add sequence, which is exactly where the aliasing R2
+    // pins lives -- this pins the false-positive direction: a no-op must not
+    // accidentally delete the row from its own index, and a second blob
+    // property on the same row, also passed back unchanged, must not be
+    // corrupted by property 1's own free/put cycle either. Raw catalog/
+    // objects API, not typeDirectory/typeRouting, for the same
+    // free-list-bucket-contamination reason R2's comment explains.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try qisTmpPath(testing.allocator, &tmp, "qis_noop.airdb");
+    defer testing.allocator.free(path);
+    var database = try Database.create(testing.allocator, path);
+    defer database.deinit();
+
+    var writeTransaction = try database.beginWrite();
+    var catalogReference = try catalog.createFromDefinitions(&writeTransaction, &.{
+        .{ .kind = .int },
+        .{ .kind = .blob, .indexed = true },
+        .{ .kind = .blob },
+    });
+    const inserted = try objects.insertTyped(&writeTransaction, catalogReference, &.{ .{ .int = 1 }, .{ .bytes = "alpha" }, .{ .bytes = "static" } });
+    catalogReference = inserted.catalogReference;
+    var propertyBuffer: [3]catalog.Value = undefined;
+    const insertedVersion = (try objects.getTyped(&writeTransaction, catalogReference, 1, &propertyBuffer)).?;
+    // The no-op: identical bytes on both blob properties, same length.
+    catalogReference = (try objects.updateTyped(&writeTransaction, catalogReference, 1, &.{ .{ .int = 1 }, .{ .bytes = "alpha" }, .{ .bytes = "static" } }, insertedVersion)).ok.catalogReference;
+    writeTransaction.setRoot(catalogReference);
+    _ = try writeTransaction.commit();
+
+    var readTransaction = try database.beginWrite();
+    defer readTransaction.deinit();
+    var alphaHits = std.ArrayList(u64).empty;
+    defer alphaHits.deinit(testing.allocator);
+    try where(&readTransaction, database.activeRoot, .{ .predicate = bytesComparison(1, .eq, "alpha") }, &alphaHits, testing.allocator);
+    try testing.expectEqualSlices(u64, &.{inserted.objectKey}, alphaHits.items);
+
+    var afterBuffer: [3]catalog.Value = undefined;
+    _ = (try objects.getTypedByObjectKey(&readTransaction, database.activeRoot, inserted.objectKey, &afterBuffer)).?;
+    try testing.expectEqualStrings("alpha", afterBuffer[1].bytes);
+    try testing.expectEqualStrings("static", afterBuffer[2].bytes);
 }
 
 // Runs `updateCount` updates of property 1 (a blob), each in its own
