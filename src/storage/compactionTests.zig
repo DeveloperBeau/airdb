@@ -915,7 +915,7 @@ test "compactInPlace preserves value indexes and passes verifyIntegrity" {
     const catalogReference = try typeDirectory.catalogReference(&readTransaction, readTransaction.root(), 0);
     var hits = std.ArrayList(u64).empty;
     defer hits.deinit(testing.allocator);
-    try query.where(&readTransaction, catalogReference, .{ .comparison = .{ .property = 1, .operator = .eq, .value = .{ .int = 3 } } }, &hits, testing.allocator);
+    try query.where(&readTransaction, catalogReference, .{ .predicate = .{ .comparison = .{ .property = 1, .operator = .eq, .value = .{ .int = 3 } } } }, &hits, testing.allocator);
     try testing.expectEqual(@as(usize, 10), hits.items.len);
 }
 

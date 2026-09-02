@@ -8,16 +8,35 @@
 //! Results are object keys (objectKeys); materialize them with
 //! objects.getTypedByObjectKey. The fetch model is stale-snapshot: a query reads one
 //! committed snapshot and returns detached keys, never live cursors.
+//!
+//! `countWhere` and `aggregateInt` take a bare `Predicate` rather than a `Request`:
+//! neither has an order and neither has a page, so a `Request` would offer fields
+//! that do nothing for them.
 
 const std = @import("std");
 const catalog = @import("schema/catalog.zig");
-const index = @import("trees/index.zig");
 const Column = @import("trees/column.zig");
 const Reference = @import("storage/reference.zig").Reference;
 const Scan = @import("query/scan.zig").Scan;
-const evaluation = @import("query/evaluation.zig");
-const planner = @import("query/planner.zig");
+const execution = @import("query/execution.zig");
 const predicateLanguage = @import("query/predicate.zig");
+const orderingLanguage = @import("query/ordering.zig");
+const paging = @import("query/paging.zig");
+
+/// Direction an ordered query emits in.
+pub const SortOrder = orderingLanguage.SortOrder;
+/// What a query orders by: the stable object key, or one int or link property's value.
+pub const SortKey = orderingLanguage.SortKey;
+/// How a query orders its results.
+pub const Ordering = orderingLanguage.Ordering;
+/// The last row a page delivered, for resuming a page with `cursorAfter`.
+pub const Cursor = orderingLanguage.Cursor;
+/// Where a page begins: after an offset, or immediately after a cursor.
+pub const PageStart = orderingLanguage.PageStart;
+/// One page of results: where it starts and how many rows it takes.
+pub const Page = orderingLanguage.Page;
+/// Everything a query asks for: which rows, in what order, and which page.
+pub const Request = orderingLanguage.Request;
 
 /// A filter tree over a type's properties.
 pub const Predicate = predicateLanguage.Predicate;
@@ -34,74 +53,22 @@ pub const Match = predicateLanguage.Match;
 /// eventually arrive across the C ABI, which is an untrusted boundary.
 pub const maxPredicateDepth = predicateLanguage.maxPredicateDepth;
 
-/// Run a query: stream every live matching (objectKey, row) pair into
-/// `onMatch(context, objectKey, row)`. With a driving predicate the candidate
-/// set comes from that property's value index (bounded by its selectivity, so
-/// a temporary candidate buffer is fine); the full-scan path streams the
-/// key->row index directly and evaluates each row inside the traversal, so no
-/// O(live) buffer is ever materialized.
-fn runQuery(
-    transaction: anytype,
-    scan: *const Scan,
-    predicate: Predicate,
-    allocator: std.mem.Allocator,
-    context: anytype,
-    comptime onMatch: fn (@TypeOf(context), u64, u64) anyerror!void,
-) !void {
-    if (planner.canDriveFromIndex(scan, predicate)) {
-        var candidates = std.ArrayList(u64).empty;
-        defer candidates.deinit(allocator);
-        try planner.collectCandidates(transaction, scan, predicate, &candidates, allocator, 0);
-        std.mem.sort(u64, candidates.items, {}, std.sort.asc(u64));
-        var previousCandidate: ?u64 = null;
-        for (candidates.items) |objectKey| {
-            if (previousCandidate != null and previousCandidate.? == objectKey) continue;
-            previousCandidate = objectKey;
-            const row = (try index.get(transaction, scan.keyToRowIndexReference, objectKey)) orelse continue;
-            if (try evaluation.isLiveMatch(transaction, scan, row, predicate)) try onMatch(context, objectKey, row);
-        }
-        return;
-    }
-    const Stream = struct {
-        transaction: @TypeOf(transaction),
-        scan: *const Scan,
-        predicate: Predicate,
-        inner: @TypeOf(context),
-        fn onEntry(self: @This(), objectKey: u64, row: u64) anyerror!void {
-            if (try evaluation.isLiveMatch(self.transaction, self.scan, row, self.predicate)) try onMatch(self.inner, objectKey, row);
-        }
-    };
-    try index.forEachEntry(transaction, scan.keyToRowIndexReference, Stream{
-        .transaction = transaction,
-        .scan = scan,
-        .predicate = predicate,
-        .inner = context,
-    }, Stream.onEntry);
-}
-
-/// Append the objectKeys of every live row satisfying `predicate` to `out`, in
-/// ascending objectKey order. `out` grows with `allocator` and the caller owns
-/// it. Drives off a value index when the tree allows one; otherwise a full scan
-/// over the live set (O(n) tree walks). A driving term that matches most rows
-/// materializes a candidate list proportional to its match count; bounded
-/// delivery is future work.
+/// Append one page of the objectKeys satisfying `request` to `out`, in the
+/// order `request.ordering` asks for. `out` grows with `allocator`, the caller
+/// owns it, and existing items are left in place. Which orderings bound their
+/// work and which do not is documented on `paging.collectPage`; the short form
+/// is that every ordering except property ordering on an unindexed property
+/// stops walking when the page fills.
 pub fn where(
     transaction: anytype,
     catalogReference: Reference,
-    predicate: Predicate,
+    request: Request,
     out: *std.ArrayList(u64),
     allocator: std.mem.Allocator,
 ) !void {
     const scan = try Scan.open(transaction, catalogReference);
-    try predicate.validate(scan.propertyKinds[0..scan.propertyCount]);
-    const Sink = struct {
-        out: *std.ArrayList(u64),
-        allocator: std.mem.Allocator,
-        fn onMatch(self: @This(), objectKey: u64, _: u64) anyerror!void {
-            try self.out.append(self.allocator, objectKey);
-        }
-    };
-    try runQuery(transaction, &scan, predicate, allocator, Sink{ .out = out, .allocator = allocator }, Sink.onMatch);
+    try request.validate(&scan);
+    try paging.collectPage(transaction, &scan, request, out, allocator);
 }
 
 /// Number of live rows satisfying `predicate`. The full-scan path streams,
@@ -118,11 +85,12 @@ pub fn countWhere(
     var rowCount: u64 = 0;
     const Sink = struct {
         rowCount: *u64,
-        fn onMatch(self: @This(), _: u64, _: u64) anyerror!void {
+        fn onMatch(self: @This(), _: u64, _: u64) anyerror!bool {
             self.rowCount.* += 1;
+            return true;
         }
     };
-    try runQuery(transaction, &scan, predicate, allocator, Sink{ .rowCount = &rowCount }, Sink.onMatch);
+    try execution.runQuery(transaction, &scan, predicate, .ascending, null, allocator, Sink{ .rowCount = &rowCount }, Sink.onMatch);
     return rowCount;
 }
 
@@ -132,7 +100,10 @@ pub const Aggregate = struct { count: u64, sum: u64, min: ?u64, max: ?u64 };
 
 /// Aggregate int property `property` over the live rows satisfying `predicate`.
 /// `sum` wraps on overflow; min/max are null when no row matches. O(n) over the
-/// live set without a usable value index.
+/// live set without a usable value index. `property`'s kind is not yet
+/// checked, unlike `sortByProperty` and `Request.validate`: a blob or
+/// collection property aggregates its raw tree-root u64 rather than being
+/// rejected. That check arrives with collection predicates.
 pub fn aggregateInt(
     transaction: anytype,
     catalogReference: Reference,
@@ -149,15 +120,16 @@ pub fn aggregateInt(
         scan: *const Scan,
         property: usize,
         agg: *Aggregate,
-        fn onMatch(self: @This(), _: u64, row: u64) anyerror!void {
+        fn onMatch(self: @This(), _: u64, row: u64) anyerror!bool {
             const value = try Column.get(self.transaction, self.scan.propertyReferences[self.property], row);
             self.agg.count += 1;
             self.agg.sum +%= value;
             if (self.agg.min == null or value < self.agg.min.?) self.agg.min = value;
             if (self.agg.max == null or value > self.agg.max.?) self.agg.max = value;
+            return true;
         }
     };
-    try runQuery(transaction, &scan, predicate, allocator, Sink{ .transaction = transaction, .scan = &scan, .property = property, .agg = &agg }, Sink.onMatch);
+    try execution.runQuery(transaction, &scan, predicate, .ascending, null, allocator, Sink{ .transaction = transaction, .scan = &scan, .property = property, .agg = &agg }, Sink.onMatch);
     return agg;
 }
 
@@ -177,41 +149,101 @@ pub fn rangeInclusive(
         .{ .comparison = .{ .property = property, .operator = .ge, .value = .{ .int = low } } },
         .{ .comparison = .{ .property = property, .operator = .le, .value = .{ .int = high } } },
     };
-    try where(transaction, catalogReference, .{ .conjunction = &bounds }, out, allocator);
+    try where(transaction, catalogReference, .{ .predicate = .{ .conjunction = &bounds } }, out, allocator);
 }
 
-/// Sort a slice of objectKeys in place by int property `property`, ascending.
-/// Reads each row's value once into a temporary pair array (allocated from
-/// `allocator`, freed before returning), then sorts: O(k log k) plus a tree
-/// walk per key. A key that no longer resolves is error.NotFound.
-pub fn sortByPropertyAscending(
+/// The first objectKey `request` matches in its ordering, or null when nothing
+/// matches. Honours `request.page.start` (so it can ask for the first row after
+/// a cursor or after an offset) and ignores `request.page.limit`. Costs one
+/// page of size 1, so on the lazy orderings it stops at the first match; it
+/// allocates one small result buffer and frees it. I/O.
+pub fn first(
+    transaction: anytype,
+    catalogReference: Reference,
+    request: Request,
+    allocator: std.mem.Allocator,
+) !?u64 {
+    var out = std.ArrayList(u64).empty;
+    defer out.deinit(allocator);
+    var firstPageRequest = request;
+    firstPageRequest.page.limit = 1;
+    try where(transaction, catalogReference, firstPageRequest, &out, allocator);
+    return if (out.items.len == 0) null else out.items[0];
+}
+
+/// Whether any live row satisfies `request`. Same cost as `first`, which it is
+/// defined in terms of. I/O.
+pub fn exists(
+    transaction: anytype,
+    catalogReference: Reference,
+    request: Request,
+    allocator: std.mem.Allocator,
+) !bool {
+    return (try first(transaction, catalogReference, request, allocator)) != null;
+}
+
+/// The cursor that resumes immediately after `objectKey` under `ordering`.
+/// Call it on the transaction that produced the page: it reads the row's
+/// current sort value, so a value that changed since the page was fetched
+/// yields a cursor for the new position. `error.NotFound` when `objectKey` no
+/// longer resolves, `error.BadProperty` when `ordering`'s property is outside
+/// the type. O(1) and no I/O for `.objectKey`; one index descent plus one
+/// column read for `.property`.
+pub fn cursorAfter(
+    transaction: anytype,
+    catalogReference: Reference,
+    ordering: Ordering,
+    objectKey: u64,
+) !Cursor {
+    switch (ordering.sortKey) {
+        .objectKey => return .{ .lastValue = objectKey, .lastObjectKey = objectKey },
+        .property => |property| {
+            const view = try catalog.loadCatalog(transaction, catalogReference);
+            if (property >= view.propertyCount) return error.BadProperty;
+            const row = (try catalog.objectKeyToRow(transaction, catalogReference, objectKey)) orelse return error.NotFound;
+            const value = try Column.get(transaction, view.propertyColumnReference(property), row);
+            return .{ .lastValue = value, .lastObjectKey = objectKey };
+        },
+    }
+}
+
+/// Sort a slice of objectKeys in place by int or link property `property`, in
+/// `order`. Ties break by objectKey, ascending under `.ascending` and
+/// descending under `.descending`, so the result is a total order and
+/// `.descending` is the exact reverse of `.ascending`. Reads each row's value
+/// once into a temporary pair array (allocated from `allocator`, freed before
+/// returning), then sorts: O(k log k) plus a tree walk per key.
+/// `error.BadProperty` when `property` is outside the type,
+/// `error.UnsupportedOrdering` when its kind is neither int nor link, and
+/// `error.NotFound` when a key no longer resolves.
+pub fn sortByProperty(
     transaction: anytype,
     catalogReference: Reference,
     objectKeys: []u64,
     property: usize,
+    order: SortOrder,
     allocator: std.mem.Allocator,
 ) !void {
     const view = try catalog.loadCatalog(transaction, catalogReference);
     if (property >= view.propertyCount) return error.BadProperty;
+    const kind = view.kind(property);
+    if (kind != .int and kind != .link) return error.UnsupportedOrdering;
     const column = view.propertyColumnReference(property);
-    const SortPair = struct { value: u64, key: u64 };
-    const pairs = try allocator.alloc(SortPair, objectKeys.len);
-    defer allocator.free(pairs);
-    for (objectKeys, 0..) |key, rowIndex| {
+    const entries = try allocator.alloc(orderingLanguage.SortEntry, objectKeys.len);
+    defer allocator.free(entries);
+    for (objectKeys, 0..) |key, entryIndex| {
         // A caller-supplied objectKey that no longer resolves (stale or deleted) is
         // an input error, not a crash.
         const row = (try catalog.objectKeyToRow(transaction, catalogReference, key)) orelse return error.NotFound;
-        pairs[rowIndex] = .{ .value = try Column.get(transaction, column, row), .key = key };
+        entries[entryIndex] = .{ .value = try Column.get(transaction, column, row), .objectKey = key };
     }
-    std.mem.sort(SortPair, pairs, {}, struct {
-        fn lessThan(_: void, left: SortPair, right: SortPair) bool {
-            return left.value < right.value;
-        }
-    }.lessThan);
-    for (pairs, 0..) |pair, rowIndex| objectKeys[rowIndex] = pair.key;
+    std.mem.sort(orderingLanguage.SortEntry, entries, order, orderingLanguage.isOrderedBefore);
+    for (entries, 0..) |entry, entryIndex| objectKeys[entryIndex] = entry.objectKey;
 }
 
 test {
     _ = @import("queryTests.zig");
     _ = @import("queryDifferentialTests.zig");
+    _ = @import("queryPaginationTests.zig");
+    _ = @import("queryLazinessTests.zig");
 }
