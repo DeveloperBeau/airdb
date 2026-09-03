@@ -4,6 +4,7 @@ const Reference = @import("../storage/reference.zig").Reference;
 const Column = @import("../trees/column.zig");
 const Index = @import("../trees/index.zig");
 const catalog = @import("../schema/catalog.zig");
+const rows = @import("rows.zig");
 
 const PropertyKind = catalog.PropertyKind;
 const ElementKind = catalog.ElementKind;
@@ -112,8 +113,9 @@ pub fn backlinkCollect(
 
 /// Set (target non-null) or clear (target null) link property `property` of
 /// the object with primary key `primaryKey`, returning the new catalog reference.
-/// Maintains the backlink index and bumps the row version. Setting the value
-/// it already has is a no-op that returns `catalogReference` unchanged. Tree walks,
+/// Maintains the backlink index and bumps the row version. Maintains the
+/// property's value index when it is indexed. Setting the value it already
+/// has is a no-op that returns `catalogReference` unchanged. Tree walks,
 /// O(log n).
 ///
 /// Backlink SOURCES are object keys, never physical rows: rows move under
@@ -130,7 +132,15 @@ pub fn setLink(transaction: *WriteTransaction, catalogReference: Reference, prim
     if (oldTarget == target) return catalogReference; // unchanged
 
     const newRaw: u64 = if (target) |unwrapped| unwrapped + 1 else 0;
+    const indexed = blk: {
+        const view = try catalog.loadCatalog(transaction, catalogReference);
+        break :blk view.indexed(property);
+    };
     var newCatalog = try catalog.replaceCollectionRoot(transaction, catalogReference, row, property, newRaw);
+    if (indexed) {
+        newCatalog = try rows.removeFromValueIndex(transaction, newCatalog, property, oldRaw, objectKey);
+        newCatalog = try rows.addToValueIndex(transaction, newCatalog, property, newRaw, objectKey);
+    }
     if (oldTarget) |previousTarget| newCatalog = try removeBacklink(transaction, newCatalog, property, previousTarget, objectKey);
     if (target) |newTarget| newCatalog = try addBacklink(transaction, newCatalog, property, newTarget, objectKey);
     return newCatalog;
@@ -242,15 +252,15 @@ pub fn nullifyInboundInCatalog(transaction: *WriteTransaction, catalogReference:
         var sources = std.ArrayList(u64).empty;
         defer sources.deinit(alloc);
         try backlinkCollect(transaction, currentCatalog, propertyIndex, objectKey, &sources, alloc);
-        for (sources.items) |src| {
-            // src is a source object key; resolve to its physical row for column
-            // access. A backlink entry whose source no longer resolves is stale
+        for (sources.items) |sourceObjectKey| {
+            // sourceObjectKey is a source object key; resolve to its physical row for
+            // column access. A backlink entry whose source no longer resolves is stale
             // (corrupt or already deleted); skip it -- the whole set for objectKey is
             // dropped below regardless.
-            const srcRow = (try catalog.objectKeyToRow(transaction, currentCatalog, src)) orelse continue;
+            const sourceRow = (try catalog.objectKeyToRow(transaction, currentCatalog, sourceObjectKey)) orelse continue;
             // matchAll means this catalog is the target's own type, so
-            // src == objectKey is the row being deleted referencing itself.
-            const selfSource = matchAll and src == objectKey;
+            // sourceObjectKey == objectKey is the row being deleted referencing itself.
+            const selfSource = matchAll and sourceObjectKey == objectKey;
             // A self-sourced to-many entry is left untouched: the dying row's
             // set tree is freed wholesale from its column raw by the delete's
             // storage reclamation, and Index.remove COWs -- freeing the old
@@ -258,9 +268,9 @@ pub fn nullifyInboundInCatalog(transaction: *WriteTransaction, catalogReference:
             // The backlink set for objectKey is dropped below regardless.
             if (selfSource and kind == .linkSet) continue;
             currentCatalog = if (kind == .link)
-                try nullifySourceLink(transaction, currentCatalog, propertyIndex, srcRow, !selfSource)
+                try nullifySourceLink(transaction, currentCatalog, propertyIndex, sourceObjectKey, sourceRow, !selfSource)
             else
-                try nullifySourceLinkSet(transaction, currentCatalog, propertyIndex, srcRow, objectKey, !selfSource);
+                try nullifySourceLinkSet(transaction, currentCatalog, propertyIndex, sourceRow, objectKey, !selfSource);
         }
         currentCatalog = try dropBacklinkSet(transaction, currentCatalog, propertyIndex, objectKey);
     }
@@ -274,25 +284,38 @@ pub fn nullifyInboundInCatalog(transaction: *WriteTransaction, catalogReference:
 // resurrecting a dangling link. The SELF-link case passes false: bumping the
 // row being deleted would make the follow-up tombstone's version check fail
 // forever, leaving self-linked objects undeletable.
-fn nullifySourceLink(transaction: *WriteTransaction, catalogReference: Reference, property: usize, srcRow: u64, bumpVersion: bool) !Reference {
+//
+// When the property is indexed, the source's objectKey is MOVED in the value
+// index from its old target's raw to 0, in the same transaction: the index is
+// the authority for indexed reads (query.minimum/maximum read its key set with
+// no residual filter, and query.where(property eq 0) drives off it), so a
+// bypassed index is a query that silently omits this row.
+fn nullifySourceLink(transaction: *WriteTransaction, catalogReference: Reference, property: usize, sourceObjectKey: u64, sourceRow: u64, bumpVersion: bool) !Reference {
     var snapshot = try catalog.CatalogSnapshot.load(transaction, catalogReference);
-    snapshot.properties[property].column = try Column.set(transaction, snapshot.properties[property].column, srcRow, 0);
+    const previousRaw = try Column.get(transaction, snapshot.properties[property].column, sourceRow);
+    const indexed = snapshot.properties[property].indexed;
+    snapshot.properties[property].column = try Column.set(transaction, snapshot.properties[property].column, sourceRow, 0);
     if (bumpVersion) {
-        snapshot.versionColumnReference = try Column.set(transaction, snapshot.versionColumnReference, srcRow, transaction.newVersion);
+        snapshot.versionColumnReference = try Column.set(transaction, snapshot.versionColumnReference, sourceRow, transaction.newVersion);
     }
-    return snapshot.replace(transaction);
+    var updatedCatalog = try snapshot.replace(transaction);
+    if (indexed and previousRaw != 0) {
+        updatedCatalog = try rows.removeFromValueIndex(transaction, updatedCatalog, property, previousRaw, sourceObjectKey);
+        updatedCatalog = try rows.addToValueIndex(transaction, updatedCatalog, property, 0, sourceObjectKey);
+    }
+    return updatedCatalog;
 }
 
 // Nullify one source row's to-many link (the linkSet path of inbound
 // nullify): remove `objectKey` from the source's set. `bumpVersion` follows the
 // same conflict-surfacing rule as nullifySourceLink.
-fn nullifySourceLinkSet(transaction: *WriteTransaction, catalogReference: Reference, property: usize, srcRow: u64, objectKey: u64, bumpVersion: bool) !Reference {
+fn nullifySourceLinkSet(transaction: *WriteTransaction, catalogReference: Reference, property: usize, sourceRow: u64, objectKey: u64, bumpVersion: bool) !Reference {
     var snapshot = try catalog.CatalogSnapshot.load(transaction, catalogReference);
-    const srcSet = try Column.get(transaction, snapshot.properties[property].column, srcRow);
-    const newSet = try Index.remove(transaction, srcSet, objectKey);
-    snapshot.properties[property].column = try Column.set(transaction, snapshot.properties[property].column, srcRow, newSet);
+    const sourceSet = try Column.get(transaction, snapshot.properties[property].column, sourceRow);
+    const newSet = try Index.remove(transaction, sourceSet, objectKey);
+    snapshot.properties[property].column = try Column.set(transaction, snapshot.properties[property].column, sourceRow, newSet);
     if (bumpVersion) {
-        snapshot.versionColumnReference = try Column.set(transaction, snapshot.versionColumnReference, srcRow, transaction.newVersion);
+        snapshot.versionColumnReference = try Column.set(transaction, snapshot.versionColumnReference, sourceRow, transaction.newVersion);
     }
     return snapshot.replace(transaction);
 }

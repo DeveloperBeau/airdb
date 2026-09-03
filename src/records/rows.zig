@@ -84,14 +84,15 @@ fn blobValueIndexRemove(transaction: *WriteTransaction, valueIndexReference: Ref
     return try byteKeyIndex.insert(transaction, valueIndexReference, key, newSet);
 }
 
-// Add objectKey under indexed property propertyIndex's key for `raw`, returning
-// the new catalog. The property's kind decides the keying: an int or link
-// property keys on the column word itself; a `.blob` property keys on the
-// stored bytes truncated to blobIndexKey.maxLength, which makes the index a
-// CANDIDATE index (see blobIndexKey.zig) rather than a covering one.
-// One catalog load, one index descent and one insert; a blob property adds
-// one blob prefix read. I/O.
-fn addToValueIndex(transaction: *WriteTransaction, catalogReference: Reference, propertyIndex: usize, raw: u64, objectKey: u64) !Reference {
+/// Add objectKey under indexed property propertyIndex's key for `raw`, returning
+/// the new catalog. The property's kind decides the keying: an int or link
+/// property keys on the column word itself; a `.blob` property keys on the
+/// stored bytes truncated to blobIndexKey.maxLength, which makes the index a
+/// CANDIDATE index (see blobIndexKey.zig) rather than a covering one.
+/// One catalog load, one index descent and one insert; a blob property adds
+/// one blob prefix read. I/O.
+/// Pub: links.zig maintains the same index when it writes a link column directly.
+pub fn addToValueIndex(transaction: *WriteTransaction, catalogReference: Reference, propertyIndex: usize, raw: u64, objectKey: u64) !Reference {
     const view = try loadCatalog(transaction, catalogReference);
     const valueIndexReference = view.valueIndexReference(propertyIndex);
     const newValueIndex = switch (view.kind(propertyIndex)) {
@@ -105,10 +106,11 @@ fn addToValueIndex(transaction: *WriteTransaction, catalogReference: Reference, 
     return try catalog.setValueIndexReference(transaction, catalogReference, propertyIndex, newValueIndex);
 }
 
-// The exact mirror of addToValueIndex: removes objectKey from indexed
-// property propertyIndex's key for `raw`, keyed the same way addToValueIndex
-// keys it.
-fn removeFromValueIndex(transaction: *WriteTransaction, catalogReference: Reference, propertyIndex: usize, raw: u64, objectKey: u64) !Reference {
+/// The exact mirror of addToValueIndex: removes objectKey from indexed
+/// property propertyIndex's key for `raw`, keyed the same way addToValueIndex
+/// keys it. Same cost; I/O.
+/// Pub: links.zig maintains the same index when it writes a link column directly.
+pub fn removeFromValueIndex(transaction: *WriteTransaction, catalogReference: Reference, propertyIndex: usize, raw: u64, objectKey: u64) !Reference {
     const view = try loadCatalog(transaction, catalogReference);
     const valueIndexReference = view.valueIndexReference(propertyIndex);
     const newValueIndex = switch (view.kind(propertyIndex)) {
